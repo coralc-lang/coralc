@@ -89,7 +89,6 @@ _mmap:
     test %rax, %rax
     jnz .LBB1
     jmp .LBB2
-
 .LBB1:
     mov $0, %rax
     mov %rbp, %rsp
