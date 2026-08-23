@@ -110,7 +110,7 @@ ir_types.IrType* mapCType(FuncGen* fg, types.CType* t)
     // reserves the full storage; field access goes through byte-offset GEPs.
     if (t->kind == types.TY_NAMED)
     {
-        u32 sz = cSize(t, fg.top);
+        u32 sz = aggSizeOf(t, fg.top);
         if (sz == 0) sz = 8;
         return fg.ctx.tyArray(fg.ctx.tyInt(8), sz);
     }
@@ -241,65 +241,120 @@ u64 parseIntLit(str.strView s)
 }
 
 ir_types.IrValue* genExpr(FuncGen* fg, ast.Expr* e);
+ir_types.IrValue* genAddr(FuncGen* fg, ast.Expr* e);
 
-// storeToLhs: emit the store half of an assignment for any lvalue form:
-// plain locals, derefs (*p / p[0] handled by caller), and struct fields.
+// aggregate size/alignment: single source of truth for layout
+// Honours [[reorder]]/[[packed]] modes; self-recursive for nested structs.
+u32 aggAlignOf(types.CType* ct, scopes.Scope* top);
+
+u32 aggSizeOf(types.CType* ct, scopes.Scope* top)
+{
+    if (ct == null) return 0;
+    ct = types.effective(ct);
+    if (ct == null) return 0;
+    switch (ct->kind)
+    {
+    case types.TY_VOID: return 0;
+    case types.TY_BOOL: return 1;
+    case types.TY_CHAR: return 1;
+    case types.TY_INT: return ct->width ? (ct->width + 7)/8 : 4;
+    case types.TY_FLOAT: return ct->width ? (ct->width + 7)/8 : 8;
+    case types.TY_PTR: return 8;
+    case types.TY_FUNC: return 8;
+    case types.TY_SLICE: return 16;
+    case types.TY_ARRAY:
+    {
+        if (ct->elem == null) return 8;
+        u32 es = aggSizeOf(ct->elem, top);
+        if (ct->countKnown && ct->count > 0) return es * (u32)ct->count;
+        return es;
+    }
+    case types.TY_NAMED:
+    {
+        if (ct->decl == null || ct->decl->kind != ast.DT_STRUCT) return 8;
+        ast.Decl* sd = ct->decl;
+        u32 nf = sd->nfields;
+        if (nf == 0) return 0;
+        bool isPacked = sd->layoutMode == 2 || sd->layoutMode == 3;
+        bool isReorder = sd->layoutMode == 1 || sd->layoutMode == 3;
+        u32 orderArr[64];
+        u32* order = orderArr;
+        bool heapOrder = nf > 64;
+        if (heapOrder) order = mman.alloc<u32>(nf);
+        for (u32 f = 0; f < nf; f++) order[f] = f;
+        if (isReorder && nf > 1)
+        {
+            for (u32 i = 0; i < nf; i++)
+                for (u32 j = i+1; j < nf; j++)
+                {
+                    types.CType* ti = scopes.resolveTypeExpr(sd->fields[order[i]].type, top, null, null, 0);
+                    types.CType* tj = scopes.resolveTypeExpr(sd->fields[order[j]].type, top, null, null, 0);
+                    bool swap = false;
+                    u32 ai = aggAlignOf(ti, top);
+                    u32 aj = aggAlignOf(tj, top);
+                    if (ai != aj) swap = aj > ai;
+                    else swap = aggSizeOf(tj, top) > aggSizeOf(ti, top);
+                    if (swap) { u32 tmp = order[i]; order[i]=order[j]; order[j]=tmp; }
+                }
+        }
+        u32 cur = 0;
+        u32 maxA = 1;
+        for (u32 idx = 0; idx < nf; idx++)
+        {
+            types.CType* ft = scopes.resolveTypeExpr(sd->fields[order[idx]].type, top, null, null, 0);
+            u32 al = aggAlignOf(ft, top);
+            u32 sz = aggSizeOf(ft, top);
+            if (al > maxA) maxA = al;
+            if (!isPacked && al > 0) { u32 pad = (al - (cur % al)) % al; cur += pad; }
+            cur += sz;
+        }
+        if (!isPacked && maxA > 1) { u32 pad = (maxA - (cur % maxA)) % maxA; cur += pad; }
+        if (heapOrder) mman.dealloc<u32>(order);
+        return cur;
+    }
+    default: return 8;
+    }
+}
+
+u32 aggAlignOf(types.CType* ct, scopes.Scope* top)
+{
+    if (ct == null) return 1;
+    ct = types.effective(ct);
+    if (ct == null) return 1;
+    switch (ct->kind)
+    {
+    case types.TY_VOID: return 1;
+    case types.TY_BOOL: return 1;
+    case types.TY_CHAR: return 1;
+    case types.TY_INT: return ct->width ? (ct->width + 7)/8 : 4;
+    case types.TY_FLOAT: return ct->width ? (ct->width + 7)/8 : 8;
+    case types.TY_PTR: return 8;
+    case types.TY_FUNC: return 8;
+    case types.TY_SLICE: return 8;
+    case types.TY_ARRAY: if (ct->elem) return aggAlignOf(ct->elem, top); return 8;
+    case types.TY_NAMED:
+    {
+        if (ct->decl == null || ct->decl->kind != ast.DT_STRUCT) return 8;
+        u32 m = 1;
+        for (u32 i = 0; i < ct->decl->nfields; i++)
+        {
+            types.CType* ft = scopes.resolveTypeExpr(ct->decl->fields[i].type, top, null, null, 0);
+            u32 a = aggAlignOf(ft, top);
+            if (a > m) m = a;
+        }
+        return m;
+    }
+    default: return 8;
+    }
+}
+
+// storeToLhs: store `rv` into the lvalue `a`. One path for every lvalue
+// form (locals, fields, index chains, derefs) through genAddr.
 void storeToLhs(FuncGen* fg, ast.Expr* a, ir_types.IrValue* rv)
 {
     if (a == null || rv == null) return;
-    if (a->kind == ast.EX_IDENT)
-    {
-        ir_types.IrValue* ptr = findLocal(fg, a->text);
-        if (ptr != null) { fg.bd.store(rv, ptr); return; }
-        return;
-    }
-    if (a->kind == ast.EX_DOT || a->kind == ast.EX_ARROW)
-    {
-        ir_types.IrValue* fp = fieldAddress(fg, a);
-        if (fp != null) { fg.bd.store(rv, fp); return; }
-        return;
-    }
-    if (a->kind == ast.EX_UNARY && opEq(a->text, "*"))
-    {
-        ir_types.IrValue* ptr = genExpr(fg, a->a);
-        if (ptr != null) fg.bd.store(rv, ptr);
-        return;
-    }
-    if (a->kind == ast.EX_DEREF)
-    {
-        ir_types.IrValue* ptr = genExpr(fg, a->a);
-        if (ptr != null) fg.bd.store(rv, ptr);
-        return;
-    }
-    if (a->kind == ast.EX_INDEX)
-    {
-        // Handle 2D case arr[i][j] as linear index i*innerSize + j
-        if (a->a->kind == ast.EX_INDEX && a->a->a->kind == ast.EX_IDENT) {
-            ir_types.IrValue* arrPtr = findLocal(fg, a->a->a->text);
-            if (arrPtr) {
-                ir_types.IrValue* outer = genExpr(fg, a->a->b);
-                ir_types.IrValue* inner = genExpr(fg, a->b);
-                ir_types.IrValue* three = fg.ctx.constInt(fg.ctx.tyInt(64), 3);
-                // For arr[2][3], inner size is 3
-                ir_types.IrInst* mul = fg.bd.mul(outer, three);
-                ir_types.IrInst* add = fg.bd.add(&mul->base, inner);
-                ir_types.IrValue* idxs[1]; idxs[0]=&add->base;
-                ir_types.IrInst* gp = fg.bd.gep(arrPtr, idxs, 1);
-                fg.bd.store(rv, &gp->base);
-                return;
-            }
-        }
-        ir_types.IrValue* basePtr = null;
-        if (a->a->kind == ast.EX_IDENT) basePtr = findLocal(fg, a->a->text);
-        if (basePtr == null) basePtr = genExpr(fg, a->a);
-        if (basePtr == null) return;
-        ir_types.IrValue* idxs[1];
-        idxs[0] = genExpr(fg, a->b);
-        if (idxs[0] == null) return;
-        ir_types.IrInst* gp = fg.bd.gep(basePtr, idxs, 1);
-        fg.bd.store(rv, &gp->base);
-        return;
-    }
+    ir_types.IrValue* ptr = genAddr(fg, a);
+    if (ptr != null) fg.bd.store(rv, ptr);
 }
 
 // structFieldOffset: byte offset of field `name` in `sd` honouring
@@ -325,10 +380,10 @@ bool structFieldOffset(FuncGen* fg, ast.Decl* sd, str.strView name, u32* outOff)
             {
                 types.CType* ti = scopes.resolveTypeExpr(sd->fields[order[i]].type, fg.top, fg.mods, null, 0);
                 types.CType* tj = scopes.resolveTypeExpr(sd->fields[order[j]].type, fg.top, fg.mods, null, 0);
-                u32 si = cSize(ti, fg.top);
-                u32 sj = cSize(tj, fg.top);
-                u32 ai = cAlign(ti, fg.top);
-                u32 aj = cAlign(tj, fg.top);
+                u32 si = aggSizeOf(ti, fg.top);
+                u32 sj = aggSizeOf(tj, fg.top);
+                u32 ai = aggAlignOf(ti, fg.top);
+                u32 aj = aggAlignOf(tj, fg.top);
                 bool swap = false;
                 if (ai != aj) swap = aj > ai;
                 else swap = sj > si;
@@ -341,8 +396,8 @@ bool structFieldOffset(FuncGen* fg, ast.Decl* sd, str.strView name, u32* outOff)
     {
         u32 f = order[idx];
         types.CType* ft = scopes.resolveTypeExpr(sd->fields[f].type, fg.top, fg.mods, null, 0);
-        u32 al = cAlign(ft, fg.top);
-        u32 sz = cSize(ft, fg.top);
+        u32 al = aggAlignOf(ft, fg.top);
+        u32 sz = aggSizeOf(ft, fg.top);
         if (!isPacked && al > 0) { u32 pad = (al - (cur % al)) % al; cur += pad; }
         if (f == fieldIdx) { *outOff = cur; found = true; break; }
         cur += sz;
@@ -409,6 +464,66 @@ ir_types.IrValue* fieldAddress(FuncGen* fg, ast.Expr* e)
     ir_types.IrType* fieldPtrTy = fg.ctx.tyPtr(fieldIrTy);
     ir_types.IrInst* bc2 = fg.bd.bitcast(&gep->base, fieldPtrTy);
     return &bc2->base;
+}
+
+// genIndexBasePtr: pointer to index into for `base[idx]`.
+// Array lvalues contribute their ADDRESS (decay, no load); pointers
+// contribute their VALUE. Reports the element CType for stride scaling.
+ir_types.IrValue* genIndexBasePtr(FuncGen* fg, ast.Expr* base, types.CType** outElemTy)
+{
+    types.CType* bt = base ? expr.inferredType(base) : null;
+    if (bt != null) bt = types.effective(bt);
+    if (bt != null && bt->kind == types.TY_ARRAY)
+    {
+        if (outElemTy != null) *outElemTy = bt->elem;
+        ir_types.IrValue* ap = genAddr(fg, base);
+        if (ap != null) return ap;
+    }
+    else if (bt != null && (bt->kind == types.TY_PTR || bt->kind == types.TY_SLICE))
+    {
+        if (outElemTy != null) *outElemTy = bt->elem;
+        return genExpr(fg, base);
+    }
+    if (outElemTy != null) *outElemTy = null;
+    ir_types.IrValue* ap = genAddr(fg, base);
+    if (ap != null) return ap;
+    return genExpr(fg, base);
+}
+
+// genAddr: address of an lvalue. No loads on the way down — this is what
+// makes arrays-of-arrays and arrays-in-structs work: every level stays a
+// pointer until the final scalar load (or an explicit decay).
+ir_types.IrValue* genAddr(FuncGen* fg, ast.Expr* e)
+{
+    if (e == null) return null;
+    switch (e->kind)
+    {
+    case ast.EX_IDENT:
+        return findLocal(fg, e->text);
+    case ast.EX_DOT:
+    case ast.EX_ARROW:
+        return fieldAddress(fg, e);
+    case ast.EX_INDEX:
+    {
+        ir_types.IrValue* addr = genAddr(fg, e);
+        if (addr == null) return fg.ctx.constInt(fg.ctx.tyInt(64), 0);
+        // array/struct result decays to its address
+        types.CType* it = expr.inferredType(e);
+        if (it != null) it = types.effective(it);
+        bool isAgg = it != null && (it->kind == types.TY_ARRAY
+            || (it->kind == types.TY_NAMED && it->decl != null && it->decl->kind == ast.DT_STRUCT));
+        if (isAgg) return addr;
+        ir_types.IrType* et = it != null ? mapCType(fg, it) : fg.ctx.tyInt(64);
+        return dbgVal(fg, e, fg.bd.load(et, addr));
+    }
+    case ast.EX_DEREF:
+        return genExpr(fg, e->a);
+    case ast.EX_UNARY:
+        if (opEq(e->text, "*")) return genExpr(fg, e->a);
+        return null;
+    default:
+        return null;
+    }
 }
 
 ir_types.IrValue* genBinary(FuncGen* fg, ast.Expr* e)
@@ -653,6 +768,12 @@ ir_types.IrValue* genExpr(FuncGen* fg, ast.Expr* e)
         ir_types.IrValue* ptr = findLocal(fg, e->text);
         if (ptr != null)
         {
+            // array/struct locals decay to their address
+            types.CType* it0 = expr.inferredType(e);
+            if (it0 != null) it0 = types.effective(it0);
+            bool agg0 = it0 != null && (it0->kind == types.TY_ARRAY
+                || (it0->kind == types.TY_NAMED && it0->decl != null && it0->decl->kind == ast.DT_STRUCT));
+            if (agg0) return ptr;
             ir_types.IrType* ty = ptr->type;
             if (ty && ty->kind == ir_types.IrTypeKind::Ptr && ty->elem)
                 return dbgVal(fg, e, fg.bd.load(ty->elem, ptr));
@@ -783,6 +904,12 @@ ir_types.IrValue* genExpr(FuncGen* fg, ast.Expr* e)
             ir_types.IrValue* fp = fieldAddress(fg, e);
             if (fp != null)
             {
+                // aggregate fields decay to their address (no load)
+                types.CType* it = expr.inferredType(e);
+                if (it != null) it = types.effective(it);
+                bool isAgg = it != null && (it->kind == types.TY_ARRAY
+                    || (it->kind == types.TY_NAMED && it->decl != null && it->decl->kind == ast.DT_STRUCT));
+                if (isAgg) return fp;
                 ir_types.IrType* ft = fp->type;
                 ir_types.IrType* et2 = ft && ft->kind == ir_types.IrTypeKind::Ptr && ft->elem ? ft->elem : fg.ctx.tyInt(64);
                 return dbgVal(fg, e, fg.bd.load(et2, fp));
@@ -850,11 +977,8 @@ ir_types.IrValue* genExpr(FuncGen* fg, ast.Expr* e)
     }
     case ast.EX_ADDR:
     {
-        if (e->a && e->a->kind == ast.EX_IDENT)
-        {
-            ir_types.IrValue* ptr = findLocal(fg, e->a->text);
-            if (ptr != null) return ptr;
-        }
+        ir_types.IrValue* ptr = genAddr(fg, e->a);
+        if (ptr != null) return ptr;
         return genExpr(fg, e->a);
     }
     default:
@@ -1059,7 +1183,14 @@ void genStmt(FuncGen* fg, ast.Stmt* s)
         ir_types.IrValue* cond = dbgVal(fg, s->a, fg.bd.icmp(ir_opcodes.IrICmpPred::Ult, idxVal, lenVal));
         fg.bd.condBr(cond, body, exit);
         fg.bd.pos(body, null); fg.terminated = false;
-        ir_types.IrValue* idxs[1]; idxs[0] = idxVal;
+        u32 fesz = elemTy != null ? aggSizeOf(elemTy, fg.top) : 8;
+        ir_types.IrValue* fsidx = idxVal;
+        if (fesz != 8)
+        {
+            ir_types.IrInst* fm = fg.bd.mul(idxVal, fg.ctx.constInt(fg.ctx.tyInt(64), fesz));
+            fsidx = &fm->base;
+        }
+        ir_types.IrValue* idxs[1]; idxs[0] = fsidx;
         ir_types.IrInst* gep = fg.bd.gep(ptrVal, idxs, 1);
         ir_types.IrValue* elem = dbgVal(fg, s->a, fg.bd.load(elemIrTy, &gep->base));
         fg.bd.store(elem, &varAlloca->base);
@@ -1427,10 +1558,10 @@ pub ir_types.IrModule* buildModule(ast.Program* prog, scopes.Scope* top,
                     {
                         types.CType* ta = scopes.resolveTypeExpr(d->fields[order[a]].type, top, mods, null, 0);
                         types.CType* tb = scopes.resolveTypeExpr(d->fields[order[b]].type, top, mods, null, 0);
-                        u32 sa = cSize(ta, top);
-                        u32 sb = cSize(tb, top);
-                        u32 aa = cAlign(ta, top);
-                        u32 ab = cAlign(tb, top);
+                        u32 sa = aggSizeOf(ta, top);
+                        u32 sb = aggSizeOf(tb, top);
+                        u32 aa = aggAlignOf(ta, top);
+                        u32 ab = aggAlignOf(tb, top);
                         bool swap = false;
                         if (aa != ab) swap = ab > aa;
                         else swap = sb > sa;
