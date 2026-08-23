@@ -18,6 +18,131 @@ mod loader = import("typecheck/loader.crl");
  mod ceval = import("mono/ceval.crl");
  mod codegen = import("codegen/emit.crl");
 
+// ---- reachable-import support ----
+const u32 RN_CAP = 512;
+struct UsedNames
+{
+    char names[512 * 64];   // flattened rows of 64 bytes
+    u32 n;
+    str.strView roots[64]; // dotted-chain roots (module aliases)
+    u32 nroots;
+}
+
+void unAdd(UsedNames* u, str.strView t)
+{
+    if (t.len == 0 || t.len >= 64) return;
+    for (u32 i = 0; i < u.n; i++)
+        if (libc.memcmp((const void*)(u.names + i * 64), (const void*)t.ptr, t.len) == 0
+            && u.names[i * 64 + t.len] == 0) return;
+    if (u.n >= RN_CAP) return;
+    libc.memcpy((void*)(u.names + u.n * 64), (const void*)t.ptr, t.len);
+    u.names[u.n * 64 + t.len] = 0;
+    u.n++;
+}
+
+void unHas(UsedNames* u, str.strView t, bool* out)
+{
+    *out = false;
+    if (t.len == 0 || t.len >= 64) return;
+    for (u32 i = 0; i < u.n; i++)
+        if (libc.memcmp((const void*)(u.names + i * 64), (const void*)t.ptr, t.len) == 0
+            && u.names[i * 64 + t.len] == 0) { *out = true; return; }
+}
+
+void unExpr(UsedNames* u, ast.Expr* e)
+{
+    if (e == null) return;
+    switch (e->kind)
+    {
+    case ast.EX_IDENT:
+        unAdd(u, e->text);
+        break;
+    case ast.EX_DOT:
+    case ast.EX_ARROW:
+        unAdd(u, e->text);   // member segment (leaf name)
+        unExpr(u, e->a);
+        break;
+    case ast.EX_CALL:
+        unExpr(u, e->a);
+        for (u32 i = 0; i < e->nargs; i++) unExpr(u, e->args[i]);
+        break;
+    case ast.EX_UNARY:
+    case ast.EX_DEREF:
+    case ast.EX_ADDR:
+    case ast.EX_PAREN:
+        unExpr(u, e->a);
+        break;
+    case ast.EX_BINARY:
+        unExpr(u, e->a);
+        unExpr(u, e->b);
+        break;
+    case ast.EX_TERNARY:
+        unExpr(u, e->a);
+        unExpr(u, e->b);
+        unExpr(u, e->c);
+        break;
+    case ast.EX_INDEX:
+        unExpr(u, e->a);
+        unExpr(u, e->b);
+        break;
+    case ast.EX_CAST:
+        unExpr(u, e->a);
+        break;
+    default:
+        break;
+    }
+}
+
+void unStmt(UsedNames* u, ast.Stmt* st)
+{
+    if (st == null) return;
+    switch (st->kind)
+    {
+    case ast.ST_BLOCK:
+        for (u32 i = 0; i < st->nstmts; i++) unStmt(u, st->stmts[i]);
+        break;
+    case ast.ST_VAR:
+        unExpr(u, st->a);
+        if (st->stmts != null && st->nstmts > 0)
+            for (u32 i = 0; i < st->nstmts; i++) unStmt(u, st->stmts[i]);
+        break;
+    case ast.ST_EXPR:
+        unExpr(u, st->a);
+        break;
+    case ast.ST_RETURN:
+        unExpr(u, st->a);
+        break;
+    case ast.ST_IF:
+        unExpr(u, st->a);
+        unStmt(u, st->body);
+        unStmt(u, st->body2);
+        break;
+    case ast.ST_WHILE:
+    case ast.ST_LOOP:
+        unExpr(u, st->a);
+        unStmt(u, st->body);
+        break;
+    case ast.ST_FOR:
+        unStmt(u, st->init);
+        unExpr(u, st->b);
+        unExpr(u, st->c);
+        unStmt(u, st->body);
+        break;
+    case ast.ST_FORIN:
+        unExpr(u, st->a);
+        unStmt(u, st->body);
+        break;
+    case ast.ST_DEFER:
+        unStmt(u, st->body);
+        break;
+    case ast.ST_ASSERT:
+        unExpr(u, st->a);
+        break;
+    default:
+        break;
+    }
+}
+
 pub struct Check
 {
     ast.Program* prog;
@@ -33,6 +158,7 @@ pub struct Check
     str.strView flagVals[16];
     u32 nflags;
 
+    loader.Loader* ld;       // set during run(); per-module srcs for diagnostics
     scopes.Scope* top;       // set during run(); used by codegen (emit)
     scopes.ModuleTable* mods;
     u32 emitMode;             // 0=none 1=h 2=ir 3=asm (set by driver)
@@ -59,14 +185,50 @@ pub struct Check
         c.debugBuild = false;
         c.outputPath = strView::empty();
         c.linkerFlags = strView::empty();
+        c.ld = null;
         c.top = null;
         c.mods = null;
         return c;
     }
 
+    // Per-decl source attribution: decls parsed from an imported module
+    // carry their own file in srcFile; report against THAT file (path +
+    // caret line from its text) so multi-module errors are locatable.
+    bool declSrc(ast.Decl* d, str.strView* fileOut, str.strView* srcOut)
+    {
+        if (d != null && d->srcFile.len > 0
+            && !veqPrefix(self.filename, "") && d->srcFile.len == self.filename.len
+            && libc.memcmp((const void*)d->srcFile.ptr, (const void*)self.filename.ptr, d->srcFile.len) == 0)
+        {
+            *fileOut = self.filename;
+            *srcOut = self.src;
+            return true;
+        }
+        if (d != null && d->srcFile.len > 0 && self.ld != null)
+        {
+            for (u32 i = 0; i < self.ld.n; i++)
+            {
+                u32 pl = 0;
+                while (self.ld.paths[i][pl] != 0) pl++;
+                if (pl == d->srcFile.len
+                    && libc.memcmp((const void*)self.ld.paths[i], (const void*)d->srcFile.ptr, pl) == 0)
+                {
+                    *fileOut = d->srcFile;
+                    *srcOut = str.strView::fromParts((const char*)self.ld.srcs[i], self.ld.srcLens[i]);
+                    return true;
+                }
+            }
+        }
+        *fileOut = self.filename;
+        *srcOut = self.src;
+        return false;
+    }
+
     void errDecl(ast.Decl* d, str.strView code, str.strView msg, str.strView help)
     {
-        error.reportCode(code, self.filename, self.src, d->line, d->col,
+        str.strView f; str.strView sc;
+        self.declSrc(d, &f, &sc);
+        error.reportCode(code, f, sc, d->line, d->col,
                          error.LVL_ERROR, msg, help);
         self.nerrors++;
     }
@@ -197,6 +359,7 @@ pub struct Check
         // load imported modules so cross-file symbols (String::new,
         // strView::fromParts, ...) resolve against real declarations
         loader.Loader* ld = loader.loaderNew(self.exeDir);
+        self.ld = ld;
         ceval.reset();
         for (u32 i = 0; i < self.prog->ndecls && i < 256; i++)
         {
@@ -229,7 +392,129 @@ pub struct Check
             scopes.scopeDeclare(top, msym);
         }
 
-        // pass 1: declare all top-level symbols
+// flag expansion + import inlining MUST precede declaration so every
+    // visible symbol (including imported modules') is declared once.
+            {
+            ast.Decl** newDecls = mman.alloc<ast.Decl*>(self.prog->ndecls * 4 + 4);
+            u32 newN = 0;
+            for (u32 i = 0; i < self.prog->ndecls; i++)
+            {
+                ast.Decl* d = self.prog->decls[i];
+                if (d == null) continue;
+                if (d->kind == ast.DT_FLAG)
+                {
+                    ast.Decl** body = null;
+                    u32 nbody = 0;
+                    str.strView sel = self.flagValue(d->name);
+                    if (sel.len > 0)
+                    {
+                        u32 off = 0;
+                        for (u32 ci = 0; ci < d->ncases; ci++)
+                        {
+                            if (vEqSV(d->caseNames[ci], sel)) { body = d->cases + off; nbody = d->caseLens[ci]; break; }
+                            off += d->caseLens[ci];
+                        }
+                    } else if (d->defaultBody != null) { body = d->defaultBody; nbody = d->ndeclDefault; }
+                    if (body != null) for (u32 k = 0; k < nbody; k++) if (body[k] != null) newDecls[newN++] = body[k];
+                    continue;
+                }
+                newDecls[newN++] = d;
+            }
+            bool hadFlag = false;
+            for (u32 i = 0; i < self.prog->ndecls; i++) if (self.prog->decls[i] != null && self.prog->decls[i]->kind == ast.DT_FLAG) { hadFlag = true; break; }
+            if (hadFlag || newN != self.prog->ndecls)
+            {
+                if (self.prog->decls) mman.dealloc<ast.Decl*>(self.prog->decls);
+                self.prog->decls = newDecls;
+                self.prog->ndecls = newN;
+            } else mman.dealloc<ast.Decl*>(newDecls);
+        }
+        if (self.emitMode != 0)
+        {
+            // Reachability closure: seed with every name referenced by the
+            // main file, then pull any imported decl whose name is referenced
+            // (its own body pulls its private helpers transitively).
+            UsedNames used;
+            used.n = 0;
+            used.nroots = 0;
+            for (u32 i = 0; i < self.prog->ndecls; i++)
+            {
+                ast.Decl* d0 = self.prog->decls[i];
+                if (d0 == null) continue;
+                if (d0->kind == ast.DT_FUNC && d0->body != null) unStmt(&used, d0->body);
+                else if (d0->value != null) unExpr(&used, d0->value);
+            }
+            bool anyUsed = used.n > 0;
+            char seenBase[6144];
+            u32 nSeen = 0;
+            ast.Decl** pulled = mman.alloc<ast.Decl*>(4096);
+            u32 nPulled = 0;
+            for (u32 li = 0; li < ld->n; li++)
+            {
+                ast.Program* ip = ld->progs[li];
+                if (ip == null) continue;
+                // dedupe by basename: the same file can sit in ld twice under
+                // different resolved paths (different import spellings)
+                {
+                    str.strView fn2 = ip->filename;
+                    u32 bs = 0;
+                    for (u32 c = 0; c < fn2.len; c++) if (fn2.ptr[c] == '/') bs = c + 1;
+                    u32 bl = fn2.len - bs;
+                    if (bl == 0 || bl > 95) continue;
+                    bool seenF = false;
+                    for (u32 k = 0; k < nSeen; k++)
+                    {
+                        u32 sl2 = 0;
+                        while (seenBase[k * 96 + sl2] != 0) sl2++;
+                        if (sl2 == bl && libc.memcmp((const void*)(seenBase + k * 96), (const void*)(fn2.ptr + bs), bl) == 0) { seenF = true; break; }
+                    }
+                    if (seenF) continue;
+                    libc.memcpy((void*)(seenBase + nSeen * 96), (const void*)(fn2.ptr + bs), bl);
+                    seenBase[nSeen * 96 + bl] = 0;
+                    nSeen++;
+                }
+                for (u32 k = 0; k < ip->ndecls; k++)
+                {
+                    ast.Decl* id = ip->decls[k];
+                    if (id == null) continue;
+                    if (id->kind != ast.DT_FUNC && id->kind != ast.DT_STRUCT && id->kind != ast.DT_ENUM && id->kind != ast.DT_TYPEDEF && id->kind != ast.DT_EXTERN && id->kind != ast.DT_VAR) continue;
+                    if (id->kind == ast.DT_IMPORT) continue;
+                    if (id->ngenerics > 0) continue;
+                    if (anyUsed)
+                    {
+                        bool need = false;
+                        unHas(&used, id->name, &need);
+                        // private helpers of an already-pulled decl get pulled
+                        // transitively in the fixpoint below; here only pub
+                        // seeds match direct usage.
+                        if (need && !id->exported) need = false;
+                        if (!need)
+                        {
+                            for (u32 pk = 0; pk < nPulled; pk++)
+                            {
+                                unStmt(&used, pulled[pk]->body);
+                                unExpr(&used, pulled[pk]->value);
+                                unHas(&used, id->name, &need);
+                                if (need) break;
+                            }
+                        }
+                        if (!need) continue;
+                    }
+                    else if (!id->exported) continue;
+                    bool exists = false;
+                    for (u32 j = 0; j < self.prog->ndecls; j++) if (self.prog->decls[j] == id) { exists = true; break; }
+                    if (exists) continue;
+                    ast.Decl** nd = mman.alloc<ast.Decl*>(self.prog->ndecls + 1);
+                    for (u32 j = 0; j < self.prog->ndecls; j++) nd[j] = self.prog->decls[j];
+                    nd[self.prog->ndecls] = id;
+                    if (self.prog->decls) mman.dealloc<ast.Decl*>(self.prog->decls);
+                    self.prog->decls = nd;
+                    self.prog->ndecls++;
+                    if (nPulled < 4096) pulled[nPulled++] = id;
+                }
+            }
+        }
+            // pass 1: declare all top-level symbols
         for (u32 i = 0; i < self.prog->ndecls; i++)
         {
             ast.Decl* d = self.prog->decls[i];
@@ -450,65 +735,6 @@ pub struct Check
             }
         }
 
-        {
-            ast.Decl** newDecls = mman.alloc<ast.Decl*>(self.prog->ndecls * 4 + 4);
-            u32 newN = 0;
-            for (u32 i = 0; i < self.prog->ndecls; i++)
-            {
-                ast.Decl* d = self.prog->decls[i];
-                if (d == null) continue;
-                if (d->kind == ast.DT_FLAG)
-                {
-                    ast.Decl** body = null;
-                    u32 nbody = 0;
-                    str.strView sel = self.flagValue(d->name);
-                    if (sel.len > 0)
-                    {
-                        u32 off = 0;
-                        for (u32 ci = 0; ci < d->ncases; ci++)
-                        {
-                            if (vEqSV(d->caseNames[ci], sel)) { body = d->cases + off; nbody = d->caseLens[ci]; break; }
-                            off += d->caseLens[ci];
-                        }
-                    } else if (d->defaultBody != null) { body = d->defaultBody; nbody = d->ndeclDefault; }
-                    if (body != null) for (u32 k = 0; k < nbody; k++) if (body[k] != null) newDecls[newN++] = body[k];
-                    continue;
-                }
-                newDecls[newN++] = d;
-            }
-            bool hadFlag = false;
-            for (u32 i = 0; i < self.prog->ndecls; i++) if (self.prog->decls[i] != null && self.prog->decls[i]->kind == ast.DT_FLAG) { hadFlag = true; break; }
-            if (hadFlag || newN != self.prog->ndecls)
-            {
-                if (self.prog->decls) mman.dealloc<ast.Decl*>(self.prog->decls);
-                self.prog->decls = newDecls;
-                self.prog->ndecls = newN;
-            } else mman.dealloc<ast.Decl*>(newDecls);
-        }
-        if (self.emitMode != 0)
-        {
-            for (u32 li = 0; li < ld->n; li++)
-            {
-                ast.Program* ip = ld->progs[li];
-                if (ip == null) continue;
-                for (u32 k = 0; k < ip->ndecls; k++)
-                {
-                    ast.Decl* id = ip->decls[k];
-                    if (id == null) continue;
-                    if (id->kind != ast.DT_FUNC && id->kind != ast.DT_STRUCT && id->kind != ast.DT_ENUM && id->kind != ast.DT_TYPEDEF && id->kind != ast.DT_EXTERN && id->kind != ast.DT_VAR) continue;
-                    if (id->ngenerics > 0) continue;
-                    bool exists = false;
-                    for (u32 j = 0; j < self.prog->ndecls; j++) if (self.prog->decls[j] == id) { exists = true; break; }
-                    if (exists) continue;
-                    ast.Decl** nd = mman.alloc<ast.Decl*>(self.prog->ndecls + 1);
-                    for (u32 j = 0; j < self.prog->ndecls; j++) nd[j] = self.prog->decls[j];
-                    nd[self.prog->ndecls] = id;
-                    if (self.prog->decls) mman.dealloc<ast.Decl*>(self.prog->decls);
-                    self.prog->decls = nd;
-                    self.prog->ndecls++;
-                }
-            }
-        }
         // pass 2: type-check const/var initializers and enum variant values
         for (u32 i = 0; i < self.prog->ndecls; i++)
         {
@@ -615,6 +841,8 @@ pub struct Check
         // codegen dispatch (emit targets). Runs while the scope/mods are still
         // alive: resolveTypeExpr needs them, and run() frees `top` below.
         str.strView outPath = self.outputPath.len>0 ? self.outputPath : self.filename;
+        // no artifacts from broken inputs
+        if (self.nerrors > 0) { scopes.scopeFree(top); return; }
         if (self.emitMode == 1) codegen.emitH(self.prog, top, mods, outPath, self.debugBuild);
         else if (self.emitMode == 2) codegen.emitIR(self.prog, top, mods, outPath, self.optLevel, self.debugBuild);
         else if (self.emitMode == 3) codegen.emitAsm(self.prog, top, mods, outPath, self.optLevel, self.debugBuild, self.flagNames, self.flagVals, self.nflags);
