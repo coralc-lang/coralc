@@ -96,6 +96,32 @@ context, verified state, repro cases, and the remaining task list.
 
 ## 3. VERIFIED GAPS — FIXED THIS SESSION
 
+## 4. NEW CRITICAL ISSUE DISCOVERED (mem2reg infinite loop at -O3)
+
+**Severity**: CRITICAL — compiler hangs indefinitely at `-O3` (and sometimes `-O2`) on code with loops and arrays.
+
+**Location**: `lib/wallvm/passes/mem2reg.crl` — the `irPassMem2Reg` pass.
+
+**Symptoms**:
+- `./coralc file.crl -o out -O3` hangs indefinitely (mem2reg pass never returns)
+- Also observed at `-O2` on some inputs with loops + arrays + nested structs
+- Works fine at `-O0` / `-O1` (mem2reg not run)
+- Affected patterns: loops with array accesses, nested structs with arrays, function calls inside loops
+
+**Root cause hypothesis** (from pass tracing):
+- `mem2reg` attempts to promote alloca-based locals to SSA registers
+- Our IR has many `alloca` for arrays/structs + complex GEP chains + loops
+- The pass likely enters an infinite loop during phi-node placement or renaming
+- Specifically `placePhis` or `renameBlock` may not converge on complex CFGs with many allocas + GEPs + loop back-edges
+
+**Workaround**: Use `-O0` or `-O1` (mem2reg not run). `-O2` sometimes works, sometimes hangs.
+
+**Action required**: Fix mem2reg to handle our IR patterns (many allocas + GEPs + loops) or gate it behind a flag/IR-shape check. This is the #1 blocker for production -O2/-O3 builds.
+
+---
+
+## 5. VERIFIED GAPS — FIXED THIS SESSION
+
 ### G1. `fn` / `loo` / any unknown return type — FIXED
 Now correctly emits `TC-TYPE "unknown return type 'fn'"` from
 `src/typecheck/expr.crl:typeFunction`. All `FOO main()` cases (fn, loo, xyz,
@@ -162,15 +188,16 @@ tab-expanding the extracted line before render.
 
 ---
 
-## 4. Remaining task list (priority order)
+## 6. Remaining task list (priority order)
 
 | # | Task | Where | Status |
 |---|------|-------|--------|
-| 1 | G1+G2 fixes verified (TC-TYPE, missing return, 2D arrays, extern, new.wir flags) — see G1-G3 above | typecheck/expr.crl, parser.crl, codegen/emitir.crl | **DONE** |
-| 2 | Finish empty-help sweep in `check.crl` + any remaining `expr.crl` opaque paths | check.crl, expr.crl | TODO |
+| 1 | **Fix mem2reg infinite loop at -O3** (CRITICAL — blocks all optimized builds) | lib/wallvm/passes/mem2reg.crl | **BLOCKER** |
+| 2 | Finish empty-help sweep in `check.crl` + remaining `expr.crl` opaque paths | check.crl, expr.crl | TODO |
 | 3 | Sweep silent glosses: parser `advance()` past garbage, `opaqueType` without diagnostic, emitir null-guards | parser.crl, typecheck/*, emitir.crl | TODO |
 | 4 | G5/G6 polish (dead branches, caret alignment) | parser.crl, error.crl | TODO |
-| 5 | Regression pass: all §3 repros + `lib2/wallvm/tests/ra_smoke.crl` + `new.wir` -O0..-O3 + full build | — | TODO |
+| 5 | Finish empty-help sweep in `check.crl` + remaining `expr.crl` opaque paths | check.crl, expr.crl | TODO |
+| 6 | Regression pass: all §3 repros + `lib2/wallvm/tests/ra_smoke.crl` + `new.wir` -O0..-O3 + full build | — | TODO (after mem2reg fixed) |
 
 ## 5. Style constraints for edits
 
