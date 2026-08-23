@@ -62,142 +62,127 @@ context, verified state, repro cases, and the remaining task list.
 
 ---
 
-## 2. What was completed this session (verified working)
+## 2. Completed & verified (protect these — regression battery below)
 
-1. **Lexer rejects bad attr forms** — `src/lexer.crl` `scanPunct()` (~line 438):
-   when matching `"@"` (len==1 op), if next two chars are not `[` `[`, emits
-   `LEX-0007 "invalid attribute syntax"` with help "attributes are [[attr]] on
-   declarations or @[[ATTR]] at module level", advances 1 char, returns.
-   - `@[reorder]` → LEX-0007 ✓
-   - `@noret` → LEX-0007 ✓
-   - `@[[no_warn_unsafe]]` → accepted ✓
-   - `lib2/` was grepped: zero `@[` or bare-`@` usages remain, nothing broke.
-2. **Parser struct attrs** — `parseStructDecl`: `isReorder`/`isPacked` via
-   `hasAttr`; both → mode 3; reorder → 1; packed → 2; else 0.
-   `parseAttachedAttrs()` records comma-separated names inside `[[...]]`, so
-   `[[reorder, packed]]` works. Verified sorted offsets d@0 b@8 a@12.
-3. **Inline asm lowering** — `genAsm` in `src/codegen/emitir.crl`:
-   - parses `s->text` captured by `parseAsmStmt` (parser.crl ~1706, braces form);
-   - splits template/output/input/clobber sections on `:` outside quotes;
-   - constraint strings parsed from `"=a"(expr)` pairs; MAXOP 16; constraint
-     storage is FLAT char arrays `char outConstr[192]` indexed `k*12+q`
-     (Coral parser does not accept 2D local arrays);
-   - operand expressions are parsed by re-running the real lexer+parser on the
-     snippet (`parseExprSnippet` using `lex.Lexer` + `parse.Parser`);
-   - outputs bound to allocas via `findLocal`; inputs evaluated with `genExpr`;
-   - emits `fg.bd.inlineAsm(...)`; appends `# clobber:` comment line to template;
-   - first `=a`/`=r` output stored back to its local slot.
-   - Verified: `asm { "movq $3, %%rax\n\t" }` → `inlineasm void [...]`;
-     extended form with clobbers → `inlineasm i64 ["...", %3, %9, %10]` +
-     `store [%12, %3]`.
-4. Build is green (`./build` no errors).
+- **Lexer**: `@[...]`/`@name` rejected (LEX-0007); only `[[attr]]` (decl) and
+  `@[[ATTR]]` (module) exist. `[[reorder, packed]]` comma form works.
+- **Types**: unknown return types rejected (TC-TYPE) — no more silent i64
+  fallback for `fn main()`/`loo main()`. Non-void fn without return → TC-RETURN.
+  void fn returning value → TC-RETURN.
+- **Distinct vs typedef**: distinct needs explicit cast both directions;
+  typedef unwraps implicitly. Enforced in assign/call/return.
+- **2D arrays** `T[N][M]` parse and lower (outer-first, C semantics).
+- **Externs** reach IR as `extern func @name -> ret {}` with isExtern=true →
+  backends emit .globl; extern VARS (`__bss_start`) reach IR as extern globals.
+- **Dotted module types** (`godot.types.ObjectPtr`): resolveDottedViaLoader +
+  retryTypeViaLoader (expr.crl) resolve RETURN TYPES through loaded programs by
+  last-segment match over exported STRUCT/DISTINCT/TYPEDEF/ENUM/TRAIT, plus
+  valueless `pub <type> <name>;` var-aliases (`pub u8 GBool`). singleton.crl
+  and register_class.crl compile 0 errors.
+- **Headers (--emit-h)**: array declarators `T name[2][3]`, #pragma once,
+  extern vars vs funcs distinguished, valueless globals emit `extern T name;`,
+  enums/distinct emitted, packed attribute once, gcc -fsyntax-only clean.
+- **Generics in headers**: instantiated display names mangled — `Box<f64>` →
+  `Box__f64` (pushMangledName). IR/asm never contain raw `<`.
+- **--explain CODE** covers LEX/SYN/TC catalogs; every diagnostic prints
+  "try `coralc --explain CODE`".
+- **Toolchain**: -o FILE; default build = -O1 + gcc link to a.out; --funroll /
+  --fborrowcheck flags exist (unroll/borrowcheck are ON unconditionally inside
+  irStructureLane per owner decision; borrowcheck violation is diagnostic-only,
+  never aborts).
+- **Errors suppress artifacts**: nerrors>0 ⇒ no .wir/.h/.s/.exe written.
+- **Per-module attribution**: imported decls carry srcFile; body-typing errors
+  report the IMPORTED file's path+line+caret via Typer.curFile/diagSrc.
 
----
-
-## 3. VERIFIED GAPS — FIXED THIS SESSION
-
-## 4. NEW CRITICAL ISSUE DISCOVERED (mem2reg infinite loop at -O3)
-
-**Severity**: CRITICAL — compiler hangs indefinitely at `-O3` (and sometimes `-O2`) on code with loops and arrays.
-
-**Location**: `lib/wallvm/passes/mem2reg.crl` — the `irPassMem2Reg` pass.
-
-**Symptoms**:
-- `./coralc file.crl -o out -O3` hangs indefinitely (mem2reg pass never returns)
-- Also observed at `-O2` on some inputs with loops + arrays + nested structs
-- Works fine at `-O0` / `-O1` (mem2reg not run)
-- Affected patterns: loops with array accesses, nested structs with arrays, function calls inside loops
-
-**Root cause hypothesis** (from pass tracing):
-- `mem2reg` attempts to promote alloca-based locals to SSA registers
-- Our IR has many `alloca` for arrays/structs + complex GEP chains + loops
-- The pass likely enters an infinite loop during phi-node placement or renaming
-- Specifically `placePhis` or `renameBlock` may not converge on complex CFGs with many allocas + GEPs + loop back-edges
-
-**Workaround**: Use `-O0` or `-O1` (mem2reg not run). `-O2` sometimes works, sometimes hangs.
-
-**Action required**: Fix mem2reg to handle our IR patterns (many allocas + GEPs + loops) or gate it behind a flag/IR-shape check. This is the #1 blocker for production -O2/-O3 builds.
+### Regression battery (run after EVERY change)
+```
+printf 'i32 main(){return 42;}\n' > t.crl && coralc t.crl -o t -O1 && ./t   # 42
+loop.crl (for i<4 s+=i) → ./l exits 6
+ios-imp.crl --emit-ir → writes
+genh2.crl --emit-h → grep Box__f64 genh2.h
+lib2/coral-godot/examples/singleton.crl --emit-ir → 0 errors
+lib2/coral-godot/examples/register_class.crl → 0 errors
+./build must be warning-free on could-not-import
+```
 
 ---
 
-## 5. VERIFIED GAPS — FIXED THIS SESSION
+## 3. CURRENT OPEN ISSUES (authoritative; C-numbers referenced everywhere)
 
-### G1. `fn` / `loo` / any unknown return type — FIXED
-Now correctly emits `TC-TYPE "unknown return type 'fn'"` from
-`src/typecheck/expr.crl:typeFunction`. All `FOO main()` cases (fn, loo, xyz,
-loin, int) now error. Helped added: "declare it or use a primitive like i32…".
-`new.crl` fixed: `int main` → `i32 main`, `loin` cases would now error.
+### C1. hello_entry.crl hangs the compiler — front-end spin, location UNKNOWN
+Repro: `cd lib2/coral-godot/examples && timeout 20 coralc hello_entry.crl
+--emit-ir` → exit 124, ZERO output bytes (hangs before parse diagnostics).
+Happens at -O0 too ⇒ NOT mem2reg/C4, NOT codegen. gdb attach attempts failed
+on shell-timeouts + wrong cwd ("cannot read input file" inside gdb session).
+Next step: from examples dir run coralc under gdb, Ctrl-C after ~5s, `bt 15`.
+Suspects: import-cycle guard bypassed via two path spellings of one file
+(guard keys on exact resolved path), or non-converging fixpoint.
 
-### G2. Non-void function with no return — FIXED
-Now emits `TC-RETURN "non-void function 'foo' must return a value of type
-'i32'"` with help "add a return statement on every path, or change the return
-type to void" (check in `typeFunction` after `typeStmt`).
+### C2. custom_wrapper.crl — TC-TYPE on METHOD return type through alias
+`godot.types.ObjectPtr body() { ... }` at :42 errors though ObjectPtr is
+`pub distinct` in types.crl and singleton proves top-level fns resolve.
+Cause: retryTypeViaLoader hooked ONLY into typeFunction retType. Methods also
+resolve via fnSig (declareSym pass-1 sig) which lacks retry, and that earlier
+opaque result wins. Fix: wire retryTypeViaLoader into fnSig's return
+resolution AND param-type resolution there + declareSym SYM_FUNC branch.
+Params currently poison silently (tolerated) — fixing them kills ghosts.
 
-### G2b. 2D arrays — FIXED
-`i32[2][3]` now parses correctly. Same for `T[N][M]` on vars/params/fields.
-Parser fix in `src/parser.crl:parseType` collects `arrSizes[16]` then wraps
-in reverse so `i32[2][3]` → outer 2 inner 3 (C semantics).
+### C3. startup_templates.crl (lib2/start/) — never tested this round.
 
-### G2c. Extern IR — FIXED
-`extern("C") T name(...)` now emitted as `extern func name -> T {}` with
-`isExtern=true` and `externLib` set, so `dumpIR` prints `extern func @name`
-and wallvm assembly backends emit `.globl`. Previously skipped (`DT_EXTERN`
-filtered out at `buildModule:1366`).
+### C4. mem2reg infinite loop at -O3
+lib/wallvm/passes/mem2reg.crl never returns on loops containing arrays/GEP
+chains; blocks ALL optimized builds (-O0/-O1 fine). Repro: any loop test with
+-O3. Fix pass or gate it behind a flag until convergent.
 
-### G3. Empty help lines — FIXED (typecheck/expr.crl)
-41 `str.strView::empty()` help args replaced with per-code helps
-(TC-RESOLVE → "declare it…", TC-RETURN → "make the return type…", etc.).
-Remaining gaps: `src/typecheck/check.crl` still has some TC-RESOLVE sites with
-empty helps (flag handling) — low priority.
+### C5. println must become formatible (std.debug.print style)
+Current: println(const u8*) = msg+newline (runtime segfault in its ASM body is
+BACKEND, out of scope this session per owner). Front-end design required:
+comptime parse of the format-string literal, `{}`/`{spec}` placeholders matched
+against trailing args, type-driven dispatch to existing _fprint* family,
+placeholder/arg mismatch = compile error at call-site file:line. Single
+emitted function per distinct arg-type tuple once C6 lands.
 
-### G4 (was) — new.crl/new.wir truncation — FIXED
-Flag bodies (platform=LINUX, ARCH=x86_64) now work. Root cause was
-`flagValueEmit` with `nflags==0` in `emitir.crl` — added fallback defaults
-(LINUX/x86_64) and case-insensitive compare. `new.wir` now correct at -O0..-O3
-(verified 2 funcs, 1 inlineasm, full _mmap syscall, correct `call` args).
+### C6. Comptime variadics `<T...>` unspecialized
+`print<T...>(T... args)` parses/typechecks but mono does not expand call sites
+into concrete instances nor lower `for (var arg : args)` pack iteration.
+Spec: `<T...>` = comptime pack — caller omits type args; tuple inferred per
+call site; one specialized body per tuple, mangled with existing `__` scheme.
+Runtime `...` remains C varargs.
 
-### G3. Empty help lines everywhere in typecheck
-Dozens of `errAt(..., str.strView::empty())` / `errTwoStr(..., "", ...)` calls in
-`src/typecheck/expr.crl` (~40 sites: TC-ARGS 277/301, TC-MEMBER 692,
-TC-RESOLVE 781, TC-INDEX 805, TC-ARITH 890/1149/1151/1163/1191, TC-COND
-899/951/1100/1102/1729, TC-EXPR 816/1315/1328/1341/1655/1671/1689/1630,
-TC-SWITCH 1751, TC-UNUSED 1372, TC-REDECL 1386, TC-ASSIGN 1596, TC-RETURN
-1615/1620, TC-ENUM 1247, TC-STRUCT 1264/1303/1311/1337, duplicate-self 1929) and
-in `check.crl`. Every one needs a concrete one-line help string (what caused it +
-how to fix). The user explicitly rejected "decent" — make each message specific
-(include the offending names/types, which most already interpolate) and every
-help actionable.
+### C7. Reachability closure REVERTED — parked in check.crl.bak / scopes.crl.bak
+Full-subtree pub inlining is live again ⇒ cross-module same-name collisions
+dodged only by manual renames (encodeB64/encodeHx). Re-landing notes:
+walker (unExpr/unStmt) + closure code in .bak is sound; before re-applying fix
+why the block produced zero [dotdecl] output when instrumented (placement vs
+gates), and keep ALL local matrices flattened to 1D — Coral parser rejects
+`char m[64][8][128]` locals and mis-parses `(x)*N` inside subscripts.
 
-### G4. User-reported: "unresolved" errors + empty text — PARTIALLY FIXED
-41 helps filled; TC-TYPE/TC-RETURN now have messages. Remaining: a few
-`check.crl` flag TC-RESOLVE sites still have empty middle strings, and any
-`opaqueType` fallback that never got a diagnostic (e.g. `X.y` where X is an
-unknown module) still silently becomes TY_UNKNOWN then later "unresolved" —
-next model should finish the sweep (see §5).
+### C8. `.crl` extension auto-resolve reverted
+Wanted: import(lib,"x") AND import(lib,"x.crl") both resolve (probe exact then
++".crl" in resolveLibImport). Current code appends .crl only when imp has no
+dot. The two-candidate probe was correct; re-apply standalone.
 
-### G5. Dead parser code after lexer change — STILL PENDING
-`skipFileAttrs` dead branch for `@[`/`@name` was fixed at the lexer (now
-unreachable); `parseAttachedAttrs` second loop for `@[[` still present but
-needed for attached module attrs (kept). No further stripping required unless
-lexer is audited.
+### C9. Dotted-type coverage gaps beyond return types
+Params, local decls, struct fields still poison-silent for dotted names
+(tolerated, no safety). Same mechanical wiring as C2 across those positions;
+optionally add a strict flag later.
 
-### G6. error.crl caret alignment — STILL PENDING (low priority)
-`caretSpaces = prefixLen + col - 4` counts BYTE columns. Tabs or multi-byte
-UTF-8 before the error column will misalign the `▲`. Fix by clamping or
-tab-expanding the extracted line before render.
+### C10. Small polish (low priority)
+- error.crl caret counts BYTE columns → tabs/UTF-8 misalign ▲ (clamp or
+  tab-expand extracted line).
+- Dead @[...]-parser branches in skipFileAttrs/parseAttachedAttrs are
+  unreachable since the lexer hard-rejects; strip when convenient.
 
 ---
 
-## 6. Remaining task list (priority order)
+## 4. Priority order
+1. C1 (hang blocks all example work)
+2. C2 (mechanical, unlocks custom_wrapper)
+3. C6 + C5 (comptime variadics then println formatting)
+4. C4 (mem2reg) → unlocks -O2/-O3 validation
+5. C7/C8 re-lands, C9/C10 polish
 
-| # | Task | Where | Status |
-|---|------|-------|--------|
-| 1 | **Fix mem2reg infinite loop at -O3** (CRITICAL — blocks all optimized builds) | lib/wallvm/passes/mem2reg.crl | **BLOCKER** |
-| 2 | Finish empty-help sweep in `check.crl` + remaining `expr.crl` opaque paths | check.crl, expr.crl | TODO |
-| 3 | Sweep silent glosses: parser `advance()` past garbage, `opaqueType` without diagnostic, emitir null-guards | parser.crl, typecheck/*, emitir.crl | TODO |
-| 4 | G5/G6 polish (dead branches, caret alignment) | parser.crl, error.crl | TODO |
-| 5 | Finish empty-help sweep in `check.crl` + remaining `expr.crl` opaque paths | check.crl, expr.crl | TODO |
-| 6 | Regression pass: all §3 repros + `lib2/wallvm/tests/ra_smoke.crl` + `new.wir` -O0..-O3 + full build | — | TODO (after mem2reg fixed) |
+---
 
 ## 5. Style constraints for edits
 
