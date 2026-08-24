@@ -9,6 +9,8 @@ mod ir_types = import("lib/wallvm/ir_types.crl");
 mod ir_builder = import("lib/wallvm/ir_builder.crl");
 mod ir_opcodes = import("lib/wallvm/ir_opcodes.crl");
 mod expr = import("typecheck/expr.crl");
+mod subst = import("mono/subst.crl");
+mod loader = import("typecheck/loader.crl");
 mod lex = import("lexer");
 mod parse = import("parser");
 
@@ -20,6 +22,8 @@ struct FuncGen
     ir_builder.IrBuilder* bd;
     scopes.Scope* top;
     scopes.ModuleTable* mods;
+    ast.Program* prog;
+    loader.Loader* ld;
     str.strView filename;
     str.strView* flagNames;
     str.strView* flagVals;
@@ -76,6 +80,111 @@ bool opEq(str.strView a, const char* b)
     return true;
 }
 
+// Mangled method symbol: <struct>__<targ1_T2>__<method> (targs segment only
+// for generic structs). Raw '<' never reaches IR/asm.
+bool idChar(u8 c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+}
+
+void pushSanitized(str.String* s, str.strView v)
+{
+    for (u32 i = 0; i < v.len; i++)
+    {
+        u8 c = v.ptr[i];
+        s.pushChar(idChar(c) ? (char)c : '_');
+    }
+}
+
+// Build "<struct>__<targs>__<method>"; targs empty for non-generic structs.
+str.String methodName3(str.strView structName, str.strView targs, str.strView method)
+{
+    str.String s = str.String::new();
+    pushSanitized(&s, structName);
+    s.pushCstr("__");
+    if (targs.len > 0) { pushSanitized(&s, targs); s.pushCstr("__"); }
+    pushSanitized(&s, method);
+    return s;
+}
+
+// Find the irMod function for monomorphized instance `md` whose type-arg
+// spelling matches the receiver's display inner text (e.g. "u64" for
+// vec<u64>). Falls back to a unique instance of that method.
+ir_types.IrValue* resolveMonoMethod(FuncGen* fg, ast.Decl* md, str.strView inner)
+{
+    u32 match = ~0u;
+    u32 count = 0;
+    for (u32 si = 0; si < subst.gNInsts; si++)
+    {
+        if (subst.gInsts[si].g != md) continue;
+        count++;
+        str.String td = str.String::new();
+        for (u32 ti = 0; ti < subst.gInsts[si].nt; ti++)
+        {
+            if (ti > 0) td.pushChar(',');
+            if (subst.gInsts[si].targs[ti] != null) td.pushView(types.typeName(subst.gInsts[si].targs[ti]));
+        }
+        bool eq2 = td.len == inner.len;
+        if (eq2) for (u32 c = 0; c < td.len; c++)
+        {
+            u8 a = td.ptr[c]; if (!idChar(a)) a = '_';
+            u8 b = inner.ptr[c]; if (!idChar(b)) b = '_';
+            if (a != b) { eq2 = false; break; }
+        }
+        if (eq2) { match = si; td.free(); break; }
+        td.free();
+    }
+    if (match == ~0u && count == 1)
+    {
+        for (u32 si = 0; si < subst.gNInsts; si++)
+            if (subst.gInsts[si].g == md) { match = si; break; }
+    }
+    if (match == ~0u) return null;
+    subst.MonoInst itv = subst.gInsts[match];
+    str.String td2 = str.String::new();
+    for (u32 ti = 0; ti < itv.nt; ti++)
+    {
+        if (ti > 0) td2.pushChar(',');
+        if (itv.targs[ti] != null) td2.pushView(types.typeName(itv.targs[ti]));
+    }
+    for (u32 ci = 0; ci < itv.nc; ci++)
+    {
+        if (itv.nt + ci > 0) td2.pushChar(',');
+        char b[24];
+        i32 n2 = libc.snprintf(b, 24, "%llu", itv.cvals[ci]);
+        for (i32 k2 = 0; k2 < n2; k2++) td2.pushChar(b[k2]);
+    }
+    str.String mn = methodName3(itv.g->structName, td2.asView(), itv.g->name);
+    td2.free();
+    ir_types.IrValue* out = null;
+    for (u32 fi = 0; fi < fg.irMod.nfuncs; fi++)
+        if (strEq(str.strView::fromCstr(fg.irMod.funcs[fi].base.name), str.strView::fromParts(mn.ptr, mn.len)))
+            { out = &fg.irMod.funcs[fi].base; break; }
+    mn.free();
+    return out;
+}
+
+ast.Decl* findStructByName(ast.Program* prog, str.strView name)
+{
+    if (prog == null) return null;
+    for (u32 i = 0; i < prog->ndecls; i++)
+    {
+        ast.Decl* d = prog->decls[i];
+        if (d != null && d->kind == ast.DT_STRUCT && strEq(d->name, name)) return d;
+    }
+    return null;
+}
+
+// True when a method takes the receiver as an implicit leading parameter
+// (no explicit self/unnamed first param).
+bool methodNeedsSelf(ast.Decl* md)
+{
+    if (md->structName.len == 0 || md->isStatic) return false;
+    if (md->nparams > 0 && (md->params[0].name.len == 0 || strEq(md->params[0].name, str.strView::fromCstr("self")))) return false;
+    return true;
+}
+
+
 ir_types.IrType* mapCType(FuncGen* fg, types.CType* t)
 {
     if (t == null) return fg.ctx.tyVoid();
@@ -106,10 +215,22 @@ ir_types.IrType* mapCType(FuncGen* fg, types.CType* t)
         for (u32 i = 0; i < t->nparams; i++) ps[i] = t->params[i] ? mapCType(fg, t->params[i]) : fg.ctx.tyInt(64);
         return fg.ctx.tyFunc(rt, ps, t->nparams, t->variadic);
     }
-    // structs/enums: opaque byte blocks sized by the layout calc so alloca
-    // reserves the full storage; field access goes through byte-offset GEPs.
     if (t->kind == types.TY_NAMED)
     {
+        libc.write(2, t->name.ptr, t->name.len);
+        libc.write(2, (const u8*)" declKind=", 10);
+        {
+            char nb[16]; u32 v= t->decl ? t->decl->kind : 999; u32 l=0; if(v==0) nb[l++]='0'; else { char r[16]; u32 rr=0; while(v>0){r[rr++]='0'+(v%10); v/=10;} while(rr>0) nb[l++]=r[--rr]; } libc.write(2, nb, l);
+        }
+        libc.write(2, (const u8*)" elemNull=", 10);
+        {
+            char nb[16]; u32 v= t->elem ? 0 : 1; nb[0]='0'+v; libc.write(2, nb,1);
+        }
+        libc.write(2, (const u8*)"\n",1);
+        if (t->decl != null && t->decl->kind == ast.DT_DISTINCT && t->elem != null)
+            return mapCType(fg, t->elem);
+        // structs/enums: opaque byte blocks sized by the layout calc so alloca
+        // reserves the full storage; field access goes through byte-offset GEPs.
         u32 sz = aggSizeOf(t, fg.top);
         if (sz == 0) sz = 8;
         return fg.ctx.tyArray(fg.ctx.tyInt(8), sz);
@@ -433,8 +554,20 @@ ir_types.IrValue* fieldAddress(FuncGen* fg, ast.Expr* e)
     if (!structFieldOffset(fg, structDecl, e->text, &off)) return null;
 
     ir_types.IrValue* basePtr = null;
+    bool ptrRecv = baseTy != null && (baseTy->kind == types.TY_PTR || baseTy->kind == types.TY_SLICE);
     if (e->a->kind == ast.EX_IDENT)
+    {
         basePtr = findLocal(fg, e->a->text);
+        // pointer receiver stored in a local: the slot holds the pointer,
+        // so one load yields the object address.
+        if (basePtr != null && ptrRecv)
+        {
+            ir_types.IrType* et3 = basePtr->type != null && basePtr->type.kind == ir_types.IrTypeKind::Ptr && basePtr->type.elem != null
+                ? basePtr->type.elem : fg.ctx.tyPtr(fg.ctx.tyInt(8));
+            ir_types.IrInst* ld3 = fg.bd.load(et3, basePtr);
+            basePtr = &ld3->base;
+        }
+    }
     if (basePtr == null)
     {
         // chained access (a.b.c): recurse for the inner address
@@ -781,6 +914,11 @@ ir_types.IrValue* genExpr(FuncGen* fg, ast.Expr* e)
     }
     case ast.EX_IDENT:
     {
+        // const generic parameter used as a value (N in arr<T, u64 N>)
+        {
+            u64 cv10 = 0;
+            if (expr.constOf(e, &cv10)) return fg.ctx.constInt(fg.ctx.tyInt(64), cv10);
+        }
         ir_types.IrValue* ptr = findLocal(fg, e->text);
         if (ptr != null)
         {
@@ -899,12 +1037,158 @@ ir_types.IrValue* genExpr(FuncGen* fg, ast.Expr* e)
                 // the function name — imported funcs land in irMod under
                 // their plain names.
                 str.strView fname = e->a->text;
-                for (u32 i = 0; i < fg.irMod.nfuncs; i++)
+                // method call on a known struct: resolve <Struct>__<T>__<name>
+                // and prepend the receiver for instance methods.
+                ir_types.IrValue** preArgs = null;
+                u32 preN = 0;
+                bool handled = false;
                 {
-                    if (strEq(str.strView::fromCstr(fg.irMod.funcs[i].base.name), fname))
-                        { callee = &fg.irMod.funcs[i].base; break; }
+                    types.CType* bt = null;
+                    if (e->a->a != null)
+                    {
+                        bt = expr.inferredType(e->a->a);
+                        if (bt != null) bt = types.effective(bt);
+                    }
+                    ast.Decl* sdFb = null;
+                    if (bt != null && bt.kind == types.TY_UNKNOWN && fg.ld != null)
+                    {
+                        // dotted generic type (std.collections.arr.arr<u64,3>)
+                        // resolved opaque at typecheck; find the struct by the
+                        // last '.'-segment of its display name across loaded progs.
+                        str.strView dn = bt.name;
+                        u32 lt2 = 0; bool hasLt2 = false;
+                        for (u32 i = 0; i < dn.len; i++) if (dn.ptr[i] == '<') { lt2 = i; hasLt2 = true; break; }
+                        str.strView head = hasLt2 ? str.strView::fromParts(dn.ptr, lt2) : dn;
+                        u32 ls = 0;
+                        for (u32 i = 0; i < head.len; i++) if (head.ptr[i] == '.') ls = i + 1;
+                        str.strView lastName = str.strView::fromParts(head.ptr + ls, head.len - ls);
+                        {
+                            libc.write(2,(const u8*)"[fb?] ln=",9);
+                            libc.write(2,lastName.ptr,lastName.len);
+                            char b9[16]; u32 v9=fg.ld.n; u32 l9=0; if(v9==0)b9[l9++]='0'; else {char r9[16];u32 rr9=0;while(v9>0){r9[rr9++]='0'+(v9%10);v9/=10;} while(rr9>0)b9[l9++]=r9[--rr9];}
+                            libc.write(2,(const u8*)" ldn=",5); libc.write(2,b9,l9);
+                            libc.write(2,(const u8*)"\n",1);
+                        }
+                        for (u32 pi2 = 0; pi2 < fg.ld.n && sdFb == null; pi2++)
+                        {
+                            ast.Program* pp = fg.ld.progs[pi2];
+                            if (pp == null) continue;
+                            for (u32 di3 = 0; di3 < pp.ndecls; di3++)
+                            {
+                                ast.Decl* cd2 = pp.decls[di3];
+                                if (cd2 != null && cd2.kind == ast.DT_STRUCT && strEq(cd2.name, lastName))
+                                {
+                                    sdFb = cd2;
+                                    libc.write(2,(const u8*)"[fb] hit ",9);
+                                    libc.write(2,lastName.ptr,lastName.len);
+                                    libc.write(2,(const u8*)"\n",1);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    libc.write(2,(const u8*)"[bt] ",5);
+                    {
+                        char hx[24];
+                        i32 hn = libc.snprintf(hx, 24, "%p", bt);
+                        if (hn > 0) libc.write(2, hx, (u64)hn);
+                        if (bt != null)
+                        {
+                            char kb = (char)('0' + (u32)bt.kind);
+                            libc.write(2, (const u8*)" kind=", 6);
+                            libc.write(2, &kb, 1);
+                        }
+                        libc.write(2, (const u8*)"\n", 1);
+                    }
+                    bool namedOk = sdFb != null
+                        || (bt != null && bt.kind == types.TY_NAMED
+                            && bt.decl != null && bt.decl.kind == ast.DT_STRUCT);
+                    if (namedOk)
+                    {
+                        ast.Decl* sd = sdFb != null ? sdFb : bt.decl;
+                        ast.Decl* md = scopes.findMethod(sd, fg.prog, fname);
+                        if (md != null)
+                        {
+                            if (sd.ngenerics > 0)
+                            {
+                                str.strView inner = str.strView::empty();
+                                if (bt.name.len > 0)
+                                {
+                                    u32 lt = 0; bool hasLt = false;
+                                    for (u32 i = 0; i < bt.name.len; i++)
+                                        if (bt.name.ptr[i] == '<') { lt = i; hasLt = true; break; }
+                                    if (hasLt && bt.name.ptr[bt.name.len - 1] == '>')
+                                        inner = str.strView::fromParts(bt.name.ptr + lt + 1, bt.name.len - lt - 2);
+                                }
+                                callee = resolveMonoMethod(fg, md, inner);
+                            }
+                            else
+                            {
+                                str.String mn = methodName3(sd.name, str.strView::empty(), fname);
+                                for (u32 fi2 = 0; fi2 < fg.irMod.nfuncs; fi2++)
+                                    if (strEq(str.strView::fromCstr(fg.irMod.funcs[fi2].base.name), str.strView::fromParts(mn.ptr, mn.len)))
+                                        { callee = &fg.irMod.funcs[fi2].base; break; }
+                                mn.free();
+                            }
+                            if (callee != null)
+                            {
+                                bool needRecv = !md.isStatic && e->a.kind == ast.EX_DOT;
+                                preN = e->nargs + (needRecv ? 1u : 0u);
+                                preArgs = preN > 0 ? mman.alloc<ir_types.IrValue*>(preN) : null;
+                                u32 ai = 0;
+                                if (needRecv)
+                                {
+                                    ir_types.IrValue* recv = genAddr(fg, e->a.a);
+                                    if (recv == null) recv = genExpr(fg, e->a.a);
+                                    preArgs[ai++] = recv;
+                                }
+                                for (; ai < preN; ai++) preArgs[ai] = genExpr(fg, e.args[ai - (needRecv ? 1u : 0u)]);
+                                handled = true;
+                            }
+                        }
+                    }
                 }
-                if (callee == null) callee = genExpr(fg, e->a);
+                if (!handled)
+                {
+                    // static-call fallback: base type may be poisoned UNKNOWN
+                    // (e.g. `Struct.method()`); scan known structs for a static
+                    // method with this name.
+                    for (u32 si3 = 0; si3 < fg.prog.ndecls && callee == null; si3++)
+                    {
+                        ast.Decl* cd = fg.prog.decls[si3];
+                        if (cd == null || cd.kind != ast.DT_STRUCT || cd.ngenerics > 0) continue;
+                        ast.Decl* md2 = scopes.findMethod(cd, fg.prog, fname);
+                        if (md2 == null || !md2.isStatic) continue;
+                        str.String mn2 = methodName3(cd.name, str.strView::empty(), fname);
+                        for (u32 fi3 = 0; fi3 < fg.irMod.nfuncs; fi3++)
+                            if (strEq(str.strView::fromCstr(fg.irMod.funcs[fi3].base.name), str.strView::fromParts(mn2.ptr, mn2.len)))
+                            {
+                                callee = &fg.irMod.funcs[fi3].base;
+                                preN = e.nargs;
+                                preArgs = preN > 0 ? mman.alloc<ir_types.IrValue*>(preN) : null;
+                                for (u32 ai2 = 0; ai2 < preN; ai2++) preArgs[ai2] = genExpr(fg, e.args[ai2]);
+                                handled = true;
+                                break;
+                            }
+                        mn2.free();
+                    }
+                }
+                if (!handled)
+                {
+                    for (u32 i = 0; i < fg.irMod.nfuncs; i++)
+                    {
+                        if (strEq(str.strView::fromCstr(fg.irMod.funcs[i].base.name), fname))
+                            { callee = &fg.irMod.funcs[i].base; break; }
+                    }
+                    if (callee == null) callee = genExpr(fg, e->a);
+                }
+                else
+                {
+                    ir_types.IrInst* ci = fg.bd.call(callee, preArgs, preN);
+                    if (preArgs) mman.dealloc<ir_types.IrValue*>(preArgs);
+                    if (ci.base.type && ci.base.type.kind == ir_types.IrTypeKind::Void) return null;
+                    return &ci.base;
+                }
             }
             else callee = genExpr(fg, e->a);
         }
@@ -1571,7 +1855,8 @@ void dumpIR(ir_types.IrModule* irMod, void* f)
 }
 
 pub ir_types.IrModule* buildModule(ast.Program* prog, scopes.Scope* top,
-                                    scopes.ModuleTable* mods, str.strView path,
+                                    scopes.ModuleTable* mods, loader.Loader* ld,
+                                    str.strView path,
                                     u32 optLevel, bool debug,
                                     ir_types.IrContext** outCtx)
 {
@@ -1675,7 +1960,7 @@ pub ir_types.IrModule* buildModule(ast.Program* prog, scopes.Scope* top,
             char vb[256]; u32 vbl = 0;
             for (u32 k = 0; k < vl; k++) vb[vbl++] = (char)d->name.ptr[k];
             vb[vbl]=0;
-            FuncGen vfg; vfg.ctx = ctx; vfg.top = top; vfg.mods = mods;
+            FuncGen vfg; vfg.ctx = ctx; vfg.top = top; vfg.mods = mods; vfg.prog = prog; vfg.ld = ld;
             types.CType* vct = d->type ? scopes.resolveTypeExpr(d->type, top, mods, null, 0) : null;
             ir_types.IrType* vt = vct ? mapCType(&vfg, vct) : ctx.tyInt(64);
             ir_types.IrGlobal* vg = ctx.createGlobal(vb, vt, false, true, null, 0);
@@ -1690,7 +1975,7 @@ pub ir_types.IrModule* buildModule(ast.Program* prog, scopes.Scope* top,
             char vb[256]; u32 vbl = 0;
             for (u32 k = 0; k < vl; k++) vb[vbl++] = (char)d->name.ptr[k];
             vb[vbl]=0;
-            FuncGen vfg; vfg.ctx = ctx; vfg.top = top; vfg.mods = mods;
+            FuncGen vfg; vfg.ctx = ctx; vfg.top = top; vfg.mods = mods; vfg.prog = prog; vfg.ld = ld;
             types.CType* vct = d->type ? scopes.resolveTypeExpr(d->type, top, mods, null, 0) : null;
             ir_types.IrType* vt = vct ? mapCType(&vfg, vct) : ctx.tyInt(64);
             ir_types.IrGlobal* vg = ctx.createGlobal(vb, vt, false, false, null, 0);
@@ -1705,7 +1990,7 @@ pub ir_types.IrModule* buildModule(ast.Program* prog, scopes.Scope* top,
         char nb[256]; u32 nbl = 0;
         for (u32 k = 0; k < nl; k++) nb[nbl++] = (char)d->name.ptr[k];
         nb[nbl]=0;
-        FuncGen sfg; sfg.ctx = ctx; sfg.top = top; sfg.mods = mods;
+        FuncGen sfg; sfg.ctx = ctx; sfg.top = top; sfg.mods = mods; sfg.prog = prog; sfg.ld = ld;
         types.CType* rct = d->type ? scopes.resolveTypeExpr(d->type, top, mods, null, 0) : null;
         ir_types.IrType* rt = rct ? mapCType(&sfg, rct) : ctx.tyVoid();
         if (d->noreturn) rt = ctx.tyVoid();
@@ -1739,6 +2024,224 @@ pub ir_types.IrModule* buildModule(ast.Program* prog, scopes.Scope* top,
         if (dup) { /* keep first; second entry unused for bodygen */ }
     }
 
+    // pass 1b: methods (struct bodies + method blocks) and monomorphized
+    // generic instances become real IrFuncs under mangled names
+    // (<Struct>__<T>__<method>); call sites resolve the same names.
+    libc.write(2,(const u8*)"[cg] insts=",11);
+    { char b9[16]; u32 v9=subst.gNInsts; u32 l9=0; if(v9==0)b9[l9++]='0'; else {char r9[16];u32 rr9=0;while(v9>0){r9[rr9++]='0'+(v9%10);v9/=10;} while(rr9>0)b9[l9++]=r9[--rr9];} libc.write(2,b9,l9);}
+    libc.write(2,(const u8*)"\n",1);
+    u32 jobCap = prog.ndecls * 4 + subst.gNInsts + 8;
+    ast.Decl** jobDecls = mman.alloc<ast.Decl*>(jobCap);
+    ir_types.IrFunc** jobFns = mman.alloc<ir_types.IrFunc*>(jobCap);
+    bool* jobMono = mman.alloc<bool>(jobCap);
+    types.CType*** jobTargs = mman.alloc<types.CType**>(jobCap);
+    u32* jobNt = mman.alloc<u32>(jobCap);
+    u64** jobCvals = mman.alloc<u64*>(jobCap);
+    u32* jobNc = mman.alloc<u32>(jobCap);
+    u32 nJobs = 0;
+
+    for (u32 i = 0; i < nd; i++)
+    {
+        ast.Decl* d = prog.decls[i];
+        if (d == null) continue;
+        if (d->kind != ast.DT_STRUCT) continue;
+        if (d->ngenerics > 0) continue; // generic structs come via subst registry
+        for (u32 mi = 0; mi < d->ndecls; mi++)
+        {
+            ast.Decl* md = d->decls[mi];
+            if (md == null || md->kind != ast.DT_FUNC || md->body == null) continue;
+            str.String mn = methodName3(d->name, str.strView::empty(), md->name);
+            bool dupm = false;
+            for (u32 k = 0; k < irMod.nfuncs; k++)
+                if (strEq(str.strView::fromCstr(irMod.funcs[k].base.name), str.strView::fromParts(mn.ptr, mn.len))) { dupm = true; break; }
+            if (dupm) { mn.free(); continue; }
+            FuncGen mfg; mfg.ctx = ctx; mfg.top = top; mfg.mods = mods; mfg.prog = prog; mfg.ld = ld;
+            types.CType* rct2 = md->type ? scopes.resolveTypeExpr(md->type, top, mods, md->generics, md->ngenerics) : null;
+            ir_types.IrType* rt2 = rct2 ? mapCType(&mfg, rct2) : ctx.tyVoid();
+            bool needSelf2 = methodNeedsSelf(md);
+            u32 base2 = needSelf2 ? 1u : 0u;
+            u32 np2 = md->nparams + base2;
+            ir_types.IrType** ptys2 = null;
+            if (np2 > 0)
+            {
+                ptys2 = mman.alloc<ir_types.IrType*>(np2);
+                if (needSelf2)
+                {
+                    ast.Decl* sdOwn2 = findStructByName(prog, md->structName);
+                    types.CType* sel2 = sdOwn2 != null ? scopes.namedType(sdOwn2, md->structName, md->line, md->col) : null;
+                    types.CType* sptr2 = mman.alloc<types.CType>(1);
+                    sptr2.kind = types.TY_PTR;
+                    sptr2.elem = sel2;
+                    ptys2[0] = mapCType(&mfg, sptr2);
+                }
+                for (u32 k = 0; k < md->nparams; k++)
+                    ptys2[k + base2] = md->params[k].type ? mapCType(&mfg, scopes.resolveTypeExpr(md->params[k].type, top, mods, md->generics, md->ngenerics)) : ctx.tyInt(64);
+            }
+            ir_types.IrFunc* mfn = ctx.createFunc(mn.asCstr(), rt2, ptys2, np2);
+            irMod.addFunc(mfn);
+            if (nJobs < jobCap) { jobDecls[nJobs] = md; jobFns[nJobs] = mfn; jobMono[nJobs] = false; jobTargs[nJobs] = null; jobNt[nJobs] = 0; nJobs++; }
+            mn.free();
+        }
+    }
+    // method blocks: `Name { ... }` decls outside the struct body
+    for (u32 i = 0; i < nd; i++)
+    {
+        ast.Decl* d = prog.decls[i];
+        if (d == null || d->kind != ast.DT_METHODBLOCK || d->structName.len == 0) continue;
+        ast.Decl* sd = findStructByName(prog, d->structName);
+        if (sd == null || sd->ngenerics > 0) continue;
+        for (u32 mi = 0; mi < d->ndecls; mi++)
+        {
+            ast.Decl* md = d->decls[mi];
+            if (md == null || md->kind != ast.DT_FUNC || md->body == null) continue;
+            str.String mn = methodName3(sd->name, str.strView::empty(), md->name);
+            bool dupm = false;
+            for (u32 k = 0; k < irMod.nfuncs; k++)
+                if (strEq(str.strView::fromCstr(irMod.funcs[k].base.name), str.strView::fromParts(mn.ptr, mn.len))) { dupm = true; break; }
+            if (dupm) { mn.free(); continue; }
+            FuncGen mfg; mfg.ctx = ctx; mfg.top = top; mfg.mods = mods; mfg.prog = prog; mfg.ld = ld;
+            types.CType* rct2 = md->type ? scopes.resolveTypeExpr(md->type, top, mods, md->generics, md->ngenerics) : null;
+            ir_types.IrType* rt2 = rct2 ? mapCType(&mfg, rct2) : ctx.tyVoid();
+            bool needSelf2 = methodNeedsSelf(md);
+            u32 base2 = needSelf2 ? 1u : 0u;
+            u32 np2 = md->nparams + base2;
+            ir_types.IrType** ptys2 = null;
+            if (np2 > 0)
+            {
+                ptys2 = mman.alloc<ir_types.IrType*>(np2);
+                if (needSelf2)
+                {
+                    ast.Decl* sdOwn2 = findStructByName(prog, md->structName);
+                    types.CType* sel2 = sdOwn2 != null ? scopes.namedType(sdOwn2, md->structName, md->line, md->col) : null;
+                    types.CType* sptr2 = mman.alloc<types.CType>(1);
+                    sptr2.kind = types.TY_PTR;
+                    sptr2.elem = sel2;
+                    ptys2[0] = mapCType(&mfg, sptr2);
+                }
+                for (u32 k = 0; k < md->nparams; k++)
+                    ptys2[k + base2] = md->params[k].type ? mapCType(&mfg, scopes.resolveTypeExpr(md->params[k].type, top, mods, md->generics, md->ngenerics)) : ctx.tyInt(64);
+            }
+            ir_types.IrFunc* mfn = ctx.createFunc(mn.asCstr(), rt2, ptys2, np2);
+            irMod.addFunc(mfn);
+            if (nJobs < jobCap) { jobDecls[nJobs] = md; jobFns[nJobs] = mfn; jobMono[nJobs] = false; jobTargs[nJobs] = null; jobNt[nJobs] = 0; nJobs++; }
+            mn.free();
+        }
+    }
+    // monomorphized instances from the registry
+    for (u32 si = 0; si < subst.gNInsts; si++)
+    {
+        subst.MonoInst itv = subst.gInsts[si];
+        ast.Decl* g = itv.g;
+        if (g == null || g->body == null)
+        {
+            libc.write(2,(const u8*)"[mono-skip] ",12);
+            if (g != null) libc.write(2,g.name.ptr,g.name.len);
+            libc.write(2,(const u8*)"\n",1);
+            continue;
+        }
+        {
+            libc.write(2,(const u8*)"[mono-take] ",12);
+            libc.write(2,g.name.ptr,g.name.len);
+            char sb[16]; u32 v9=g.structName.len; u32 l9=0; if(v9==0)sb[l9++]='0'; else {char r9[16];u32 rr9=0;while(v9>0){r9[rr9++]='0'+(v9%10);v9/=10;} while(rr9>0)sb[l9++]=r9[--rr9];}
+            libc.write(2,(const u8*)" snlen=",7); libc.write(2,sb,l9);
+            libc.write(2,(const u8*)"\n",1);
+        }
+        // targs display joined with ','
+        str.String tdisp = str.String::new();
+        for (u32 ti = 0; ti < itv.nt; ti++)
+        {
+            if (ti > 0) tdisp.pushChar(',');
+            if (itv.targs[ti] != null) tdisp.pushView(types.typeName(itv.targs[ti]));
+        }
+        for (u32 ci = 0; ci < itv.nc; ci++)
+        {
+            if (itv.nt + ci > 0) tdisp.pushChar(',');
+            char b[24];
+            i32 n2 = libc.snprintf(b, 24, "%llu", itv.cvals[ci]);
+            for (i32 k2 = 0; k2 < n2; k2++) tdisp.pushChar(b[k2]);
+        }
+        str.strView owner = g->structName.len > 0 ? g->structName : g->name;
+        str.String mn = methodName3(owner, tdisp.asView(), g->structName.len > 0 ? g->name : g->name);
+        tdisp.free();
+        bool dupm = false;
+        for (u32 k = 0; k < irMod.nfuncs; k++)
+            if (strEq(str.strView::fromCstr(irMod.funcs[k].base.name), str.strView::fromParts(mn.ptr, mn.len))) { dupm = true; break; }
+        if (dupm) { mn.free(); continue; }
+        // generic parameter names live on the OWNING STRUCT for methods
+        str.strView* gnamesE = g.generics;
+        u32 ngE = g.ngenerics;
+        {
+            ast.Decl* own9 = findStructByName(prog, g.structName);
+            if (own9 == null && ld != null)
+            {
+                for (u32 pi8 = 0; pi8 < ld.n && own9 == null; pi8++)
+                {
+                    ast.Program* pp8 = ld.progs[pi8];
+                    if (pp8 == null) continue;
+                    for (u32 di8 = 0; di8 < pp8.ndecls; di8++)
+                    {
+                        ast.Decl* cd8 = pp8.decls[di8];
+                        if (cd8 != null && cd8.kind == ast.DT_STRUCT && strEq(cd8.name, g.structName)) { own9 = cd8; break; }
+                    }
+                }
+            }
+            if (own9 != null) { gnamesE = own9.generics; ngE = own9.ngenerics; }
+        }
+        subst.push(gnamesE, itv.targs, ngE > itv.nt ? itv.nt : ngE);
+        if (itv.nc > 0 && ngE >= itv.nc)
+        {
+            str.strView cn3[16];
+            u64 cv3[16];
+            u32 base3c = ngE - itv.nc;
+            for (u32 k = 0; k < itv.nc && k < 16; k++)
+            {
+                cn3[k] = gnamesE[base3c + k];
+                cv3[k] = itv.cvals[k];
+            }
+            subst.pushConsts(cn3, cv3, itv.nc);
+        }
+        FuncGen mfg; mfg.ctx = ctx; mfg.top = top; mfg.mods = mods; mfg.prog = prog; mfg.ld = ld;
+        types.CType* rct3 = g->type ? scopes.resolveTypeExpr(g->type, top, mods, g->generics, g->ngenerics) : null;
+        ir_types.IrType* rt3 = rct3 ? mapCType(&mfg, rct3) : ctx.tyVoid();
+        bool needSelf3 = methodNeedsSelf(g);
+        u32 base3 = needSelf3 ? 1u : 0u;
+        u32 np3 = g->nparams + base3;
+        ir_types.IrType** ptys3 = null;
+        if (np3 > 0)
+        {
+            ptys3 = mman.alloc<ir_types.IrType*>(np3);
+            if (needSelf3)
+            {
+                ast.Decl* sdOwn3 = findStructByName(prog, g->structName);
+                types.CType* sel3 = sdOwn3 != null ? scopes.namedType(sdOwn3, g->structName, g->line, g->col) : null;
+                types.CType* sptr3 = mman.alloc<types.CType>(1);
+                sptr3.kind = types.TY_PTR;
+                sptr3.elem = sel3;
+                ptys3[0] = mapCType(&mfg, sptr3);
+            }
+            for (u32 k = 0; k < g->nparams; k++)
+                ptys3[k + base3] = g->params[k].type ? mapCType(&mfg, scopes.resolveTypeExpr(g->params[k].type, top, mods, g->generics, g->ngenerics)) : ctx.tyInt(64);
+        }
+        subst.pop();
+        ir_types.IrFunc* mfn = ctx.createFunc(mn.asCstr(), rt3, ptys3, np3);
+        irMod.addFunc(mfn);
+        if (nJobs < jobCap)
+        {
+            types.CType** ta = mman.alloc<types.CType*>(itv.nt > 0 ? itv.nt : 1);
+            for (u32 ti2 = 0; ti2 < itv.nt; ti2++) ta[ti2] = itv.targs[ti2];
+            u64* ca = null;
+            if (itv.nc > 0)
+            {
+                ca = mman.alloc<u64>(itv.nc);
+                for (u32 k = 0; k < itv.nc; k++) ca[k] = itv.cvals[k];
+            }
+            jobDecls[nJobs] = g; jobFns[nJobs] = mfn; jobMono[nJobs] = true;
+            jobTargs[nJobs] = ta; jobNt[nJobs] = itv.nt;
+            jobCvals[nJobs] = ca; jobNc[nJobs] = itv.nc; nJobs++;
+        }
+        mn.free();
+    }
+
     // pass 2: bodies into the pre-created IrFuncs.
     for (u32 i = 0; i < nd; i++)
     {
@@ -1753,7 +2256,7 @@ pub ir_types.IrModule* buildModule(ast.Program* prog, scopes.Scope* top,
         if (fname == null || fname[0] == 0) continue;
 
         FuncGen fg;
-        fg.ctx = ctx; fg.irMod = irMod; fg.top = top; fg.mods = mods;
+        fg.ctx = ctx; fg.irMod = irMod; fg.top = top; fg.mods = mods; fg.prog = prog; fg.ld = ld;
         fg.filename = path;
         fg.flagNames = null; fg.flagVals = null; fg.nflags = 0;
         fg.debug = debug;
@@ -1810,9 +2313,129 @@ pub ir_types.IrModule* buildModule(ast.Program* prog, scopes.Scope* top,
         if (fg.localNames) mman.dealloc<str.strView>(fg.localNames);
         if (fg.localPtrs) mman.dealloc<ir_types.IrValue*>(fg.localPtrs);
     }
+
+    // pass 2b: method / monomorphized-instance bodies
+    for (u32 ji = 0; ji < nJobs; ji++)
+    {
+        ast.Decl* d = jobDecls[ji];
+        ir_types.IrFunc* fn = jobFns[ji];
+        if (d == null || fn == null || d->body == null) continue;
+        bool isMethod = d->structName.len > 0;
+        if (jobMono[ji])
+        {
+            str.strView* gnJ = d.generics; u32 ngJ = d.ngenerics;
+            ast.Decl* ownJ = findStructByName(prog, d.structName);
+            if (ownJ == null && ld != null)
+            {
+                for (u32 pj = 0; pj < ld.n && ownJ == null; pj++)
+                {
+                    ast.Program* ppj = ld.progs[pj];
+                    if (ppj == null) continue;
+                    for (u32 dj = 0; dj < ppj.ndecls; dj++)
+                    {
+                        ast.Decl* cdj = ppj.decls[dj];
+                        if (cdj != null && cdj.kind == ast.DT_STRUCT && strEq(cdj.name, d.structName)) { ownJ = cdj; break; }
+                    }
+                }
+            }
+            if (ownJ != null) { gnJ = ownJ.generics; ngJ = ownJ.ngenerics; }
+            subst.push(gnJ, jobTargs[ji], ngJ > jobNt[ji] ? jobNt[ji] : ngJ);
+            if (jobNc[ji] > 0 && ngJ >= jobNc[ji])
+            {
+                str.strView cn4[16]; u64 cv4[16];
+                u32 base4 = ngJ - jobNc[ji];
+                for (u32 k = 0; k < jobNc[ji] && k < 16; k++) { cn4[k]=gnJ[base4+k]; cv4[k]=jobCvals[ji][k]; }
+                subst.pushConsts(cn4, cv4, jobNc[ji]);
+            }
+        }
+        FuncGen fg;
+        fg.ctx = ctx; fg.irMod = irMod; fg.top = top; fg.mods = mods; fg.prog = prog; fg.ld = ld;
+        fg.filename = path;
+        fg.flagNames = null; fg.flagVals = null; fg.nflags = 0;
+        fg.debug = debug;
+        fg.localNames = null; fg.localPtrs = null; fg.nlocals = 0; fg.capLocals = 0; fg.terminated = false;
+        fg.func = fn;
+        ir_types.IrBlock* entry = ctx.createBlock("entry");
+        fn.addBlock(entry);
+        ir_builder.IrBuilder bd = ir_builder.IrBuilder::new(ctx);
+        bd.pos(entry, null);
+        fg.bd = &bd;
+
+        // implicit self slot for instance methods: synthesize a local holding
+        // the incoming receiver pointer before declared params.
+        bool explicitSelf = d->nparams > 0 && (d->params[0].name.len == 0 || strEq(d->params[0].name, str.strView::fromCstr("self")));
+        if (isMethod && !d->isStatic && !explicitSelf)
+        {
+            ast.Decl* sdOwn = findStructByName(prog, d->structName);
+            types.CType* selem = sdOwn != null ? scopes.namedType(sdOwn, d->structName, d->line, d->col) : null;
+            types.CType* sptr = mman.alloc<types.CType>(1);
+            sptr.kind = types.TY_PTR;
+            sptr.elem = selem;
+            ir_types.IrType* spt = mapCType(&fg, sptr);
+            ir_types.IrInst* al = bd.alloca(spt);
+            ir_types.IrValue* pv = mman.alloc<ir_types.IrValue>(1);
+            pv.kind = (ir_types.IrValueKind)0;
+            pv.type = spt;
+            pv.id = ctx.nextValueId();
+            pv.valData = 0;
+            pv.name = null;
+            pv.users = null;
+            pv.nusers = 0;
+            pv.capUsers = 0;
+            bd.store(pv, &al.base);
+            addLocal(&fg, str.strView::fromCstr("self"), &al.base);
+        }
+
+        u32 nps = d->nparams;
+        for (u32 pi = 0; pi < nps; pi++)
+        {
+            ir_types.IrType* pt = fn.paramTypes != null && pi < fn.nparams && fn.paramTypes[pi] ? fn.paramTypes[pi] : ctx.tyInt(64);
+            ir_types.IrInst* al = bd.alloca(pt);
+            char pb[64]; u32 pl=0;
+            str.strView pname = d->params[pi].name.len > 0 ? d->params[pi].name : str.strView::fromCstr("self");
+            for (u32 k=0;k<pname.len&&pl<63;k++) pb[pl++]=(char)pname.ptr[k];
+            pb[pl]=0;
+            ir_types.IrValue* pv = mman.alloc<ir_types.IrValue>(1);
+            pv.kind = (ir_types.IrValueKind)0;
+            pv.type = pt;
+            pv.id = ctx.nextValueId();
+            pv.valData = 0;
+            pv.name = null;
+            pv.users = null;
+            pv.nusers = 0;
+            pv.capUsers = 0;
+            if (pl>0)
+            {
+                char* nc = mman.alloc<char>(pl+1);
+                for (u32 k=0;k<pl;k++) nc[k]=pb[k];
+                nc[pl]=0;
+                pv.name = nc;
+            }
+            bd.store(pv, &al.base);
+            addLocal(&fg, pname, &al.base);
+        }
+
+        genBlockStmts(&fg, d->body);
+        ir_types.IrType* retTy = fn.retType;
+        if (!fg.terminated)
+        {
+            if (retTy == null || retTy.kind == ir_types.IrTypeKind::Void) bd.retVoid();
+            else
+            {
+                ir_types.IrValue* z = null;
+                if (retTy.kind == ir_types.IrTypeKind::Float) z = ctx.constFloat(retTy, 0.0);
+                else z = ctx.constInt(retTy, 0);
+                bd.ret(z);
+            }
+        }
+        if (optLevel > 0) wallvm.irOptimize(fn, ctx, optLevel);
+        if (fg.localNames) mman.dealloc<str.strView>(fg.localNames);
+        if (fg.localPtrs) mman.dealloc<ir_types.IrValue*>(fg.localPtrs);
+        if (jobMono[ji]) subst.pop();
+    }
     return irMod;
 }
-pub void emitIR(ast.Program* prog, scopes.Scope* top, scopes.ModuleTable* mods, str.strView path, u32 optLevel, bool debug)
+pub void emitIR(ast.Program* prog, scopes.Scope* top, scopes.ModuleTable* mods, loader.Loader* ld, str.strView path, u32 optLevel, bool debug)
 {
     str.String opath = str.String::new();
     u32 lastDot = 0; bool dot = false;
@@ -1821,7 +2444,7 @@ pub void emitIR(ast.Program* prog, scopes.Scope* top, scopes.ModuleTable* mods, 
     else opath.pushView(path);
     opath.pushCstr(".wir");
     ir_types.IrContext* ctx = null;
-    ir_types.IrModule* irMod = buildModule(prog, top, mods, path, optLevel, debug, &ctx);
+    ir_types.IrModule* irMod = buildModule(prog, top, mods, ld, path, optLevel, debug, &ctx);
     void* f = libc.fopen(opath.asCstr(), (const u8*)"wb");
     if (f != null)
     {
