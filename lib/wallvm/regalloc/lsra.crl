@@ -5,6 +5,7 @@ mod ir_types = import("wallvm/ir_types.crl");
 mod ir_opcodes = import("wallvm/ir_opcodes.crl");
 mod asm_rules = import("wallvm/rules/asm_rules.crl");
 mod mman = import("std/memory/mman.crl");
+mod libc = import("std/platform/libc.crl");
 
 const u32 NO_REG = 0xFFFFFFFF;
 const i32 NO_SLOT = -1;
@@ -56,6 +57,10 @@ struct LiveInterval
     i32 spillSlot;
     bool isFloat;
     bool spansCall;
+    // Greedy allocator: hotness per unit of register occupancy.
+    u32 uses;
+    u32 defs;
+    f64 spillWeight;
 }
 
 pub struct LinearScanRegAlloc
@@ -322,8 +327,7 @@ pub struct LinearScanRegAlloc
                 ir_opcodes.IrOpcode op = inst.opcode;
                 if (op == ir_opcodes.IrOpcode::Store || op == ir_opcodes.IrOpcode::Br ||
                     op == ir_opcodes.IrOpcode::CondBr || op == ir_opcodes.IrOpcode::Ret ||
-                    op == ir_opcodes.IrOpcode::Unreachable || op == ir_opcodes.IrOpcode::Noret ||
-                    op == ir_opcodes.IrOpcode::Alloca)
+                    op == ir_opcodes.IrOpcode::Unreachable || op == ir_opcodes.IrOpcode::Noret)
                 {
                 }
                 else
@@ -413,6 +417,9 @@ pub struct LinearScanRegAlloc
                 li.physReg = NO_REG;
                 li.spillSlot = NO_SLOT;
                 li.isFloat = false;
+                li.uses = 0;
+                li.defs = 1;
+                li.spillWeight = 0.0;
                 ir_types.IrValue* vv = self.vregValues[vreg];
                 if (vv && vv->type && vv->type->kind == ir_types.IrTypeKind::Float)
                     li.isFloat = true;
@@ -459,6 +466,7 @@ pub struct LinearScanRegAlloc
                             {
                                 if ((u32)predEnd > self.intervals[k].end)
                                     self.intervals[k].end = (u32)predEnd;
+                                self.intervals[k].uses++;
                                 break;
                             }
                         }
@@ -477,6 +485,7 @@ pub struct LinearScanRegAlloc
                             {
                                 if (linearIdx > self.intervals[k].end)
                                     self.intervals[k].end = linearIdx;
+                                self.intervals[k].uses++;
                                 break;
                             }
                         }
@@ -507,19 +516,33 @@ pub struct LinearScanRegAlloc
             }
         }
 
+        // Greedy weight: frequency of definition/use per position of range.
+        // Range of one still gets full def credit so tiny hot values win.
+        for (u32 i = 0; i < self.numIntervals; i++)
+        {
+            LiveInterval* li = &self.intervals[i];
+            u64 len = (u64)(li.end - li.start) + 1;
+            li.spillWeight = ((f64)li.uses + 2.0 * (f64)li.defs) / (f64)len;
+        }
+
         self.regIsFree = mman.alloc<u32>(self.numRegs);
         self.active = mman.alloc<u32>(self.numRegs + 1);
         self.floatRegIsFree = mman.alloc<u32>(self.numFloatRegs);
         self.floatActive = mman.alloc<u32>(self.numFloatRegs + 1);
     }
 
+    // Greedy order: hottest first; ties fall back to program order so
+    // allocation stays deterministic.
     static void sortIntervals(LiveInterval* intervals, u32 count)
     {
         for (u32 i = 1; i < count; i++)
         {
             LiveInterval key = intervals[i];
             i32 j = (i32)i - 1;
-            while (j >= 0 && intervals[j].start > key.start)
+            while (j >= 0 &&
+                   (intervals[j].spillWeight < key.spillWeight ||
+                    (intervals[j].spillWeight == key.spillWeight &&
+                     intervals[j].start > key.start)))
             {
                 intervals[j + 1] = intervals[j];
                 j--;
@@ -530,6 +553,9 @@ pub struct LinearScanRegAlloc
 
     void scanClass(LiveInterval* cur, u32* freeSet, u32* activeList, u32* numActivePtr, u32 regCount, u32 calleeStart)
     {
+        libc.write(2,(const u8*)"[sc] v=",7);
+        { char b[16]; u32 v=cur->vreg; u32 l=0; if(v==0)b[l++]='0'; else {char r[16];u32 rr=0;while(v>0){r[rr++]='0'+(v%10);v/=10;} while(rr>0)b[l++]=r[--rr];} libc.write(2,b,l); }
+        { char b[24]; i32 n=libc.snprintf(b,24," s=%u e=%u f=%u\n",cur->start,cur->end,(u32)cur->isFloat); if(n>0) libc.write(2,b,(u64)n); }
         u32 numActive = *numActivePtr;
         u32 newActive = 0;
         for (u32 j = 0; j < numActive; j++)
@@ -548,10 +574,6 @@ pub struct LinearScanRegAlloc
             {
                 freeSet[a->physReg] = 1;
                 self.regForVreg[a->vreg] = a->physReg;
-            }
-            else if (a && a->end == cur->start && a->start == cur->start)
-            {
-                // zero-length tie: same-position intervals must not share a reg
             }
             else
             {
@@ -608,22 +630,51 @@ pub struct LinearScanRegAlloc
                 }
             }
 
-            if (cur->end > furthestEnd && furthest)
+            // Greedy eviction: find the lowest-weight occupant of a usable
+            // register; steal it when the newcomer is hotter, else spill.
+            u32 victimIdx = ~0u;
+            f64 victimW = 0.0;
+            u32 victimReg = NO_REG;
+            LiveInterval* victim = null;
+            for (u32 j = 0; j < numActive; j++)
             {
-                furthest->spillSlot = self.nextSpillSlot++;
-                self.slotForVreg[furthest->vreg] = furthest->spillSlot;
+                u32 avreg = activeList[j];
+                for (u32 k = 0; k < self.numIntervals; k++)
+                {
+                    if (self.intervals[k].vreg == avreg)
+                    {
+                        LiveInterval* a = &self.intervals[k];
+                        if (a->physReg == NO_REG) break;
+                        if (cur->spansCall && a->physReg < calleeStart) break;
+                        if (victim == null || a->spillWeight < victimW)
+                        {
+                            victimW = a->spillWeight;
+                            victimIdx = j;
+                            victimReg = a->physReg;
+                            victim = a;
+                        }
+                        break;
+                    }
+                }
+            }
+
+            if (victim != null && victimW < cur->spillWeight)
+            {
+                victim->spillSlot = self.nextSpillSlot++;
+                self.slotForVreg[victim->vreg] = victim->spillSlot;
                 if (self.nextSpillSlot > 0x7FFFFFFF)
                     self.nextSpillSlot = 0x7FFFFFFF;
+                self.regForVreg[victim->vreg] = NO_REG;
+                victim->physReg = NO_REG;
 
-                u32 freedReg = furthest->physReg;
-                cur->physReg = freedReg;
-                // The evicted interval is spilled, it no longer occupies
-                // a register, and must not keep a stale mapping to one.
-                self.regForVreg[furthest->vreg] = NO_REG;
-                furthest->physReg = NO_REG;
-
-                activeList[furthestIdx] = cur->vreg;
-                self.regForVreg[cur->vreg] = freedReg;
+                // compact: drop victim, append cur
+                for (u32 j = victimIdx; j + 1 < numActive; j++)
+                    activeList[j] = activeList[j + 1];
+                numActive--;
+                cur->physReg = victimReg;
+                freeSet[victimReg] = 0;
+                activeList[numActive++] = cur->vreg;
+                self.regForVreg[cur->vreg] = victimReg;
             }
             else
             {
