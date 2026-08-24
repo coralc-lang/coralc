@@ -4,6 +4,7 @@ mod ir_types = import("wallvm/ir_types.crl");
 mod ir_opcodes = import("wallvm/ir_opcodes.crl");
 mod asm_rules = import("wallvm/rules/asm_rules.crl");
 mod mman = import("std/memory/mman.crl");
+mod libc = import("std/platform/libc.crl");
 
 // genFunc always consumes lsra's valData assignments (SPILL_BIT/FLOAT_BIT
 // encoding), chosen per-target by the switch in wallvm.crl.
@@ -599,12 +600,9 @@ pub struct X86_64Codegen
             return;
         }
         const char* home = self.allocIntNames[self.valLow(e)];
-        if (home[0] == r[0] && home[1] == r[1] && home[2] == r[2])
-        {
-            u32 ai = self.intIdxOf(r);
-            if (ai != ~0u) self.setIntHold(ai, v->id);
-            return;
-        }
+        // Always emit the move: the holds cache is not trustworthy across
+        // synthesized allocas/param spills and a skipped reload reads stale
+        // register contents (wrong-value bugs).
         self.inst2("mov", r, home);
         u32 ai = self.intIdxOf(r);
         if (ai != ~0u) self.setIntHold(ai, v->id);
@@ -671,9 +669,7 @@ pub struct X86_64Codegen
             return;
         }
         const char* home = self.allocIntNames[self.valLow(e)];
-        if (home[0] == r[0] && home[1] == r[1] && home[2] == r[2]) return;
         u32 ai = self.intIdxOf(home);
-        if (ai != ~0u && ai < self.intHoldsCap && self.intHolds[ai] == v->id + 1) return;
         self.inst2("mov", home, r);
         if (ai != ~0u) self.setIntHold(ai, v->id);
     }
@@ -1279,8 +1275,9 @@ pub struct X86_64Codegen
             sz = ((es + 7) / 8) * 8;
         }
         self.subRsp((u64)sz);
-        const char* dreg = self.destReg(res);
-        const char* acc = dreg ? dreg : "rax";
+        // Alloca results carry no lsra home; stage through the reserved
+        // scratch pair so the destination never clobbers a live value.
+        const char* acc = "rax";
         if (self.att) { self.pad(); self.s("lea "); self.opMemBase("rsp"); self.s(", %"); self.s(acc); self.c('\n'); }
         else { self.pad(); self.s("lea "); self.s(acc); self.s(", [rsp]\n"); }
         if (dreg)
@@ -1625,6 +1622,99 @@ pub struct X86_64Codegen
         self.c('\n');
     }
 
+    // Seed parameter homes from ABI registers. After lsra, every entry
+    // store whose value operand has no defining instruction IS a parameter;
+    // its valData now encodes the assigned home (register or spill slot).
+    // Emitting mov argReg -> home in the prologue makes every later use of
+    // that value read the incoming argument.
+    void emitParamPrologue(ir_types.IrFunc* func)
+    {
+        if (func->nparams == 0 || func->nblocks == 0) return;
+        ir_types.IrBlock* eb = func->blocks[0];
+        u32 maxId = 0;
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+            for (u32 ii = 0; ii < func->blocks[bi].ninsts; ii++)
+            {
+                u32 rid = func->blocks[bi].insts[ii]->base.id;
+                if (rid > maxId) maxId = rid;
+                for (u32 j = 0; j < func->blocks[bi].insts[ii]->nops; j++)
+                {
+                    ir_types.IrValue* op = func->blocks[bi].insts[ii]->ops[j];
+                    if (op && op->kind == ir_types.IrValueKind::Inst && op->id > maxId) maxId = op->id;
+                }
+            }
+        u8* defined = mman.alloc<u8>(maxId + 1);
+        for (u32 i = 0; i <= maxId; i++) defined[i] = 0;
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+            for (u32 ii = 0; ii < func->blocks[bi].ninsts; ii++)
+                defined[func->blocks[bi].insts[ii]->base.id] = 1;
+
+        u32 intPi = 0;
+        u32 flPi = 0;
+        for (u32 ii = 0; ii < eb->ninsts; ii++)
+        {
+            ir_types.IrInst* inst = eb->insts[ii];
+            if (inst->opcode != ir_opcodes.IrOpcode::Store || inst->nops < 1) continue;
+            ir_types.IrValue* src = inst->ops[0];
+            if (!src || src->kind != ir_types.IrValueKind::Inst) continue;
+            if (src->id <= maxId && defined[src->id]) continue;
+            bool dup = false;
+            // only first occurrence counts
+            for (u32 jj = 0; jj < ii; jj++)
+            {
+                ir_types.IrInst* pj = eb->insts[jj];
+                if (pj->opcode == ir_opcodes.IrOpcode::Store && pj->nops >= 1 && pj->ops[0] == src) { dup = true; break; }
+            }
+            if (dup) continue;
+            bool isF = src->type && src->type->kind == ir_types.IrTypeKind::Float;
+            u64 e = self.valEnc(src);
+            if (isF)
+            {
+                const char* xr = flPi < self.abi.numFloatArgRegs ? self.abi.floatArgRegs[flPi] : null;
+                flPi++;
+                if (xr == null) continue;
+                if ((e & 0x80000000UL) != 0)
+                {
+                    if (self.att) { self.pad(); self.s("movq %"); self.s(xr); self.s(", "); self.emitSpillRef(e); self.c('\n'); }
+                    else { self.pad(); self.s("movq "); self.emitSpillRef(e); self.s(", "); self.s(xr); self.c('\n'); }
+                }
+                else if ((e & 0x40000000UL) != 0)
+                {
+                    const char* home = self.allocFloatNames[self.valLow(e)];
+                    if (!(home[0] == xr[0] && home[1] == xr[1] && home[2] == xr[2] && home[3] == xr[3]))
+                        self.inst2("movq", home, xr);
+                }
+            }
+            else
+            {
+                if (intPi >= self.abi.numArgRegs) continue;
+                const char* ar = self.abi.argRegs[intPi];
+                {
+                    libc.write(2,(const u8*)"[pp] ",5);
+                    char b0[16]; u32 v9=intPi; u32 l9=0; if(v9==0)b0[l9++]='0'; else {char r9[8];u32 rr9=0;while(v9>0){r9[rr9++]='0'+(v9%10);v9/=10;} while(rr9>0)b0[l9++]=r9[--rr9];}
+                    libc.write(2,b0,l9);
+                    u64 ee=self.valEnc(src);
+                    char hx[12]; for(u32 q=0;q<8;q++){hx[q]="0123456789abcdef"[(ee>>(28-q*4))&0xF];}
+                    libc.write(2,(const u8*)" enc=",5); libc.write(2,hx,8);
+                    libc.write(2,(const u8*)"\n",1);
+                }
+                intPi++;
+                if ((e & 0x80000000UL) != 0)
+                {
+                    if (self.att) { self.pad(); self.s("movq %"); self.s(ar); self.s(", "); self.emitSpillRef(e); self.c('\n'); }
+                    else { self.pad(); self.s("movq "); self.emitSpillRef(e); self.s(", "); self.s(ar); self.c('\n'); }
+                }
+                else if ((e & 0x40000000UL) == 0)
+                {
+                    const char* home = self.allocIntNames[self.valLow(e)];
+                    if (!(home[0] == ar[0] && home[1] == ar[1] && home[2] == ar[2]))
+                        self.inst2("mov", home, ar);
+                }
+            }
+        }
+        mman.dealloc<u8>(defined);
+    }
+
     bool genFunc(ir_types.IrFunc* func)
     {
         if (!func) return false;
@@ -1691,6 +1781,7 @@ pub struct X86_64Codegen
         self.inst2("mov", "rbp", "rsp");
         if (self.frameSize > 0)
             self.subRsp((u64)self.frameSize);
+        self.emitParamPrologue(func);
 
         // Ensure block label array
         if (func->nblocks > self.blockLabelsCap)

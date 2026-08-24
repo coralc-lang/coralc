@@ -102,6 +102,14 @@ pub struct LinearScanRegAlloc
     wallvm.ir_types.IrValue** slotAllocas;
     u32 numSlots;
 
+    // Incoming parameters: undefined Inst-kind values consumed by entry
+    // stores. Each gets its own vreg with an interval starting at 0 so the
+    // scanner assigns it a home; the backend seeds that home from the ABI
+    // argument register in the prologue.
+    wallvm.ir_types.IrValue** paramVals;
+    u32 numParams;
+    u32 capParams;
+
     LinearScanRegAlloc new(wallvm.ir_types.IrContext* ctx, wallvm.asm_rules.ABIRules* abi, RegAllocConfig* cfg)
     {
         LinearScanRegAlloc r;
@@ -185,6 +193,9 @@ pub struct LinearScanRegAlloc
         r.wordType = null;
         r.slotAllocas = null;
         r.numSlots = 0;
+        r.paramVals = null;
+        r.numParams = 0;
+        r.capParams = 0;
         return r;
     }
 
@@ -254,6 +265,18 @@ pub struct LinearScanRegAlloc
         }
     }
 
+    void ensureParams(u32 n)
+    {
+        if (n < self.capParams) return;
+        u32 nc = self.capParams ? self.capParams * 2 : 8;
+        while (nc <= n) nc *= 2;
+        wallvm.ir_types.IrValue** np = std.mman.alloc<wallvm.ir_types.IrValue*>(nc);
+        for (u32 i = 0; i < self.numParams; i++) np[i] = self.paramVals[i];
+        if (self.paramVals) std.mman.dealloc<wallvm.ir_types.IrValue*>(self.paramVals);
+        self.paramVals = np;
+        self.capParams = nc;
+    }
+
     void assignVregs(wallvm.ir_types.IrFunc* func)
     {
         self.blocks = func->blocks;
@@ -308,10 +331,69 @@ pub struct LinearScanRegAlloc
                 idx++;
             }
         }
+
+        // Harvest parameters: entry-block stores whose value operand is an
+        // Inst-kind value with no defining instruction anywhere in the
+        // function. Each becomes a fresh vreg (interval starts at 0).
+        {
+            u32 maxId = 0;
+            for (u32 b = 0; b < self.numBlocks; b++)
+                for (u32 i = 0; i < self.blocks[b].ninsts; i++)
+                {
+                    u32 rid = self.blocks[b].insts[i].base.id;
+                    if (rid > maxId) maxId = rid;
+                    for (u32 j = 0; j < self.blocks[b].insts[i].nops; j++)
+                    {
+                        wallvm.ir_types.IrValue* op = self.blocks[b].insts[i].ops[j];
+                        if (op && op.kind == wallvm.ir_types.IrValueKind::Inst && op.id > maxId) maxId = op.id;
+                    }
+                }
+            u8* defined = std.mman.alloc<u8>(maxId + 1);
+            for (u32 i = 0; i <= maxId; i++) defined[i] = 0;
+            for (u32 b = 0; b < self.numBlocks; b++)
+                for (u32 i = 0; i < self.blocks[b].ninsts; i++)
+                    defined[self.blocks[b].insts[i].base.id] = 1;
+
+            wallvm.ir_types.IrBlock* eb = self.blocks[0];
+            for (u32 i = 0; i < eb.ninsts; i++)
+            {
+                wallvm.ir_types.IrInst* inst = eb.insts[i];
+                if (inst.opcode != wallvm.irOps.IrOpcode::Store || inst.nops < 1) continue;
+                wallvm.ir_types.IrValue* src = inst.ops[0];
+                if (!src || src.kind != wallvm.ir_types.IrValueKind::Inst) continue;
+                if (src.id <= maxId && defined[src.id]) continue;
+                bool already = false;
+                for (u32 k = 0; k < self.numParams; k++)
+                    if (self.paramVals[k] == src) { already = true; break; }
+                if (already) continue;
+                u32 pv = self.numVregs++;
+                self.ensureVregs(pv);
+                self.vregValues[pv] = src;
+                src.valData = (u64)pv;
+                self.ensureParams(self.numParams);
+                self.paramVals[self.numParams++] = src;
+            }
+            std.mman.dealloc<u8>(defined);
+        }
     }
 
     void computeIntervals(wallvm.ir_types.IrFunc* func)
     {
+        for (u32 k = 0; k < self.numParams; k++)
+        {
+            wallvm.ir_types.IrValue* pv2 = self.paramVals[k];
+            if (!pv2) continue;
+            u32 vreg = (u32)pv2.valData;
+            self.ensureIntervals();
+            LiveInterval* li = &self.intervals[self.numIntervals++];
+            li.vreg = vreg;
+            li.start = 0;
+            li.end = 0;
+            li.physReg = NO_REG;
+            li.spillSlot = NO_SLOT;
+            li.isFloat = pv2.type && pv2.type.kind == wallvm.ir_types.IrTypeKind::Float;
+        }
+
         for (u32 i = 0; i < self.totalInsts; i++)
         {
             u32 vreg = self.instVreg[i];
@@ -544,8 +626,11 @@ pub struct LinearScanRegAlloc
         *numActivePtr = numActive;
     }
 
-    void tryCoalesce()
+    void tryCoalesce(LinearScanRegAlloc*)
     {
+        // Simple coalescing for mov copies: if dest and src are vregs with non-overlapping
+        // intervals, they can share the same register. This eliminates the extra moves
+        // noted in wallvm_backend_notes.md "Register-relay copies".
         for (u32 idx = 0; idx < self.totalInsts; idx++) {
             wallvm.ir_types.IrInst* inst = self.linearInsts[idx];
             if (!inst || inst.opcode != wallvm.irOps.IrOpcode::Bitcast) continue;
@@ -554,6 +639,7 @@ pub struct LinearScanRegAlloc
             if (!src || src.kind != wallvm.ir_types.IrValueKind::Inst) continue;
             u32 srcVreg = (u32)src.valData;
             u32 dstVreg = (u32)inst.base.valData;
+            // Find intervals
             LiveInterval* srcI = null; LiveInterval* dstI = null;
             for (u32 k=0;k<self.numIntervals;k++) {
                 if (self.intervals[k].vreg==srcVreg) srcI=&self.intervals[k];
@@ -561,16 +647,23 @@ pub struct LinearScanRegAlloc
             }
             if (!srcI || !dstI) continue;
             if (srcI.isFloat != dstI.isFloat) continue;
+            // If intervals overlap, cannot coalesce
             bool overlap = !(srcI.end < dstI.start || dstI.end < srcI.start);
             if (overlap) continue;
+            // Try to coalesce: make dst share src's interval range (union)
+            // For now, just extend src's interval to cover dst's range and mark dst as coalesced
+            // The actual register assignment will happen in linearScan; we just merge intervals
+            // by extending src to cover dst and marking dst as needing same reg
+            // Simplest: if src interval ends before dst starts, extend src to dst's end
             if (srcI.end < dstI.start) {
                 srcI.end = dstI.end;
+                // Mark dst as coalesced by making its interval empty (so it won't get its own reg)
                 dstI.start = dstI.end + 1;
             }
         }
     }
 
-    void linearScan()
+    void linearScan(LinearScanRegAlloc*)
     {
         self.tryCoalesce();
         for (u32 i = 0; i < self.numRegs; i++)
@@ -639,7 +732,7 @@ pub struct LinearScanRegAlloc
         bb.ninsts++;
     }
 
-    wallvm.ir_types.IrValue* getOrCreateSlotAlloca(i32 slot, wallvm.ir_types.IrBlock* insertBlock, u32 insertIdx)
+    wallvm.ir_types.IrValue* getOrCreateSlotAlloca(LinearScanRegAlloc*, i32 slot, wallvm.ir_types.IrBlock* insertBlock, u32 insertIdx)
     {
         self.ensureSlotAllocas(slot);
         if (self.slotAllocas[slot])
@@ -652,7 +745,7 @@ pub struct LinearScanRegAlloc
         return &alloca->base;
     }
 
-    void handleSpills(wallvm.ir_types.IrFunc* func)
+    void handleSpills(LinearScanRegAlloc*, wallvm.ir_types.IrFunc* func)
     {
         // When the backend consumes valData directly, it decodes SPILL_BIT
         // itself, no IR-level load/store rewriting.
@@ -787,7 +880,7 @@ pub struct LinearScanRegAlloc
         }
     }
 
-    void rewrite(wallvm.ir_types.IrFunc* func)
+    void rewrite(LinearScanRegAlloc*, wallvm.ir_types.IrFunc* func)
     {
         // Store physreg assignments in valData for codegen consumption.
         // Bit 31, spilled (low 31 bits = spill slot index)
@@ -813,7 +906,7 @@ pub struct LinearScanRegAlloc
         }
     }
 
-    bool allocate(wallvm.ir_types.IrFunc* func)
+    bool allocate(LinearScanRegAlloc*, wallvm.ir_types.IrFunc* func)
     {
         if (!func || func->nblocks == 0) return false;
 
@@ -837,11 +930,12 @@ pub struct LinearScanRegAlloc
         if (self.active) std.mman.dealloc<u32>(self.active);
         if (self.floatActive) std.mman.dealloc<u32>(self.floatActive);
         if (self.slotAllocas) std.mman.dealloc<wallvm.ir_types.IrValue*>(self.slotAllocas);
+        if (self.paramVals) std.mman.dealloc<wallvm.ir_types.IrValue*>(self.paramVals);
 
         return true;
     }
 
-    void destroy()
+    void destroy(LinearScanRegAlloc*)
     {
         if (self.vregValues) std.mman.dealloc<wallvm.ir_types.IrValue*>(self.vregValues);
         if (self.regForVreg) std.mman.dealloc<u32>(self.regForVreg);

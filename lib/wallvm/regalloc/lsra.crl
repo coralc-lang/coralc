@@ -107,6 +107,14 @@ pub struct LinearScanRegAlloc
     ir_types.IrValue** slotAllocas;
     u32 numSlots;
 
+    // Incoming parameters: undefined Inst-kind values consumed by entry
+    // stores. Each gets its own vreg with an interval starting at 0 so the
+    // scanner assigns it a home; the backend seeds that home from the ABI
+    // argument register in the prologue.
+    ir_types.IrValue** paramVals;
+    u32 numParams;
+    u32 capParams;
+
     LinearScanRegAlloc new(ir_types.IrContext* ctx, asm_rules.ABIRules* abi, RegAllocConfig* cfg)
     {
         LinearScanRegAlloc r;
@@ -190,6 +198,9 @@ pub struct LinearScanRegAlloc
         r.wordType = null;
         r.slotAllocas = null;
         r.numSlots = 0;
+        r.paramVals = null;
+        r.numParams = 0;
+        r.capParams = 0;
         return r;
     }
 
@@ -259,6 +270,18 @@ pub struct LinearScanRegAlloc
         }
     }
 
+    void ensureParams(LinearScanRegAlloc*, u32 n)
+    {
+        if (n < self.capParams) return;
+        u32 nc = self.capParams ? self.capParams * 2 : 8;
+        while (nc <= n) nc *= 2;
+        ir_types.IrValue** np = mman.alloc<ir_types.IrValue*>(nc);
+        for (u32 i = 0; i < self.numParams; i++) np[i] = self.paramVals[i];
+        if (self.paramVals) mman.dealloc<ir_types.IrValue*>(self.paramVals);
+        self.paramVals = np;
+        self.capParams = nc;
+    }
+
     void assignVregs(LinearScanRegAlloc*, ir_types.IrFunc* func)
     {
         self.blocks = func->blocks;
@@ -299,7 +322,8 @@ pub struct LinearScanRegAlloc
                 ir_opcodes.IrOpcode op = inst.opcode;
                 if (op == ir_opcodes.IrOpcode::Store || op == ir_opcodes.IrOpcode::Br ||
                     op == ir_opcodes.IrOpcode::CondBr || op == ir_opcodes.IrOpcode::Ret ||
-                    op == ir_opcodes.IrOpcode::Unreachable || op == ir_opcodes.IrOpcode::Noret)
+                    op == ir_opcodes.IrOpcode::Unreachable || op == ir_opcodes.IrOpcode::Noret ||
+                    op == ir_opcodes.IrOpcode::Alloca)
                 {
                 }
                 else
@@ -313,10 +337,69 @@ pub struct LinearScanRegAlloc
                 idx++;
             }
         }
+
+        // Harvest parameters: entry-block stores whose value operand is an
+        // Inst-kind value with no defining instruction anywhere in the
+        // function. Each becomes a fresh vreg (interval starts at 0).
+        {
+            u32 maxId = 0;
+            for (u32 b = 0; b < self.numBlocks; b++)
+                for (u32 i = 0; i < self.blocks[b].ninsts; i++)
+                {
+                    u32 rid = self.blocks[b].insts[i].base.id;
+                    if (rid > maxId) maxId = rid;
+                    for (u32 j = 0; j < self.blocks[b].insts[i].nops; j++)
+                    {
+                        ir_types.IrValue* op = self.blocks[b].insts[i].ops[j];
+                        if (op && op.kind == ir_types.IrValueKind::Inst && op.id > maxId) maxId = op.id;
+                    }
+                }
+            u8* defined = mman.alloc<u8>(maxId + 1);
+            for (u32 i = 0; i <= maxId; i++) defined[i] = 0;
+            for (u32 b = 0; b < self.numBlocks; b++)
+                for (u32 i = 0; i < self.blocks[b].ninsts; i++)
+                    defined[self.blocks[b].insts[i].base.id] = 1;
+
+            ir_types.IrBlock* eb = self.blocks[0];
+            for (u32 i = 0; i < eb.ninsts; i++)
+            {
+                ir_types.IrInst* inst = eb.insts[i];
+                if (inst.opcode != ir_opcodes.IrOpcode::Store || inst.nops < 1) continue;
+                ir_types.IrValue* src = inst.ops[0];
+                if (!src || src.kind != ir_types.IrValueKind::Inst) continue;
+                if (src.id <= maxId && defined[src.id]) continue;
+                bool already = false;
+                for (u32 k = 0; k < self.numParams; k++)
+                    if (self.paramVals[k] == src) { already = true; break; }
+                if (already) continue;
+                u32 pv = self.numVregs++;
+                self.ensureVregs(pv);
+                self.vregValues[pv] = src;
+                src.valData = (u64)pv;
+                self.ensureParams(self.numParams);
+                self.paramVals[self.numParams++] = src;
+            }
+            mman.dealloc<u8>(defined);
+        }
     }
 
     void computeIntervals(LinearScanRegAlloc*, ir_types.IrFunc* func)
     {
+        for (u32 k = 0; k < self.numParams; k++)
+        {
+            ir_types.IrValue* pv2 = self.paramVals[k];
+            if (!pv2) continue;
+            u32 vreg = (u32)pv2.valData;
+            self.ensureIntervals();
+            LiveInterval* li = &self.intervals[self.numIntervals++];
+            li.vreg = vreg;
+            li.start = 0;
+            li.end = 0;
+            li.physReg = NO_REG;
+            li.spillSlot = NO_SLOT;
+            li.isFloat = pv2.type && pv2.type.kind == ir_types.IrTypeKind::Float;
+        }
+
         for (u32 i = 0; i < self.totalInsts; i++)
         {
             u32 vreg = self.instVreg[i];
@@ -465,6 +548,10 @@ pub struct LinearScanRegAlloc
             {
                 freeSet[a->physReg] = 1;
                 self.regForVreg[a->vreg] = a->physReg;
+            }
+            else if (a && a->end == cur->start && a->start == cur->start)
+            {
+                // zero-length tie: same-position intervals must not share a reg
             }
             else
             {
@@ -853,6 +940,7 @@ pub struct LinearScanRegAlloc
         if (self.active) mman.dealloc<u32>(self.active);
         if (self.floatActive) mman.dealloc<u32>(self.floatActive);
         if (self.slotAllocas) mman.dealloc<ir_types.IrValue*>(self.slotAllocas);
+        if (self.paramVals) mman.dealloc<ir_types.IrValue*>(self.paramVals);
 
         return true;
     }
