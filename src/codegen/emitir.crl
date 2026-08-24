@@ -24,6 +24,7 @@ struct FuncGen
     scopes.ModuleTable* mods;
     ast.Program* prog;
     loader.Loader* ld;
+    ir_types.IrInst* sretTemp;
     str.strView filename;
     str.strView* flagNames;
     str.strView* flagVals;
@@ -164,6 +165,61 @@ ir_types.IrValue* resolveMonoMethod(FuncGen* fg, ast.Decl* md, str.strView inner
     return out;
 }
 
+// Aggregate return: mapCType lowers struct returns to array(i8,N); such
+// returns travel through a hidden destination pointer as the first integer
+// argument (private convention; caller pre-allocates the storage).
+bool isAggIrRet(ir_types.IrType* fnTy)
+{
+    if (!fnTy || fnTy.kind != ir_types.IrTypeKind::Func) return false;
+    ir_types.IrType* rt = fnTy.ret;
+    if (!rt || rt.kind != ir_types.IrTypeKind::Array) return false;
+    return rt.elem != null && rt.elem.kind == ir_types.IrTypeKind::Int && rt.elem.width == 8;
+}
+
+bool declHasAggRet(FuncGen* fg, ast.Decl* d)
+{
+    if (d == null || d.type == null) return false;
+    types.CType* ct = scopes.resolveTypeExpr(d.type, fg.top, fg.mods, d.generics, d.ngenerics);
+    if (ct == null) return false;
+    if (ct.kind == types.TY_NAMED && ct.decl != null && ct.decl.kind == ast.DT_STRUCT)
+        return true;
+    if (ct.kind == types.TY_ARRAY) return true;
+    if (ct.kind == types.TY_UNKNOWN && ct.name.len > 0)
+    {
+        for (u32 i = 0; i < ct.name.len; i++)
+            if (ct.name.ptr[i] == '<') return true;
+    }
+    return false;
+}
+
+ast.Decl* findStructByDisplay(FuncGen* fg, str.strView displayName)
+{
+    u32 ls = 0;
+    for (u32 i = 0; i < displayName.len; i++)
+        if (displayName.ptr[i] == '.') ls = i + 1;
+    str.strView lastName = str.strView::fromParts(displayName.ptr + ls, displayName.len - ls);
+    // trim trailing <...> if the segment itself carries it
+    u32 lt = 0;
+    for (u32 i = 0; i < lastName.len; i++)
+        if (lastName.ptr[i] == '<') { lastName = str.strView::fromParts(lastName.ptr, i); break; }
+    ast.Decl* sd = findStructByName(fg.prog, lastName);
+    if (sd != null) return sd;
+    if (fg.ld != null)
+    {
+        for (u32 pi = 0; pi < fg.ld.n; pi++)
+        {
+            ast.Program* pp = fg.ld.progs[pi];
+            if (pp == null) continue;
+            for (u32 di = 0; di < pp.ndecls; di++)
+            {
+                ast.Decl* cd = pp.decls[di];
+                if (cd != null && cd.kind == ast.DT_STRUCT && strEq(cd.name, lastName)) return cd;
+            }
+        }
+    }
+    return null;
+}
+
 ast.Decl* findStructByName(ast.Program* prog, str.strView name)
 {
     if (prog == null) return null;
@@ -217,23 +273,166 @@ ir_types.IrType* mapCType(FuncGen* fg, types.CType* t)
     }
     if (t->kind == types.TY_NAMED)
     {
-        libc.write(2, t->name.ptr, t->name.len);
-        libc.write(2, (const u8*)" declKind=", 10);
-        {
-            char nb[16]; u32 v= t->decl ? t->decl->kind : 999; u32 l=0; if(v==0) nb[l++]='0'; else { char r[16]; u32 rr=0; while(v>0){r[rr++]='0'+(v%10); v/=10;} while(rr>0) nb[l++]=r[--rr]; } libc.write(2, nb, l);
-        }
-        libc.write(2, (const u8*)" elemNull=", 10);
-        {
-            char nb[16]; u32 v= t->elem ? 0 : 1; nb[0]='0'+v; libc.write(2, nb,1);
-        }
-        libc.write(2, (const u8*)"\n",1);
         if (t->decl != null && t->decl->kind == ast.DT_DISTINCT && t->elem != null)
             return mapCType(fg, t->elem);
         // structs/enums: opaque byte blocks sized by the layout calc so alloca
         // reserves the full storage; field access goes through byte-offset GEPs.
+        bool pushed = false;
+        if (t->decl != null && t->decl->kind == ast.DT_STRUCT
+            && t->decl->ngenerics > 0 && t->name.len > 0)
+        {
+            u32 lt = 0; bool hasLt = false;
+            for (u32 i = 0; i < t->name.len; i++)
+                if (t->name.ptr[i] == '<') { lt = i; hasLt = true; break; }
+            if (hasLt && t->name.ptr[t->name.len - 1] == '>')
+            {
+                str.strView inner = str.strView::fromParts(
+                    t->name.ptr + lt + 1, t->name.len - lt - 2);
+                str.strView parts[16];
+                u32 nparts = 0;
+                u32 start4 = 0;
+                for (u32 k = 0; k <= inner.len && nparts < 16; k++)
+                {
+                    if (k == inner.len || inner.ptr[k] == ',')
+                    {
+                        str.strView piece = str.strView::fromParts(inner.ptr + start4, k - start4);
+                        while (piece.len > 0 && piece.ptr[0] == ' ') { piece.ptr++; piece.len--; }
+                        while (piece.len > 0 && piece.ptr[piece.len-1] == ' ') piece.len--;
+                        parts[nparts++] = piece;
+                        start4 = k + 1;
+                    }
+                }
+                if (nparts == t->decl->ngenerics)
+                {
+                    types.CType* rtys[16];
+                    u64 cvs[16];
+                    u32 nty = 0; u32 ncv = 0;
+                    bool ok5 = true;
+                    for (u32 k = 0; k < nparts; k++)
+                    {
+                        str.strView pv = parts[k];
+                        bool digits = pv.len > 0;
+                        for (u32 c2 = 0; c2 < pv.len; c2++)
+                            if (pv.ptr[c2] < '0' || pv.ptr[c2] > '9') { digits = false; break; }
+                        if (digits)
+                        {
+                            u64 mag6 = 0;
+                            for (u32 c2 = 0; c2 < pv.len; c2++) mag6 = mag6 * 10 + (u64)(pv.ptr[c2] - '0');
+                            cvs[ncv++] = mag6;
+                        }
+                        else
+                        {
+                            types.CType* pr6 = mman.alloc<types.CType>(1);
+                            if (types.primType(pv, pr6)) rtys[nty++] = pr6;
+                            else { ok5 = false; break; }
+                        }
+                    }
+                    if (ok5 && nty + ncv == t->decl->ngenerics)
+                    {
+                        subst.push(t->decl->generics, rtys, nty);
+                        if (ncv > 0)
+                        {
+                            str.strView cn[16]; u64 cv[16];
+                            u32 basec = t->decl->ngenerics - ncv;
+                            for (u32 k = 0; k < ncv && k < 16; k++)
+                            {
+                                cn[k] = t->decl->generics[basec + k];
+                                cv[k] = cvs[k];
+                            }
+                            subst.pushConsts(cn, cv, ncv);
+                        }
+                        pushed = true;
+                    }
+                }
+            }
+        }
         u32 sz = aggSizeOf(t, fg.top);
+        if (pushed) subst.pop();
         if (sz == 0) sz = 8;
         return fg.ctx.tyArray(fg.ctx.tyInt(8), sz);
+    }
+    // Dotted-generic instances resolve to TY_UNKNOWN at typecheck; recover
+    // the struct here so aggregates get full-size allocas instead of one word.
+    if (t->kind == types.TY_UNKNOWN && t->name.len > 0)
+    {
+        bool hasLt = false;
+        for (u32 i = 0; i < t->name.len; i++)
+            if (t->name.ptr[i] == '<') { hasLt = true; break; }
+        if (hasLt && t->name.ptr[t->name.len - 1] == '>')
+        {
+            ast.Decl* sd = findStructByDisplay(fg, t.name);
+            if (sd != null && sd.kind == ast.DT_STRUCT && sd.ngenerics > 0)
+            {
+                str.strView inner = str.strView::empty();
+                u32 lt = 0;
+                for (u32 i = 0; i < t.name.len; i++)
+                    if (t.name.ptr[i] == '<') { lt = i; break; }
+                if (t.name.ptr[t.name.len - 1] == '>')
+                    inner = str.strView::fromParts(t.name.ptr + lt + 1, t.name.len - lt - 2);
+                str.strView parts[16];
+                u32 nparts = 0;
+                u32 start4 = 0;
+                for (u32 k = 0; k <= inner.len && nparts < 16; k++)
+                {
+                    if (k == inner.len || inner.ptr[k] == ',')
+                    {
+                        str.strView piece = str.strView::fromParts(inner.ptr + start4, k - start4);
+                        while (piece.len > 0 && piece.ptr[0] == ' ') { piece.ptr++; piece.len--; }
+                        while (piece.len > 0 && piece.ptr[piece.len-1] == ' ') piece.len--;
+                        parts[nparts++] = piece;
+                        start4 = k + 1;
+                    }
+                }
+                if (nparts == sd.ngenerics)
+                {
+                    types.CType* rtys[16];
+                    u64 cvs[16];
+                    u32 nty = 0; u32 ncv = 0;
+                    bool ok5 = true;
+                    for (u32 k = 0; k < nparts; k++)
+                    {
+                        str.strView pv = parts[k];
+                        bool digits = pv.len > 0;
+                        for (u32 c2 = 0; c2 < pv.len; c2++)
+                            if (pv.ptr[c2] < '0' || pv.ptr[c2] > '9') { digits = false; break; }
+                        if (digits)
+                        {
+                            u64 mag6 = 0;
+                            for (u32 c2 = 0; c2 < pv.len; c2++) mag6 = mag6 * 10 + (u64)(pv.ptr[c2] - '0');
+                            cvs[ncv++] = mag6;
+                        }
+                        else
+                        {
+                            types.CType* pr6 = mman.alloc<types.CType>(1);
+                            if (types.primType(pv, pr6)) rtys[nty++] = pr6;
+                            else { ok5 = false; break; }
+                        }
+                    }
+                    if (ok5 && nty + ncv == sd.ngenerics)
+                    {
+                        subst.push(sd.generics, rtys, nty);
+                        if (ncv > 0)
+                        {
+                            str.strView cn[16]; u64 cv[16];
+                            u32 basec = sd.ngenerics - ncv;
+                            for (u32 k = 0; k < ncv && k < 16; k++)
+                            {
+                                cn[k] = sd.generics[basec + k];
+                                cv[k] = cvs[k];
+                            }
+                            subst.pushConsts(cn, cv, ncv);
+                        }
+                        types.CType tmp = *t;
+                        tmp.kind = types.TY_NAMED;
+                        tmp.decl = sd;
+                        u32 sz = aggSizeOf(&tmp, fg.top);
+                        subst.pop();
+                        if (sz == 0) sz = 8;
+                        return fg.ctx.tyArray(fg.ctx.tyInt(8), sz);
+                    }
+                }
+            }
+        }
     }
     return fg.ctx.tyInt(64);
 }
@@ -1148,17 +1347,26 @@ ir_types.IrValue* genExpr(FuncGen* fg, ast.Expr* e)
                             if (callee != null)
                             {
                                 bool needRecv = !md.isStatic && e->a.kind == ast.EX_DOT;
-                                preN = e->nargs + (needRecv ? 1u : 0u);
+                                bool calleeSret = isAggIrRet(callee.type);
+                                preN = e.nargs + (needRecv ? 1u : 0u) + (calleeSret ? 1u : 0u);
                                 preArgs = preN > 0 ? mman.alloc<ir_types.IrValue*>(preN) : null;
                                 u32 ai = 0;
+                                ir_types.IrInst* sretAlloca = null;
+                                if (calleeSret)
+                                {
+                                    ir_types.IrType* drt = callee.type.ret;
+                                    sretAlloca = fg.bd.alloca(drt);
+                                    preArgs[ai++] = &sretAlloca.base;
+                                }
                                 if (needRecv)
                                 {
-                                    ir_types.IrValue* recv = genAddr(fg, e->a.a);
-                                    if (recv == null) recv = genExpr(fg, e->a.a);
+                                    ir_types.IrValue* recv = genAddr(fg, e.a.a);
+                                    if (recv == null) recv = genExpr(fg, e.a.a);
                                     preArgs[ai++] = recv;
                                 }
-                                for (; ai < preN; ai++) preArgs[ai] = genExpr(fg, e.args[ai - (needRecv ? 1u : 0u)]);
+                                for (; ai < preN; ai++) preArgs[ai] = genExpr(fg, e.args[ai - (needRecv ? 1u : 0u) - (calleeSret ? 1u : 0u)]);
                                 handled = true;
+                                fg.sretTemp = sretAlloca;
                             }
                         }
                     }
@@ -1201,6 +1409,12 @@ ir_types.IrValue* genExpr(FuncGen* fg, ast.Expr* e)
                 {
                     ir_types.IrInst* ci = fg.bd.call(callee, preArgs, preN);
                     if (preArgs) mman.dealloc<ir_types.IrValue*>(preArgs);
+                    if (fg.sretTemp != null)
+                    {
+                        ir_types.IrInst* outAl = fg.sretTemp;
+                        fg.sretTemp = null;
+                        return &outAl.base;
+                    }
                     if (ci.base.type && ci.base.type.kind == ir_types.IrTypeKind::Void) return null;
                     return &ci.base;
                 }
@@ -1208,15 +1422,19 @@ ir_types.IrValue* genExpr(FuncGen* fg, ast.Expr* e)
             else callee = genExpr(fg, e->a);
         }
         if (callee == null) callee = fg.ctx.constInt(fg.ctx.tyPtr(fg.ctx.tyInt(8)), 0);
-        u32 n = e->nargs;
-        ir_types.IrValue** args = null;
-        if (n > 0)
+        bool plainSret = isAggIrRet(callee.type);
+        u32 n = e.nargs + (plainSret ? 1u : 0u);
+        ir_types.IrValue** args = n > 0 ? mman.alloc<ir_types.IrValue*>(n) : null;
+        ir_types.IrInst* sretAlloca2 = null;
+        if (plainSret)
         {
-            args = mman.alloc<ir_types.IrValue*>(n);
-            for (u32 i = 0; i < n; i++) args[i] = genExpr(fg, e->args[i]);
+            sretAlloca2 = fg.bd.alloca(callee.type.ret);
+            args[0] = &sretAlloca2.base;
         }
+        for (u32 i = plainSret ? 1u : 0u; i < n; i++) args[i] = genExpr(fg, e.args[i - (plainSret ? 1u : 0u)]);
         ir_types.IrInst* ci = fg.bd.call(callee, args, n);
         if (args) mman.dealloc<ir_types.IrValue*>(args);
+        if (sretAlloca2 != null) return &sretAlloca2.base;
         if (ci->base.type && ci->base.type->kind == ir_types.IrTypeKind::Void) return null;
         return &ci->base;
     }
@@ -1318,13 +1536,47 @@ void genStmt(FuncGen* fg, ast.Stmt* s)
             for (u32 i = 0; i < s->nstmts; i++) genStmt(fg, s->stmts[i]);
             break;
         }
+        // Aggregate-returning initializers hand back STORAGE (hidden-sret
+        // destination); alias the local to it instead of copying through
+        // an extra indirection.
+        if (s->a != null && s->a.kind == ast.EX_CALL)
+        {
+            // Static callee lookup: aggregate returns hand back STORAGE
+            // (hidden-sret destination); alias the local to it instead of
+            // copying through an extra indirection. Decided WITHOUT
+            // evaluating so the initializer is emitted exactly once.
+            bool aggInit = false;
+            ast.Expr* cb = s->a.a;
+            if (cb != null)
+            {
+                str.strView cn2 = cb.kind == ast.EX_DOT || cb.kind == ast.EX_ARROW
+                    ? cb.text : cb.text;
+                for (u32 fi9 = 0; fi9 < fg.irMod.nfuncs; fi9++)
+                {
+                    if (strEq(str.strView::fromCstr(fg.irMod.funcs[fi9].base.name), cn2))
+                    {
+                        aggInit = isAggIrRet(fg.irMod.funcs[fi9].base.type);
+                        break;
+                    }
+                }
+            }
+            if (aggInit)
+            {
+                ir_types.IrValue* v0 = genExpr(fg, s.a);
+                if (v0 != null)
+                {
+                    addLocal(fg, s.text, v0);
+                    break;
+                }
+            }
+        }
         ir_types.IrType* ty = s->type ? mapTypeExpr(fg, s->type) : fg.ctx.tyInt(64);
         ir_types.IrInst* al = fg.bd.alloca(ty);
-        addLocal(fg, s->text, &al->base);
+        addLocal(fg, s.text, &al.base);
         if (s->a != null)
         {
-            ir_types.IrValue* v = genExpr(fg, s->a);
-            if (v != null) fg.bd.store(v, &al->base);
+            ir_types.IrValue* v = genExpr(fg, s.a);
+            if (v != null) fg.bd.store(v, &al.base);
         }
         break;
     }
@@ -2009,13 +2261,17 @@ pub ir_types.IrModule* buildModule(ast.Program* prog, scopes.Scope* top,
         types.CType* rct = d->type ? scopes.resolveTypeExpr(d->type, top, mods, null, 0) : null;
         ir_types.IrType* rt = rct ? mapCType(&sfg, rct) : ctx.tyVoid();
         if (d->noreturn) rt = ctx.tyVoid();
-        u32 np = d->nparams;
+        bool sretP = rt != null && rt.kind == ir_types.IrTypeKind::Array && rt.elem != null
+            && rt.elem.kind == ir_types.IrTypeKind::Int && rt.elem.width == 8;
+        u32 sretOff = sretP ? 1u : 0u;
+        u32 np = d->nparams + sretOff;
         ir_types.IrType** ptys = null;
         if (np > 0)
         {
             ptys = mman.alloc<ir_types.IrType*>(np);
-            for (u32 k = 0; k < np; k++)
-                ptys[k] = d->params[k].type ? mapCType(&sfg, scopes.resolveTypeExpr(d->params[k].type, top, mods, null, 0)) : ctx.tyInt(64);
+            if (sretP) ptys[0] = sfg.ctx.tyPtr(rt);
+            for (u32 k = 0; k < d->nparams; k++)
+                ptys[k + sretOff] = d->params[k].type ? mapCType(&sfg, scopes.resolveTypeExpr(d->params[k].type, top, mods, null, 0)) : ctx.tyInt(64);
         }
         // dedupe: a name already present keeps the first entry
         bool dup = false;
@@ -2074,7 +2330,8 @@ pub ir_types.IrModule* buildModule(ast.Program* prog, scopes.Scope* top,
             types.CType* rct2 = md->type ? scopes.resolveTypeExpr(md->type, top, mods, md->generics, md->ngenerics) : null;
             ir_types.IrType* rt2 = rct2 ? mapCType(&mfg, rct2) : ctx.tyVoid();
             bool needSelf2 = methodNeedsSelf(md);
-            u32 base2 = needSelf2 ? 1u : 0u;
+            bool sret2 = declHasAggRet(&mfg, md);
+            u32 base2 = (needSelf2 ? 1u : 0u) + (sret2 ? 1u : 0u);
             u32 np2 = md->nparams + base2;
             ir_types.IrType** ptys2 = null;
             if (np2 > 0)
@@ -2087,7 +2344,7 @@ pub ir_types.IrModule* buildModule(ast.Program* prog, scopes.Scope* top,
                     types.CType* sptr2 = mman.alloc<types.CType>(1);
                     sptr2.kind = types.TY_PTR;
                     sptr2.elem = sel2;
-                    ptys2[0] = mapCType(&mfg, sptr2);
+                    ptys2[sret2 ? 1u : 0u] = mapCType(&mfg, sptr2);
                 }
                 for (u32 k = 0; k < md->nparams; k++)
                     ptys2[k + base2] = md->params[k].type ? mapCType(&mfg, scopes.resolveTypeExpr(md->params[k].type, top, mods, md->generics, md->ngenerics)) : ctx.tyInt(64);
@@ -2118,7 +2375,8 @@ pub ir_types.IrModule* buildModule(ast.Program* prog, scopes.Scope* top,
             types.CType* rct2 = md->type ? scopes.resolveTypeExpr(md->type, top, mods, md->generics, md->ngenerics) : null;
             ir_types.IrType* rt2 = rct2 ? mapCType(&mfg, rct2) : ctx.tyVoid();
             bool needSelf2 = methodNeedsSelf(md);
-            u32 base2 = needSelf2 ? 1u : 0u;
+            bool sret2 = declHasAggRet(&mfg, md);
+            u32 base2 = (needSelf2 ? 1u : 0u) + (sret2 ? 1u : 0u);
             u32 np2 = md->nparams + base2;
             ir_types.IrType** ptys2 = null;
             if (np2 > 0)
@@ -2131,7 +2389,7 @@ pub ir_types.IrModule* buildModule(ast.Program* prog, scopes.Scope* top,
                     types.CType* sptr2 = mman.alloc<types.CType>(1);
                     sptr2.kind = types.TY_PTR;
                     sptr2.elem = sel2;
-                    ptys2[0] = mapCType(&mfg, sptr2);
+                    ptys2[sret2 ? 1u : 0u] = mapCType(&mfg, sptr2);
                 }
                 for (u32 k = 0; k < md->nparams; k++)
                     ptys2[k + base2] = md->params[k].type ? mapCType(&mfg, scopes.resolveTypeExpr(md->params[k].type, top, mods, md->generics, md->ngenerics)) : ctx.tyInt(64);
@@ -2219,12 +2477,16 @@ pub ir_types.IrModule* buildModule(ast.Program* prog, scopes.Scope* top,
         types.CType* rct3 = g->type ? scopes.resolveTypeExpr(g->type, top, mods, g->generics, g->ngenerics) : null;
         ir_types.IrType* rt3 = rct3 ? mapCType(&mfg, rct3) : ctx.tyVoid();
         bool needSelf3 = methodNeedsSelf(g);
-        u32 base3 = needSelf3 ? 1u : 0u;
+        bool sret3 = rt3 != null && rt3.kind == ir_types.IrTypeKind::Array && rt3.elem != null
+            && rt3.elem.kind == ir_types.IrTypeKind::Int && rt3.elem.width == 8;
+        u32 sretOff3 = sret3 ? 1u : 0u;
+        u32 base3 = (needSelf3 ? 1u : 0u) + sretOff3;
         u32 np3 = g->nparams + base3;
         ir_types.IrType** ptys3 = null;
         if (np3 > 0)
         {
             ptys3 = mman.alloc<ir_types.IrType*>(np3);
+            if (sret3) ptys3[0] = mfg.ctx.tyPtr(rt3);
             if (needSelf3)
             {
                 ast.Decl* sdOwn3 = findStructByName(prog, g->structName);
@@ -2232,7 +2494,7 @@ pub ir_types.IrModule* buildModule(ast.Program* prog, scopes.Scope* top,
                 types.CType* sptr3 = mman.alloc<types.CType>(1);
                 sptr3.kind = types.TY_PTR;
                 sptr3.elem = sel3;
-                ptys3[0] = mapCType(&mfg, sptr3);
+                ptys3[sret3 ? 1u : 0u] = mapCType(&mfg, sptr3);
             }
             for (u32 k = 0; k < g->nparams; k++)
                 ptys3[k + base3] = g->params[k].type ? mapCType(&mfg, scopes.resolveTypeExpr(g->params[k].type, top, mods, g->generics, g->ngenerics)) : ctx.tyInt(64);
@@ -2284,9 +2546,35 @@ pub ir_types.IrModule* buildModule(ast.Program* prog, scopes.Scope* top,
         fg.bd = &bd;
 
         u32 nps = d->nparams;
+        u32 pOff = 0;
+        {
+            ir_types.IrType* frt = fn.retType;
+            bool aggR = frt != null && frt.kind == ir_types.IrTypeKind::Array
+                && frt.elem != null && frt.elem.kind == ir_types.IrTypeKind::Int && frt.elem.width == 8;
+            if (aggR && fn.nparams >= 1)
+            {
+                pOff = 1;
+                // hidden sret destination: synthesized as the first
+                // entry-store so backend seeds it from rdi.
+                ir_types.IrType* pt = fn.paramTypes != null && fn.paramTypes[0] ? fn.paramTypes[0] : fg.ctx.tyPtr(frt);
+                ir_types.IrInst* al = bd.alloca(pt);
+                ir_types.IrValue* pv = mman.alloc<ir_types.IrValue>(1);
+                pv.kind = (ir_types.IrValueKind)0;
+                pv.type = pt;
+                pv.id = ctx.nextValueId();
+                pv.valData = 0;
+                pv.name = null;
+                pv.users = null;
+                pv.nusers = 0;
+                pv.capUsers = 0;
+                bd.store(pv, &al.base);
+                addLocal(&fg, str.strView::fromCstr("__sret"), &al.base);
+            }
+        }
         for (u32 pi = 0; pi < nps; pi++)
         {
-            ir_types.IrType* pt = fn.paramTypes != null && pi < fn.nparams && fn.paramTypes[pi] ? fn.paramTypes[pi] : ctx.tyInt(64);
+            u32 fi2 = pi + pOff + ((d.structName.len > 0 && !d.isStatic && !(d.nparams > 0 && (d.params[0].name.len == 0 || strEq(d.params[0].name, str.strView::fromCstr("self"))))) ? 1u : 0u);
+            ir_types.IrType* pt = fn.paramTypes != null && fi2 < fn.nparams && fn.paramTypes[fi2] ? fn.paramTypes[fi2] : ctx.tyInt(64);
             ir_types.IrInst* al = bd.alloca(pt);
             char pb[64]; u32 pl=0;
             for (u32 k=0;k<d->params[pi].name.len&&pl<63;k++) pb[pl++]=(char)d->params[pi].name.ptr[k];
@@ -2376,6 +2664,37 @@ pub ir_types.IrModule* buildModule(ast.Program* prog, scopes.Scope* top,
         bd.pos(entry, null);
         fg.bd = &bd;
 
+        // hidden sret destination: synthesized as the first param-slot store
+        // so the backend seeds it from the first ABI integer register.
+        {
+            ir_types.IrType* frt = fn.retType;
+            bool aggR = frt != null && frt.kind == ir_types.IrTypeKind::Array
+                && frt.elem != null && frt.elem.kind == ir_types.IrTypeKind::Int && frt.elem.width == 8;
+            bool isSretFn = false;
+            {
+                u32 extraHint = fn.nparams;
+                u32 declaredTotal = d.nparams + (d.structName.len > 0 && !d.isStatic ? 1u : 0u);
+                (void)extraHint; (void)declaredTotal;
+                isSretFn = aggR && fn.nparams >= 1;
+            }
+            if (isSretFn)
+            {
+                ir_types.IrType* pt = fn.paramTypes != null && fn.paramTypes[0] ? fn.paramTypes[0] : fg.ctx.tyPtr(frt);
+                ir_types.IrInst* al = bd.alloca(pt);
+                ir_types.IrValue* pv = mman.alloc<ir_types.IrValue>(1);
+                pv.kind = (ir_types.IrValueKind)0;
+                pv.type = pt;
+                pv.id = ctx.nextValueId();
+                pv.valData = 0;
+                pv.name = null;
+                pv.users = null;
+                pv.nusers = 0;
+                pv.capUsers = 0;
+                bd.store(pv, &al.base);
+                addLocal(&fg, str.strView::fromCstr("__sret"), &al.base);
+            }
+        }
+
         // implicit self slot for instance methods: synthesize a local holding
         // the incoming receiver pointer before declared params.
         bool explicitSelf = d->nparams > 0 && (d->params[0].name.len == 0 || strEq(d->params[0].name, str.strView::fromCstr("self")));
@@ -2402,9 +2721,35 @@ pub ir_types.IrModule* buildModule(ast.Program* prog, scopes.Scope* top,
         }
 
         u32 nps = d->nparams;
+        u32 pOff = 0;
+        {
+            ir_types.IrType* frt = fn.retType;
+            bool aggR = frt != null && frt.kind == ir_types.IrTypeKind::Array
+                && frt.elem != null && frt.elem.kind == ir_types.IrTypeKind::Int && frt.elem.width == 8;
+            if (aggR && fn.nparams >= 1)
+            {
+                pOff = 1;
+                // hidden sret destination: synthesized as the first
+                // entry-store so backend seeds it from rdi.
+                ir_types.IrType* pt = fn.paramTypes != null && fn.paramTypes[0] ? fn.paramTypes[0] : fg.ctx.tyPtr(frt);
+                ir_types.IrInst* al = bd.alloca(pt);
+                ir_types.IrValue* pv = mman.alloc<ir_types.IrValue>(1);
+                pv.kind = (ir_types.IrValueKind)0;
+                pv.type = pt;
+                pv.id = ctx.nextValueId();
+                pv.valData = 0;
+                pv.name = null;
+                pv.users = null;
+                pv.nusers = 0;
+                pv.capUsers = 0;
+                bd.store(pv, &al.base);
+                addLocal(&fg, str.strView::fromCstr("__sret"), &al.base);
+            }
+        }
         for (u32 pi = 0; pi < nps; pi++)
         {
-            ir_types.IrType* pt = fn.paramTypes != null && pi < fn.nparams && fn.paramTypes[pi] ? fn.paramTypes[pi] : ctx.tyInt(64);
+            u32 fi2 = pi + pOff + ((d.structName.len > 0 && !d.isStatic && !(d.nparams > 0 && (d.params[0].name.len == 0 || strEq(d.params[0].name, str.strView::fromCstr("self"))))) ? 1u : 0u);
+            ir_types.IrType* pt = fn.paramTypes != null && fi2 < fn.nparams && fn.paramTypes[fi2] ? fn.paramTypes[fi2] : ctx.tyInt(64);
             ir_types.IrInst* al = bd.alloca(pt);
             char pb[64]; u32 pl=0;
             str.strView pname = d->params[pi].name.len > 0 ? d->params[pi].name : str.strView::fromCstr("self");
