@@ -54,6 +54,9 @@ pub struct BorrowViolation
     u32 line;
     u32 col;
     const char* message;
+    // Distinct per-rule detail. Points at the offending instruction's
+    // function name (static storage) so the reporter can name it.
+    const char* funcName;
 }
 
 pub struct BorrowCheckOptions
@@ -131,11 +134,11 @@ pub struct BorrowCheckPass
         switch (kind)
         {
         case BorrowCheckKind::StaleLoadAcrossCall:
-            return "load stays live across a call that may write the region";
+            return "loaded value stays live across a call that may write through its pointer argument";
         case BorrowCheckKind::AliasingCallArgs:
-            return "two pointer arguments alias the same region";
+            return "two pointer arguments of this call resolve to the same region while the callee can write through one of them";
         case BorrowCheckKind::StoreVsLiveLoad:
-            return "store to a region with a still-live load of it";
+            return "store to a region invalidates a load of that region whose value is still used afterwards";
         }
         return "borrow check violation";
     }
@@ -146,6 +149,7 @@ pub struct BorrowCheckPass
         BorrowViolation v;
         v.kind = kind;
         v.message = self.messageFor(kind);
+        v.funcName = (self.curFunc && self.curFunc.base.name) ? self.curFunc.base.name : null;
         if (at && at.debugLoc.file)
         {
             v.file = at.debugLoc.file;
@@ -270,6 +274,22 @@ pub struct BorrowCheckPass
                         if (inst.ops[oi])
                             self.ufUnion((wallvm.ir_types.IrValue*)inst, inst.ops[oi]);
                 }
+            }
+        }
+        // Second sweep: GEP and Alloca results join their base's set so
+        // alloca→GEP→bitcast chains collapse to one region even when the
+        // chain order puts the union members before the cast.
+        for (u32 bi = 0; bi < func.nblocks; bi++)
+        {
+            wallvm.ir_types.IrBlock* bb = func.blocks[bi];
+            for (u32 ii = 0; ii < bb.ninsts; ii++)
+            {
+                wallvm.ir_types.IrInst* inst = bb.insts[ii];
+                if (inst.opcode == wallvm.irOps.IrOpcode::Bitcast && inst.nops >= 1 && inst.ops[0])
+                    self.ufUnion((wallvm.ir_types.IrValue*)inst, inst.ops[0]);
+                else if (inst.opcode == wallvm.irOps.IrOpcode::Gep && inst.nops >= 1
+                         && inst.ops[0] && self.isPointerValue(inst.ops[0]))
+                    self.ufUnion((wallvm.ir_types.IrValue*)inst, inst.ops[0]);
             }
         }
     }
@@ -432,19 +452,40 @@ pub struct BorrowCheckPass
     // which case the value still aliases its own SSA value.
     bool regionOf(wallvm.ir_types.IrValue* v, wallvm.ir_types.IrValue** base, u64* off)
     {
-        wallvm.ir_types.IrValue* cur = v;
+        wallvm.ir_types.IrValue* cur = self.ufFind(v);
         u64 acc = 0;
         while (cur && cur.kind == wallvm.ir_types.IrValueKind::Inst)
         {
             wallvm.ir_types.IrInst* inst = (wallvm.ir_types.IrInst*)cur;
-            if (inst.opcode != wallvm.irOps.IrOpcode::Gep) break;
-            for (u32 i = 1; i < inst.nops; i++)
+            if (inst.opcode == wallvm.irOps.IrOpcode::Gep)
             {
-                wallvm.ir_types.IrValue* idx = inst.ops[i];
-                if (!idx || idx.kind != wallvm.ir_types.IrValueKind::ConstInt) return false;
-                acc += idx.valData * 8;
+                // The union-find already merged GEPs with their bases, but
+                // the offset still accumulates along the chain. Stop at the
+                // first base whose GEP operands are not all constant.
+                bool allConst = true;
+                for (u32 i = 1; i < inst.nops; i++)
+                {
+                    wallvm.ir_types.IrValue* idx = inst.ops[i];
+                    if (!idx || idx.kind != wallvm.ir_types.IrValueKind::ConstInt) { allConst = false; break; }
+                    acc += idx.valData * 8;
+                }
+                if (!allConst)
+                {
+                    // Unknown offset: report the region as its own SSA value
+                    // with an unknown flag via max offset.
+                    *base = cur;
+                    *off = acc;
+                    return false;
+                }
+                cur = inst.ops[0];
             }
-            cur = inst.ops[0];
+            else if (inst.opcode == wallvm.irOps.IrOpcode::Bitcast && inst.nops >= 1)
+            {
+                wallvm.ir_types.IrValue* nx = self.ufFind(inst.ops[0]);
+                if (nx == cur) break;
+                cur = nx;
+            }
+            else break;
         }
         *base = self.ufFind(cur);
         *off = acc;
@@ -898,16 +939,40 @@ pub struct BorrowCheckPass
             if (call.opcode != wallvm.irOps.IrOpcode::Call || call.nops < 2) continue;
 
             // Rule, no two pointer arguments may alias the same region
-            // when the callee can write through either of them.
+            // when the callee can write through either of them. When the
+            // callee's write capability is unknown (extern, bodyless), a
+            // same-base alias is still reported conservatively.
             for (u32 ai = 1; ai < call.nops; ai++)
             {
                 wallvm.ir_types.IrValue* argA = call.ops[ai];
                 if (!self.isPointerValue(argA)) continue;
-                if (!self.calleeWrites(call.ops[0], ai - 1)) continue;
+                bool writes = self.calleeWrites(call.ops[0], ai - 1);
+                wallvm.ir_types.IrValue* ab = null;
+                u64 ao2 = 0;
+                bool ak = self.regionOf(argA, &ab, &ao2);
                 for (u32 aj = ai + 1; aj < call.nops; aj++)
                 {
                     wallvm.ir_types.IrValue* argB = call.ops[aj];
                     if (!self.isPointerValue(argB)) continue;
+                    bool bWrites = self.calleeWrites(call.ops[0], aj - 1);
+                    if (!writes && !bWrites) continue;
+                    // Same SSA value or same resolved region base: aliasing
+                    // regardless of offset knowledge.
+                    if (argA == argB || ab == null)
+                    {
+                        // fall through to regionsOverlap for exactness
+                    }
+                    else
+                    {
+                        wallvm.ir_types.IrValue* bb = null;
+                        u64 bo2 = 0;
+                        self.regionOf(argB, &bb, &bo2);
+                        if (ab == bb)
+                        {
+                            self.recordViolation(BorrowCheckKind::AliasingCallArgs, call);
+                            continue;
+                        }
+                    }
                     if (self.regionsOverlap(argA, false, argB, false))
                         self.recordViolation(BorrowCheckKind::AliasingCallArgs, call);
                 }
