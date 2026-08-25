@@ -43,6 +43,16 @@ pub struct X86_64Codegen
     u32* icmpSkipIds;
     u32 nIcmpSkip;
     u32 capIcmpSkip;
+    // Value id (+1) known to be physically in xmm0 right now. Killed at
+    // calls (caller-saved) and block boundaries; lets floatLoad into xmm0
+    // become a no-op instead of a home relay.
+    u32 xmm0Hold;
+    // Fused read-modify-write stores: store(ptr P, add(load(P), X)) lowers
+    // to a single memory-operand add. Parallel arrays keyed by store id.
+    u32* fusedStoreIds;
+    ir_types.IrValue** fusedAddends;
+    u32 nFused;
+    u32 capFused;
     char** allocIntNames;
     u32 numAllocInt;
     char** allocFloatNames;
@@ -690,6 +700,13 @@ pub struct X86_64Codegen
             return;
         }
         const char* home = self.allocIntNames[self.valLow(e)];
+        // Same register: nothing to move, just refresh the hold tracking.
+        if (home[0] == r[0] && home[1] == r[1] && home[2] == r[2] && home[3] == r[3])
+        {
+            u32 ai = self.intIdxOf(r);
+            if (ai != ~0u) self.setIntHold(ai, v->id);
+            return;
+        }
         // Always emit the move: the holds cache is not trustworthy across
         // synthesized allocas/param spills and a skipped reload reads stale
         // register contents (wrong-value bugs).
@@ -760,8 +777,15 @@ pub struct X86_64Codegen
         }
         const char* home = self.allocIntNames[self.valLow(e)];
         u32 ai = self.intIdxOf(home);
+        // Already in the target register: skip the self-move.
+        if (home[0] == r[0] && home[1] == r[1] && home[2] == r[2] && home[3] == r[3])
+        {
+            if (ai != ~0u) self.setIntHold(ai, v->id);
+            return;
+        }
         self.inst2("mov", home, r);
-        if (ai != ~0u) self.setIntHold(ai, v->id);
+        u32 ai2 = self.intIdxOf(r);
+        if (ai2 != ~0u) self.setIntHold(ai2, v->id);
     }
 
     // Width-specific register names for movzx/movsx operands.
@@ -1212,11 +1236,31 @@ pub struct X86_64Codegen
             }
         }
 
+        // SysV classification: SSE-class args take xmm regs by float
+        // ordinal; INTEGER-class args take rdi/rsi/rdx/rcx/r8/r9 by int
+        // ordinal (float slots do NOT consume GPRs). ireg[i] is the
+        // destination GPR for int arg i, or null when stack-passed.
+        const char* ireg[8];
+        {
+            u32 icnt = 0;
+            for (u32 z = 0; z < 8; z++) ireg[z] = null;
+            for (u32 i = 0; i < k && i < 8; i++)
+            {
+                ir_types.IrValue* arg = inst->ops[i + 1];
+                if (arg && arg->type && arg->type->kind == ir_types.IrTypeKind::Float) continue;
+                if (icnt >= self.abi.numArgRegs) break;
+                ireg[i] = self.abi.argRegs[icnt];
+                icnt++;
+            }
+        }
+
         u32 m = 0;
-        for (u32 i = k; i < nArgs; i++)
+        for (u32 i = 0; i < nArgs; i++)
         {
             ir_types.IrValue* arg = inst->ops[i + 1];
-            if (!arg || !arg->type || arg->type->kind != ir_types.IrTypeKind::Float) m++;
+            if (arg && arg->type && arg->type->kind == ir_types.IrTypeKind::Float) continue;
+            if (i < 8 && ireg[i] != null) continue;
+            m++;
         }
         u32 align = self.abi.stackAlignment ? self.abi.stackAlignment : 16;
         u32 pad = 0;
@@ -1229,52 +1273,39 @@ pub struct X86_64Codegen
 
         // Stack args, descending index: the first stack arg ends up at
         // [rsp+8] at the callee.
-        for (u32 i = nArgs; i > k; i--)
+        for (u32 ii = nArgs; ii > 0; ii--)
         {
-            ir_types.IrValue* arg = inst->ops[i];
+            u32 ai5 = ii - 1;
+            ir_types.IrValue* arg = inst->ops[ii];
             if (arg && arg->type && arg->type->kind == ir_types.IrTypeKind::Float) continue;
+            if (ai5 < 8 && ireg[ai5] != null) continue;
             self.load(arg, "rax");
             self.inst1("push", "rax");
         }
-        // Register args: direct move when no source home overlaps a
-        // destination arg register. Fallback to push/pop for overlap.
+// Register args: SysV class-based staging — direct moves when no source
+        // home overlaps a destination arg register, push/pop fallback otherwise.
         {
             bool overlap = false;
-            // Only need push/pop when a source operand lives in a register
-            // that is also the destination of a DIFFERENT argument.
-            // Sources from spill slots/memory and constants are always safe.
-            for (u32 sc = 0; sc < k && !overlap; sc++)
-            {
-                ir_types.IrValue* sa = inst->ops[sc + 1];
-                if (!sa) continue;
-                if (self.isConst(sa)) continue;
-                if (sa.type && sa.type.kind == ir_types.IrTypeKind.Float) continue;
-                u64 se2 = self.valEnc(sa);
-                if ((se2 & 0x80000000UL) != 0) continue; // spilled = memory = safe
-                if ((se2 & 0x40000000UL) != 0) continue; // float pool = safe
-                const char* sh = self.allocIntNames[self.valLow(se2)];
-                for (u32 dd = 0; dd < k && !overlap; dd++)
-                {
-                    if (dd == sc) continue;
-                    if (sh[0] == self.abi.argRegs[dd][0] &&
-                        sh[1] == self.abi.argRegs[dd][1] &&
-                        sh[2] == self.abi.argRegs[dd][2])
-                        overlap = true;
-                }
-            }
             for (u32 si = 0; si < k && !overlap; si++)
             {
                 ir_types.IrValue* sa = inst->ops[si + 1];
-                if (!sa || (sa->type && sa->type.kind == ir_types.IrTypeKind.Float)) continue;
+                if (!sa || (sa->type && sa->type->kind == ir_types.IrTypeKind::Float)) continue;
+                if (si < 8 && ireg[si] == null) continue;
+                if (self.isConst(sa)) continue;
                 u64 se2 = self.valEnc(sa);
                 if ((se2 & 0x80000000UL) != 0 || (se2 & 0x40000000UL) != 0) continue;
                 const char* srcHome = self.allocIntNames[self.valLow(se2)];
-                for (u32 di = 0; di < k; di++)
+                for (u32 di = 0; di < k && !overlap; di++)
                 {
-                    if (srcHome[0] == self.abi.argRegs[di][0] &&
-                        srcHome[1] == self.abi.argRegs[di][1] &&
-                        srcHome[2] == self.abi.argRegs[di][2])
-                    { if (si != di) { overlap = true; break; } }
+                    const char* dr2 = (di < 8) ? ireg[di] : null;
+                    if (dr2 == null) continue;
+                    bool eqR = true;
+                    for (u32 c2 = 0; c2 < 8; c2++)
+                    {
+                        if (srcHome[c2] != dr2[c2]) { eqR = false; break; }
+                        if (srcHome[c2] == 0) break;
+                    }
+                    if (eqR && si != di) { overlap = true; break; }
                 }
             }
             if (!overlap)
@@ -1283,8 +1314,9 @@ pub struct X86_64Codegen
                 for (u32 i = 0; i < k; i++)
                 {
                     ir_types.IrValue* arg = inst->ops[i + 1];
-                    if (arg && arg->type && arg->type->kind == ir_types.IrTypeKind.Float) continue;
-                    const char* dreg = self.abi.argRegs[i];
+                    if (arg && arg->type && arg->type->kind == ir_types.IrTypeKind::Float) continue;
+                    const char* dreg = (i < 8) ? ireg[i] : null;
+                    if (dreg == null) continue;
                     self.load(arg, dreg);
                     u32 ai2 = self.intIdxOf(dreg);
                     if (ai2 != ~0u) self.setIntHold(ai2, arg ? arg->id : 0);
@@ -1297,6 +1329,7 @@ pub struct X86_64Codegen
                 {
                     ir_types.IrValue* arg = inst->ops[i + 1];
                     if (arg && arg->type && arg->type->kind == ir_types.IrTypeKind::Float) continue;
+                    if (i < 8 && ireg[i] == null) continue;
                     self.load(arg, "rax");
                     self.inst1("push", "rax");
                 }
@@ -1304,7 +1337,8 @@ pub struct X86_64Codegen
                 {
                     ir_types.IrValue* arg = inst->ops[i];
                     if (arg && arg->type && arg->type->kind == ir_types.IrTypeKind::Float) continue;
-                    const char* reg = self.abi.argRegs[i - 1];
+                    const char* reg = (i - 1 < 8) ? ireg[i - 1] : null;
+                    if (reg == null) continue;
                     self.inst1("pop", reg);
                     u32 ai3 = self.intIdxOf(reg);
                     if (ai3 != ~0u) self.setIntHold(ai3, arg ? arg->id : 0);
