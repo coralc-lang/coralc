@@ -37,6 +37,12 @@ pub struct X86_64Codegen
     // collision between functions.
     u32 labelSeq;
     bool unsupported;
+    // ICmp results consumed by exactly one CondBr: their normal setcc
+    // emission is skipped and the branch re-emits cmp + jcc directly,
+    // killing the setcc/movzx/relay/test chain on every `if`.
+    u32* icmpSkipIds;
+    u32 nIcmpSkip;
+    u32 capIcmpSkip;
     char** allocIntNames;
     u32 numAllocInt;
     char** allocFloatNames;
@@ -83,6 +89,9 @@ pub struct X86_64Codegen
         c.blockLabelsCap = 0;
         c.labelSeq = 0;
         c.unsupported = false;
+        c.icmpSkipIds = null;
+        c.nIcmpSkip = 0;
+        c.capIcmpSkip = 0;
         c.allocIntNames = null;
         c.numAllocInt = 0;
         c.allocFloatNames = null;
@@ -228,6 +237,76 @@ pub struct X86_64Codegen
     {
         if (self.att) { self.c('('); self.c('%'); self.s(b); self.c(')'); }
         else { self.c('['); self.s(b); self.c(']'); }
+    }
+
+    // Is this value a plain allocated int register (not const/spill/float)?
+    bool isIntRegValue(ir_types.IrValue* v)
+    {
+        if (!v || self.isConst(v)) return false;
+        u64 e = self.valEnc(v);
+        if ((e & 0x80000000UL) != 0) return false; // spill slot
+        if ((e & 0x40000000UL) != 0) return false; // float pool
+        return true;
+    }
+
+    // jcc mnemonic for an ICmp predicate.
+    const char* iccFor(ir_opcodes.IrICmpPred p)
+    {
+        switch (p)
+        {
+        case ir_opcodes.IrICmpPred::Eq: return "je";
+        case ir_opcodes.IrICmpPred::Ne: return "jne";
+        case ir_opcodes.IrICmpPred::Slt: return "jl";
+        case ir_opcodes.IrICmpPred::Sle: return "jle";
+        case ir_opcodes.IrICmpPred::Sgt: return "jg";
+        case ir_opcodes.IrICmpPred::Sge: return "jge";
+        case ir_opcodes.IrICmpPred::Ult: return "jb";
+        case ir_opcodes.IrICmpPred::Ule: return "jbe";
+        case ir_opcodes.IrICmpPred::Ugt: return "ja";
+        case ir_opcodes.IrICmpPred::Uge: return "jae";
+        }
+        return "jmp";
+    }
+
+    bool icmpSkipped(ir_types.IrInst* inst)
+    {
+        for (u32 i = 0; i < self.nIcmpSkip; i++)
+            if (self.icmpSkipIds[i] == inst->base.id) return true;
+        return false;
+    }
+
+    void icmpSkipAdd(u32 id)
+    {
+        if (self.nIcmpSkip >= self.capIcmpSkip)
+        {
+            u32 nc = self.capIcmpSkip ? self.capIcmpSkip * 2 : 16;
+            u32* ni = mman.alloc<u32>(nc);
+            for (u32 i = 0; i < self.nIcmpSkip; i++) ni[i] = self.icmpSkipIds[i];
+            if (self.icmpSkipIds) mman.dealloc<u32>(self.icmpSkipIds);
+            self.icmpSkipIds = ni;
+            self.capIcmpSkip = nc;
+        }
+        self.icmpSkipIds[self.nIcmpSkip++] = id;
+    }
+
+    // Prescan: mark ICmp results whose only user is the CondBr on them.
+    void prescanBranchIcmps(ir_types.IrFunc* func)
+    {
+        self.nIcmpSkip = 0;
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            ir_types.IrBlock* bb = func->blocks[bi];
+            for (u32 ii = 0; ii < bb.ninsts; ii++)
+            {
+                ir_types.IrInst* ins = bb.insts[ii];
+                if (ins.opcode != ir_opcodes.IrOpcode::ICmp) continue;
+                if (ins.base.nusers != 1 || ins.base.users == null) continue;
+                ir_types.IrInst* user = ins.base.users[0];
+                if (user == null || user.opcode != ir_opcodes.IrOpcode::CondBr) continue;
+                if (user.nops < 1 || user.ops[0] != &ins.base) continue;
+                self.icmpSkipAdd(ins.base.id);
+            }
+        }
     }
 
     const char* szSuffix(u32 w)
@@ -1293,11 +1372,25 @@ pub struct X86_64Codegen
         u32 w = ty ? ty->width : 64;
         const char* dreg = self.destReg(res);
         const char* acc = dreg ? dreg : "rax";
-        self.load(ptr, "rax");
-        if (self.att)
-        { self.pad(); self.s("mov"); self.s(self.szSuffix(w)); self.c(' '); self.opMemBase("rax"); self.s(", %"); self.emitRegW(acc, w); self.c('\n'); }
+        // Pointer already resident in an allocated register: load through
+        // it directly instead of relaying the address through rax first.
+        if (ptr != null && self.isIntRegValue(ptr))
+        {
+            u64 pe2 = self.valEnc(ptr);
+            const char* pr = self.allocIntNames[self.valLow(pe2)];
+            if (self.att)
+            { self.pad(); self.s("mov"); self.s(self.szSuffix(w)); self.c(' '); self.opMemBase(pr); self.s(", %"); self.emitRegW(acc, w); self.c('\n'); }
+            else
+            { self.pad(); self.s("mov "); self.emitRegW(acc, w); self.s(", "); self.emitSize(ty); self.s("["); self.s(pr); self.s("]\n"); }
+        }
         else
-        { self.pad(); self.s("mov "); self.emitRegW(acc, w); self.s(", "); self.emitSize(ty); self.s("[rax]\n"); }
+        {
+            self.load(ptr, "rax");
+            if (self.att)
+            { self.pad(); self.s("mov"); self.s(self.szSuffix(w)); self.c(' '); self.opMemBase("rax"); self.s(", %"); self.emitRegW(acc, w); self.c('\n'); }
+            else
+            { self.pad(); self.s("mov "); self.emitRegW(acc, w); self.s(", "); self.emitSize(ty); self.s("[rax]\n"); }
+        }
         if (dreg)
             self.markDest(dreg, res);
         else
@@ -1886,6 +1979,11 @@ pub struct X86_64Codegen
         }
         self.frameSize = self.totalAllocaSize;
 
+        // ICmp results feeding exactly one CondBr get fused: the branch
+        // re-emits the compare and jumps on flags, so the setcc/movzx
+        // materialization of the bool is skipped entirely.
+        self.prescanBranchIcmps(func);
+
         // Function label
         if (func->base.name && func->base.name[0])
         {
@@ -1958,10 +2056,26 @@ pub struct X86_64Codegen
                     u32 ebi = ev ? self.resolveBlock(ev) : ~0u;
                     self.emitPhiEdges(blk, tv);
                     self.emitPhiEdges(blk, ev);
-                    self.loadArith(cond, "rax");
-                    self.inst2("test", "rax", "rax");
-                    if (tbi != ~0u && self.blockLabels[tbi] != ~0u)
-                        self.emitJcc("jnz", tbi);
+                    // Fused compare-and-branch: cond is a skipped ICmp, so
+                    // recompute the compare and jump on flags directly.
+                    ir_types.IrInst* cdef = (cond != null && cond.kind == ir_types.IrValueKind::Inst)
+                        ? (ir_types.IrInst*)cond : null;
+                    if (cdef != null && cdef.opcode == ir_opcodes.IrOpcode::ICmp
+                        && self.icmpSkipped(cdef))
+                    {
+                        self.loadArith(cdef.nops > 0 ? cdef.ops[0] : null, "rax");
+                        self.loadArith(cdef.nops > 1 ? cdef.ops[1] : null, "rcx");
+                        self.inst2("cmp", "rax", "rcx");
+                        if (tbi != ~0u && self.blockLabels[tbi] != ~0u)
+                            self.emitJcc(self.iccFor(cdef.icmpPred), tbi);
+                    }
+                    else
+                    {
+                        self.loadArith(cond, "rax");
+                        self.inst2("test", "rax", "rax");
+                        if (tbi != ~0u && self.blockLabels[tbi] != ~0u)
+                            self.emitJcc("jnz", tbi);
+                    }
                     if (ebi != ~0u && self.blockLabels[ebi] != ~0u)
                         self.emitJmp(ebi);
                     lastBlockTerminates = true;
@@ -2092,7 +2206,10 @@ pub struct X86_64Codegen
                     self.emitCast(inst); break;
 
                 // Compare
-                case ir_opcodes.IrOpcode::ICmp: self.emitICmp(inst); break;
+                case ir_opcodes.IrOpcode::ICmp:
+                    if (self.icmpSkipped(inst)) break; // fused into its CondBr
+                    self.emitICmp(inst);
+                    break;
                 case ir_opcodes.IrOpcode::FCmp: self.emitFCmp(inst); break;
 
                 // Other
