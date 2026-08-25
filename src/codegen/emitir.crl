@@ -35,6 +35,21 @@ struct FuncGen
     u32 nlocals;
     u32 capLocals;
     bool terminated;
+
+    // frontend inline expansion: spliced callee frames (params bound to
+    // already-lowered argument values). Pack params (comptime variadics)
+    // carry one value + element CType per actual argument.
+    str.strView inNames[16];
+    ir_types.IrValue** inVals[16];
+    types.CType** inElems[16];
+    u32 inCounts[16];
+    u32 nIn;
+    ir_types.IrValue* inlineRet;   // when set, ST_RETURN stores instead
+
+    // active pack-unroll variables (comptime for over T... args)
+    str.strView packVarNames[16];
+    types.CType* packVarTypes[16];
+    u32 nPackVars;
 }
 str.strView flagValueEmit(FuncGen* fg, str.strView name)
 {
@@ -180,8 +195,17 @@ ir_types.IrValue* resolveMonoMethod(FuncGen* fg, ast.Decl* md, str.strView inner
         i32 n2 = libc.snprintf(b, 24, "%llu", itv.cvals[ci]);
         for (i32 k2 = 0; k2 < n2; k2++) td2.pushChar(b[k2]);
     }
-    str.String mn = methodName3(itv.g->structName, td2.asView(), itv.g->name);
+    // owner mirrors the emitter loop: free functions mangle under their own
+    // name since they have no owning struct.
+    str.strView ownerM = itv.g->structName.len > 0 ? itv.g->structName : itv.g->name;
+    str.String mn = methodName3(ownerM, td2.asView(), itv.g->name);
     td2.free();
+    if (libc.getenv("CORAL_DEBUG_VARIADIC") != null)
+    {
+        char db8[128];
+        i32 dn8 = libc.snprintf(db8, 128, "[rmm2] match=%u mn=%.*s\n", match, (int)mn.len, mn.ptr);
+        if (dn8 > 0) libc.write(2, db8, (u64)dn8);
+    }
     ir_types.IrValue* out = null;
     for (u32 fi = 0; fi < fg.irMod.nfuncs; fi++)
         if (strEq(str.strView::fromCstr(fg.irMod.funcs[fi].base.name), str.strView::fromParts(mn.ptr, mn.len)))
@@ -515,6 +539,169 @@ void coerceCallArgs(FuncGen* fg, ir_types.IrValue* callee, ir_types.IrValue** ar
         if (v->type->kind != ir_types.IrTypeKind::Int) continue;
         args[i] = dbgVal(fg, null, fg.bd.siToFp(v, fps[i]));
     }
+}
+
+// Normalize an argument's cached CType for pack-element use: string literals
+// are typed as an opaque NAMED "string literal" marker; their real lowering
+// is a pointer to char.
+types.CType* normalizePackElem(FuncGen* fg, types.CType* t)
+{
+    if (t == null) return null;
+    if (t.kind == types.TY_NAMED && t.decl == null
+        && strEq(t.name, str.strView::fromCstr("string literal")))
+    {
+        types.CType* p = mman.alloc<types.CType>(1);
+        mman.zero<types.CType>(p, 1);
+        p.kind = types.TY_PTR;
+        p.width = 64;
+        types.CType* c = mman.alloc<types.CType>(1);
+        mman.zero<types.CType>(c, 1);
+        c.kind = types.TY_CHAR;
+        c.width = 8;
+        p.elem = c;
+        p.name = str.strView::fromCstr("const char*");
+        return p;
+    }
+    return t;
+}
+
+// A body is splice-safe when every ST_RETURN is the final statement of the
+// top-level block (no early returns from nested control flow).
+bool inlineBodySafe(ast.Stmt* b)
+{
+    if (b == null || b->kind != ast.ST_BLOCK) return false;
+    for (u32 i = 0; i < b->nstmts; i++)
+    {
+        ast.Stmt* s = b.stmts[i];
+        if (s == null) continue;
+        if (s.kind == ast.ST_RETURN && i + 1 != b.nstmts) return false;
+    }
+    return true;
+}
+
+// Frontend-style inline expansion: generate the callee's body statements
+// directly into the caller with parameters bound to lowered arguments.
+// Handles plain inline fns and comptime-variadic generics (pack param bound
+// to the per-site argument list). Returns true when spliced.
+bool tryInlineSplice(FuncGen* fg, ast.Decl* fd, ast.Expr* e, ir_types.IrValue** outVal)
+{
+    *outVal = null;
+    if (fd == null || fd.body == null || e == null) return false;
+    bool compVar = fd.variadic && fd.ngenerics > 0;
+    if (!fd.isInline && !compVar) return false;
+    if (!inlineBodySafe(fd.body)) return false;
+
+    // resolve return type without subst: opaque generic rets bail out to a
+    // normal call (splicing those needs mono context)
+    types.CType* rct = fd.type ? scopes.resolveTypeExpr(fd.type, fg.top, fg.mods, fd.generics, fd.ngenerics) : null;
+    if (rct != null) rct = types.effective(rct);
+    bool retVoidish = rct == null || rct.kind == types.TY_VOID
+        || rct.kind == types.TY_UNKNOWN;
+    if (!retVoidish && !fd.isInline)
+    {
+        // comptime-variadic with concrete-looking non-void ret is fine only
+        // when fully concrete; keep simple: allow int/float/ptr/bool/char
+        if (!(rct.kind == types.TY_INT || rct.kind == types.TY_FLOAT
+            || rct.kind == types.TY_BOOL || rct.kind == types.TY_CHAR
+            || rct.kind == types.TY_PTR)) return false;
+    }
+
+    u32 np = fd.nparams;
+    if (np >= 16) return false;
+    // evaluate arguments once, left to right
+    ir_types.IrValue** vals = null;
+    types.CType** elems = null;
+    u32 packedFrom = compVar ? (np > 0 ? np - 1 : 0u) : np;
+    u32 nPackedVals = 0;
+    if (e.nargs > 0)
+    {
+        vals = mman.alloc<ir_types.IrValue*>(e.nargs);
+        elems = mman.alloc<types.CType*>(e.nargs);
+    }
+    for (u32 ai = 0; ai < e.nargs; ai++)
+    {
+        vals[ai] = genExpr(fg, e.args[ai]);
+        types.CType* at = expr.inferredType(e.args[ai]);
+        elems[ai] = normalizePackElem(fg, at);
+    }
+    if (compVar) nPackedVals = e.nargs > packedFrom ? e.nargs - packedFrom : 0u;
+
+    // bind parameters
+    u32 saveN = fg.nIn;
+    for (u32 pi = 0; pi < np; pi++)
+    {
+        if (fg.nIn >= 16) break;
+        fg.inNames[fg.nIn] = fd.params[pi].name;
+        if (compVar && pi + 1 == np)
+        {
+            fg.inVals[fg.nIn] = vals ? vals + packedFrom : null;
+            fg.inElems[fg.nIn] = elems ? elems + packedFrom : null;
+            fg.inCounts[fg.nIn] = nPackedVals;
+        }
+        else
+        {
+            fg.inVals[fg.nIn] = (pi < e.nargs && vals != null) ? vals + pi : null;
+            fg.inElems[fg.nIn] = null;
+            fg.inCounts[fg.nIn] = (pi < e.nargs) ? 1u : 0u;
+        }
+        fg.nIn++;
+    }
+    // extra call args beyond declared params (defensive)
+    for (u32 ai = np; ai < e.nargs; ai++)
+    {
+        if (!compVar || fg.nIn >= 16) break;
+        fg.inNames[fg.nIn] = e.args[ai].text;
+        fg.inVals[fg.nIn] = vals ? vals + ai : null;
+        fg.inElems[fg.nIn] = null;
+        fg.inCounts[fg.nIn] = 1u;
+        fg.nIn++;
+    }
+
+    // result slot
+    ir_types.IrValue* resSlot = null;
+    if (!retVoidish)
+    {
+        ir_types.IrType* rt = mapCType(fg, rct);
+        ir_types.IrInst* al = fg.bd.alloca(rt);
+        resSlot = &al.base;
+    }
+    ir_types.IrValue* saveRet = fg.inlineRet;
+    fg.inlineRet = resSlot;
+    genBlockStmts(fg, fd.body);
+    fg.inlineRet = saveRet;
+    fg.nIn = saveN;
+    if (resSlot != null)
+    {
+        ir_types.IrType* rt2 = resSlot.type;
+        *outVal = dbgVal(fg, null, fg.bd.load(rt2.elem != null ? rt2.elem : fg.ctx.tyInt(64), resSlot));
+    }
+    return true;
+}
+
+// Current pack element type for a loop-variable name during pack unrolling.
+types.CType* lookupPackElem(FuncGen* fg, str.strView name)
+{
+    for (u32 i = fg.nPackVars; i > 0; i--)
+        if (strEq(fg.packVarNames[i-1], name)) return fg.packVarTypes[i-1];
+    return null;
+}
+
+// Find a free-function declaration by name across loaded programs.
+ast.Decl* findFuncInLoaded(FuncGen* fg, str.strView name)
+{
+    if (fg.ld == null) return null;
+    for (u32 i = 0; i < fg.ld.n; i++)
+    {
+        ast.Program* p = fg.ld.progs[i];
+        for (u32 j = 0; p != null && j < p.ndecls; j++)
+        {
+            ast.Decl* d = p.decls[j];
+            if (d != null && d.kind == ast.DT_FUNC && d.body != null
+                && strEq(d.name, name))
+                return d;
+        }
+    }
+    return null;
 }
 
 void setDbgExpr(FuncGen* fg, ir_types.IrInst* inst, ast.Expr* e)
@@ -1267,6 +1454,39 @@ ir_types.IrValue* genExpr(FuncGen* fg, ast.Expr* e)
         {
             if (e->a->kind == ast.EX_IDENT)
             {
+                // inline / comptime-variadic: expand into the caller
+                scopes.Sym* si9 = scopes.scopeLookup(fg.top, e->a->text);
+                ast.Decl* fd9 = (si9 != null && si9.kind == scopes.SYM_FUNC)
+                    ? si9.decl : findFuncInLoaded(fg, e->a->text);
+                {
+                    ir_types.IrValue* iv = null;
+                    if (fd9 != null && tryInlineSplice(fg, fd9, e, &iv)) return iv;
+                    if (fd9 != null && fd9.ngenerics > 0)
+                    {
+                        // generic helper call inside a spliced body: resolve
+                        // the instance, inferring the pack element type from
+                        // any loop-variable argument.
+                        str.strView inner9 = str.strView::empty();
+                        for (u32 ai9 = 0; ai9 < e.nargs; ai9++)
+                        {
+                            if (e.args[ai9] == null || e.args[ai9].kind != ast.EX_IDENT) continue;
+                            types.CType* et9 = lookupPackElem(fg, e.args[ai9].text);
+                            if (et9 != null) { inner9 = types.typeName(et9); break; }
+                        }
+                        ir_types.IrValue* mc = resolveMonoMethod(fg, fd9, inner9);
+                        if (mc != null)
+                        {
+                            u32 an9 = e.nargs;
+                            ir_types.IrValue** aa9 = an9 > 0 ? mman.alloc<ir_types.IrValue*>(an9) : null;
+                            for (u32 ai9 = 0; ai9 < an9; ai9++) aa9[ai9] = genExpr(fg, e.args[ai9]);
+                            coerceCallArgs(fg, mc, aa9, an9);
+                            ir_types.IrInst* ci9 = fg.bd.call(mc, aa9, an9);
+                            if (aa9 != null) mman.dealloc<ir_types.IrValue*>(aa9);
+                            if (ci9.base.type != null && ci9.base.type.kind == ir_types.IrTypeKind::Void) return null;
+                            return &ci9.base;
+                        }
+                    }
+                }
                 scopes.Sym* s = scopes.scopeLookup(fg.top, e->a->text);
                 if (s != null && s->type != null && s->type->kind == types.TY_FUNC)
                 {
@@ -1443,7 +1663,12 @@ ir_types.IrValue* genExpr(FuncGen* fg, ast.Expr* e)
                                 }
                             }
                         }
-                        if (fd != null) callee = resolveMonoMethod(fg, fd, str.strView::empty());
+                        if (fd != null)
+                        {
+                            ir_types.IrValue* iv2 = null;
+                            if (tryInlineSplice(fg, fd, e, &iv2)) { handled = true; return iv2; }
+                            callee = resolveMonoMethod(fg, fd, str.strView::empty());
+                        }
                         if (libc.getenv("CORAL_DEBUG_VARIADIC") != null)
                         {
                             char db6[96];
@@ -1663,6 +1888,12 @@ void genStmt(FuncGen* fg, ast.Stmt* s)
         if (s->a != null)
         {
             ir_types.IrValue* v = genExpr(fg, s->a);
+            // spliced inline body: return stores into the caller's slot
+            if (fg.inlineRet != null)
+            {
+                if (v != null) fg.bd.store(v, fg.inlineRet);
+                break;
+            }
             // implicit int->float on the returned value (return 1; in f64 fn)
             if (v != null && fg.func.retType != null
                 && fg.func.retType.kind == ir_types.IrTypeKind::Float
@@ -1791,6 +2022,48 @@ void genStmt(FuncGen* fg, ast.Stmt* s)
     case ast.ST_FORIN:
     {
         types.CType* itTy = s->a ? expr.inferredType(s->a) : null;
+        // comptime pack iteration (for var x : args over T...): unroll — one
+        // body copy per pack element, loop var bound to that argument.
+        {
+            str.strView pname = s->a->text;
+            ir_types.IrValue** pv = null;
+            types.CType** pe = null;
+            u32 pn = 0;
+            for (u32 fi2 = fg.nIn; fi2 > 0; fi2--)
+            {
+                if (strEq(fg.inNames[fi2-1], pname))
+                {
+                    pv = fg.inVals[fi2-1]; pe = fg.inElems[fi2-1];
+                    pn = fg.inCounts[fi2-1];
+                    break;
+                }
+            }
+            if (pe != null && pn > 0)
+            {
+                types.CType* pk = itTy != null && types.effective(itTy)->kind == types.TY_PACK
+                    ? types.effective(itTy) : null;
+                u32 n2u = pk != null ? (pk->nparams < pn ? pk->nparams : pn) : pn;
+                for (u32 ei = 0; ei < n2u; ei++)
+                {
+                    types.CType* et = (pe[ei] != null) ? pe[ei]
+                        : (pk != null && pk->params != null ? pk->params[ei] : null);
+                    ir_types.IrType* etIr = et != null ? mapCType(fg, et) : fg.ctx.tyInt(64);
+                    ir_types.IrInst* va2 = fg.bd.alloca(etIr);
+                    if (pv != null && pv[ei] != null) fg.bd.store(pv[ei], &va2->base);
+                    addLocal(fg, s->text, &va2->base);
+                    if (fg.nPackVars < 16)
+                    {
+                        fg.packVarNames[fg.nPackVars] = s->text;
+                        fg.packVarTypes[fg.nPackVars] = et;
+                        fg.nPackVars++;
+                        genBlockStmts(fg, s->body);
+                        fg.nPackVars--;
+                    }
+                    else genBlockStmts(fg, s->body);
+                }
+                break;
+            }
+        }
         types.CType* elemTy = itTy ? itTy->elem : null;
         if (elemTy == null && itTy != null && itTy->kind == types.TY_SLICE) elemTy = itTy->elem;
         if (elemTy == null) elemTy = s->type ? scopes.resolveTypeExpr(s->type, fg.top, fg.mods, null, 0) : null;
@@ -2316,7 +2589,7 @@ pub ir_types.IrModule* buildModule(ast.Program* prog, scopes.Scope* top,
             char vb[256]; u32 vbl = 0;
             for (u32 k = 0; k < vl; k++) vb[vbl++] = (char)d->name.ptr[k];
             vb[vbl]=0;
-            FuncGen vfg; vfg.ctx = ctx; vfg.top = top; vfg.mods = mods; vfg.prog = prog; vfg.ld = ld;
+            FuncGen vfg; mman.zero<FuncGen>(&vfg, 1); vfg.ctx = ctx; vfg.top = top; vfg.mods = mods; vfg.prog = prog; vfg.ld = ld;
             types.CType* vct = d->type ? scopes.resolveTypeExpr(d->type, top, mods, null, 0) : null;
             ir_types.IrType* vt = vct ? mapCType(&vfg, vct) : ctx.tyInt(64);
             ir_types.IrGlobal* vg = ctx.createGlobal(vb, vt, false, true, null, 0);
@@ -2331,7 +2604,7 @@ pub ir_types.IrModule* buildModule(ast.Program* prog, scopes.Scope* top,
             char vb[256]; u32 vbl = 0;
             for (u32 k = 0; k < vl; k++) vb[vbl++] = (char)d->name.ptr[k];
             vb[vbl]=0;
-            FuncGen vfg; vfg.ctx = ctx; vfg.top = top; vfg.mods = mods; vfg.prog = prog; vfg.ld = ld;
+            FuncGen vfg; mman.zero<FuncGen>(&vfg, 1); vfg.ctx = ctx; vfg.top = top; vfg.mods = mods; vfg.prog = prog; vfg.ld = ld;
             types.CType* vct = d->type ? scopes.resolveTypeExpr(d->type, top, mods, null, 0) : null;
             ir_types.IrType* vt = vct ? mapCType(&vfg, vct) : ctx.tyInt(64);
             ir_types.IrGlobal* vg = ctx.createGlobal(vb, vt, false, false, null, 0);
@@ -2341,12 +2614,16 @@ pub ir_types.IrModule* buildModule(ast.Program* prog, scopes.Scope* top,
         bool isFunc = (d->kind == ast.DT_FUNC) || (d->kind == ast.DT_EXTERN && d->isVar == false);
         if (!isFunc) continue;
         if (d->ngenerics > 0) continue;
+        // inline fns and comptime-variadic generics expand at call sites;
+        // never emit standalone copies
+        if (d->isInline) continue;
+        if (d->variadic && d->nparams > 0 && d.body != null) continue;
         u32 nl = d->name.len;
         if (nl == 0 || nl > 255) continue;
         char nb[256]; u32 nbl = 0;
         for (u32 k = 0; k < nl; k++) nb[nbl++] = (char)d->name.ptr[k];
         nb[nbl]=0;
-        FuncGen sfg; sfg.ctx = ctx; sfg.top = top; sfg.mods = mods; sfg.prog = prog; sfg.ld = ld;
+        FuncGen sfg; mman.zero<FuncGen>(&sfg, 1); sfg.ctx = ctx; sfg.top = top; sfg.mods = mods; sfg.prog = prog; sfg.ld = ld;
         types.CType* rct = d->type ? scopes.resolveTypeExpr(d->type, top, mods, null, 0) : null;
         ir_types.IrType* rt = rct ? mapCType(&sfg, rct) : ctx.tyVoid();
         if (d->noreturn) rt = ctx.tyVoid();
@@ -2417,7 +2694,7 @@ pub ir_types.IrModule* buildModule(ast.Program* prog, scopes.Scope* top,
             for (u32 k = 0; k < irMod.nfuncs; k++)
                 if (strEq(str.strView::fromCstr(irMod.funcs[k].base.name), str.strView::fromParts(mn.ptr, mn.len))) { dupm = true; break; }
             if (dupm) { mn.free(); continue; }
-            FuncGen mfg; mfg.ctx = ctx; mfg.top = top; mfg.mods = mods; mfg.prog = prog; mfg.ld = ld;
+            FuncGen mfg; mman.zero<FuncGen>(&mfg, 1); mfg.ctx = ctx; mfg.top = top; mfg.mods = mods; mfg.prog = prog; mfg.ld = ld;
             types.CType* rct2 = md->type ? scopes.resolveTypeExpr(md->type, top, mods, md->generics, md->ngenerics) : null;
             ir_types.IrType* rt2 = rct2 ? mapCType(&mfg, rct2) : ctx.tyVoid();
             bool needSelf2 = methodNeedsSelf(md);
@@ -2462,7 +2739,7 @@ pub ir_types.IrModule* buildModule(ast.Program* prog, scopes.Scope* top,
             for (u32 k = 0; k < irMod.nfuncs; k++)
                 if (strEq(str.strView::fromCstr(irMod.funcs[k].base.name), str.strView::fromParts(mn.ptr, mn.len))) { dupm = true; break; }
             if (dupm) { mn.free(); continue; }
-            FuncGen mfg; mfg.ctx = ctx; mfg.top = top; mfg.mods = mods; mfg.prog = prog; mfg.ld = ld;
+            FuncGen mfg; mman.zero<FuncGen>(&mfg, 1); mfg.ctx = ctx; mfg.top = top; mfg.mods = mods; mfg.prog = prog; mfg.ld = ld;
             types.CType* rct2 = md->type ? scopes.resolveTypeExpr(md->type, top, mods, md->generics, md->ngenerics) : null;
             ir_types.IrType* rt2 = rct2 ? mapCType(&mfg, rct2) : ctx.tyVoid();
             bool needSelf2 = methodNeedsSelf(md);
@@ -2497,6 +2774,8 @@ pub ir_types.IrModule* buildModule(ast.Program* prog, scopes.Scope* top,
         subst.MonoInst itv = subst.gInsts[si];
         ast.Decl* g = itv.g;
         if (g == null || g->body == null) continue;
+        // inline fns and comptime-variadic generics expand at call sites
+        if (g.isInline || (g.variadic && g.nparams > 0)) continue;
         if (libc.getenv("CORAL_DEBUG_VARIADIC") != null)
         {
             char db4[128];
@@ -2565,7 +2844,7 @@ pub ir_types.IrModule* buildModule(ast.Program* prog, scopes.Scope* top,
             }
             subst.pushConsts(cn3, cv3, itv.nc);
         }
-        FuncGen mfg; mfg.ctx = ctx; mfg.top = top; mfg.mods = mods; mfg.prog = prog; mfg.ld = ld;
+        FuncGen mfg; mman.zero<FuncGen>(&mfg, 1); mfg.ctx = ctx; mfg.top = top; mfg.mods = mods; mfg.prog = prog; mfg.ld = ld;
         types.CType* rct3 = g->type ? scopes.resolveTypeExpr(g->type, top, mods, g->generics, g->ngenerics) : null;
         ir_types.IrType* rt3 = rct3 ? mapCType(&mfg, rct3) : ctx.tyVoid();
         bool needSelf3 = methodNeedsSelf(g);
@@ -2618,6 +2897,7 @@ pub ir_types.IrModule* buildModule(ast.Program* prog, scopes.Scope* top,
         if (d == null) continue;
         bool isFuncDecl = (d->kind == ast.DT_FUNC) || (d->kind == ast.DT_EXTERN && d->isVar == false);
         if (!isFuncDecl || d->body == null || d->ngenerics > 0) continue;
+        if (d.isInline || (d.variadic && d.nparams > 0)) continue; // spliced at call sites
         if (d->isVar) continue;
         ir_types.IrFunc* fn = fns[i];
         if (fn == null) continue;
@@ -2625,6 +2905,7 @@ pub ir_types.IrModule* buildModule(ast.Program* prog, scopes.Scope* top,
         if (fname == null || fname[0] == 0) continue;
 
         FuncGen fg;
+        mman.zero<FuncGen>(&fg, 1);
         fg.ctx = ctx; fg.irMod = irMod; fg.top = top; fg.mods = mods; fg.prog = prog; fg.ld = ld;
         fg.filename = path;
         fg.flagNames = null; fg.flagVals = null; fg.nflags = 0;
@@ -2744,6 +3025,7 @@ pub ir_types.IrModule* buildModule(ast.Program* prog, scopes.Scope* top,
             }
         }
         FuncGen fg;
+        mman.zero<FuncGen>(&fg, 1);
         fg.ctx = ctx; fg.irMod = irMod; fg.top = top; fg.mods = mods; fg.prog = prog; fg.ld = ld;
         fg.filename = path;
         fg.flagNames = null; fg.flagVals = null; fg.nflags = 0;

@@ -305,6 +305,114 @@ pub struct X86_64Codegen
     }
 
     // Prescan: mark ICmp results whose only user is the CondBr on them.
+    // ── Static frame folding ──
+    // Resolve a pointer value to a fixed rbp-relative frame offset: an
+    // Alloca pre-assigned by the prescan, or a GEP chain of constant byte
+    // offsets over such an Alloca. When this succeeds, loads/stores use the
+    // displacement directly (movsd -40(%rbp), %xmm0) and the address never
+    // occupies a register or spill slot — matching gcc's -O0 local access.
+    bool staticMemRef(ir_types.IrValue* v, u32* offOut)
+    {
+        if (!v || v.kind != ir_types.IrValueKind::Inst) return false;
+        ir_types.IrInst* inst = (ir_types.IrInst*)v;
+        u64 acc = 0;
+        while (inst != null)
+        {
+            if (inst.opcode == ir_opcodes.IrOpcode::Gep)
+            {
+                if (inst.nops < 1) return false;
+                for (u32 i = 1; i < inst.nops; i++)
+                {
+                    ir_types.IrValue* idx = inst.ops[i];
+                    if (!idx || idx.kind != ir_types.IrValueKind::ConstInt) return false;
+                    acc += idx.valData;
+                }
+                if (inst.ops[0].kind != ir_types.IrValueKind::Inst) return false;
+                inst = (ir_types.IrInst*)inst.ops[0];
+                continue;
+            }
+            break;
+        }
+        if (inst.opcode != ir_opcodes.IrOpcode::Alloca) return false;
+        u32 id = inst.base.id;
+        if (id >= self.allocaOffsetsCap || self.allocaOffsets[id] == 0) return false;
+        *offOut = self.allocaOffsets[id] + (u32)acc;
+        return true;
+    }
+
+    // Mark GEPs whose every user is a Load/Store that can fold statically:
+    // their address materialization is skipped entirely.
+    // Static frame slot producing this VALUE (a Load from a fixed slot).
+    bool valueStaticSlot(ir_types.IrValue* v, u32* offOut)
+    {
+        if (!v || v.kind != ir_types.IrValueKind::Inst) return false;
+        ir_types.IrInst* i = (ir_types.IrInst*)v;
+        if (i.opcode != ir_opcodes.IrOpcode::Load || i.nops < 1) return false;
+        return self.staticMemRef(i.ops[0], offOut);
+    }
+
+    // The value's ONLY consumer is a store into a fixed frame slot.
+    bool singleUserStoreStatic(ir_types.IrValue* v)
+    {
+        if (!v || v.nusers != 1 || v.users == null) return false;
+        ir_types.IrInst* st = (ir_types.IrInst*)v.users[0];
+        if (st == null || st.opcode != ir_opcodes.IrOpcode::Store || st.nops < 2) return false;
+        if (st.ops[0] != v) return false;
+        u32 d3 = 0;
+        return self.staticMemRef(st.ops[1], &d3);
+    }
+
+    void prescanStaticGeps(ir_types.IrFunc* func)
+    {
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            ir_types.IrBlock* bb = func->blocks[bi];
+            for (u32 ii = 0; ii < bb.ninsts; ii++)
+            {
+                ir_types.IrInst* ins = bb.insts[ii];
+                if (ins.opcode != ir_opcodes.IrOpcode::Gep) continue;
+                if (ins.base.nusers == 0 || ins.base.users == null) continue;
+                u32 dummy = 0;
+                if (!self.staticMemRef((ir_types.IrValue*)ins, &dummy)) continue;
+                bool allFoldable = true;
+                for (u32 ui = 0; ui < ins.base.nusers; ui++)
+                {
+                    ir_types.IrInst* user = ins.base.users[ui];
+                    if (user == null
+                        || (user.opcode != ir_opcodes.IrOpcode::Load
+                            && user.opcode != ir_opcodes.IrOpcode::Store)
+                        || user.nops < 2
+                        || user.ops[1] != &ins.base)
+                    { allFoldable = false; break; }
+                }
+                if (allFoldable && !self.icmpSkipped(ins))
+                    self.icmpSkipAdd(ins.base.id);
+            }
+        }
+        // Single-use Loads feeding a float binop or Ret from a fixed slot:
+        // the consumer reloads the displacement directly, so skip them.
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            ir_types.IrBlock* bb = func->blocks[bi];
+            for (u32 ii = 0; ii < bb.ninsts; ii++)
+            {
+                ir_types.IrInst* ins = bb.insts[ii];
+                if (ins.opcode != ir_opcodes.IrOpcode::Load || ins.base.nusers != 1) continue;
+                if (ins.base.users == null) continue;
+                ir_types.IrInst* user = ins.base.users[0];
+                if (user == null) continue;
+                if (user.opcode != ir_opcodes.IrOpcode::FAdd
+                    && user.opcode != ir_opcodes.IrOpcode::FSub
+                    && user.opcode != ir_opcodes.IrOpcode::FMul
+                    && user.opcode != ir_opcodes.IrOpcode::FDiv
+                    && user.opcode != ir_opcodes.IrOpcode::Ret) continue;
+                u32 d2 = 0;
+                if (self.staticMemRef(ins.ops[0], &d2) && !self.icmpSkipped(ins))
+                    self.icmpSkipAdd(ins.base.id);
+            }
+        }
+    }
+
     void prescanBranchIcmps(ir_types.IrFunc* func)
     {
         self.nIcmpSkip = 0;
@@ -1483,9 +1591,28 @@ pub struct X86_64Codegen
         u32 w = ty ? ty->width : 64;
         const char* dreg = self.destReg(res);
         const char* acc = dreg ? dreg : "rax";
-        // Pointer already resident in an allocated register: load through
-        // it directly instead of relaying the address through rax first.
-        if (ptr != null && self.isIntRegValue(ptr))
+        // Pointer resolves to a fixed frame slot: use the displacement
+        // directly — the address never touches a register.
+        u32 soff = 0;
+        if (self.staticMemRef(ptr, &soff))
+        {
+            if (ty != null && ty.kind == ir_types.IrTypeKind::Float)
+            {
+                // Floats home via xmm0; int acc is meaningless here.
+                if (self.att)
+                { self.pad(); self.s(w == 64 ? "movsd" : "movss"); self.c(' '); self.opMemRbp(soff); self.s(", %xmm0"); self.c('\n'); }
+                else
+                { self.pad(); self.s("mov "); self.s(w == 64 ? "sd" : "ss"); self.s("xmm0, "); self.opMemRbp(soff); self.c('\n'); }
+                if (dreg) self.markDest(dreg, res);
+                else self.floatStore(res, "xmm0");
+                return;
+            }
+            if (self.att)
+            { self.pad(); self.s("mov"); self.s(self.szSuffix(w)); self.c(' '); self.opMemRbp(soff); self.s(", %"); self.emitRegW(acc, w); self.c('\n'); }
+            else
+            { self.pad(); self.s("mov "); self.emitRegW(acc, w); self.s(", "); self.emitSize(ty); self.opMemRbp(soff); self.c('\n'); }
+        }
+        else if (ptr != null && self.isIntRegValue(ptr))
         {
             u64 pe2 = self.valEnc(ptr);
             const char* pr = self.allocIntNames[self.valLow(pe2)];
@@ -1518,6 +1645,35 @@ pub struct X86_64Codegen
         // Fused read-modify-write: the skipped Load/Add pair feeding this
         // store collapses into one memory-operand add.
         i32 fIdx = self.fusedIndexFor(inst);
+        u32 fsoff = 0;
+        bool fStatic = ptr != null && self.staticMemRef(ptr, &fsoff);
+        if (fIdx >= 0 && fStatic)
+        {
+            ir_types.IrValue* addend = self.fusedAddends[fIdx];
+            if (self.isConst(addend))
+            {
+                if (self.att)
+                { self.pad(); self.s("add"); self.s(self.szSuffix(w)); self.c(' '); self.opImmU(addend.valData); self.s(", "); self.opMemRbp(fsoff); self.c('\n'); }
+                else
+                { self.pad(); self.s("add "); self.emitSize(ty); self.opMemRbp(fsoff); self.s(", "); self.u(addend.valData); self.c('\n'); }
+                return;
+            }
+            u32 aoff = 0;
+            if (self.valueStaticSlot(addend, &aoff))
+            {
+                if (self.att)
+                { self.pad(); self.s("mov"); self.s(self.szSuffix(w)); self.c(' '); self.opMemRbp(aoff); self.s(", %"); self.emitRegW("rcx", w); self.c('\n'); }
+                else
+                { self.pad(); self.s("mov "); self.emitRegW("rcx", w); self.s(", "); self.emitSize(ty); self.opMemRbp(aoff); self.c('\n'); }
+            }
+            else
+                self.loadArith(addend, "rcx");
+            if (self.att)
+            { self.pad(); self.s("add"); self.s(self.szSuffix(w)); self.c(' '); self.c('%'); self.emitRegW("rcx", w); self.s(", "); self.opMemRbp(fsoff); self.c('\n'); }
+            else
+            { self.pad(); self.s("add "); self.emitSize(ty); self.opMemRbp(fsoff); self.s(", "); self.emitRegW("rcx", w); self.c('\n'); }
+            return;
+        }
         if (fIdx >= 0 && ptr != null && self.isIntRegValue(ptr))
         {
             ir_types.IrValue* addend = self.fusedAddends[fIdx];
@@ -1539,8 +1695,34 @@ pub struct X86_64Codegen
             return;
         }
 
+        // Plain int store through a fixed frame slot: displacement direct.
+        u32 istoff = 0;
+        if (ptr != null && self.staticMemRef(ptr, &istoff)
+            && !(ty != null && ty.kind == ir_types.IrTypeKind::Float))
+        {
+            const char* vreg = "rax";
+            if (val != null && self.isIntRegValue(val))
+                vreg = self.allocIntNames[self.valLow(self.valEnc(val))];
+            else
+                self.load(val, "rax");
+            if (self.att)
+            { self.pad(); self.s("mov"); self.s(self.szSuffix(w)); self.c(' '); self.c('%'); self.emitRegW(vreg, w); self.s(", "); self.opMemRbp(istoff); self.c('\n'); }
+            else
+            { self.pad(); self.s("mov "); self.emitSize(ty); self.opMemRbp(istoff); self.s(", "); self.emitRegW(vreg, w); self.c('\n'); }
+            return;
+        }
         if (ty && ty->kind == ir_types.IrTypeKind::Float)
         {
+            u32 soff2 = 0;
+            if (self.staticMemRef(ptr, &soff2))
+            {
+                self.floatLoad(val, "xmm0");
+                if (self.att)
+                { self.pad(); self.s(w == 64 ? "movsd" : "movss"); self.c(' '); self.c('%'); self.s("xmm0"); self.s(", "); self.opMemRbp(soff2); self.c('\n'); }
+                else
+                { self.pad(); self.s("mov "); self.s(w == 64 ? "sd" : "ss"); self.opMemRbp(soff2); self.s(", xmm0\n"); }
+                return;
+            }
             // Pointer resident in an allocated register: no rcx relay.
             if (ptr != null && self.isIntRegValue(ptr))
             {
@@ -1896,10 +2078,41 @@ pub struct X86_64Codegen
         else if (mne[0] == 's') op = isDouble ? "subsd" : "subss";
         else if (mne[0] == 'm') op = isDouble ? "mulsd" : "mulss";
         else op = isDouble ? "divsd" : "divss";
-        self.floatLoad(lhs, "xmm0");
-        self.floatLoad(rhs, "xmm1");
-        self.inst2(op, "xmm0", "xmm1");
-        self.floatStore(res, "xmm0");
+        // gcc-style: load the left operand, then apply the op with a
+        // memory operand when the right side lives in a fixed frame slot.
+        u32 loff2 = 0;
+        bool lStatic = self.valueStaticSlot(lhs, &loff2);
+        const char* mn = isDouble ? "movsd" : "movss";
+        if (lStatic)
+        {
+            if (self.att)
+            { self.pad(); self.s(mn); self.c(' '); self.opMemRbp(loff2); self.s(", %xmm0"); self.c('\n'); }
+            else
+            { self.pad(); self.s("mov "); self.s(isDouble ? "sd" : "ss"); self.s("xmm0, "); self.opMemRbp(loff2); self.c('\n'); }
+            self.xmm0Hold = lhs.id + 1;
+        }
+        else
+            self.floatLoad(lhs, "xmm0");
+        u32 roff2 = 0;
+        bool rStatic = rhs != null && self.valueStaticSlot(rhs, &roff2);
+        if (rStatic)
+        {
+            if (self.att)
+            { self.pad(); self.s(op); self.c(' '); self.opMemRbp(roff2); self.s(", %xmm0"); self.c('\n'); }
+            else
+            { self.pad(); self.s(op); self.s(" xmm0, "); self.opMemRbp(roff2); self.c('\n'); }
+        }
+        else
+        {
+            self.floatLoad(rhs, "xmm1");
+            self.inst2(op, "xmm0", "xmm1");
+        }
+        // Result consumed only by a fixed-slot store: leave it in xmm0
+        // and let that store write the displacement directly.
+        if (!self.singleUserStoreStatic(res))
+            self.floatStore(res, "xmm0");
+        else
+            self.xmm0Hold = res.id + 1;
     }
 
     void emitFAbs(ir_types.IrInst* inst)
@@ -2149,6 +2362,7 @@ pub struct X86_64Codegen
         // re-emits the compare and jumps on flags, so the setcc/movzx
         // materialization of the bool is skipped entirely.
         self.prescanBranchIcmps(func);
+        self.prescanStaticGeps(func);
 
         // Function label
         if (func->base.name && func->base.name[0])
@@ -2279,9 +2493,31 @@ pub struct X86_64Codegen
                     if (rv && rt && rt.kind != ir_types.IrTypeKind::Void)
                     {
                         if (rt.kind == ir_types.IrTypeKind::Float)
-                            self.floatLoad(rv, "xmm0");
+                        {
+                            u32 rso = 0;
+                            if (self.valueStaticSlot(rv, &rso))
+                            {
+                                if (self.att)
+                                { self.pad(); self.s(rt.width == 64 ? "movsd" : "movss"); self.c(' '); self.opMemRbp(rso); self.s(", %xmm0"); self.c('\n'); }
+                                else
+                                { self.pad(); self.s("mov "); self.s(rt.width == 64 ? "sd" : "ss"); self.s("xmm0, "); self.opMemRbp(rso); self.c('\n'); }
+                            }
+                            else
+                                self.floatLoad(rv, "xmm0");
+                        }
                         else
-                            self.load(rv, "rax");
+                        {
+                            u32 rso2 = 0;
+                            if (self.valueStaticSlot(rv, &rso2))
+                            {
+                                if (self.att)
+                                { self.pad(); self.s("mov"); self.s(self.szSuffix(rt.width)); self.c(' '); self.opMemRbp(rso2); self.s(", %"); self.emitRegW("rax", rt.width); self.c('\n'); }
+                                else
+                                { self.pad(); self.s("mov "); self.emitRegW("rax", rt.width); self.s(", "); self.emitSize(rt); self.opMemRbp(rso2); self.c('\n'); }
+                            }
+                            else
+                                self.load(rv, "rax");
+                        }
                     }
                     self.emitEpilogue();
                     lastBlockTerminates = true;
