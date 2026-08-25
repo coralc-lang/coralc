@@ -102,6 +102,11 @@ pub struct X86_64Codegen
         c.icmpSkipIds = null;
         c.nIcmpSkip = 0;
         c.capIcmpSkip = 0;
+        c.xmm0Hold = 0;
+        c.fusedStoreIds = null;
+        c.fusedAddends = null;
+        c.nFused = 0;
+        c.capFused = 0;
         c.allocIntNames = null;
         c.numAllocInt = 0;
         c.allocFloatNames = null;
@@ -303,6 +308,7 @@ pub struct X86_64Codegen
     void prescanBranchIcmps(ir_types.IrFunc* func)
     {
         self.nIcmpSkip = 0;
+        self.nFused = 0;
         for (u32 bi = 0; bi < func->nblocks; bi++)
         {
             ir_types.IrBlock* bb = func->blocks[bi];
@@ -317,6 +323,65 @@ pub struct X86_64Codegen
                 self.icmpSkipAdd(ins.base.id);
             }
         }
+        // Fused read-modify-write: store(P, add(L, X)) where L loads from
+        // the same P and both are single-use. Both get skipped; emitStore
+        // lowers to one memory-operand add.
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            ir_types.IrBlock* bb = func->blocks[bi];
+            for (u32 ii = 0; ii < bb.ninsts; ii++)
+            {
+                ir_types.IrInst* st = bb.insts[ii];
+                if (st.opcode != ir_opcodes.IrOpcode::Store || st.nops < 2) continue;
+                ir_types.IrValue* ptr = st.ops[1];
+                ir_types.IrValue* val = st.ops[0];
+                if (!ptr || !val || val.kind != ir_types.IrValueKind::Inst) continue;
+                ir_types.IrInst* addI = (ir_types.IrInst*)val;
+                if (addI.opcode != ir_opcodes.IrOpcode::Add) continue;
+                if (addI.base.nusers != 1 || addI.base.users == null
+                    || addI.base.users[0] != st || addI.nops < 2) continue;
+                // either operand order: base load + addend
+                ir_types.IrInst* ld = null;
+                ir_types.IrValue* addend = null;
+                for (u32 oo = 0; oo < 2; oo++)
+                {
+                    ir_types.IrValue* cand = addI.ops[oo];
+                    if (!cand || cand.kind != ir_types.IrValueKind::Inst) continue;
+                    ir_types.IrInst* ci = (ir_types.IrInst*)cand;
+                    if (ci.opcode == ir_opcodes.IrOpcode::Load && ci.nops >= 1
+                        && ci.ops[0] == ptr
+                        && ci.base.nusers == 1 && ci.base.users != null
+                        && ci.base.users[0] == addI)
+                    { ld = ci; addend = addI.ops[oo == 0 ? 1 : 0]; break; }
+                }
+                if (ld == null || addend == null) continue;
+                if (addend == &ld.base) continue;
+                self.icmpSkipAdd(addI.base.id);
+                self.icmpSkipAdd(ld.base.id);
+                if (self.nFused >= self.capFused)
+                {
+                    u32 nc = self.capFused ? self.capFused * 2 : 8;
+                    u32* ni = mman.alloc<u32>(nc);
+                    ir_types.IrValue** nv = mman.alloc<ir_types.IrValue*>(nc);
+                    for (u32 k = 0; k < self.nFused; k++) { ni[k] = self.fusedStoreIds[k]; nv[k] = self.fusedAddends[k]; }
+                    if (self.fusedStoreIds) mman.dealloc<u32>(self.fusedStoreIds);
+                    if (self.fusedAddends) mman.dealloc<ir_types.IrValue*>(self.fusedAddends);
+                    self.fusedStoreIds = ni;
+                    self.fusedAddends = nv;
+                    self.capFused = nc;
+                }
+                self.fusedStoreIds[self.nFused] = st->base.id;
+                self.fusedAddends[self.nFused] = addend;
+                self.nFused++;
+            }
+        }
+    }
+
+    i32 fusedIndexFor(ir_types.IrInst* st)
+    {
+        for (u32 i = 0; i < self.nFused; i++)
+            if (self.fusedStoreIds[i] == st->base.id) return (i32)i;
+        return -1;
     }
 
     const char* szSuffix(u32 w)
@@ -905,6 +970,11 @@ pub struct X86_64Codegen
 
     void floatLoad(ir_types.IrValue* v, const char* xd)
     {
+        // Value already sitting in xmm0 (tracked): nothing to do. This is
+        // what kills the movq %xmm0,%xmm3 / movq %xmm3,%xmm0 relay after
+        // calls whose float result feeds the next float use directly.
+        if (xd[0] == 'x' && xd[1] == 'm' && xd[2] == 'm' && xd[3] == '0'
+            && self.xmm0Hold == v->id + 1) return;
         if (v && self.isConst(v))
         {
             self.movImm("rax", v->valData, 64);
@@ -947,6 +1017,8 @@ pub struct X86_64Codegen
     void floatStore(ir_types.IrValue* v, const char* xs)
     {
         if (!v) return;
+        if (xs[0] == 'x' && xs[1] == 'm' && xs[2] == 'm' && xs[3] == '0')
+            self.xmm0Hold = v->id + 1;
         u64 e = self.valEnc(v);
         if ((e & 0x80000000UL) != 0)
         {
@@ -1355,6 +1427,8 @@ pub struct X86_64Codegen
         }
         if (callee)
         {
+            // xmm0 is caller-saved: any hold dies at the call boundary.
+            self.xmm0Hold = 0;
             if (callee->kind == ir_types.IrValueKind::Func && callee->name && callee->name[0])
             {
                 self.externSym(callee->name);
@@ -1368,7 +1442,10 @@ pub struct X86_64Codegen
             }
         }
         else
+        {
+            self.xmm0Hold = 0;
             self.inst0("call 0");
+        }
 
         if (self.abi.shadowSpaceBytes > 0)
             self.addRsp(self.abi.shadowSpaceBytes);
@@ -1437,8 +1514,45 @@ pub struct X86_64Codegen
         ir_types.IrValue* ptr = inst->nops > 1 ? inst->ops[1] : null;
         ir_types.IrType* ty = val ? val->type : null;
         u32 w = ty ? ty->width : 64;
+
+        // Fused read-modify-write: the skipped Load/Add pair feeding this
+        // store collapses into one memory-operand add.
+        i32 fIdx = self.fusedIndexFor(inst);
+        if (fIdx >= 0 && ptr != null && self.isIntRegValue(ptr))
+        {
+            ir_types.IrValue* addend = self.fusedAddends[fIdx];
+            u64 pe2 = self.valEnc(ptr);
+            const char* pr = self.allocIntNames[self.valLow(pe2)];
+            if (self.isConst(addend))
+            {
+                if (self.att)
+                { self.pad(); self.s("add"); self.s(self.szSuffix(w)); self.c(' '); self.opImmU(addend.valData); self.s(", "); self.opMemBase(pr); self.c('\n'); }
+                else
+                { self.pad(); self.s("add "); self.emitSize(ty); self.s("["); self.s(pr); self.s("], "); self.u(addend.valData); self.c('\n'); }
+                return;
+            }
+            self.loadArith(addend, "rcx");
+            if (self.att)
+            { self.pad(); self.s("add"); self.s(self.szSuffix(w)); self.c(' '); self.c('%'); self.emitRegW("rcx", w); self.s(", "); self.opMemBase(pr); self.c('\n'); }
+            else
+            { self.pad(); self.s("add "); self.emitSize(ty); self.s("["); self.s(pr); self.s("], "); self.emitRegW("rcx", w); self.c('\n'); }
+            return;
+        }
+
         if (ty && ty->kind == ir_types.IrTypeKind::Float)
         {
+            // Pointer resident in an allocated register: no rcx relay.
+            if (ptr != null && self.isIntRegValue(ptr))
+            {
+                u64 pe3 = self.valEnc(ptr);
+                const char* pr3 = self.allocIntNames[self.valLow(pe3)];
+                self.floatLoad(val, "xmm0");
+                if (self.att)
+                { self.pad(); self.s("mov"); self.s(self.szSuffix(w)); self.c(' '); self.c('%'); self.s("xmm0"); self.s(", "); self.opMemBase(pr3); self.c('\n'); }
+                else
+                { self.pad(); self.s("mov"); self.c(' '); self.emitSize(ty); self.s("["); self.s(pr3); self.s("], "); self.s("xmm0\n"); }
+                return;
+            }
             self.load(ptr, "rcx");
             self.floatLoad(val, "xmm0");
             if (self.att)
@@ -1449,6 +1563,24 @@ pub struct X86_64Codegen
         }
         if (ty && ty->kind == ir_types.IrTypeKind::Ptr)
             w = 64;
+        // Pointer already resident in an allocated register: store through
+        // it directly; when the VALUE also lives in an allocated register,
+        // use its home instead of relaying through rax first.
+        if (ptr != null && self.isIntRegValue(ptr))
+        {
+            u64 pe2 = self.valEnc(ptr);
+            const char* pr = self.allocIntNames[self.valLow(pe2)];
+            const char* vreg = "rax";
+            if (val != null && self.isIntRegValue(val))
+                vreg = self.allocIntNames[self.valLow(self.valEnc(val))];
+            else
+                self.load(val, "rax");
+            if (self.att)
+            { self.pad(); self.s("mov"); self.s(self.szSuffix(w)); self.c(' '); self.c('%'); self.emitRegW(vreg, w); self.s(", "); self.opMemBase(pr); self.c('\n'); }
+            else
+            { self.pad(); self.s("mov "); self.emitSize(ty); self.s("["); self.s(pr); self.s("], "); self.emitRegW(vreg, w); self.c('\n'); }
+            return;
+        }
         self.load(ptr, "rcx");
         self.load(val, "rax");
         if (self.att)
@@ -2059,6 +2191,8 @@ pub struct X86_64Codegen
             ir_types.IrBlock* blk = func->blocks[bi];
             if (bi > 0) self.c('\n');
             self.emitBlockLabel(bi);
+            // xmm0 contents do not survive block boundaries in the model
+            self.xmm0Hold = 0;
 
             lastBlockTerminates = false;
             for (u32 ii = 0; ii < blk->ninsts; ii++)
@@ -2180,7 +2314,10 @@ pub struct X86_64Codegen
                 case ir_opcodes.IrOpcode::Not: self.emitUnary(inst, "not"); break;
 
                 // Binary arithmetic
-                case ir_opcodes.IrOpcode::Add: self.emitArith(inst, "add"); break;
+                case ir_opcodes.IrOpcode::Add:
+                    if (self.icmpSkipped(inst)) break; // fused into a store
+                    self.emitArith(inst, "add");
+                    break;
                 case ir_opcodes.IrOpcode::Sub: self.emitArith(inst, "sub"); break;
                 case ir_opcodes.IrOpcode::Mul: self.emitArith(inst, "imul"); break;
                 case ir_opcodes.IrOpcode::SDiv: self.emitDivRem(inst, "idiv", true, false); break;
@@ -2222,7 +2359,10 @@ pub struct X86_64Codegen
 
                 // Memory
                 case ir_opcodes.IrOpcode::Alloca: self.emitAlloca(inst); break;
-                case ir_opcodes.IrOpcode::Load: self.emitLoad(inst); break;
+                case ir_opcodes.IrOpcode::Load:
+                    if (self.icmpSkipped(inst)) break; // fused into a store
+                    self.emitLoad(inst);
+                    break;
                 case ir_opcodes.IrOpcode::Store: self.emitStore(inst); break;
                 case ir_opcodes.IrOpcode::Gep: self.emitGep(inst); break;
 
