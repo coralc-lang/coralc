@@ -1,0 +1,518 @@
+// Project build commands for the coral driver: -init/-new/-build/-run/-clean.
+// A project is a directory containing `build.crl`:
+//
+//     name = "myapp"
+//     main = "src/main.crl"   # default
+//     out  = "myapp"          # default: name
+//     opt  = 1                # 0..3
+//
+// Sources are discovered by walking import("relative/path.crl") edges from
+// the manifest main file. import(lib, ...) references the compiler runtime
+// and is not tracked. Build state lives in .coralb/.
+//
+// Compilation re-executes /proc/self/exe on the manifest main file so the
+// driver pipeline stays defined in exactly one place.
+
+mod mman = import("std/memory/mman.crl");
+mod str = import("std/text/string.crl");
+mod libc = import("std/platform/libc.crl");
+mod fs = import("std/io/fs.crl");
+mod process = import("std/io/process.crl");
+
+pub struct FileEntry
+{
+    str.strView path;
+    i64 mtime;
+}
+
+pub struct Manifest
+{
+    str.String name;
+    str.String mainFile;
+    str.String outName;
+    u32 optLevel;
+}
+
+static void writeOut(const u8* s)
+{
+    u64 n = 0;
+    while (s[n]) n++;
+    libc.write(1, s, n);
+}
+
+static void writeErr(const u8* s)
+{
+    u64 n = 0;
+    while (s[n]) n++;
+    libc.write(2, s, n);
+}
+
+static void writeU64(u64 v)
+{
+    char cnt[24];
+    u32 cn = 0;
+    if (v == 0) { cnt[cn++] = '0'; }
+    else { u8 rev[24]; u32 rr = 0; u64 t = v; while (t > 0) { rev[rr++] = (u8)('0' + (t % 10)); t /= 10; } while (rr > 0) cnt[cn++] = rev[--rr]; }
+    libc.write(1, cnt, cn);
+}
+
+static bool svEq(str.strView a, str.strView b)
+{
+    if (a.len != b.len) return false;
+    for (u32 i = 0; i < a.len; i++)
+        if (a.ptr[i] != b.ptr[i]) return false;
+    return true;
+}
+
+static str.strView trimSp(str.strView v)
+{
+    u32 b = 0;
+    u32 e = v.len;
+    while (b < e && (v.ptr[b] == ' ' || v.ptr[b] == '\t' || v.ptr[b] == '\r')) b++;
+    while (e > b && (v.ptr[e - 1] == ' ' || v.ptr[e - 1] == '\t' || v.ptr[e - 1] == '\r')) e--;
+    return str.strView::fromParts(v.ptr + b, e - b);
+}
+
+static str.String concatViews(str.strView a, str.strView b)
+{
+    str.String r = str.String::withCap(a.len + b.len);
+    r.appendView(a);
+    r.appendView(b);
+    return r;
+}
+
+static str.String dirNameOf(str.strView path)
+{
+    u32 last = 0;
+    bool any = false;
+    for (u32 i = 0; i < path.len; i++)
+        if (path.ptr[i] == '/') { last = i; any = true; }
+    if (!any) return str.String::fromCstr(".");
+    return str.String::fromParts(path.ptr, last);
+}
+
+static str.String joinPath(str.strView dir, str.strView base)
+{
+    if (dir.len == 0) return str.String::fromView(base);
+    if (dir.ptr[dir.len - 1] == '/') return concatViews(dir, base);
+    str.String r = str.String::withCap(dir.len + 1 + base.len);
+    r.appendView(dir);
+    r.pushChar('/');
+    r.appendView(base);
+    return r;
+}
+
+// ---------------------------------------------------------------- manifest
+
+static bool parseManifestText(str.strView text, Manifest* m)
+{
+    u32 lineStart = 0;
+    for (u32 i = 0; i <= text.len; i++)
+    {
+        if (i != text.len && text.ptr[i] != '\n') continue;
+        str.strView line = trimSp(str.strView::fromParts(text.ptr + lineStart, i - lineStart));
+        lineStart = i + 1;
+        if (line.len == 0 || line.ptr[0] == '#') continue;
+        u32 eq = 0;
+        bool foundEq = false;
+        for (u32 k = 0; k < line.len; k++)
+            if (line.ptr[k] == '=') { eq = k; foundEq = true; break; }
+        if (!foundEq) continue;
+        str.strView key = trimSp(str.strView::fromParts(line.ptr, eq));
+        str.strView val = trimSp(str.strView::fromParts(line.ptr + eq + 1, line.len - eq - 1));
+        if (val.len >= 2 && val.ptr[0] == '"' && val.ptr[val.len - 1] == '"')
+            val = str.strView::fromParts(val.ptr + 1, val.len - 2);
+        if (svEq(key, str.strView::fromCstr("name"))) m.name = str.String::fromView(val);
+        else if (svEq(key, str.strView::fromCstr("main"))) m.mainFile = str.String::fromView(val);
+        else if (svEq(key, str.strView::fromCstr("out"))) m.outName = str.String::fromView(val);
+        else if (svEq(key, str.strView::fromCstr("opt")))
+        {
+            if (val.len == 1 && val.ptr[0] >= '0' && val.ptr[0] <= '3')
+                m.optLevel = (u32)(val.ptr[0] - '0');
+        }
+    }
+    return true;
+}
+
+static bool loadManifest(Manifest* m)
+{
+    m.name = str.String::fromCstr("");
+    m.mainFile = str.String::fromCstr("src/main.crl");
+    m.outName = str.String::fromCstr("");
+    m.optLevel = 1;
+    if (!fs.fileExists(str.strView::fromCstr("build.crl")))
+    {
+        writeErr("coral: no build.crl found in current directory\n");
+        return false;
+    }
+    std.string.String text = fs.readFileToString(str.strView::fromCstr("build.crl"));
+    parseManifestText(text.asView(), m);
+    if (m.name.len() == 0) m.name = str.String::fromCstr("app");
+    if (m.outName.len() == 0) m.outName = str.String::fromView(m.name.asView());
+    return true;
+}
+
+// ---------------------------------------------------------- source discovery
+
+static void addUnique(vec<FileEntry>* files, vec<str.String>* seen, str.String path)
+{
+    for (u32 i = 0; i < seen.count(); i++)
+        if (svEq(seen.at(i).asView(), path.asView())) return;
+    seen.push(path);
+    FileEntry fe;
+    fe.path = path.asView();
+    fe.mtime = 0;
+    fs.Stat st;
+    if (fs.statPath(fe.path, &st))
+        fe.mtime = st.st_mtime * 1000000000 + st.st_mtimeNsec;
+    files.push(fe);
+}
+
+// Extract the quoted target from import(...) argument text. Empty when this
+// form is skipped: `lib, "..."` runtime imports, globs, package roots.
+static str.strView extractImportTarget(str.strView argsText)
+{
+    u32 b = 0;
+    while (b < argsText.len && argsText.ptr[b] == ' ') b++;
+    if (b < argsText.len && argsText.ptr[b] != '"')
+    {
+        // an origin identifier precedes the path; only `lib` exists today
+        while (b < argsText.len && argsText.ptr[b] != ',' ) b++;
+        while (b < argsText.len && (argsText.ptr[b] == ',' || argsText.ptr[b] == ' ')) b++;
+        // everything currently behind an identifier is compiler-runtime
+        return str.strView::empty();
+    }
+    if (b >= argsText.len || argsText.ptr[b] != '"') return str.strView::empty();
+    b++;
+    u32 e = b;
+    while (e < argsText.len && argsText.ptr[e] != '"') e++;
+    if (e >= argsText.len) return str.strView::empty();
+    str.strView t = str.strView::fromParts(argsText.ptr + b, e - b);
+    // skip globs ("std*") and package roots ("core" — no extension)
+    bool glob = false;
+    bool hasExt = false;
+    for (u32 k = 0; k < t.len; k++)
+    {
+        if (t.ptr[k] == '*') glob = true;
+        if (t.ptr[k] == '.' ) hasExt = true;
+    }
+    if (glob || !hasExt) return str.strView::empty();
+    return t;
+}
+
+static void collectSources(str.strView filePath, vec<FileEntry>* files, vec<str.String>* visited)
+{
+    for (u32 i = 0; i < visited.count(); i++)
+        if (svEq(visited.at(i).asView(), filePath)) return;
+
+    addUnique(files, visited, str.String::fromView(filePath));
+
+    std.string.String text = fs.readFileToString(filePath);
+    str.strView v = text.asView();
+    str.String dir = dirNameOf(filePath);
+
+    u32 i = 0;
+    while (i + 7 <= v.len)
+    {
+        bool isImp = v.ptr[i] == 'i' && v.ptr[i+1] == 'm' && v.ptr[i+2] == 'p'
+                  && v.ptr[i+3] == 'o' && v.ptr[i+4] == 'r' && v.ptr[i+5] == 't'
+                  && v.ptr[i+6] == '(' ;
+        if (!isImp) { i++; continue; }
+        u32 start = i + 7;
+        u32 depth = 1;
+        u32 end = start;
+        while (end < v.len && depth > 0)
+        {
+            if (v.ptr[end] == '(') depth++;
+            else if (v.ptr[end] == ')') depth--;
+            end++;
+        }
+        if (end <= start) { i = end; continue; }
+        str.strView argsText = str.strView::fromParts(v.ptr + start, end - 1 - start);
+        str.strView target = extractImportTarget(argsText);
+        if (target.len > 0)
+        {
+            str.String full = joinPath(dir.asView(), target);
+            if (!fs.fileExists(full.asView()))
+            {
+                str.String withExt = concatViews(full.asView(), str.strView::fromCstr(".crl"));
+                if (fs.fileExists(withExt.asView())) full = withExt;
+                else full.len = 0;
+            }
+            if (full.len > 0)
+                collectSources(full.asView(), files, visited);
+        }
+        i = end;
+    }
+}
+
+// ---------------------------------------------------------------- cache
+
+static str.String cachePath()
+{
+    return str.String::fromCstr(".coralb/cache.txt");
+}
+
+static void loadCache(vec<i64>* mtimes, vec<str.String>* paths, i64* binTime)
+{
+    *binTime = 0;
+    if (!fs.fileExists(cachePath().asView())) return;
+    std.string.String text = fs.readFileToString(cachePath().asView());
+    str.strView v = text.asView();
+    u32 lineStart = 0;
+    u32 lineNo = 0;
+    for (u32 i = 0; i <= v.len; i++)
+    {
+        if (i != v.len && v.ptr[i] != '\n') continue;
+        str.strView line = trimSp(str.strView::fromParts(v.ptr + lineStart, i - lineStart));
+        lineStart = i + 1;
+        lineNo++;
+        if (line.len == 0) continue;
+        if (lineNo == 1)
+        {
+            bool ok = false;
+            *binTime = (i64)std.ios.parseU64(line, &ok);
+            continue;
+        }
+        u32 sp = 0;
+        bool gotSp = false;
+        for (u32 k = 0; k < line.len; k++)
+            if (line.ptr[k] == ' ') { sp = k; gotSp = true; break; }
+        if (!gotSp) continue;
+        str.strView mt = str.strView::fromParts(line.ptr, sp);
+        str.strView pth = trimSp(str.strView::fromParts(line.ptr + sp + 1, line.len - sp - 1));
+        bool ok = false;
+        i64 mm = (i64)std.ios.parseU64(mt, &ok);
+        if (!ok) continue;
+        mtimes.push(mm);
+        paths.push(str.String::fromView(pth));
+    }
+}
+
+static void saveCache(i64 binTime, vec<FileEntry>* files)
+{
+    str.String out = str.String::withCap(256);
+    out.appendView(std.fmt.formatUint((u64)(binTime < 0 ? 0 : binTime), 10, false));
+    out.pushChar('\n');
+    for (u32 i = 0; i < files.count(); i++)
+    {
+        FileEntry fe = files.at(i);
+        out.appendView(std.fmt.formatUint((u64)(fe.mtime < 0 ? 0 : fe.mtime), 10, false));
+        out.pushChar(' ');
+        out.appendView(fe.path);
+        out.pushChar('\n');
+    }
+    fs.writeFileFromString(cachePath().asView(), &out);
+}
+
+static bool isUpToDate(vec<FileEntry>* files, str.strView binPath)
+{
+    fs.Stat bst;
+    if (!fs.statPath(binPath, &bst)) return false;
+    i64 binTime = bst.st_mtime * 1000000000 + bst.st_mtimeNsec;
+    vec<i64> cmt = vec<i64>::new();
+    vec<str.String> cp = vec<str.String>::new();
+    i64 cachedBin = 0;
+    loadCache(&cmt, &cp, &cachedBin);
+    if (cmt.count() != files.count()) return false;
+    if (cachedBin != binTime) return false;
+    for (u32 i = 0; i < files.count(); i++)
+    {
+        FileEntry fe = files.at(i);
+        bool found = false;
+        for (u32 j = 0; j < cp.count(); j++)
+        {
+            if (svEq(cp.at(j).asView(), fe.path) && cmt.at(j) == fe.mtime)
+            { found = true; break; }
+        }
+        if (!found) return false;
+        if (fe.mtime > binTime) return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------- commands
+
+static str.String binPathOf(const Manifest* m)
+{
+    return concatViews(str.strView::fromCstr(".coralb/bin/"), m.outName.asView());
+}
+
+static i32 cmdBuild(bool quiet)
+{
+    Manifest m;
+    if (!loadManifest(&m)) return 1;
+    if (!fs.fileExists(m.mainFile.asView()))
+    {
+        writeErr("coral: manifest main file missing: ");
+        writeErr(m.mainFile.asView().ptr);
+        writeErr("\n");
+        return 1;
+    }
+    vec<FileEntry> files = vec<FileEntry>::new();
+    vec<str.String> visited = vec<str.String>::new();
+    collectSources(m.mainFile.asView(), &files, &visited);
+
+    str.String bin = binPathOf(&m);
+    if (isUpToDate(&files, bin.asView()))
+    {
+        if (!quiet) writeOut("up to date\n");
+        return 0;
+    }
+
+    // re-execute ourselves on the manifest main file
+    char exeBuf[512];
+    i64 exeN = libc.readlink("/proc/self/exe", exeBuf, 512);
+    if (exeN <= 0 || exeN >= 512)
+    {
+        writeErr("coral: cannot resolve own executable\n");
+        return 1;
+    }
+    exeBuf[exeN] = 0;
+    str.String exe = str.String::fromCstr(exeBuf);
+
+    str.String optFlag = concatViews(str.strView::fromCstr("-O"), std.fmt.formatUint(m.optLevel, 10, false));
+    str.String oVal = concatViews(str.strView::fromCstr("-o"), bin.asView());
+
+    vec<std.string.strView> args = vec<std.string.strView>::new();
+    args.push(m.mainFile.asView());
+    args.push(optFlag.asView());
+    args.push(oVal.asView());
+
+    writeOut("[coral] building ");
+    writeOut(m.name.asView().ptr);
+    writeOut(" (");
+    writeU64(files.count());
+    writeOut(" files)\n");
+
+    i32 code = process.run(exe.asView(), &args);
+    if (code != 0) return code;
+
+    fs.Stat bst;
+    i64 bt = 0;
+    if (fs.statPath(bin.asView(), &bst))
+        bt = bst.st_mtime * 1000000000 + bst.st_mtimeNsec;
+    saveCache(bt, &files);
+    writeOut("[coral] built ");
+    writeOut(bin.asView().ptr);
+    writeOut("\n");
+    return 0;
+}
+
+static i32 cmdInit(bool makeNew, str.strView nameArg)
+{
+    str.String projName = str.String::fromCstr("app");
+    if (makeNew)
+    {
+        if (nameArg.len == 0)
+        {
+            writeErr("coral: -new requires a project name\n");
+            return 1;
+        }
+        projName = str.String::fromView(nameArg);
+        fs.createDirRecursive(nameArg, 493);
+        fs.createDirRecursive(joinPath(nameArg, str.strView::fromCstr("src")).asView(), 493);
+        if (libc.chdir(nameArg.ptr) != 0)
+        {
+            writeErr("coral: cannot enter project directory\n");
+            return 1;
+        }
+    }
+    else
+    {
+        fs.createDirRecursive(str.strView::fromCstr("src"), 493);
+    }
+
+    if (fs.fileExists(str.strView::fromCstr("build.crl")))
+    {
+        writeErr("coral: build.crl already exists here\n");
+        return 1;
+    }
+
+    str.String mf = str.String::fromCstr("name = ");
+    mf.pushChar(34);
+    mf.appendView(projName.asView());
+    mf.pushChar(34);
+    mf.appendView(str.strView::fromCstr("\nmain = src/main.crl\n# out = "));
+    mf.appendView(projName.asView());
+    mf.appendView(str.strView::fromCstr("\n# opt = 1   # 0..3\n"));
+    fs.writeFileFromString(str.strView::fromCstr("build.crl"), &mf);
+
+    str.String src = str.String::withCap(160);
+    src.appendView(str.strView::fromCstr("mod std = import(lib, "));
+    src.pushChar(34);
+    src.appendView(str.strView::fromCstr("std"));
+    src.pushChar(34);
+    src.appendView(str.strView::fromCstr(");\n\ni32 main()\n{\n    std.ios.nprint("));
+    src.pushChar(34);
+    src.appendView(str.strView::fromCstr("hello from coral\\n"));
+    src.pushChar(34);
+    src.appendView(str.strView::fromCstr(");\n    return 0;\n}\n"));
+    fs.writeFileFromString(str.strView::fromCstr("src/main.crl"), &src);
+
+    if (makeNew) writeOut("[coral] created project\n");
+    else writeOut("[coral] initialized project\n");
+    return 0;
+}
+
+static i32 cmdRun(u32 argc, char** argv)
+{
+    i32 rc = cmdBuild(false);
+    if (rc != 0) return rc;
+    Manifest m;
+    loadManifest(&m);
+    str.String bin = binPathOf(&m);
+    if (!fs.fileExists(bin.asView()))
+    {
+        writeErr("coral: binary not found after build\n");
+        return 1;
+    }
+    vec<std.string.strView> args = vec<std.string.strView>::new();
+    bool afterDash = false;
+    for (u32 i = 2; i < argc; i++)
+    {
+        str.strView a = str.strView::fromCstr(argv[i]);
+        if (!afterDash && svEq(a, str.strView::fromCstr("--"))) { afterDash = true; continue; }
+        if (afterDash) args.push(a);
+    }
+    return process.run(bin.asView(), &args);
+}
+
+static i32 cmdClean()
+{
+    Manifest m;
+    if (!loadManifest(&m)) return 1;
+    str.String bin = binPathOf(&m);
+    fs.deleteFile(bin.asView());
+    fs.deleteFile(cachePath().asView());
+    writeOut("[coral] cleaned\n");
+    return 0;
+}
+
+// ---------------------------------------------------------------- dispatch
+
+pub bool isBuildCommand(char** argv)
+{
+    if (argv[1] == null) return false;
+    str.strView a = str.strView::fromCstr(argv[1]);
+    if (a.len < 2 || a.ptr[0] != '-') return false;
+    if (svEq(a, str.strView::fromCstr("-init"))) return true;
+    if (svEq(a, str.strView::fromCstr("-new"))) return true;
+    if (svEq(a, str.strView::fromCstr("-build"))) return true;
+    if (svEq(a, str.strView::fromCstr("-run"))) return true;
+    if (svEq(a, str.strView::fromCstr("-clean"))) return true;
+    return false;
+}
+
+pub i32 runCommand(u32 argc, char** argv)
+{
+    str.strView cmd = str.strView::fromCstr(argv[1]);
+    if (svEq(cmd, str.strView::fromCstr("-init"))) return cmdInit(false, str.strView::empty());
+    if (svEq(cmd, str.strView::fromCstr("-new")))
+        return cmdInit(true, argc > 2 ? str.strView::fromCstr(argv[2]) : str.strView::empty());
+    if (svEq(cmd, str.strView::fromCstr("-build"))) return cmdBuild(false);
+    if (svEq(cmd, str.strView::fromCstr("-run"))) return cmdRun(argc, argv);
+    if (svEq(cmd, str.strView::fromCstr("-clean"))) return cmdClean();
+    writeErr("coral: unknown command\n");
+    return 1;
+}
