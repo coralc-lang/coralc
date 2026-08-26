@@ -1,0 +1,3281 @@
+mod libc = import("std/platform/libc.crl");
+mod ast = import("ast/ast.crl");
+mod scopes = import("typecheck/scopes.crl");
+mod types = import("typecheck/types.crl");
+mod str = import("std/text/string.crl");
+mod mman = import("std/memory/mman.crl");
+mod wallvm = import("lib/wallvm/wallvm.crl");
+mod ir_types = import("lib/wallvm/ir_types.crl");
+mod ir_builder = import("lib/wallvm/ir_builder.crl");
+mod ir_opcodes = import("lib/wallvm/ir_opcodes.crl");
+mod expr = import("typecheck/expr.crl");
+mod subst = import("mono/subst.crl");
+mod loader = import("typecheck/loader.crl");
+mod lex = import("lexer");
+mod parse = import("parser");
+
+struct FuncGen
+{
+    ir_types.IrContext* ctx;
+    ir_types.IrModule* irMod;
+    ir_types.IrFunc* func;
+    ir_builder.IrBuilder* bd;
+    scopes.Scope* top;
+    scopes.ModuleTable* mods;
+    ast.Program* prog;
+    loader.Loader* ld;
+    ir_types.IrInst* sretTemp;
+    str.strView filename;
+    str.strView* flagNames;
+    str.strView* flagVals;
+    u32 nflags;
+    bool debug;
+    str.strView* localNames;
+    ir_types.IrValue** localPtrs;
+    u32 nlocals;
+    u32 capLocals;
+    bool terminated;
+
+    // frontend inline expansion: spliced callee frames (params bound to
+    // already-lowered argument values). Pack params (comptime variadics)
+    // carry one value + element CType per actual argument.
+    str.strView inNames[16];
+    ir_types.IrValue** inVals[16];
+    types.CType** inElems[16];
+    u32 inCounts[16];
+    u32 nIn;
+    ir_types.IrValue* inlineRet;   // when set, ST_RETURN stores instead
+
+    // active pack-unroll variables (comptime for over T... args)
+    str.strView packVarNames[16];
+    types.CType* packVarTypes[16];
+    u32 nPackVars;
+}
+str.strView flagValueEmit(FuncGen* fg, str.strView name)
+{
+    for (u32 i = 0; i < fg.nflags; i++) if (strEq(fg.flagNames[i], name)) return fg.flagVals[i];
+    for (u32 i = 0; i < fg.nflags; i++) {
+        if (fg.flagNames[i].len == name.len) {
+            bool eq = true;
+            for (u32 k = 0; k < name.len; k++) {
+                u8 a = fg.flagNames[i].ptr[k]; if (a >= 'A' && a <= 'Z') a = a + 32;
+                u8 b = name.ptr[k]; if (b >= 'A' && b <= 'Z') b = b + 32;
+                if (a != b) { eq = false; break; }
+            }
+            if (eq) return fg.flagVals[i];
+        }
+    }
+    if (fg.nflags == 0) {
+        if (name.len==8) {
+            bool isPlatform=true;
+            const char* p="platform";
+            for(u32 k=0;k<8;k++){u8 a=name.ptr[k]; if(a>='A'&&a<='Z') a+=32; if(a!=(u8)p[k]){isPlatform=false;break;}}
+            if(isPlatform) return str.strView::fromCstr("LINUX");
+        }
+        if (name.len==4) {
+            bool isArch=true;
+            const char* p="arch";
+            for(u32 k=0;k<4;k++){u8 a=name.ptr[k]; if(a>='A'&&a<='Z') a+=32; if(a!=(u8)p[k]){isArch=false;break;}}
+            if(isArch) return str.strView::fromCstr("x86_64");
+        }
+    }
+    return str.strView::empty();
+}
+
+bool strEq(str.strView a, str.strView b)
+{
+    if (a.len != b.len) return false;
+    return libc.memcmp(a.ptr, b.ptr, a.len) == 0;
+}
+
+bool opEq(str.strView a, const char* b)
+{
+    u64 n = 0; while (b[n]) n++;
+    if (a.len != n) return false;
+    for (u64 i = 0; i < n; i++) if (a.ptr[i] != (u8)b[i]) return false;
+    return true;
+}
+
+// Mangled method symbol: <struct>__<targ1_T2>__<method> (targs segment only
+// for generic structs). Raw '<' never reaches IR/asm.
+bool idChar(u8 c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+}
+
+void pushSanitized(str.String* s, str.strView v)
+{
+    for (u32 i = 0; i < v.len; i++)
+    {
+        u8 c = v.ptr[i];
+        s.pushChar(idChar(c) ? (char)c : '_');
+    }
+}
+
+// Build "<struct>__<targs>__<method>"; targs empty for non-generic structs.
+str.String methodName3(str.strView structName, str.strView targs, str.strView method)
+{
+    str.String s = str.String::new();
+    pushSanitized(&s, structName);
+    s.pushCstr("__");
+    if (targs.len > 0) { pushSanitized(&s, targs); s.pushCstr("__"); }
+    pushSanitized(&s, method);
+    return s;
+}
+
+// Find the irMod function for monomorphized instance `md` whose type-arg
+// spelling matches the receiver's display inner text (e.g. "u64" for
+// vec<u64>). Falls back to a unique instance of that method.
+ir_types.IrValue* resolveMonoMethod(FuncGen* fg, ast.Decl* md, str.strView inner)
+{
+    u32 match = ~0u;
+    u32 count = 0;
+    for (u32 si = 0; si < subst.gNInsts; si++)
+    {
+        if (subst.gInsts[si].g != md) continue;
+        count++;
+        str.String td = str.String::new();
+        for (u32 ti = 0; ti < subst.gInsts[si].nt; ti++)
+        {
+            if (ti > 0) td.pushChar(',');
+            if (subst.gInsts[si].targs[ti] != null) td.pushView(types.typeName(subst.gInsts[si].targs[ti]));
+        }
+        bool eq2 = td.len == inner.len;
+        if (eq2) for (u32 c = 0; c < td.len; c++)
+        {
+            u8 a = td.ptr[c]; if (!idChar(a)) a = '_';
+            u8 b = inner.ptr[c]; if (!idChar(b)) b = '_';
+            if (a != b) { eq2 = false; break; }
+        }
+        if (eq2) { match = si; td.free(); break; }
+        td.free();
+    }
+    if (match == ~0u && count == 1)
+    {
+        for (u32 si = 0; si < subst.gNInsts; si++)
+            if (subst.gInsts[si].g == md) { match = si; break; }
+    }
+    if (match == ~0u)
+    {
+        // The same source file can be loaded as several distinct Program
+        // copies, so the call site's decl may be a different object than the
+        // one the instantiation was recorded under. Fall back to a unique
+        // free-function name match.
+        u32 nameCount = 0;
+        u32 nameIdx = ~0u;
+        for (u32 si = 0; si < subst.gNInsts; si++)
+        {
+            ast.Decl* gg = subst.gInsts[si].g;
+            if (gg == null || gg->structName.len > 0) continue;
+            if (!strEq(gg.name, md.name)) continue;
+            nameCount++;
+            nameIdx = si;
+        }
+        if (nameCount == 1) match = nameIdx;
+        if (libc.getenv("CORAL_DEBUG_VARIADIC") != null)
+        {
+            char db7[80];
+            i32 dn7 = libc.snprintf(db7, 80, "[rmm] ptrCount=%u nameCount=%u insts=%u\n",
+                count, nameCount, subst.gNInsts);
+            if (dn7 > 0) libc.write(2, db7, (u64)dn7);
+        }
+    }
+    if (match == ~0u) return null;
+    subst.MonoInst itv = subst.gInsts[match];
+    str.String td2 = str.String::new();
+    for (u32 ti = 0; ti < itv.nt; ti++)
+    {
+        if (ti > 0) td2.pushChar(',');
+        if (itv.targs[ti] != null) td2.pushView(types.typeName(itv.targs[ti]));
+    }
+    for (u32 ci = 0; ci < itv.nc; ci++)
+    {
+        if (itv.nt + ci > 0) td2.pushChar(',');
+        char b[24];
+        i32 n2 = libc.snprintf(b, 24, "%llu", itv.cvals[ci]);
+        for (i32 k2 = 0; k2 < n2; k2++) td2.pushChar(b[k2]);
+    }
+    // owner mirrors the emitter loop: free functions mangle under their own
+    // name since they have no owning struct.
+    str.strView ownerM = itv.g->structName.len > 0 ? itv.g->structName : itv.g->name;
+    str.String mn = methodName3(ownerM, td2.asView(), itv.g->name);
+    td2.free();
+    if (libc.getenv("CORAL_DEBUG_VARIADIC") != null)
+    {
+        char db8[128];
+        i32 dn8 = libc.snprintf(db8, 128, "[rmm2] match=%u mn=%.*s\n", match, (int)mn.len, mn.ptr);
+        if (dn8 > 0) libc.write(2, db8, (u64)dn8);
+    }
+    ir_types.IrValue* out = null;
+    for (u32 fi = 0; fi < fg.irMod.nfuncs; fi++)
+        if (strEq(str.strView::fromCstr(fg.irMod.funcs[fi].base.name), str.strView::fromParts(mn.ptr, mn.len)))
+            { out = &fg.irMod.funcs[fi].base; break; }
+    mn.free();
+    return out;
+}
+
+// Aggregate return: mapCType lowers struct returns to array(i8,N); such
+// returns travel through a hidden destination pointer as the first integer
+// argument (private convention; caller pre-allocates the storage).
+bool isAggIrRet(ir_types.IrType* fnTy)
+{
+    if (!fnTy || fnTy.kind != ir_types.IrTypeKind::Func) return false;
+    ir_types.IrType* rt = fnTy.ret;
+    if (!rt || rt.kind != ir_types.IrTypeKind::Array) return false;
+    return rt.elem != null && rt.elem.kind == ir_types.IrTypeKind::Int && rt.elem.width == 8;
+}
+
+bool declHasAggRet(FuncGen* fg, ast.Decl* d)
+{
+    if (d == null || d.type == null) return false;
+    types.CType* ct = scopes.resolveTypeExpr(d.type, fg.top, fg.mods, d.generics, d.ngenerics);
+    if (ct == null) return false;
+    if (ct.kind == types.TY_NAMED && ct.decl != null && ct.decl.kind == ast.DT_STRUCT)
+        return true;
+    if (ct.kind == types.TY_ARRAY) return true;
+    if (ct.kind == types.TY_UNKNOWN && ct.name.len > 0)
+    {
+        for (u32 i = 0; i < ct.name.len; i++)
+            if (ct.name.ptr[i] == '<') return true;
+    }
+    return false;
+}
+
+ast.Decl* findStructByDisplay(FuncGen* fg, str.strView displayName)
+{
+    u32 ls = 0;
+    for (u32 i = 0; i < displayName.len; i++)
+        if (displayName.ptr[i] == '.') ls = i + 1;
+    str.strView lastName = str.strView::fromParts(displayName.ptr + ls, displayName.len - ls);
+    // trim trailing <...> if the segment itself carries it
+    u32 lt = 0;
+    for (u32 i = 0; i < lastName.len; i++)
+        if (lastName.ptr[i] == '<') { lastName = str.strView::fromParts(lastName.ptr, i); break; }
+    ast.Decl* sd = findStructByName(fg.prog, lastName);
+    if (sd != null) return sd;
+    if (fg.ld != null)
+    {
+        for (u32 pi = 0; pi < fg.ld.n; pi++)
+        {
+            ast.Program* pp = fg.ld.progs[pi];
+            if (pp == null) continue;
+            for (u32 di = 0; di < pp.ndecls; di++)
+            {
+                ast.Decl* cd = pp.decls[di];
+                if (cd != null && cd.kind == ast.DT_STRUCT && strEq(cd.name, lastName)) return cd;
+            }
+        }
+    }
+    return null;
+}
+
+ast.Decl* findStructByName(ast.Program* prog, str.strView name)
+{
+    if (prog == null) return null;
+    for (u32 i = 0; i < prog->ndecls; i++)
+    {
+        ast.Decl* d = prog->decls[i];
+        if (d != null && d->kind == ast.DT_STRUCT && strEq(d->name, name)) return d;
+    }
+    return null;
+}
+
+// True when a method takes the receiver as an implicit leading parameter
+// (no explicit self/unnamed first param).
+bool methodNeedsSelf(ast.Decl* md)
+{
+    if (md->structName.len == 0 || md->isStatic) return false;
+    if (md->nparams > 0 && (md->params[0].name.len == 0 || strEq(md->params[0].name, str.strView::fromCstr("self")))) return false;
+    return true;
+}
+
+
+ir_types.IrType* mapCType(FuncGen* fg, types.CType* t)
+{
+    if (t == null) return fg.ctx.tyVoid();
+    t = types.effective(t);
+    if (t == null) return fg.ctx.tyVoid();
+    if (t->kind == types.TY_VOID) return fg.ctx.tyVoid();
+    if (t->kind == types.TY_BOOL) return fg.ctx.tyInt(1);
+    if (t->kind == types.TY_CHAR) return fg.ctx.tyInt(8);
+    if (t->kind == types.TY_INT) { u32 w = t->width; if (w == 0) w = 32; return fg.ctx.tyInt(w); }
+    if (t->kind == types.TY_FLOAT) return fg.ctx.tyDouble();
+    if (t->kind == types.TY_PTR || t->kind == types.TY_SLICE)
+    {
+        ir_types.IrType* e = t->elem ? mapCType(fg, t->elem) : fg.ctx.tyInt(8);
+        return fg.ctx.tyPtr(e);
+    }
+    if (t->kind == types.TY_ARRAY)
+    {
+        ir_types.IrType* e = t->elem ? mapCType(fg, t->elem) : fg.ctx.tyInt(8);
+        u32 c = t->countKnown ? (u32)t->count : 0;
+        if (c == 0) return fg.ctx.tyPtr(e);
+        return fg.ctx.tyArray(e, c);
+    }
+    if (t->kind == types.TY_FUNC)
+    {
+        ir_types.IrType* rt = t->ret ? mapCType(fg, t->ret) : fg.ctx.tyVoid();
+        if (t->nparams == 0) return fg.ctx.tyFunc(rt, null, 0, t->variadic);
+        ir_types.IrType** ps = mman.alloc<ir_types.IrType*>(t->nparams);
+        for (u32 i = 0; i < t->nparams; i++) ps[i] = t->params[i] ? mapCType(fg, t->params[i]) : fg.ctx.tyInt(64);
+        return fg.ctx.tyFunc(rt, ps, t->nparams, t->variadic);
+    }
+    if (t->kind == types.TY_NAMED)
+    {
+        if (t->decl != null && t->decl->kind == ast.DT_DISTINCT && t->elem != null)
+            return mapCType(fg, t->elem);
+        // structs/enums: opaque byte blocks sized by the layout calc so alloca
+        // reserves the full storage; field access goes through byte-offset GEPs.
+        bool pushed = false;
+        if (t->decl != null && t->decl->kind == ast.DT_STRUCT
+            && t->decl->ngenerics > 0 && t->name.len > 0)
+        {
+            u32 lt = 0; bool hasLt = false;
+            for (u32 i = 0; i < t->name.len; i++)
+                if (t->name.ptr[i] == '<') { lt = i; hasLt = true; break; }
+            if (hasLt && t->name.ptr[t->name.len - 1] == '>')
+            {
+                str.strView inner = str.strView::fromParts(
+                    t->name.ptr + lt + 1, t->name.len - lt - 2);
+                str.strView parts[16];
+                u32 nparts = 0;
+                u32 start4 = 0;
+                for (u32 k = 0; k <= inner.len && nparts < 16; k++)
+                {
+                    if (k == inner.len || inner.ptr[k] == ',')
+                    {
+                        str.strView piece = str.strView::fromParts(inner.ptr + start4, k - start4);
+                        while (piece.len > 0 && piece.ptr[0] == ' ') { piece.ptr++; piece.len--; }
+                        while (piece.len > 0 && piece.ptr[piece.len-1] == ' ') piece.len--;
+                        parts[nparts++] = piece;
+                        start4 = k + 1;
+                    }
+                }
+                if (nparts == t->decl->ngenerics)
+                {
+                    types.CType* rtys[16];
+                    u64 cvs[16];
+                    u32 nty = 0; u32 ncv = 0;
+                    bool ok5 = true;
+                    for (u32 k = 0; k < nparts; k++)
+                    {
+                        str.strView pv = parts[k];
+                        bool digits = pv.len > 0;
+                        for (u32 c2 = 0; c2 < pv.len; c2++)
+                            if (pv.ptr[c2] < '0' || pv.ptr[c2] > '9') { digits = false; break; }
+                        if (digits)
+                        {
+                            u64 mag6 = 0;
+                            for (u32 c2 = 0; c2 < pv.len; c2++) mag6 = mag6 * 10 + (u64)(pv.ptr[c2] - '0');
+                            cvs[ncv++] = mag6;
+                        }
+                        else
+                        {
+                            types.CType* pr6 = mman.alloc<types.CType>(1);
+                            if (types.primType(pv, pr6)) rtys[nty++] = pr6;
+                            else { ok5 = false; break; }
+                        }
+                    }
+                    if (ok5 && nty + ncv == t->decl->ngenerics)
+                    {
+                        subst.push(t->decl->generics, rtys, nty);
+                        if (ncv > 0)
+                        {
+                            str.strView cn[16]; u64 cv[16];
+                            u32 basec = t->decl->ngenerics - ncv;
+                            for (u32 k = 0; k < ncv && k < 16; k++)
+                            {
+                                cn[k] = t->decl->generics[basec + k];
+                                cv[k] = cvs[k];
+                            }
+                            subst.pushConsts(cn, cv, ncv);
+                        }
+                        pushed = true;
+                    }
+                }
+            }
+        }
+        u32 sz = aggSizeOf(t, fg.top);
+        if (pushed) subst.pop();
+        if (sz == 0) sz = 8;
+        return fg.ctx.tyArray(fg.ctx.tyInt(8), sz);
+    }
+    // Dotted-generic instances resolve to TY_UNKNOWN at typecheck; recover
+    // the struct here so aggregates get full-size allocas instead of one word.
+    if (t->kind == types.TY_UNKNOWN && t->name.len > 0)
+    {
+        bool hasLt = false;
+        for (u32 i = 0; i < t->name.len; i++)
+            if (t->name.ptr[i] == '<') { hasLt = true; break; }
+        if (hasLt && t->name.ptr[t->name.len - 1] == '>')
+        {
+            ast.Decl* sd = findStructByDisplay(fg, t.name);
+            if (sd != null && sd.kind == ast.DT_STRUCT && sd.ngenerics > 0)
+            {
+                str.strView inner = str.strView::empty();
+                u32 lt = 0;
+                for (u32 i = 0; i < t.name.len; i++)
+                    if (t.name.ptr[i] == '<') { lt = i; break; }
+                if (t.name.ptr[t.name.len - 1] == '>')
+                    inner = str.strView::fromParts(t.name.ptr + lt + 1, t.name.len - lt - 2);
+                str.strView parts[16];
+                u32 nparts = 0;
+                u32 start4 = 0;
+                for (u32 k = 0; k <= inner.len && nparts < 16; k++)
+                {
+                    if (k == inner.len || inner.ptr[k] == ',')
+                    {
+                        str.strView piece = str.strView::fromParts(inner.ptr + start4, k - start4);
+                        while (piece.len > 0 && piece.ptr[0] == ' ') { piece.ptr++; piece.len--; }
+                        while (piece.len > 0 && piece.ptr[piece.len-1] == ' ') piece.len--;
+                        parts[nparts++] = piece;
+                        start4 = k + 1;
+                    }
+                }
+                if (nparts == sd.ngenerics)
+                {
+                    types.CType* rtys[16];
+                    u64 cvs[16];
+                    u32 nty = 0; u32 ncv = 0;
+                    bool ok5 = true;
+                    for (u32 k = 0; k < nparts; k++)
+                    {
+                        str.strView pv = parts[k];
+                        bool digits = pv.len > 0;
+                        for (u32 c2 = 0; c2 < pv.len; c2++)
+                            if (pv.ptr[c2] < '0' || pv.ptr[c2] > '9') { digits = false; break; }
+                        if (digits)
+                        {
+                            u64 mag6 = 0;
+                            for (u32 c2 = 0; c2 < pv.len; c2++) mag6 = mag6 * 10 + (u64)(pv.ptr[c2] - '0');
+                            cvs[ncv++] = mag6;
+                        }
+                        else
+                        {
+                            types.CType* pr6 = mman.alloc<types.CType>(1);
+                            if (types.primType(pv, pr6)) rtys[nty++] = pr6;
+                            else { ok5 = false; break; }
+                        }
+                    }
+                    if (ok5 && nty + ncv == sd.ngenerics)
+                    {
+                        subst.push(sd.generics, rtys, nty);
+                        if (ncv > 0)
+                        {
+                            str.strView cn[16]; u64 cv[16];
+                            u32 basec = sd.ngenerics - ncv;
+                            for (u32 k = 0; k < ncv && k < 16; k++)
+                            {
+                                cn[k] = sd.generics[basec + k];
+                                cv[k] = cvs[k];
+                            }
+                            subst.pushConsts(cn, cv, ncv);
+                        }
+                        types.CType tmp = *t;
+                        tmp.kind = types.TY_NAMED;
+                        tmp.decl = sd;
+                        u32 sz = aggSizeOf(&tmp, fg.top);
+                        subst.pop();
+                        if (sz == 0) sz = 8;
+                        return fg.ctx.tyArray(fg.ctx.tyInt(8), sz);
+                    }
+                }
+            }
+        }
+    }
+    return fg.ctx.tyInt(64);
+}
+
+ir_types.IrType* mapTypeExpr(FuncGen* fg, ast.TypeExpr* te)
+{
+    if (te == null) return fg.ctx.tyVoid();
+    types.CType* ct = scopes.resolveTypeExpr(te, fg.top, fg.mods, null, 0);
+    if (ct == null) return fg.ctx.tyInt(64);
+    return mapCType(fg, ct);
+}
+
+ir_types.IrValue* findLocal(FuncGen* fg, str.strView name)
+{
+    for (u32 i = fg.nlocals; i > 0; i--)
+        if (strEq(fg.localNames[i-1], name)) return fg.localPtrs[i-1];
+    return null;
+}
+
+void addLocal(FuncGen* fg, str.strView name, ir_types.IrValue* ptr)
+{
+    if (fg.nlocals >= fg.capLocals)
+    {
+        u32 nc = fg.capLocals ? fg.capLocals*2 : 16;
+        str.strView* nn = mman.alloc<str.strView>(nc);
+        ir_types.IrValue** np = mman.alloc<ir_types.IrValue*>(nc);
+        for (u32 i = 0; i < fg.nlocals; i++) { nn[i]=fg.localNames[i]; np[i]=fg.localPtrs[i]; }
+        if (fg.localNames) mman.dealloc<str.strView>(fg.localNames);
+        if (fg.localPtrs) mman.dealloc<ir_types.IrValue*>(fg.localPtrs);
+        fg.localNames = nn; fg.localPtrs = np; fg.capLocals = nc;
+    }
+    fg.localNames[fg.nlocals] = name;
+    fg.localPtrs[fg.nlocals] = ptr;
+    fg.nlocals++;
+}
+
+ir_types.IrValue* asVal(ir_types.IrInst* i) { return &i->base; }
+ir_types.IrValue* dbgVal(FuncGen* fg, ast.Expr* e, ir_types.IrInst* inst) { setDbgExpr(fg, inst, e); return asVal(inst); }
+
+// Coerce call arguments to the callee's formal parameter kinds: an integer
+// value passed to a float formal must go through siToFp, because the x86_64
+// backend stages SSE-class arguments from xmm registers only. No-op when the
+// callee type carries no param info (indirect/null callees).
+// True when this call targets a declaration marked [[noret]]: the callee
+// never returns, so the call site terminates the block (Noret) instead of
+// falling through to a fake return.
+bool isNoretCallee(FuncGen* fg, ast.Expr* e)
+{
+    if (e == null) return false;
+    str.strView name = str.strView::empty();
+    if (e.kind == ast.EX_IDENT || e.kind == ast.EX_DOT || e.kind == ast.EX_ARROW)
+        name = e.text;
+    else if (e.kind == ast.EX_GENERIC && e.a != null)
+        name = e.a.text;
+    if (name.len == 0) return false;
+    for (u32 i = 0; i < fg.prog.ndecls; i++)
+    {
+        ast.Decl* d = fg.prog.decls[i];
+        if (d != null && d.noreturn && (d.kind == ast.DT_FUNC || d.kind == ast.DT_EXTERN)
+            && strEq(d.name, name)) return true;
+    }
+    if (fg.ld != null)
+    {
+        for (u32 pi = 0; pi < fg.ld.n; pi++)
+        {
+            ast.Program* pp = fg.ld.progs[pi];
+            for (u32 di = 0; pp != null && di < pp.ndecls; di++)
+            {
+                ast.Decl* d = pp.decls[di];
+                if (d != null && d.noreturn && (d.kind == ast.DT_FUNC || d.kind == ast.DT_EXTERN)
+                    && strEq(d.name, name)) return true;
+            }
+        }
+    }
+    return false;
+}
+
+void coerceCallArgs(FuncGen* fg, ir_types.IrValue* callee, ir_types.IrValue** args, u32 n)
+{
+    if (callee == null || callee->type == null
+        || callee->type->kind != ir_types.IrTypeKind::Func
+        || callee->type->params == null) return;
+    ir_types.IrType** fps = callee->type->params;
+    for (u32 i = 0; i < n && i < callee->type->nparams; i++)
+    {
+        ir_types.IrValue* v = args[i];
+        if (v == null || v->type == null || fps[i] == null) continue;
+        if (fps[i]->kind != ir_types.IrTypeKind::Float) continue;
+        if (v->type->kind != ir_types.IrTypeKind::Int) continue;
+        args[i] = dbgVal(fg, null, fg.bd.siToFp(v, fps[i]));
+    }
+}
+
+// Normalize an argument's cached CType for pack-element use: string literals
+// are typed as an opaque NAMED "string literal" marker; their real lowering
+// is a pointer to char.
+types.CType* normalizePackElem(FuncGen* fg, types.CType* t)
+{
+    if (t == null) return null;
+    if (t.kind == types.TY_NAMED && t.decl == null
+        && strEq(t.name, str.strView::fromCstr("string literal")))
+    {
+        types.CType* p = mman.alloc<types.CType>(1);
+        mman.zero<types.CType>(p, 1);
+        p.kind = types.TY_PTR;
+        p.width = 64;
+        types.CType* c = mman.alloc<types.CType>(1);
+        mman.zero<types.CType>(c, 1);
+        c.kind = types.TY_CHAR;
+        c.width = 8;
+        p.elem = c;
+        p.name = str.strView::fromCstr("const char*");
+        return p;
+    }
+    return t;
+}
+
+// A body is splice-safe when every ST_RETURN is the final statement of the
+// top-level block (no early returns from nested control flow).
+bool inlineBodySafe(ast.Stmt* b)
+{
+    if (b == null || b->kind != ast.ST_BLOCK) return false;
+    for (u32 i = 0; i < b->nstmts; i++)
+    {
+        ast.Stmt* s = b.stmts[i];
+        if (s == null) continue;
+        if (s.kind == ast.ST_RETURN && i + 1 != b.nstmts) return false;
+    }
+    return true;
+}
+
+// Frontend-style inline expansion: generate the callee's body statements
+// directly into the caller with parameters bound to lowered arguments.
+// Handles plain inline fns and comptime-variadic generics (pack param bound
+// to the per-site argument list). Returns true when spliced.
+bool tryInlineSplice(FuncGen* fg, ast.Decl* fd, ast.Expr* e, ir_types.IrValue** outVal)
+{
+    *outVal = null;
+    if (fd == null || fd.body == null || e == null) return false;
+    bool compVar = fd.variadic && fd.ngenerics > 0;
+    if (libc.getenv("CORAL_DEBUG_VARIADIC") != null)
+    {
+        char dbz3[112];
+        i32 dnz3 = libc.snprintf(dbz3, 112, "[splice?] %.*s inline=%u compVar=%u body=%p nparams=%u\n",
+            (int)fd.name.len, fd.name.ptr, (u32)fd.isInline, (u32)compVar,
+            (void*)fd.body, fd.nparams);
+        if (dnz3 > 0) libc.write(2, dbz3, (u64)dnz3);
+    }
+    if (!fd.isInline && !compVar) return false;
+    if (!inlineBodySafe(fd.body))
+    {
+        if (libc.getenv("CORAL_DEBUG_VARIADIC") != null)
+        {
+            char dbz[96];
+            i32 dnz = libc.snprintf(dbz, 96, "[splice-unsafe] %.*s\n", (int)fd.name.len, fd.name.ptr);
+            if (dnz > 0) libc.write(2, dbz, (u64)dnz);
+        }
+        return false;
+    }
+
+    // resolve return type without subst: opaque generic rets bail out to a
+    // normal call (splicing those needs mono context)
+    types.CType* rct = fd.type ? scopes.resolveTypeExpr(fd.type, fg.top, fg.mods, fd.generics, fd.ngenerics) : null;
+    if (rct != null) rct = types.effective(rct);
+    bool retVoidish = rct == null || rct.kind == types.TY_VOID
+        || rct.kind == types.TY_UNKNOWN;
+    if (!retVoidish && !fd.isInline)
+    {
+        // comptime-variadic with concrete-looking non-void ret is fine only
+        // when fully concrete; keep simple: allow int/float/ptr/bool/char
+        if (!(rct.kind == types.TY_INT || rct.kind == types.TY_FLOAT
+            || rct.kind == types.TY_BOOL || rct.kind == types.TY_CHAR
+            || rct.kind == types.TY_PTR)) return false;
+    }
+
+    u32 np = fd.nparams;
+    if (np >= 16) return false;
+    // evaluate arguments once, left to right
+    ir_types.IrValue** vals = null;
+    types.CType** elems = null;
+    u32 packedFrom = compVar ? (np > 0 ? np - 1 : 0u) : np;
+    u32 nPackedVals = 0;
+    if (e.nargs > 0)
+    {
+        vals = mman.alloc<ir_types.IrValue*>(e.nargs);
+        elems = mman.alloc<types.CType*>(e.nargs);
+    }
+    for (u32 ai = 0; ai < e.nargs; ai++)
+    {
+        vals[ai] = genExpr(fg, e.args[ai]);
+        types.CType* at = expr.inferredType(e.args[ai]);
+        elems[ai] = normalizePackElem(fg, at);
+    }
+    if (compVar) nPackedVals = e.nargs > packedFrom ? e.nargs - packedFrom : 0u;
+
+    // bind parameters
+    u32 saveN = fg.nIn;
+    for (u32 pi = 0; pi < np; pi++)
+    {
+        if (fg.nIn >= 16) break;
+        fg.inNames[fg.nIn] = fd.params[pi].name;
+        if (compVar && pi + 1 == np)
+        {
+            fg.inVals[fg.nIn] = vals ? vals + packedFrom : null;
+            fg.inElems[fg.nIn] = elems ? elems + packedFrom : null;
+            fg.inCounts[fg.nIn] = nPackedVals;
+        }
+        else
+        {
+            fg.inVals[fg.nIn] = (pi < e.nargs && vals != null) ? vals + pi : null;
+            fg.inElems[fg.nIn] = null;
+            fg.inCounts[fg.nIn] = (pi < e.nargs) ? 1u : 0u;
+        }
+        fg.nIn++;
+    }
+    // extra call args beyond declared params (defensive)
+    for (u32 ai = np; ai < e.nargs; ai++)
+    {
+        if (!compVar || fg.nIn >= 16) break;
+        fg.inNames[fg.nIn] = e.args[ai].text;
+        fg.inVals[fg.nIn] = vals ? vals + ai : null;
+        fg.inElems[fg.nIn] = null;
+        fg.inCounts[fg.nIn] = 1u;
+        fg.nIn++;
+    }
+
+    // result slot
+    ir_types.IrValue* resSlot = null;
+    if (!retVoidish)
+    {
+        ir_types.IrType* rt = mapCType(fg, rct);
+        ir_types.IrInst* al = fg.bd.alloca(rt);
+        resSlot = &al.base;
+    }
+    ir_types.IrValue* saveRet = fg.inlineRet;
+    fg.inlineRet = resSlot;
+    genBlockStmts(fg, fd.body);
+    fg.inlineRet = saveRet;
+    fg.nIn = saveN;
+    if (resSlot != null)
+    {
+        ir_types.IrType* rt2 = resSlot.type;
+        *outVal = dbgVal(fg, null, fg.bd.load(rt2.elem != null ? rt2.elem : fg.ctx.tyInt(64), resSlot));
+    }
+    return true;
+}
+
+// Current pack element type for a loop-variable name during pack unrolling.
+types.CType* lookupPackElem(FuncGen* fg, str.strView name)
+{
+    for (u32 i = fg.nPackVars; i > 0; i--)
+        if (strEq(fg.packVarNames[i-1], name)) return fg.packVarTypes[i-1];
+    return null;
+}
+
+// Find a free-function declaration by name across loaded programs.
+ast.Decl* findFuncInLoaded(FuncGen* fg, str.strView name)
+{
+    if (fg.ld == null) return null;
+    for (u32 i = 0; i < fg.ld.n; i++)
+    {
+        ast.Program* p = fg.ld.progs[i];
+        for (u32 j = 0; p != null && j < p.ndecls; j++)
+        {
+            ast.Decl* d = p.decls[j];
+            if (d != null && d.kind == ast.DT_FUNC && d.body != null
+                && strEq(d.name, name))
+                return d;
+        }
+    }
+    return null;
+}
+
+void setDbgExpr(FuncGen* fg, ir_types.IrInst* inst, ast.Expr* e)
+{
+    if (inst == null || e == null) return;
+    u32 len = 0; while (fg.filename.ptr[len] && len < fg.filename.len) len++;
+    char* copy = mman.alloc<char>(fg.filename.len + 1);
+    for (u32 i = 0; i < fg.filename.len; i++) copy[i] = (char)fg.filename.ptr[i];
+    copy[fg.filename.len] = 0;
+    inst.setDebugLoc(copy, e->line, e->col);
+}
+void setDbgStmt(FuncGen* fg, ir_types.IrInst* inst, ast.Stmt* s)
+{
+    if (inst == null || s == null) return;
+    char* copy = mman.alloc<char>(fg.filename.len + 1);
+    for (u32 i = 0; i < fg.filename.len; i++) copy[i] = (char)fg.filename.ptr[i];
+    copy[fg.filename.len] = 0;
+    inst.setDebugLoc(copy, s->line, s->col);
+}
+u32 cSize(types.CType* ct, scopes.Scope* top)
+{
+    if (ct == null) return 0;
+    ct = types.effective(ct);
+    if (ct == null) return 0;
+    switch (ct->kind)
+    {
+    case types.TY_VOID: return 0;
+    case types.TY_BOOL: return 1;
+    case types.TY_CHAR: return 1;
+    case types.TY_INT: return ct->width ? (ct->width + 7)/8 : 4;
+    case types.TY_FLOAT: return ct->width ? (ct->width + 7)/8 : 8;
+    case types.TY_PTR: return 8;
+    case types.TY_FUNC: return 8;
+    case types.TY_SLICE: return 16;
+    case types.TY_ARRAY:
+        if (ct->elem == null) return 8;
+        { u32 es = cSize(ct->elem, top); if (ct->countKnown) return es * (u32)ct->count; return es; }
+    case types.TY_NAMED:
+        if (ct->decl != null && ct->decl->kind == ast.DT_STRUCT) return ct->decl->nfields * 8;
+        return 8;
+    default: return 8;
+    }
+}
+u32 cAlign(types.CType* ct, scopes.Scope* top)
+{
+    if (ct == null) return 1;
+    ct = types.effective(ct);
+    if (ct == null) return 1;
+    switch (ct->kind)
+    {
+    case types.TY_VOID: return 1;
+    case types.TY_BOOL: return 1;
+    case types.TY_CHAR: return 1;
+    case types.TY_INT: return ct->width ? (ct->width + 7)/8 : 4;
+    case types.TY_FLOAT: return ct->width ? (ct->width + 7)/8 : 8;
+    case types.TY_PTR: return 8;
+    case types.TY_FUNC: return 8;
+    case types.TY_SLICE: return 8;
+    case types.TY_ARRAY: if (ct->elem) return cAlign(ct->elem, top); return 8;
+    case types.TY_NAMED:
+        if (ct->decl != null && ct->decl->kind == ast.DT_STRUCT)
+        {
+            u32 m = 1;
+            for (u32 i = 0; i < ct->decl->nfields; i++)
+            {
+                types.CType* ft = scopes.resolveTypeExpr(ct->decl->fields[i].type, top, null, null, 0);
+                u32 a = cAlign(ft, top);
+                if (a > m) m = a;
+            }
+            return m;
+        }
+        return 8;
+    default: return 8;
+    }
+}
+u64 parseIntLit(str.strView s)
+{
+    u64 v = 0;
+    bool hex = s.len > 2 && s.ptr[0]=='0' && (s.ptr[1]=='x' || s.ptr[1]=='X');
+    u32 i = hex ? 2 : 0;
+    for (; i < s.len; i++)
+    {
+        u8 c = s.ptr[i];
+        if (c >= '0' && c <= '9') v = v* (hex?16:10) + (c-'0');
+        else if (hex && c >= 'a' && c <= 'f') v = v*16 + 10 + (c-'a');
+        else if (hex && c >= 'A' && c <= 'F') v = v*16 + 10 + (c-'A');
+        else break;
+    }
+    return v;
+}
+
+ir_types.IrValue* genExpr(FuncGen* fg, ast.Expr* e);
+ir_types.IrValue* genAddr(FuncGen* fg, ast.Expr* e);
+
+// aggregate size/alignment: single source of truth for layout
+// Honours [[reorder]]/[[packed]] modes; self-recursive for nested structs.
+u32 aggAlignOf(types.CType* ct, scopes.Scope* top);
+
+u32 aggSizeOf(types.CType* ct, scopes.Scope* top)
+{
+    if (ct == null) return 0;
+    ct = types.effective(ct);
+    if (ct == null) return 0;
+    switch (ct->kind)
+    {
+    case types.TY_VOID: return 0;
+    case types.TY_BOOL: return 1;
+    case types.TY_CHAR: return 1;
+    case types.TY_INT: return ct->width ? (ct->width + 7)/8 : 4;
+    case types.TY_FLOAT: return ct->width ? (ct->width + 7)/8 : 8;
+    case types.TY_PTR: return 8;
+    case types.TY_FUNC: return 8;
+    case types.TY_SLICE: return 16;
+    case types.TY_ARRAY:
+    {
+        if (ct->elem == null) return 8;
+        u32 es = aggSizeOf(ct->elem, top);
+        if (ct->countKnown && ct->count > 0) return es * (u32)ct->count;
+        return es;
+    }
+    case types.TY_NAMED:
+    {
+        if (ct->decl == null || ct->decl->kind != ast.DT_STRUCT) return 8;
+        ast.Decl* sd = ct->decl;
+        u32 nf = sd->nfields;
+        if (nf == 0) return 0;
+        bool isPacked = sd->layoutMode == 2 || sd->layoutMode == 3;
+        bool isReorder = sd->layoutMode == 1 || sd->layoutMode == 3;
+        u32 orderArr[64];
+        u32* order = orderArr;
+        bool heapOrder = nf > 64;
+        if (heapOrder) order = mman.alloc<u32>(nf);
+        for (u32 f = 0; f < nf; f++) order[f] = f;
+        if (isReorder && nf > 1)
+        {
+            for (u32 i = 0; i < nf; i++)
+                for (u32 j = i+1; j < nf; j++)
+                {
+                    types.CType* ti = scopes.resolveTypeExpr(sd->fields[order[i]].type, top, null, null, 0);
+                    types.CType* tj = scopes.resolveTypeExpr(sd->fields[order[j]].type, top, null, null, 0);
+                    bool swap = false;
+                    u32 ai = aggAlignOf(ti, top);
+                    u32 aj = aggAlignOf(tj, top);
+                    if (ai != aj) swap = aj > ai;
+                    else swap = aggSizeOf(tj, top) > aggSizeOf(ti, top);
+                    if (swap) { u32 tmp = order[i]; order[i]=order[j]; order[j]=tmp; }
+                }
+        }
+        u32 cur = 0;
+        u32 maxA = 1;
+        for (u32 idx = 0; idx < nf; idx++)
+        {
+            types.CType* ft = scopes.resolveTypeExpr(sd->fields[order[idx]].type, top, null, null, 0);
+            u32 al = aggAlignOf(ft, top);
+            u32 sz = aggSizeOf(ft, top);
+            if (al > maxA) maxA = al;
+            if (!isPacked && al > 0) { u32 pad = (al - (cur % al)) % al; cur += pad; }
+            cur += sz;
+        }
+        if (!isPacked && maxA > 1) { u32 pad = (maxA - (cur % maxA)) % maxA; cur += pad; }
+        if (heapOrder) mman.dealloc<u32>(order);
+        return cur;
+    }
+    default: return 8;
+    }
+}
+
+u32 aggAlignOf(types.CType* ct, scopes.Scope* top)
+{
+    if (ct == null) return 1;
+    ct = types.effective(ct);
+    if (ct == null) return 1;
+    switch (ct->kind)
+    {
+    case types.TY_VOID: return 1;
+    case types.TY_BOOL: return 1;
+    case types.TY_CHAR: return 1;
+    case types.TY_INT: return ct->width ? (ct->width + 7)/8 : 4;
+    case types.TY_FLOAT: return ct->width ? (ct->width + 7)/8 : 8;
+    case types.TY_PTR: return 8;
+    case types.TY_FUNC: return 8;
+    case types.TY_SLICE: return 8;
+    case types.TY_ARRAY: if (ct->elem) return aggAlignOf(ct->elem, top); return 8;
+    case types.TY_NAMED:
+    {
+        if (ct->decl == null || ct->decl->kind != ast.DT_STRUCT) return 8;
+        u32 m = 1;
+        for (u32 i = 0; i < ct->decl->nfields; i++)
+        {
+            types.CType* ft = scopes.resolveTypeExpr(ct->decl->fields[i].type, top, null, null, 0);
+            u32 a = aggAlignOf(ft, top);
+            if (a > m) m = a;
+        }
+        return m;
+    }
+    default: return 8;
+    }
+}
+
+// storeToLhs: store `rv` into the lvalue `a`. One path for every lvalue
+// form (locals, fields, index chains, derefs) through genAddr.
+void storeToLhs(FuncGen* fg, ast.Expr* a, ir_types.IrValue* rv)
+{
+    if (a == null || rv == null) return;
+    ir_types.IrValue* ptr = genAddr(fg, a);
+    if (ptr != null) fg.bd.store(rv, ptr);
+}
+
+// structFieldOffset: byte offset of field `name` in `sd` honouring
+// reorder/packed layout modes. Returns false when the field is absent.
+bool structFieldOffset(FuncGen* fg, ast.Decl* sd, str.strView name, u32* outOff)
+{
+    u32 fieldIdx = (u32)-1;
+    for (u32 fi = 0; fi < sd->nfields; fi++)
+        if (strEq(sd->fields[fi].name, name)) { fieldIdx = fi; break; }
+    if (fieldIdx == (u32)-1) return false;
+    bool isPacked = sd->layoutMode == 2 || sd->layoutMode == 3;
+    bool isReorder = sd->layoutMode == 1 || sd->layoutMode == 3;
+    u32 nf = sd->nfields;
+    u32 orderArr[64];
+    u32* order = orderArr;
+    bool heapOrder = nf > 64;
+    if (heapOrder) order = mman.alloc<u32>(nf);
+    for (u32 f = 0; f < nf; f++) order[f] = f;
+    if (isReorder && nf > 1)
+    {
+        for (u32 i = 0; i < nf; i++)
+            for (u32 j = i+1; j < nf; j++)
+            {
+                types.CType* ti = scopes.resolveTypeExpr(sd->fields[order[i]].type, fg.top, fg.mods, null, 0);
+                types.CType* tj = scopes.resolveTypeExpr(sd->fields[order[j]].type, fg.top, fg.mods, null, 0);
+                u32 si = aggSizeOf(ti, fg.top);
+                u32 sj = aggSizeOf(tj, fg.top);
+                u32 ai = aggAlignOf(ti, fg.top);
+                u32 aj = aggAlignOf(tj, fg.top);
+                bool swap = false;
+                if (ai != aj) swap = aj > ai;
+                else swap = sj > si;
+                if (swap) { u32 tmp = order[i]; order[i]=order[j]; order[j]=tmp; }
+            }
+    }
+    u32 cur = 0;
+    bool found = false;
+    for (u32 idx = 0; idx < nf; idx++)
+    {
+        u32 f = order[idx];
+        types.CType* ft = scopes.resolveTypeExpr(sd->fields[f].type, fg.top, fg.mods, null, 0);
+        u32 al = aggAlignOf(ft, fg.top);
+        u32 sz = aggSizeOf(ft, fg.top);
+        if (!isPacked && al > 0) { u32 pad = (al - (cur % al)) % al; cur += pad; }
+        if (f == fieldIdx) { *outOff = cur; found = true; break; }
+        cur += sz;
+    }
+    if (heapOrder) mman.dealloc<u32>(order);
+    return found;
+}
+
+// fieldAddress: IR pointer to the member of a DOT/ARROW expression, or null.
+// Handles `v.field` (local alloca base), `p->field` / `p.field` (pointer
+// base), and nested chains. honours reorder/packed layouts.
+ir_types.IrValue* fieldAddress(FuncGen* fg, ast.Expr* e)
+{
+    types.CType* baseTy = expr.inferredType(e->a);
+    if (baseTy != null) baseTy = types.effective(baseTy);
+    ast.Decl* structDecl = null;
+    if (baseTy != null && baseTy->kind == types.TY_NAMED && baseTy->decl != null && baseTy->decl->kind == ast.DT_STRUCT)
+    {
+        // value receiver: `.` on a struct value -> use its alloca directly
+        structDecl = baseTy->decl;
+    }
+    else if (baseTy != null && (baseTy->kind == types.TY_PTR || baseTy->kind == types.TY_SLICE)
+             && baseTy->elem != null && baseTy->elem->kind == types.TY_NAMED
+             && baseTy->elem->decl != null && baseTy->elem->decl->kind == ast.DT_STRUCT)
+    {
+        // pointer receiver: `.` or `->` on a pointer derefs implicitly here
+        // because genExpr on the ident already loaded; we need the ADDRESS,
+        // so re-derive it from the local alloca when possible.
+        structDecl = baseTy->elem->decl;
+    }
+    if (structDecl == null) return null;
+    u32 off = 0;
+    if (!structFieldOffset(fg, structDecl, e->text, &off)) return null;
+
+    ir_types.IrValue* basePtr = null;
+    bool ptrRecv = baseTy != null && (baseTy->kind == types.TY_PTR || baseTy->kind == types.TY_SLICE);
+    if (e->a->kind == ast.EX_IDENT)
+    {
+        basePtr = findLocal(fg, e->a->text);
+        // pointer receiver stored in a local: the slot holds the pointer,
+        // so one load yields the object address.
+        if (basePtr != null && ptrRecv)
+        {
+            ir_types.IrType* et3 = basePtr->type != null && basePtr->type.kind == ir_types.IrTypeKind::Ptr && basePtr->type.elem != null
+                ? basePtr->type.elem : fg.ctx.tyPtr(fg.ctx.tyInt(8));
+            ir_types.IrInst* ld3 = fg.bd.load(et3, basePtr);
+            basePtr = &ld3->base;
+        }
+    }
+    if (basePtr == null)
+    {
+        // chained access (a.b.c): recurse for the inner address
+        if ((e->a->kind == ast.EX_DOT || e->a->kind == ast.EX_ARROW))
+            basePtr = fieldAddress(fg, e->a);
+        else
+            basePtr = genExpr(fg, e->a);
+    }
+    if (basePtr == null) return null;
+
+    ir_types.IrType* i8Ptr = fg.ctx.tyPtr(fg.ctx.tyInt(8));
+    ir_types.IrValue* casted = basePtr;
+    if (basePtr->type != i8Ptr)
+    {
+        ir_types.IrInst* bc = fg.bd.bitcast(basePtr, i8Ptr);
+        casted = &bc->base;
+    }
+    ir_types.IrValue* offVal = fg.ctx.constInt(fg.ctx.tyInt(64), off);
+    ir_types.IrValue* idxs[1]; idxs[0] = offVal;
+    ir_types.IrInst* gep = fg.bd.gep(casted, idxs, 1);
+
+    ast.StructField* sf = null;
+    for (u32 fi = 0; fi < structDecl->nfields; fi++)
+        if (strEq(structDecl->fields[fi].name, e->text)) { sf = &structDecl->fields[fi]; break; }
+    types.CType* fct = sf != null ? scopes.resolveTypeExpr(sf->type, fg.top, fg.mods, null, 0) : null;
+    ir_types.IrType* fieldIrTy = fct ? mapCType(fg, fct) : fg.ctx.tyInt(64);
+    ir_types.IrType* fieldPtrTy = fg.ctx.tyPtr(fieldIrTy);
+    ir_types.IrInst* bc2 = fg.bd.bitcast(&gep->base, fieldPtrTy);
+    return &bc2->base;
+}
+
+// genIndexBasePtr: pointer to index into for `base[idx]`.
+// Array lvalues contribute their ADDRESS (decay, no load); pointers
+// contribute their VALUE. Reports the element CType for stride scaling.
+ir_types.IrValue* genIndexBasePtr(FuncGen* fg, ast.Expr* base, types.CType** outElemTy)
+{
+    types.CType* bt = base ? expr.inferredType(base) : null;
+    if (bt != null) bt = types.effective(bt);
+    if (bt != null && bt->kind == types.TY_ARRAY)
+    {
+        if (outElemTy != null) *outElemTy = bt->elem;
+        ir_types.IrValue* ap = genAddr(fg, base);
+        if (ap != null) return ap;
+    }
+    else if (bt != null && (bt->kind == types.TY_PTR || bt->kind == types.TY_SLICE))
+    {
+        if (outElemTy != null) *outElemTy = bt->elem;
+        return genExpr(fg, base);
+    }
+    if (outElemTy != null) *outElemTy = null;
+    ir_types.IrValue* ap = genAddr(fg, base);
+    if (ap != null) return ap;
+    return genExpr(fg, base);
+}
+
+// genAddr: address of an lvalue. No loads on the way down — this is what
+// makes arrays-of-arrays and arrays-in-structs work: every level stays a
+// pointer until the final scalar load (or an explicit decay).
+ir_types.IrValue* genAddr(FuncGen* fg, ast.Expr* e)
+{
+    if (e == null) return null;
+    switch (e->kind)
+    {
+    case ast.EX_IDENT:
+    {
+        ir_types.IrValue* lp = findLocal(fg, e->text);
+        if (lp != null) return lp;
+        // module-level / extern variable
+        for (u32 gi = 0; gi < fg.irMod.nglobals; gi++)
+            if (strEq(str.strView::fromCstr(fg.irMod.globals[gi].base.name), e->text))
+                return &fg.irMod.globals[gi].base;
+        return null;
+    }
+    case ast.EX_DOT:
+    case ast.EX_ARROW:
+        return fieldAddress(fg, e);
+    case ast.EX_INDEX:
+    {
+        types.CType* elemTy = null;
+        ir_types.IrValue* basePtr = genIndexBasePtr(fg, e->a, &elemTy);
+        if (basePtr == null) return null;
+        ir_types.IrValue* idx = genExpr(fg, e->b);
+        if (idx == null) return null;
+        u32 esz = 8;
+        if (elemTy != null) esz = aggSizeOf(elemTy, fg.top);
+        ir_types.IrValue* sidx = idx;
+        // GEP indices are BYTE offsets end-to-end: scale here for every
+        // element wider than one byte; the backend adds verbatim.
+        if (esz > 1)
+        {
+            ir_types.IrInst* m = fg.bd.mul(idx, fg.ctx.constInt(fg.ctx.tyInt(64), esz));
+            setDbgExpr(fg, m, e);
+            sidx = &m->base;
+        }
+        ir_types.IrValue* idxs[1]; idxs[0] = sidx;
+        ir_types.IrInst* gp = fg.bd.gep(basePtr, idxs, 1);
+        setDbgExpr(fg, gp, e);
+        return &gp->base;
+    }
+    case ast.EX_DEREF:
+        return genExpr(fg, e->a);
+    case ast.EX_UNARY:
+        if (opEq(e->text, "*")) return genExpr(fg, e->a);
+        return null;
+    default:
+        return null;
+    }
+}
+
+ir_types.IrValue* genBinary(FuncGen* fg, ast.Expr* e)
+{
+    str.strView op = e->text;
+    ast.Expr* a = e->a;
+    ast.Expr* b = e->b;
+    bool isAssign = opEq(op, "=") || (op.len >= 2 && op.ptr[op.len-1] == (u8)'=' && op.ptr[op.len-2] != (u8)'=' && op.ptr[op.len-2] != (u8)'!' && op.ptr[op.len-2] != (u8)'<' && op.ptr[op.len-2] != (u8)'>');
+    if (isAssign)
+    {
+        // compound-assign desugar: a op= b -> a = a op b ; plain a = b
+        if (op.len >= 2 && op.ptr[op.len-1] == (u8)'=' && op.ptr[op.len-2] != (u8)'='
+            && op.ptr[op.len-2] != (u8)'!' && op.ptr[op.len-2] != (u8)'<'
+            && op.ptr[op.len-2] != (u8)'>' && !opEq(op, "="))
+        {
+            char binOp[4]; u32 bo = 0;
+            for (u32 i = 0; i + 1 < op.len; i++) binOp[bo++] = (char)op.ptr[i];
+            binOp[bo] = 0;
+            ast.Expr lhsCopy = *a;
+            ir_types.IrValue* cur = genExpr(fg, &lhsCopy);
+            ir_types.IrValue* rv = genExpr(fg, b);
+            if (cur == null) return rv;
+            if (rv == null) return cur;
+            ir_types.IrInst* t = null;
+            bool flt = (cur->type && cur->type->kind == ir_types.IrTypeKind::Float);
+            if (bo == 1 && binOp[0] == '+') t = flt ? fg.bd.fadd(cur, rv) : fg.bd.add(cur, rv);
+            else if (bo == 1 && binOp[0] == '-') t = flt ? fg.bd.fsub(cur, rv) : fg.bd.sub(cur, rv);
+            else if (bo == 1 && binOp[0] == '*') t = flt ? fg.bd.fmul(cur, rv) : fg.bd.mul(cur, rv);
+            else if (bo == 1 && binOp[0] == '/') t = flt ? fg.bd.fdiv(cur, rv) : fg.bd.sdiv(cur, rv);
+            else if (bo == 1 && binOp[0] == '%') t = fg.bd.srem(cur, rv);
+            else if (bo == 1 && binOp[0] == '&') t = fg.bd.andOp(cur, rv);
+            else if (bo == 1 && binOp[0] == '|') t = fg.bd.orOp(cur, rv);
+            else if (bo == 1 && binOp[0] == '^') t = fg.bd.xorOp(cur, rv);
+            else if (bo == 2 && binOp[0] == '<' && binOp[1] == '<') t = fg.bd.shl(cur, rv);
+            else if (bo == 2 && binOp[0] == '>' && binOp[1] == '>') t = fg.bd.ashr(cur, rv);
+            if (t != null)
+            {
+                setDbgExpr(fg, t, e);
+                ir_types.IrValue* res = &t->base;
+                storeToLhs(fg, a, res);
+                return res;
+            }
+            return rv;
+        }
+        ir_types.IrValue* rv = genExpr(fg, b);
+        storeToLhs(fg, a, rv);
+        return rv;
+    }
+    ir_types.IrValue* l = genExpr(fg, a);
+    ir_types.IrValue* r = genExpr(fg, b);
+    if (l == null) l = fg.ctx.constInt(fg.ctx.tyInt(64), 0);
+    if (r == null) r = fg.ctx.constInt(fg.ctx.tyInt(64), 0);
+    types.CType* lt = a ? expr.inferredType(a) : null;
+    types.CType* rt = b ? expr.inferredType(b) : null;
+    bool isFloat = (lt && lt->kind == types.TY_FLOAT) || (rt && rt->kind == types.TY_FLOAT);
+    if (isFloat) isFloat = true;
+    else if (l->type && l->type->kind == ir_types.IrTypeKind::Float) isFloat = true;
+    else if (r->type && r->type->kind == ir_types.IrTypeKind::Float) isFloat = true;
+    if (isFloat)
+    {
+        ir_types.IrInst* t = null;
+        if (opEq(op, "+")) t = fg.bd.fadd(l, r);
+        else if (opEq(op, "-")) t = fg.bd.fsub(l, r);
+        else if (opEq(op, "*")) t = fg.bd.fmul(l, r);
+        else if (opEq(op, "/")) t = fg.bd.fdiv(l, r);
+        else if (opEq(op, "==")) t = fg.bd.fcmp(ir_opcodes.IrFCmpPred::Oeq, l, r);
+        else if (opEq(op, "!=")) t = fg.bd.fcmp(ir_opcodes.IrFCmpPred::One, l, r);
+        else if (opEq(op, "<")) t = fg.bd.fcmp(ir_opcodes.IrFCmpPred::Olt, l, r);
+        else if (opEq(op, "<=")) t = fg.bd.fcmp(ir_opcodes.IrFCmpPred::Ole, l, r);
+        else if (opEq(op, ">")) t = fg.bd.fcmp(ir_opcodes.IrFCmpPred::Ogt, l, r);
+        else if (opEq(op, ">=")) t = fg.bd.fcmp(ir_opcodes.IrFCmpPred::Oge, l, r);
+        else t = fg.bd.fadd(l, r);
+        setDbgExpr(fg, t, e);
+        return &t->base;
+    }
+    if (opEq(op, "+")) { ir_types.IrInst* t = fg.bd.add(l, r); setDbgExpr(fg, t, e); return &t->base; }
+    if (opEq(op, "-")) { ir_types.IrInst* t = fg.bd.sub(l, r); setDbgExpr(fg, t, e); return &t->base; }
+    if (opEq(op, "*")) { ir_types.IrInst* t = fg.bd.mul(l, r); setDbgExpr(fg, t, e); return &t->base; }
+    if (opEq(op, "/"))
+    {
+        bool uns = (lt && lt->kind == types.TY_INT && !lt->isSigned) || (rt && rt->kind == types.TY_INT && !rt->isSigned);
+        ir_types.IrInst* t = uns ? fg.bd.udiv(l, r) : fg.bd.sdiv(l, r);
+        setDbgExpr(fg, t, e);
+        return &t->base;
+    }
+    if (opEq(op, "%"))
+    {
+        bool uns = (lt && lt->kind == types.TY_INT && !lt->isSigned) || (rt && rt->kind == types.TY_INT && !rt->isSigned);
+        ir_types.IrInst* t = uns ? fg.bd.urem(l, r) : fg.bd.srem(l, r);
+        setDbgExpr(fg, t, e);
+        return &t->base;
+    }
+    if (opEq(op, "&")) { ir_types.IrInst* t = fg.bd.andOp(l, r); setDbgExpr(fg, t, e); return &t->base; }
+    if (opEq(op, "|")) { ir_types.IrInst* t = fg.bd.orOp(l, r); setDbgExpr(fg, t, e); return &t->base; }
+    if (opEq(op, "^")) { ir_types.IrInst* t = fg.bd.xorOp(l, r); setDbgExpr(fg, t, e); return &t->base; }
+    if (opEq(op, "<<")) { ir_types.IrInst* t = fg.bd.shl(l, r); setDbgExpr(fg, t, e); return &t->base; }
+    if (opEq(op, ">>"))
+    {
+        bool uns = lt && lt->kind == types.TY_INT && !lt->isSigned;
+        ir_types.IrInst* t = uns ? fg.bd.lshr(l, r) : fg.bd.ashr(l, r);
+        setDbgExpr(fg, t, e);
+        return &t->base;
+    }
+    if (opEq(op, "==")) { ir_types.IrInst* t = fg.bd.icmp(ir_opcodes.IrICmpPred::Eq, l, r); setDbgExpr(fg, t, e); return &t->base; }
+    if (opEq(op, "!=")) { ir_types.IrInst* t = fg.bd.icmp(ir_opcodes.IrICmpPred::Ne, l, r); setDbgExpr(fg, t, e); return &t->base; }
+    if (opEq(op, "<"))
+    {
+        bool uns = lt && lt->kind == types.TY_INT && !lt->isSigned;
+        ir_types.IrInst* t = fg.bd.icmp(uns ? ir_opcodes.IrICmpPred::Ult : ir_opcodes.IrICmpPred::Slt, l, r);
+        setDbgExpr(fg, t, e);
+        return &t->base;
+    }
+    if (opEq(op, "<="))
+    {
+        bool uns = lt && lt->kind == types.TY_INT && !lt->isSigned;
+        ir_types.IrInst* t = fg.bd.icmp(uns ? ir_opcodes.IrICmpPred::Ule : ir_opcodes.IrICmpPred::Sle, l, r);
+        setDbgExpr(fg, t, e);
+        return &t->base;
+    }
+    if (opEq(op, ">"))
+    {
+        bool uns = lt && lt->kind == types.TY_INT && !lt->isSigned;
+        ir_types.IrInst* t = fg.bd.icmp(uns ? ir_opcodes.IrICmpPred::Ugt : ir_opcodes.IrICmpPred::Sgt, l, r);
+        setDbgExpr(fg, t, e);
+        return &t->base;
+    }
+    if (opEq(op, ">="))
+    {
+        bool uns = lt && lt->kind == types.TY_INT && !lt->isSigned;
+        ir_types.IrInst* t = fg.bd.icmp(uns ? ir_opcodes.IrICmpPred::Uge : ir_opcodes.IrICmpPred::Sge, l, r);
+        setDbgExpr(fg, t, e);
+        return &t->base;
+    }
+    if (opEq(op, "&&"))
+    {
+        ir_types.IrValue* z = fg.ctx.constInt(fg.ctx.tyInt(1), 0);
+        ir_types.IrInst* c1 = fg.bd.icmp(ir_opcodes.IrICmpPred::Ne, l, z);
+        ir_types.IrInst* c2 = fg.bd.icmp(ir_opcodes.IrICmpPred::Ne, r, z);
+        ir_types.IrInst* t = fg.bd.andOp(&c1->base, &c2->base);
+        setDbgExpr(fg, t, e);
+        return &t->base;
+    }
+    if (opEq(op, "||"))
+    {
+        ir_types.IrValue* z = fg.ctx.constInt(fg.ctx.tyInt(1), 0);
+        ir_types.IrInst* c1 = fg.bd.icmp(ir_opcodes.IrICmpPred::Ne, l, z);
+        ir_types.IrInst* c2 = fg.bd.icmp(ir_opcodes.IrICmpPred::Ne, r, z);
+        ir_types.IrInst* t = fg.bd.orOp(&c1->base, &c2->base);
+        setDbgExpr(fg, t, e);
+        return &t->base;
+    }
+    ir_types.IrInst* t = fg.bd.add(l, r);
+    setDbgExpr(fg, t, e);
+    return &t->base;
+}
+
+ir_types.IrValue* genExpr(FuncGen* fg, ast.Expr* e)
+{
+    if (e == null) return null;
+    if (fg.terminated) return null;
+    switch (e->kind)
+    {
+    case ast.EX_INT:
+    {
+        u64 v = parseIntLit(e->text);
+        bool neg = false;
+        if (e->text.len > 0 && e->text.ptr[0] == '-') neg = true;
+        if (neg) v = (u64)(0 - (i64)v);
+        return fg.ctx.constInt(fg.ctx.tyInt(64), v);
+    }
+    case ast.EX_FLOAT:
+    {
+        f64 fv = 0; u64 raw = 0;
+        if (e->text.len > 0)
+        {
+            u64 v = 0; bool dot = false; f64 div = 1;
+            for (u32 i = 0; i < e->text.len; i++)
+            {
+                u8 c = e->text.ptr[i];
+                if (c == '.') { dot = true; continue; }
+                if (c >= '0' && c <= '9')
+                {
+                    if (!dot) v = v*10 + (c-'0');
+                    else { div *= 10; fv = fv + (f64)(c-'0')/div; }
+                }
+            }
+            if (!dot) fv = (f64)v;
+            else fv += (f64)v;
+            mman.copy<u8>((u8*)&raw, (u8*)&fv, 8);
+        }
+        return fg.ctx.constFloat(fg.ctx.tyDouble(), fv);
+    }
+    case ast.EX_BOOL:
+        return fg.ctx.constInt(fg.ctx.tyInt(1), opEq(e->text, "true") ? 1 : 0);
+    case ast.EX_NULL:
+        return fg.ctx.constInt(fg.ctx.tyPtr(fg.ctx.tyInt(8)), 0);
+    case ast.EX_CHAR:
+    {
+        u64 v = 0;
+        if (e->text.len >= 3) v = e->text.ptr[1];
+        else if (e->text.len == 1) v = e->text.ptr[0];
+        return fg.ctx.constInt(fg.ctx.tyInt(8), v);
+    }
+    case ast.EX_STR:
+    {
+        // Parse string literal: e->text is "\"hello\\n\"" with quotes
+        u32 slen = e->text.len;
+        if (slen >= 2 && e->text.ptr[0] == '"' && e->text.ptr[slen-1] == '"') {
+            // Count actual length with escapes
+            u32 outLen = 0;
+            for (u32 i=1; i+1 < slen; i++) {
+                if (e->text.ptr[i] == '\\' && i+1 < slen-1) {
+                    char n = e->text.ptr[i+1];
+                    if (n=='n' || n=='t' || n=='r' || n=='\\' || n=='"' || n=='0') { outLen++; i++; }
+                    else outLen++;
+                } else outLen++;
+            }
+            char* out = mman.alloc<char>(outLen+1);
+            u32 oi=0;
+            for (u32 i=1; i+1 < slen; i++) {
+                if (e->text.ptr[i] == '\\' && i+1 < slen-1) {
+                    char n = e->text.ptr[i+1];
+                    if (n=='n') out[oi++]='\n';
+                    else if (n=='t') out[oi++]='\t';
+                    else if (n=='r') out[oi++]='\r';
+                    else if (n=='\\') out[oi++]='\\';
+                    else if (n=='"') out[oi++]='"';
+                    else if (n=='0') out[oi++]='\0';
+                    else out[oi++]=n;
+                    i++;
+                } else out[oi++]=e->text.ptr[i];
+            }
+            out[outLen]=0;
+            ir_types.IrStringConst* sc = fg.ctx.createStringConst(out, outLen);
+            fg.irMod.addConstString(sc);
+            return &sc->base;
+        }
+        return fg.ctx.constInt(fg.ctx.tyPtr(fg.ctx.tyInt(8)), 0);
+    }
+    case ast.EX_IDENT:
+    {
+        // const generic parameter used as a value (N in arr<T, u64 N>)
+        {
+            u64 cv10 = 0;
+            if (expr.constOf(e, &cv10)) return fg.ctx.constInt(fg.ctx.tyInt(64), cv10);
+        }
+        ir_types.IrValue* ptr = findLocal(fg, e->text);
+        if (ptr != null)
+        {
+            // array/struct locals decay to their address
+            types.CType* it0 = expr.inferredType(e);
+            if (it0 != null) it0 = types.effective(it0);
+            bool agg0 = it0 != null && (it0->kind == types.TY_ARRAY
+                || (it0->kind == types.TY_NAMED && it0->decl != null && it0->decl->kind == ast.DT_STRUCT));
+            if (agg0) return ptr;
+            ir_types.IrType* ty = ptr->type;
+            if (ty && ty->kind == ir_types.IrTypeKind::Ptr && ty->elem)
+                return dbgVal(fg, e, fg.bd.load(ty->elem, ptr));
+            return dbgVal(fg, e, fg.bd.load(fg.ctx.tyInt(64), ptr));
+        }
+        scopes.Sym* s = scopes.scopeLookup(fg.top, e->text);
+        if (s != null && s->kind == scopes.SYM_FUNC)
+        {
+            for (u32 i = 0; i < fg.irMod.nfuncs; i++)
+                if (strEq(str.strView::fromCstr(fg.irMod.funcs[i].base.name), e->text))
+                    return &fg.irMod.funcs[i].base;
+            return fg.ctx.constInt(fg.ctx.tyPtr(fg.ctx.tyInt(8)), 0);
+        }
+        // module-level / extern variable
+        for (u32 gi = 0; gi < fg.irMod.nglobals; gi++)
+        {
+            if (strEq(str.strView::fromCstr(fg.irMod.globals[gi].base.name), e->text))
+            {
+                ir_types.IrValue* gb = &fg.irMod.globals[gi].base;
+                types.CType* it = expr.inferredType(e);
+                if (it != null) it = types.effective(it);
+                bool isAgg = it != null && (it->kind == types.TY_ARRAY
+                    || (it->kind == types.TY_NAMED && it->decl != null && it->decl->kind == ast.DT_STRUCT));
+                if (isAgg) return gb;   // aggregates decay to their address
+                ir_types.IrType* et = it != null ? mapCType(fg, it) : fg.ctx.tyInt(64);
+                return dbgVal(fg, e, fg.bd.load(et, gb));
+            }
+        }
+        return fg.ctx.constInt(fg.ctx.tyInt(64), 0);
+    }
+    case ast.EX_PAREN:
+        return genExpr(fg, e->a);
+    case ast.EX_UNARY:
+    {
+        if (e->post && (opEq(e->text, "++") || opEq(e->text, "--"))) {
+            ir_types.IrValue* cur = genExpr(fg, e->a);
+            ir_types.IrValue* one = fg.ctx.constInt(cur ? cur->type : fg.ctx.tyInt(32), 1);
+            ir_types.IrValue* upd = opEq(e->text, "++") ? dbgVal(fg, e, fg.bd.add(cur, one)) : dbgVal(fg, e, fg.bd.sub(cur, one));
+            storeToLhs(fg, e->a, upd);
+            return cur;
+        }
+        if (e->post) return genExpr(fg, e->a);
+        if (opEq(e->text, "-"))
+        {
+            ir_types.IrValue* v = genExpr(fg, e->a);
+            if (v && v->type && v->type->kind == ir_types.IrTypeKind::Float) {
+                ir_types.IrValue* z = fg.ctx.constFloat(v->type, 0.0);
+                return dbgVal(fg, e, fg.bd.fsub(z, v));
+            }
+            return dbgVal(fg, e, fg.bd.neg(v));
+        }
+        if (opEq(e->text, "!"))
+        {
+            ir_types.IrValue* v = genExpr(fg, e->a);
+            ir_types.IrValue* z = fg.ctx.constInt(v->type ? v->type : fg.ctx.tyInt(1), 0);
+            return dbgVal(fg, e, fg.bd.icmp(ir_opcodes.IrICmpPred::Eq, v, z));
+        }
+        if (opEq(e->text, "~")) return dbgVal(fg, e, fg.bd.notOp(genExpr(fg, e->a)));
+        if (opEq(e->text, "*"))
+        {
+            ir_types.IrValue* ptr = genExpr(fg, e->a);
+            ir_types.IrType* ty = ptr && ptr->type && ptr->type->kind==ir_types.IrTypeKind::Ptr && ptr->type->elem ? ptr->type->elem : fg.ctx.tyInt(64);
+            return dbgVal(fg, e, fg.bd.load(ty, ptr));
+        }
+        if (opEq(e->text, "&"))
+        {
+            if (e->a && e->a->kind == ast.EX_IDENT)
+            {
+                ir_types.IrValue* ptr = findLocal(fg, e->a->text);
+                if (ptr != null) return ptr;
+            }
+            return genExpr(fg, e->a);
+        }
+        if (opEq(e->text, "+")) return genExpr(fg, e->a);
+        return genExpr(fg, e->a);
+    }
+    case ast.EX_BINARY:
+        return genBinary(fg, e);
+    case ast.EX_TERNARY:
+    {
+        ir_types.IrValue* c = genExpr(fg, e->a);
+        ir_types.IrValue* t = genExpr(fg, e->b);
+        ir_types.IrValue* f = genExpr(fg, e->c);
+        return dbgVal(fg, e, fg.bd.select(c, t, f));
+    }
+    case ast.EX_CALL:
+    {
+        ir_types.IrValue* callee = null;
+        if (e->a)
+        {
+            if (e->a->kind == ast.EX_IDENT)
+            {
+                // inline / comptime-variadic: expand into the caller
+                scopes.Sym* si9 = scopes.scopeLookup(fg.top, e->a->text);
+                ast.Decl* fd9 = (si9 != null && si9.kind == scopes.SYM_FUNC)
+                    ? si9.decl : findFuncInLoaded(fg, e->a->text);
+                {
+                    ir_types.IrValue* iv = null;
+                    if (libc.getenv("CORAL_DEBUG_VARIADIC") != null)
+                    {
+                        char dbz2[96];
+                        i32 dnz2 = libc.snprintf(dbz2, 96, "[ident-cal] %.*s fd=%p\n",
+                            (int)e.a.text.len, e.a.text.ptr, (void*)fd9);
+                        if (dnz2 > 0) libc.write(2, dbz2, (u64)dnz2);
+                    }
+                    if (fd9 != null && tryInlineSplice(fg, fd9, e, &iv)) return iv;
+                    if (fd9 != null && fd9.ngenerics > 0)
+                    {
+                        // generic helper call inside a spliced body: resolve
+                        // the instance, inferring the pack element type from
+                        // any loop-variable argument.
+                        str.strView inner9 = str.strView::empty();
+                        for (u32 ai9 = 0; ai9 < e.nargs; ai9++)
+                        {
+                            if (e.args[ai9] == null || e.args[ai9].kind != ast.EX_IDENT) continue;
+                            types.CType* et9 = lookupPackElem(fg, e.args[ai9].text);
+                            if (et9 != null) { inner9 = types.typeName(et9); break; }
+                        }
+                        ir_types.IrValue* mc = resolveMonoMethod(fg, fd9, inner9);
+                        if (mc != null)
+                        {
+                            u32 an9 = e.nargs;
+                            ir_types.IrValue** aa9 = an9 > 0 ? mman.alloc<ir_types.IrValue*>(an9) : null;
+                            for (u32 ai9 = 0; ai9 < an9; ai9++) aa9[ai9] = genExpr(fg, e.args[ai9]);
+                            coerceCallArgs(fg, mc, aa9, an9);
+                            ir_types.IrInst* ci9 = fg.bd.call(mc, aa9, an9);
+                            if (aa9 != null) mman.dealloc<ir_types.IrValue*>(aa9);
+                            if (ci9.base.type != null && ci9.base.type.kind == ir_types.IrTypeKind::Void) return null;
+                            return &ci9.base;
+                        }
+                    }
+                }
+                scopes.Sym* s = scopes.scopeLookup(fg.top, e->a->text);
+                if (s != null && s->type != null && s->type->kind == types.TY_FUNC)
+                {
+                    for (u32 i = 0; i < fg.irMod.nfuncs; i++)
+                    {
+                        if (strEq(str.strView::fromCstr(fg.irMod.funcs[i].base.name), e->a->text))
+                            { callee = &fg.irMod.funcs[i].base; break; }
+                    }
+                }
+                if (callee == null) callee = genExpr(fg, e->a);
+            }
+            else if (e->a->kind == ast.EX_DOT || e->a->kind == ast.EX_ARROW)
+            {
+                // module-qualified call (`mod.sub.fn`): the LAST segment is
+                // the function name — imported funcs land in irMod under
+                // their plain names.
+                str.strView fname = e->a->text;
+                // method call on a known struct: resolve <Struct>__<T>__<name>
+                // and prepend the receiver for instance methods.
+                ir_types.IrValue** preArgs = null;
+                u32 preN = 0;
+                bool handled = false;
+                {
+                    types.CType* bt = null;
+                    if (e->a->a != null)
+                    {
+                        bt = expr.inferredType(e->a->a);
+                        if (bt != null) bt = types.effective(bt);
+                    }
+                    ast.Decl* sdFb = null;
+                    if (bt != null && bt.kind == types.TY_UNKNOWN && fg.ld != null)
+                    {
+                        // dotted generic type (std.collections.arr.arr<u64,3>)
+                        // resolved opaque at typecheck; find the struct by the
+                        // last '.'-segment of its display name across loaded progs.
+                        str.strView dn = bt.name;
+                        u32 lt2 = 0; bool hasLt2 = false;
+                        for (u32 i = 0; i < dn.len; i++) if (dn.ptr[i] == '<') { lt2 = i; hasLt2 = true; break; }
+                        str.strView head = hasLt2 ? str.strView::fromParts(dn.ptr, lt2) : dn;
+                        u32 ls = 0;
+                        for (u32 i = 0; i < head.len; i++) if (head.ptr[i] == '.') ls = i + 1;
+                        str.strView lastName = str.strView::fromParts(head.ptr + ls, head.len - ls);
+                        for (u32 pi2 = 0; pi2 < fg.ld.n && sdFb == null; pi2++)
+                        {
+                            ast.Program* pp = fg.ld.progs[pi2];
+                            if (pp == null) continue;
+                            for (u32 di3 = 0; di3 < pp.ndecls; di3++)
+                            {
+                                ast.Decl* cd2 = pp.decls[di3];
+                                if (cd2 != null && cd2.kind == ast.DT_STRUCT && strEq(cd2.name, lastName))
+                                {
+                                    sdFb = cd2;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    bool namedOk = sdFb != null
+                        || (bt != null && bt.kind == types.TY_NAMED
+                            && bt.decl != null && bt.decl.kind == ast.DT_STRUCT);
+                    if (namedOk)
+                    {
+                        ast.Decl* sd = sdFb != null ? sdFb : bt.decl;
+                        ast.Decl* md = scopes.findMethod(sd, fg.prog, fname);
+                        if (md != null)
+                        {
+                            if (sd.ngenerics > 0)
+                            {
+                                str.strView inner = str.strView::empty();
+                                if (bt.name.len > 0)
+                                {
+                                    u32 lt = 0; bool hasLt = false;
+                                    for (u32 i = 0; i < bt.name.len; i++)
+                                        if (bt.name.ptr[i] == '<') { lt = i; hasLt = true; break; }
+                                    if (hasLt && bt.name.ptr[bt.name.len - 1] == '>')
+                                        inner = str.strView::fromParts(bt.name.ptr + lt + 1, bt.name.len - lt - 2);
+                                }
+                                callee = resolveMonoMethod(fg, md, inner);
+                            }
+                            else
+                            {
+                                str.String mn = methodName3(sd.name, str.strView::empty(), fname);
+                                for (u32 fi2 = 0; fi2 < fg.irMod.nfuncs; fi2++)
+                                    if (strEq(str.strView::fromCstr(fg.irMod.funcs[fi2].base.name), str.strView::fromParts(mn.ptr, mn.len)))
+                                        { callee = &fg.irMod.funcs[fi2].base; break; }
+                                mn.free();
+                            }
+                            if (callee != null)
+                            {
+                                bool needRecv = !md.isStatic && e->a.kind == ast.EX_DOT;
+                                bool calleeSret = isAggIrRet(callee.type);
+                                preN = e.nargs + (needRecv ? 1u : 0u) + (calleeSret ? 1u : 0u);
+                                preArgs = preN > 0 ? mman.alloc<ir_types.IrValue*>(preN) : null;
+                                u32 ai = 0;
+                                ir_types.IrInst* sretAlloca = null;
+                                if (calleeSret)
+                                {
+                                    ir_types.IrType* drt = callee.type.ret;
+                                    sretAlloca = fg.bd.alloca(drt);
+                                    preArgs[ai++] = &sretAlloca.base;
+                                }
+                                if (needRecv)
+                                {
+                                    ir_types.IrValue* recv = genAddr(fg, e.a.a);
+                                    if (recv == null) recv = genExpr(fg, e.a.a);
+                                    preArgs[ai++] = recv;
+                                }
+                                for (; ai < preN; ai++) preArgs[ai] = genExpr(fg, e.args[ai - (needRecv ? 1u : 0u) - (calleeSret ? 1u : 0u)]);
+                                handled = true;
+                                fg.sretTemp = sretAlloca;
+                            }
+                        }
+                    }
+                }
+                if (!handled)
+                {
+                    // static-call fallback: base type may be poisoned UNKNOWN
+                    // (e.g. `Struct.method()`); scan known structs for a static
+                    // method with this name.
+                    for (u32 si3 = 0; si3 < fg.prog.ndecls && callee == null; si3++)
+                    {
+                        ast.Decl* cd = fg.prog.decls[si3];
+                        if (cd == null || cd.kind != ast.DT_STRUCT || cd.ngenerics > 0) continue;
+                        ast.Decl* md2 = scopes.findMethod(cd, fg.prog, fname);
+                        if (md2 == null || !md2.isStatic) continue;
+                        str.String mn2 = methodName3(cd.name, str.strView::empty(), fname);
+                        for (u32 fi3 = 0; fi3 < fg.irMod.nfuncs; fi3++)
+                            if (strEq(str.strView::fromCstr(fg.irMod.funcs[fi3].base.name), str.strView::fromParts(mn2.ptr, mn2.len)))
+                            {
+                                callee = &fg.irMod.funcs[fi3].base;
+                                preN = e.nargs;
+                                preArgs = preN > 0 ? mman.alloc<ir_types.IrValue*>(preN) : null;
+                                for (u32 ai2 = 0; ai2 < preN; ai2++) preArgs[ai2] = genExpr(fg, e.args[ai2]);
+                                handled = true;
+                                break;
+                            }
+                        mn2.free();
+                    }
+                }
+                if (!handled)
+                {
+                    for (u32 i = 0; i < fg.irMod.nfuncs; i++)
+                    {
+                        if (strEq(str.strView::fromCstr(fg.irMod.funcs[i].base.name), fname))
+                            { callee = &fg.irMod.funcs[i].base; break; }
+                    }
+                    // free generic function called through a module path
+                    // (std.ios.println(...)): instances live in the mono
+                    // registry under a mangled name, so resolve via the decl.
+                    if (callee == null)
+                    {
+                        ast.Decl* fd = null;
+                        for (u32 di5 = 0; di5 < fg.prog.ndecls && fd == null; di5++)
+                        {
+                            ast.Decl* cd5 = fg.prog.decls[di5];
+                            if (cd5 != null && cd5.kind == ast.DT_FUNC
+                                && cd5.structName.len == 0 && cd5.ngenerics > 0
+                                && cd5.body != null && strEq(cd5.name, fname))
+                                fd = cd5;
+                        }
+                        if (fd == null && fg.ld != null)
+                        {
+                            for (u32 pi5 = 0; pi5 < fg.ld.n && fd == null; pi5++)
+                            {
+                                ast.Program* pp5 = fg.ld.progs[pi5];
+                                if (pp5 == null) continue;
+                                for (u32 di6 = 0; di6 < pp5.ndecls; di6++)
+                                {
+                                    ast.Decl* cd6 = pp5.decls[di6];
+                                    if (cd6 != null && cd6.kind == ast.DT_FUNC
+                                        && cd6.structName.len == 0
+                                        && cd6.ngenerics > 0 && cd6.body != null
+                                        && strEq(cd6.name, fname)) { fd = cd6; break; }
+                                }
+                            }
+                        }
+                        if (fd != null)
+                        {
+                            ir_types.IrValue* iv2 = null;
+                            if (tryInlineSplice(fg, fd, e, &iv2)) { handled = true; return iv2; }
+                            callee = resolveMonoMethod(fg, fd, str.strView::empty());
+                        }
+                        if (libc.getenv("CORAL_DEBUG_VARIADIC") != null)
+                        {
+                            char db6[96];
+                            i32 dn6 = libc.snprintf(db6, 96, "[cg-callee] fname=%.*s fd=%p callee=%p\n",
+                                (int)fname.len, fname.ptr, (void*)fd, (void*)callee);
+                            if (dn6 > 0) libc.write(2, db6, (u64)dn6);
+                        }
+                        if (callee != null)
+                        {
+                            bool calleeSret3 = isAggIrRet(callee.type);
+                            preN = e.nargs + (calleeSret3 ? 1u : 0u);
+                            preArgs = preN > 0 ? mman.alloc<ir_types.IrValue*>(preN) : null;
+                            u32 ai4 = 0;
+                            ir_types.IrInst* sretA3 = null;
+                            if (calleeSret3)
+                            {
+                                sretA3 = fg.bd.alloca(callee.type.ret);
+                                preArgs[ai4++] = &sretA3.base;
+                            }
+                            for (; ai4 < preN; ai4++)
+                                preArgs[ai4] = genExpr(fg, e.args[ai4 - (calleeSret3 ? 1u : 0u)]);
+                            handled = true;
+                            fg.sretTemp = sretA3;
+                        }
+                    }
+                    if (callee == null) callee = genExpr(fg, e->a);
+                }
+                else
+                {
+                    coerceCallArgs(fg, callee, preArgs, preN);
+                    ir_types.IrInst* ci = fg.bd.call(callee, preArgs, preN);
+                    if (preArgs) mman.dealloc<ir_types.IrValue*>(preArgs);
+                    if (fg.sretTemp != null)
+                    {
+                        ir_types.IrInst* outAl = fg.sretTemp;
+                        fg.sretTemp = null;
+                        return &outAl.base;
+                    }
+                    if (ci.base.type && ci.base.type.kind == ir_types.IrTypeKind::Void) return null;
+                    return &ci.base;
+                }
+            }
+            else callee = genExpr(fg, e->a);
+        }
+        if (callee == null) callee = fg.ctx.constInt(fg.ctx.tyPtr(fg.ctx.tyInt(8)), 0);
+        bool plainSret = isAggIrRet(callee.type);
+        u32 n = e.nargs + (plainSret ? 1u : 0u);
+        ir_types.IrValue** args = n > 0 ? mman.alloc<ir_types.IrValue*>(n) : null;
+        ir_types.IrInst* sretAlloca2 = null;
+        if (plainSret)
+        {
+            sretAlloca2 = fg.bd.alloca(callee.type.ret);
+            args[0] = &sretAlloca2.base;
+        }
+        for (u32 i = plainSret ? 1u : 0u; i < n; i++) args[i] = genExpr(fg, e.args[i - (plainSret ? 1u : 0u)]);
+        coerceCallArgs(fg, callee, args, n);
+        ir_types.IrInst* ci = fg.bd.call(callee, args, n);
+        if (args) mman.dealloc<ir_types.IrValue*>(args);
+        // [[noret]] callee: the call never returns, so the block ends
+        // here — nothing may follow, and no fallback return is appended.
+        if (e.kind == ast.EX_CALL && isNoretCallee(fg, e.a))
+        {
+            fg.terminated = true;
+            return null;
+        }
+        if (sretAlloca2 != null) return &sretAlloca2.base;
+        if (ci->base.type && ci->base.type->kind == ir_types.IrTypeKind::Void) return null;
+        return &ci->base;
+    }
+    case ast.EX_CAST:
+    {
+        ir_types.IrValue* v = genExpr(fg, e->a);
+        ir_types.IrType* dt = mapTypeExpr(fg, e->type);
+        if (v == null || dt == null) return v;
+        if (v->type == dt) return v;
+        // string literals are Array(i8,N)-typed constants whose VALUE is the
+        // emitted address (backend lowers them via leaq); casting to any
+        // pointer must preserve that address, never truncate it.
+        if (dt->kind == ir_types.IrTypeKind::Ptr
+            && v->type != null && v->type->kind == ir_types.IrTypeKind::Array)
+            return v;
+        if (v->type && v->type->kind == ir_types.IrTypeKind::Float && dt->kind == ir_types.IrTypeKind::Float)
+        {
+            if (v->type->width == 64 && dt->width == 32) return dbgVal(fg, e, fg.bd.fpTrunc(v, dt));
+            if (v->type->width == 32 && dt->width == 64) return dbgVal(fg, e, fg.bd.fpExt(v, dt));
+            return v;
+        }
+        if (v->type && v->type->kind == ir_types.IrTypeKind::Float) return dbgVal(fg, e, fg.bd.fpToSi(v, dt));
+        if (dt->kind == ir_types.IrTypeKind::Float)
+        {
+            if (v->type && v->type->width == 64) return dbgVal(fg, e, fg.bd.siToFp(v, dt));
+            return dbgVal(fg, e, fg.bd.siToFp(v, dt));
+        }
+        if (v->type && dt->width > v->type->width) return dbgVal(fg, e, fg.bd.sext(v, dt));
+        if (v->type && dt->width < v->type->width) return dbgVal(fg, e, fg.bd.trunc(v, dt));
+        return dbgVal(fg, e, fg.bd.bitcast(v, dt));
+    }
+    case ast.EX_DOT:
+    case ast.EX_ARROW:
+        {
+            ir_types.IrValue* fp = fieldAddress(fg, e);
+            if (fp != null)
+            {
+                // aggregate fields decay to their address (no load)
+                types.CType* it = expr.inferredType(e);
+                if (it != null) it = types.effective(it);
+                bool isAgg = it != null && (it->kind == types.TY_ARRAY
+                    || (it->kind == types.TY_NAMED && it->decl != null && it->decl->kind == ast.DT_STRUCT));
+                if (isAgg) return fp;
+                ir_types.IrType* ft = fp->type;
+                ir_types.IrType* et2 = ft && ft->kind == ir_types.IrTypeKind::Ptr && ft->elem ? ft->elem : fg.ctx.tyInt(64);
+                return dbgVal(fg, e, fg.bd.load(et2, fp));
+            }
+            return genExpr(fg, e->a);
+        }
+    case ast.EX_INDEX:
+    {
+        ir_types.IrValue* addr = genAddr(fg, e);
+        if (addr == null) return fg.ctx.constInt(fg.ctx.tyInt(64), 0);
+        // array/struct results decay to their address
+        types.CType* it = expr.inferredType(e);
+        if (it != null) it = types.effective(it);
+        bool isAgg = it != null && (it->kind == types.TY_ARRAY
+            || (it->kind == types.TY_NAMED && it->decl != null && it->decl->kind == ast.DT_STRUCT));
+        if (isAgg) return addr;
+        ir_types.IrType* et = it != null ? mapCType(fg, it) : fg.ctx.tyInt(64);
+        return dbgVal(fg, e, fg.bd.load(et, addr));
+    }
+    case ast.EX_DEREF:
+    {
+        ir_types.IrValue* p = genExpr(fg, e->a);
+        ir_types.IrType* et = p->type && p->type->kind==ir_types.IrTypeKind::Ptr ? p->type->elem : fg.ctx.tyInt(64);
+        return dbgVal(fg, e, fg.bd.load(et, p));
+    }
+    case ast.EX_ADDR:
+    {
+        ir_types.IrValue* ptr = genAddr(fg, e->a);
+        if (ptr != null) return ptr;
+        return genExpr(fg, e->a);
+    }
+    default:
+        return fg.ctx.constInt(fg.ctx.tyInt(64), 0);
+    }
+}
+
+void genStmt(FuncGen* fg, ast.Stmt* s);
+
+void genBlockStmts(FuncGen* fg, ast.Stmt* blk)
+{
+    if (blk == null) return;
+    if (blk->kind == ast.ST_BLOCK)
+    {
+        for (u32 i = 0; i < blk->nstmts; i++) genStmt(fg, blk->stmts[i]);
+        return;
+    }
+    genStmt(fg, blk);
+}
+
+void genStmt(FuncGen* fg, ast.Stmt* s)
+{
+    if (s == null || fg.terminated) return;
+    switch (s->kind)
+    {
+    case ast.ST_BLOCK:
+        for (u32 i = 0; i < s->nstmts; i++) genStmt(fg, s->stmts[i]);
+        break;
+    case ast.ST_VAR:
+    {
+        if (s->stmts != null && s->nstmts > 0)
+        {
+            for (u32 i = 0; i < s->nstmts; i++) genStmt(fg, s->stmts[i]);
+            break;
+        }
+        // Aggregate-returning initializers hand back STORAGE (hidden-sret
+        // destination); alias the local to it instead of copying through
+        // an extra indirection.
+        if (s->a != null && s->a.kind == ast.EX_CALL)
+        {
+            // Static callee lookup: aggregate returns hand back STORAGE
+            // (hidden-sret destination); alias the local to it instead of
+            // copying through an extra indirection. Decided WITHOUT
+            // evaluating so the initializer is emitted exactly once.
+            bool aggInit = false;
+            ast.Expr* cb = s->a.a;
+            if (cb != null)
+            {
+                str.strView cn2 = cb.kind == ast.EX_DOT || cb.kind == ast.EX_ARROW
+                    ? cb.text : cb.text;
+                for (u32 fi9 = 0; fi9 < fg.irMod.nfuncs; fi9++)
+                {
+                    if (strEq(str.strView::fromCstr(fg.irMod.funcs[fi9].base.name), cn2))
+                    {
+                        aggInit = isAggIrRet(fg.irMod.funcs[fi9].base.type);
+                        break;
+                    }
+                }
+            }
+            if (aggInit)
+            {
+                ir_types.IrValue* v0 = genExpr(fg, s.a);
+                if (v0 != null)
+                {
+                    addLocal(fg, s.text, v0);
+                    break;
+                }
+            }
+        }
+        ir_types.IrType* ty = s->type ? mapTypeExpr(fg, s->type) : fg.ctx.tyInt(64);
+        ir_types.IrInst* al = fg.bd.alloca(ty);
+        addLocal(fg, s.text, &al.base);
+        if (s->a != null)
+        {
+            ir_types.IrValue* v = genExpr(fg, s.a);
+            // implicit int->float on the initializer (f64 x = 1;)
+            if (v != null && ty != null && ty.kind == ir_types.IrTypeKind::Float
+                && v->type != null && v->type->kind == ir_types.IrTypeKind::Int)
+                v = dbgVal(fg, s.a, fg.bd.siToFp(v, ty));
+            if (v != null) fg.bd.store(v, &al.base);
+        }
+        break;
+    }
+    case ast.ST_RETURN:
+    {
+        if (s->a != null)
+        {
+            ir_types.IrValue* v = genExpr(fg, s->a);
+            // spliced inline body: return stores into the caller's slot
+            if (fg.inlineRet != null)
+            {
+                if (v != null) fg.bd.store(v, fg.inlineRet);
+                break;
+            }
+            // implicit int->float on the returned value (return 1; in f64 fn)
+            if (v != null && fg.func.retType != null
+                && fg.func.retType.kind == ir_types.IrTypeKind::Float
+                && v->type != null && v->type->kind == ir_types.IrTypeKind::Int)
+                v = dbgVal(fg, s->a, fg.bd.siToFp(v, fg.func.retType));
+            if (v != null) fg.bd.ret(v);
+            else fg.bd.retVoid();
+        } else fg.bd.retVoid();
+        fg.terminated = true;
+        break;
+    }
+    case ast.ST_EXPR:
+        if (s->a) genExpr(fg, s->a);
+        break;
+    case ast.ST_IF:
+    {
+        ir_types.IrValue* c = genExpr(fg, s->a);
+        if (c == null) c = fg.ctx.constInt(fg.ctx.tyInt(1), 0);
+        if (c->type && c->type->width != 1)
+        {
+            ir_types.IrValue* z = fg.ctx.constInt(c->type, 0);
+            c = dbgVal(fg, s->a, fg.bd.icmp(ir_opcodes.IrICmpPred::Ne, c, z));
+        }
+        ir_types.IrBlock* thenBb = fg.ctx.createBlock("if.then");
+        ir_types.IrBlock* elseBb = s->body2 ? fg.ctx.createBlock("if.else") : null;
+        ir_types.IrBlock* joinBb = fg.ctx.createBlock("if.join");
+        fg.func.addBlock(thenBb);
+        if (elseBb) fg.func.addBlock(elseBb);
+        fg.func.addBlock(joinBb);
+        if (elseBb) fg.bd.condBr(c, thenBb, elseBb);
+        else fg.bd.condBr(c, thenBb, joinBb);
+        bool savedTerm = fg.terminated;
+        fg.bd.pos(thenBb, null); fg.terminated = false;
+        genBlockStmts(fg, s->body);
+        if (!fg.terminated) fg.bd.br(joinBb);
+        if (elseBb)
+        {
+            fg.bd.pos(elseBb, null); fg.terminated = false;
+            genBlockStmts(fg, s->body2);
+            if (!fg.terminated) fg.bd.br(joinBb);
+        }
+        fg.bd.pos(joinBb, null); fg.terminated = false;
+        if (savedTerm) {}
+        break;
+    }
+    case ast.ST_WHILE:
+    {
+        ir_types.IrBlock* head = fg.ctx.createBlock("while.head");
+        ir_types.IrBlock* body = fg.ctx.createBlock("while.body");
+        ir_types.IrBlock* exit = fg.ctx.createBlock("while.exit");
+        fg.func.addBlock(head); fg.func.addBlock(body); fg.func.addBlock(exit);
+        fg.bd.br(head);
+        fg.bd.pos(head, null);
+        ir_types.IrValue* c = genExpr(fg, s->a);
+        if (c == null) c = fg.ctx.constInt(fg.ctx.tyInt(1), 0);
+        if (c->type && c->type->width != 1)
+        {
+            ir_types.IrValue* z = fg.ctx.constInt(c->type, 0);
+            c = dbgVal(fg, s->a, fg.bd.icmp(ir_opcodes.IrICmpPred::Ne, c, z));
+        }
+        fg.bd.condBr(c, body, exit);
+        fg.bd.pos(body, null); fg.terminated = false;
+        genBlockStmts(fg, s->body);
+        if (!fg.terminated) fg.bd.br(head);
+        fg.bd.pos(exit, null); fg.terminated = false;
+        break;
+    }
+    case ast.ST_FOR:
+    {
+        if (s->init) genStmt(fg, s->init);
+        ir_types.IrBlock* head = fg.ctx.createBlock("for.head");
+        ir_types.IrBlock* body = fg.ctx.createBlock("for.body");
+        ir_types.IrBlock* exit = fg.ctx.createBlock("for.exit");
+        fg.func.addBlock(head); fg.func.addBlock(body); fg.func.addBlock(exit);
+        fg.bd.br(head);
+        fg.bd.pos(head, null);
+        if (s->b != null)
+        {
+            ir_types.IrValue* c = genExpr(fg, s->b);
+            if (c == null) c = fg.ctx.constInt(fg.ctx.tyInt(1), 1);
+            if (c->type && c->type->width != 1)
+            {
+                ir_types.IrValue* z = fg.ctx.constInt(c->type, 0);
+                c = dbgVal(fg, s->b, fg.bd.icmp(ir_opcodes.IrICmpPred::Ne, c, z));
+            }
+            fg.bd.condBr(c, body, exit);
+        } else fg.bd.br(body);
+        fg.bd.pos(body, null); fg.terminated = false;
+        genBlockStmts(fg, s->body);
+        if (s->c != null && !fg.terminated) genExpr(fg, s->c);
+        if (!fg.terminated) fg.bd.br(head);
+        fg.bd.pos(exit, null); fg.terminated = false;
+        break;
+    }
+    case ast.ST_LOOP:
+    {
+        ir_types.IrBlock* body = fg.ctx.createBlock("loop.body");
+        ir_types.IrBlock* exit = fg.ctx.createBlock("loop.exit");
+        fg.func.addBlock(body); fg.func.addBlock(exit);
+        fg.bd.br(body);
+        fg.bd.pos(body, null); fg.terminated = false;
+        genBlockStmts(fg, s->body);
+        if (!fg.terminated) fg.bd.br(body);
+        fg.bd.pos(exit, null); fg.terminated = false;
+        break;
+    }
+    case ast.ST_FLAG:
+    {
+        str.strView sel = flagValueEmit(fg, s->text);
+        bool handled = false;
+        for (u32 ci = 0; ci < s->ncases; ci++)
+        {
+            ast.StmtCase* sc = s->cases[ci];
+            if (sc == null || sc->value == null) continue;
+            if (strEq(sc->value->text, sel))
+            {
+                for (u32 k = 0; k < sc->nbody; k++) genStmt(fg, sc->body[k]);
+                handled = true;
+                break;
+            }
+        }
+        if (!handled && s->defaultCase != null)
+            for (u32 k = 0; k < s->defaultCase->nbody; k++) genStmt(fg, s->defaultCase->body[k]);
+        break;
+    }
+    case ast.ST_FORIN:
+    {
+        types.CType* itTy = s->a ? expr.inferredType(s->a) : null;
+        // comptime pack iteration (for var x : args over T...): unroll — one
+        // body copy per pack element, loop var bound to that argument.
+        {
+            str.strView pname = s->a->text;
+            ir_types.IrValue** pv = null;
+            types.CType** pe = null;
+            u32 pn = 0;
+            for (u32 fi2 = fg.nIn; fi2 > 0; fi2--)
+            {
+                if (strEq(fg.inNames[fi2-1], pname))
+                {
+                    pv = fg.inVals[fi2-1]; pe = fg.inElems[fi2-1];
+                    pn = fg.inCounts[fi2-1];
+                    break;
+                }
+            }
+            if (pe != null && pn > 0)
+            {
+                types.CType* pk = itTy != null && types.effective(itTy)->kind == types.TY_PACK
+                    ? types.effective(itTy) : null;
+                u32 n2u = pk != null ? (pk->nparams < pn ? pk->nparams : pn) : pn;
+                for (u32 ei = 0; ei < n2u; ei++)
+                {
+                    types.CType* et = (pe[ei] != null) ? pe[ei]
+                        : (pk != null && pk->params != null ? pk->params[ei] : null);
+                    ir_types.IrType* etIr = et != null ? mapCType(fg, et) : fg.ctx.tyInt(64);
+                    ir_types.IrInst* va2 = fg.bd.alloca(etIr);
+                    if (pv != null && pv[ei] != null) fg.bd.store(pv[ei], &va2->base);
+                    addLocal(fg, s->text, &va2->base);
+                    if (fg.nPackVars < 16)
+                    {
+                        fg.packVarNames[fg.nPackVars] = s->text;
+                        fg.packVarTypes[fg.nPackVars] = et;
+                        fg.nPackVars++;
+                        genBlockStmts(fg, s->body);
+                        fg.nPackVars--;
+                    }
+                    else genBlockStmts(fg, s->body);
+                }
+                break;
+            }
+        }
+        types.CType* elemTy = itTy ? itTy->elem : null;
+        if (elemTy == null && itTy != null && itTy->kind == types.TY_SLICE) elemTy = itTy->elem;
+        if (elemTy == null) elemTy = s->type ? scopes.resolveTypeExpr(s->type, fg.top, fg.mods, null, 0) : null;
+        ir_types.IrType* elemIrTy = elemTy ? mapCType(fg, elemTy) : fg.ctx.tyInt(64);
+        ir_types.IrValue* container = s->a ? genExpr(fg, s->a) : null;
+        if (container == null) break;
+        ir_types.IrType* containerTy = container->type;
+        ir_types.IrValue* lenVal = null;
+        ir_types.IrValue* ptrVal = container;
+        if (itTy != null && itTy->kind == types.TY_ARRAY && itTy->countKnown) lenVal = fg.ctx.constInt(fg.ctx.tyInt(64), itTy->count);
+        else if (containerTy != null && containerTy->kind == ir_types.IrTypeKind::Ptr) lenVal = fg.ctx.constInt(fg.ctx.tyInt(64), 0);
+        else lenVal = fg.ctx.constInt(fg.ctx.tyInt(64), 0);
+        // handle slice-like container where len is field
+        if (itTy != null && (itTy->kind == types.TY_SLICE || itTy->kind == types.TY_ARRAY))
+        {
+                // for slice, need len from struct; for now use 0
+        }
+        ir_types.IrInst* idxAlloca = fg.bd.alloca(fg.ctx.tyInt(64));
+        fg.bd.store(fg.ctx.constInt(fg.ctx.tyInt(64), 0), &idxAlloca->base);
+        ir_types.IrInst* varAlloca = fg.bd.alloca(elemIrTy);
+        addLocal(fg, s->text, &varAlloca->base);
+        ir_types.IrBlock* head = fg.ctx.createBlock("forin.head");
+        ir_types.IrBlock* body = fg.ctx.createBlock("forin.body");
+        ir_types.IrBlock* exit = fg.ctx.createBlock("forin.exit");
+        fg.func.addBlock(head); fg.func.addBlock(body); fg.func.addBlock(exit);
+        fg.bd.br(head);
+        fg.bd.pos(head, null);
+        ir_types.IrValue* idxVal = dbgVal(fg, s->a, fg.bd.load(fg.ctx.tyInt(64), &idxAlloca->base));
+        ir_types.IrValue* cond = dbgVal(fg, s->a, fg.bd.icmp(ir_opcodes.IrICmpPred::Ult, idxVal, lenVal));
+        fg.bd.condBr(cond, body, exit);
+        fg.bd.pos(body, null); fg.terminated = false;
+        u32 fesz = elemTy != null ? aggSizeOf(elemTy, fg.top) : 8;
+        ir_types.IrValue* fsidx = idxVal;
+        if (fesz != 8)
+        {
+            ir_types.IrInst* fm = fg.bd.mul(idxVal, fg.ctx.constInt(fg.ctx.tyInt(64), fesz));
+            fsidx = &fm->base;
+        }
+        ir_types.IrValue* idxs[1]; idxs[0] = fsidx;
+        ir_types.IrInst* gep = fg.bd.gep(ptrVal, idxs, 1);
+        ir_types.IrValue* elem = dbgVal(fg, s->a, fg.bd.load(elemIrTy, &gep->base));
+        fg.bd.store(elem, &varAlloca->base);
+        genBlockStmts(fg, s->body);
+        if (!fg.terminated)
+        {
+            ir_types.IrValue* cur = dbgVal(fg, s->a, fg.bd.load(fg.ctx.tyInt(64), &idxAlloca->base));
+            ir_types.IrValue* one = fg.ctx.constInt(fg.ctx.tyInt(64), 1);
+            ir_types.IrValue* nxt = dbgVal(fg, s->a, fg.bd.add(cur, one));
+            fg.bd.store(nxt, &idxAlloca->base);
+            fg.bd.br(head);
+        }
+        fg.bd.pos(exit, null); fg.terminated = false;
+        break;
+    }
+    case ast.ST_BREAK:
+    case ast.ST_CONTINUE:
+        break;
+    case ast.ST_ASSERT:
+        if (s->a) genExpr(fg, s->a);
+        break;
+    case ast.ST_DEFER:
+        if (s->body) genBlockStmts(fg, s->body);
+        break;
+    case ast.ST_ASM:
+    {
+        genAsm(fg, s);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+// parseExprSnippet: run the real lexer+parser over a raw operand source
+// slice (e.g. `(u64)addr` or `length`) and return the ast.Expr. The buffer
+// stays alive for the compiler process lifetime (mman arena).
+ast.Expr* parseExprSnippet(FuncGen* fg, const char* src, u32 len)
+{
+    char* buf = mman.alloc<char>(len + 1);
+    for (u32 i = 0; i < len; i++) buf[i] = src[i];
+    buf[len] = 0;
+    lex.Lexer lx = lex.Lexer::new((const u8*)buf, len);
+    lex.LexResult lr = lx.lex();
+    if (lr.n == 0) return null;
+    str.strView sv = str.strView::fromParts(buf, len);
+    parse.Parser p = parse.Parser::new(lr.toks, lr.n, (const u8*)buf, len, sv);
+    return p.parseExpr();
+}
+
+// genAsm: lower a GCC-style extended asm block into an InlineAsm instruction.
+//
+//   asm volatile { "tmpl %0 .. %1" : "=a"(out1), "=r"(out2) : "D"(in1), "r"(in2) : "rcx", "memory" }
+//
+// Operand numbering follows GCC: outputs get %0..%nOut-1, inputs continue
+// %nOut... Input expressions are evaluated into IR values and passed as
+// instruction operands; outputs are the locals' allocas, and a register
+// -constrained first output ("=a"/"=r") receives the asm result stored back
+// after the block. Clobbers are appended to the template as a trailing
+// "# clobber:" comment line so the .wir records them for the backend.
+void genAsm(FuncGen* fg, ast.Stmt* s)
+{
+    const char* raw = s->text.ptr ? (const char*)s->text.ptr : "";
+    u32 rlen = s->text.len;
+    // slice between the outer braces
+    u32 lbrace = 0; u32 rbrace = 0;
+    for (u32 i = 0; i < rlen; i++) if (raw[i] == '{') { lbrace = i+1; break; }
+    for (u32 i = rlen; i > 0; i--) if (raw[i-1] == '}') { rbrace = i-1; break; }
+    if (lbrace >= rbrace) return;
+    const char* body = raw + lbrace;
+    u32 blen = rbrace - lbrace;
+
+    // split template / outputs / inputs / clobbers at top-level colons
+    u32 secStart[4]; u32 secLen[4]; u32 nsec = 0;
+    u32 depth = 0; bool inStr = false; u32 start = 0;
+    for (u32 i = 0; i <= blen; i++)
+    {
+        char c = i < blen ? body[i] : ':';
+        bool atEnd = i == blen;
+        if (inStr)
+        {
+            if (c == '"') inStr = false;
+            continue;
+        }
+        if (c == '"') { inStr = true; continue; }
+        if (c == '(' || c == '[') { depth++; continue; }
+        if (c == ')' || c == ']') { if (depth) depth--; continue; }
+        if ((c == ':' && depth == 0) || atEnd)
+        {
+            if (nsec < 4) { secStart[nsec] = start; secLen[nsec] = i - start; nsec++; }
+            start = i + 1;
+            if (atEnd) break;
+        }
+    }
+
+    // template: concatenated string literals with escapes resolved
+    str.String tmpl = str.String::new();
+    {
+        u32 ts = secStart[0], tl = nsec > 0 ? secLen[0] : 0;
+        u32 i = 0;
+        while (i < tl)
+        {
+            if (body[ts + i] != '"') { i++; continue; }
+            i++;
+            while (i < tl && body[ts + i] != '"')
+            {
+                char c = body[ts + i];
+                if (c == '\\' && i + 1 < tl)
+                {
+                    char n = body[ts + i + 1];
+                    if (n == 'n') tmpl.pushChar('\n');
+                    else if (n == 't') tmpl.pushChar('\t');
+                    else if (n == '\\') tmpl.pushChar('\\');
+                    else if (n == '"') tmpl.pushChar('"');
+                    else if (n == '0') tmpl.pushChar('\0');
+                    else { tmpl.pushChar('\\'); tmpl.pushChar(n); }
+                    i += 2;
+                    continue;
+                }
+                tmpl.pushChar(c);
+                i++;
+            }
+            i++;
+        }
+    }
+
+    // operand list parser: "constr"(expr) pairs -> constraints + exprs
+    const u32 MAXOP = 16;
+    ast.Expr* outExprs[16];
+    ast.Expr* inExprs[16];
+    char outConstr[192];
+    char inConstr[192];
+    u32 nOut = 0;
+    u32 nIn = 0;
+    for (u32 z = 0; z < 192; z++) { outConstr[z] = 0; inConstr[z] = 0; }
+    for (u32 sec = 1; sec < 3 && sec < nsec; sec++)
+    {
+        u32 ss = secStart[sec], sl = secLen[sec];
+        u32 i = 0;
+        while (i < sl)
+        {
+            while (i < sl && (body[ss+i] == ' ' || body[ss+i] == ',' || body[ss+i] == '\n' || body[ss+i] == '\t')) i++;
+            if (i >= sl || body[ss+i] != '"') break;
+            i++;
+            char* dst = (sec == 1) ? outConstr + nOut * 12 : inConstr + nIn * 12;
+            u32 ci = 0;
+            while (i < sl && body[ss+i] != '"' && ci < 11) { dst[ci++] = body[ss+i]; i++; }
+            dst[ci] = 0;
+            if (i < sl && body[ss+i] == '"') i++;
+            while (i < sl && (body[ss+i] == ' ' || body[ss+i] == '(')) i++;
+            // capture the parenthesized expr source
+            u32 d = 1; u32 es = i;
+            while (i < sl && d > 0)
+            {
+                char c = body[ss+i];
+                if (c == '(') d++;
+                else if (c == ')') d--;
+                if (d == 0) break;
+                i++;
+            }
+            u32 el = i > es ? i - es : 0;
+            if (i < sl) i++;
+            if (el == 0) continue;
+            // re-parse through the real parser by wrapping in parens
+            ast.Expr* parsed = parseExprSnippet(fg, body + ss + es, el);
+            if (parsed == null) continue;
+            if (sec == 1 && nOut < MAXOP) { outExprs[nOut++] = parsed; }
+            else if (sec == 2 && nIn < MAXOP) { inExprs[nIn++] = parsed; }
+        }
+    }
+
+    // clobbers: quoted names appended as a comment on the template
+    if (nsec >= 4 && secLen[3] > 0)
+    {
+        u32 cs = secStart[3], cl = secLen[3];
+        bool any = false;
+        for (u32 i = 0; i < cl; i++) if (body[cs+i] == '"') { any = true; break; }
+        if (any)
+        {
+            tmpl.pushView(str.strView::fromCstr("\n\t# clobber:"));
+            bool lastQ = true;
+            for (u32 i = 0; i < cl; i++)
+            {
+                char c = body[cs+i];
+                if (c == '"') { if (!lastQ) tmpl.pushChar(' '); lastQ = false; continue; }
+                if (!lastQ) tmpl.pushChar(c);
+            }
+        }
+    }
+
+    // evaluate input operands into IR values
+    ir_types.IrValue* args[2 * MAXOP];
+    u32 nargs = 0;
+    ir_types.IrType* retTy = fg.ctx.tyVoid();
+    ir_types.IrValue* regOutPtr = null;
+    for (u32 k = 0; k < nOut && k < MAXOP; k++)
+    {
+        ast.Expr* oe = outExprs[k];
+        ir_types.IrValue* ptr = null;
+        if (oe->kind == ast.EX_IDENT) ptr = findLocal(fg, oe->text);
+        else if (oe->kind == ast.EX_UNARY && opEq(oe->text, "*")) ptr = genExpr(fg, oe->a);
+        else if (oe->kind == ast.EX_DEREF) ptr = genExpr(fg, oe->a);
+        if (ptr == null) continue;
+        args[nargs++] = ptr;
+        // first '='-constrained output bound to a register receives rax/ret
+        bool isWrite = false;
+        for (u32 q = 0; q < 11 && outConstr[k * 12 + q]; q++) if (outConstr[k * 12 + q] == '=') { isWrite = true; break; }
+        if (isWrite && regOutPtr == null)
+        {
+            bool isReg = false;
+            for (u32 q = 0; q < 11 && outConstr[k * 12 + q]; q++)
+            {
+                char cc = outConstr[k * 12 + q];
+                if (cc == 'a' || cc == 'r') { isReg = true; break; }
+            }
+            if (isReg)
+            {
+                regOutPtr = ptr;
+                ir_types.IrType* et = ptr->type;
+                if (et && et->kind == ir_types.IrTypeKind::Ptr && et->elem) retTy = et->elem;
+            }
+        }
+    }
+    for (u32 k = 0; k < nIn && k < MAXOP; k++)
+    {
+        ir_types.IrValue* v = genExpr(fg, inExprs[k]);
+        if (v == null) v = fg.ctx.constInt(fg.ctx.tyInt(64), 0);
+        args[nargs++] = v;
+    }
+
+    // emit
+    u32 tlen = tmpl.len;
+    char* tcopy = mman.alloc<char>(tlen + 1);
+    for (u32 i = 0; i < tlen; i++) tcopy[i] = tmpl.ptr[i];
+    tcopy[tlen] = 0;
+    tmpl.free();
+    ir_types.IrInst* ia = fg.bd.inlineAsm(tcopy, args, nargs, retTy);
+    setDbgStmt(fg, ia, s);
+    // write the register-constrained result back to its variable slot
+    if (regOutPtr != null && retTy->kind != ir_types.IrTypeKind::Void)
+        fg.bd.store(&ia->base, regOutPtr);
+}
+
+// Struct blocks in .wir are display-only (no backend or pass consumes
+// mod.structs; field offsets are computed independently by
+// structFieldOffset). Off by default; flip for IR inspection.
+pub bool gIrDumpStructs = false;
+
+void dumpIR(ir_types.IrModule* irMod, void* f)
+{
+    const char* hdr = "; WallVM IR\n";
+    u64 n = 0; while (hdr[n]) n++; libc.fwrite((u8*)hdr,1,n,f);
+    // structs
+    if (gIrDumpStructs)
+    for (u32 i = 0; i < irMod.nstructs; i++)
+    {
+        ir_types.IrStructType* st = irMod.structs[i];
+        if (!st || !st.name) continue;
+        libc.fwrite((u8*)"struct @",1,8,f);
+        u64 nl=0; while(st.name[nl]) nl++; libc.fwrite((u8*)st.name,1,nl,f);
+        char hb[32]; i32 hn = libc.snprintf(hb,32," size=%u {\n", st.size);
+        if (hn>0) libc.fwrite((u8*)hb,1,(u64)hn,f);
+        for (u32 k = 0; k < st.nfields; k++)
+        {
+            const char* ft = st.fieldTypes[k] ? ir_types.irTypeStr(st.fieldTypes[k]) : "?";
+            const char* fn2 = st.fieldNames[k] ? st.fieldNames[k] : "?";
+            libc.fwrite((u8*)"  ",1,2,f);
+            u64 fl=0; while(ft[fl]) fl++; libc.fwrite((u8*)ft,1,fl,f);
+            libc.fwrite((u8*)" ",1,1,f);
+            u64 fl2=0; while(fn2[fl2]) fl2++; libc.fwrite((u8*)fn2,1,fl2,f);
+            char ob[32]; i32 on = libc.snprintf(ob,32," @%u\n", st.offsets ? st.offsets[k] : 0);
+            if (on>0) libc.fwrite((u8*)ob,1,(u64)on,f);
+        }
+        libc.fwrite((u8*)"}\n",1,2,f);
+    }
+    // globals
+    for (u32 i = 0; i < irMod.nglobals; i++)
+    {
+        ir_types.IrGlobal* g = irMod.globals[i];
+        if (!g || !g.base.name) continue;
+        if (g.isExtern) libc.fwrite((u8*)"extern ",1,7,f);
+        libc.fwrite((u8*)"global @",1,8,f);
+        u64 nl=0; while(g.base.name[nl]) nl++; libc.fwrite((u8*)g.base.name,1,nl,f);
+        const char* gt = g.base.type ? ir_types.irTypeStr(g.base.type) : "?";
+        libc.fwrite((u8*)" : ",1,3,f);
+        u64 tl=0; while(gt[tl]) tl++; libc.fwrite((u8*)gt,1,tl,f);
+        libc.fwrite((u8*)"\n",1,1,f);
+    }
+    libc.fwrite((u8*)"\n",1,1,f);
+    for (u32 i = 0; i < irMod.nfuncs; i++)
+    {
+        ir_types.IrFunc* fn = irMod.funcs[i];
+        const char* fnName = fn.base.name ? fn.base.name : "anon";
+        u64 l=0; while(fnName[l]) l++;
+        const char* rt = fn.retType ? ir_types.irTypeStr(fn.retType) : "void";
+        u64 rl=0; while(rt[rl]) rl++;
+        if (fn.isExtern)
+        {
+            // one-liner: `extern func @name -> ret {}`
+            libc.fwrite((u8*)"extern func @",1,13,f);
+            libc.fwrite((u8*)fnName,1,l,f);
+            libc.fwrite((u8*)" -> ",1,4,f);
+            libc.fwrite((u8*)rt,1,rl,f);
+            libc.fwrite((u8*)" {}\n\n",1,5,f);
+            continue;
+        }
+        libc.fwrite((u8*)"func @",1,6,f);
+        libc.fwrite((u8*)fnName,1,l,f);
+        libc.fwrite((u8*)" -> ",1,4,f);
+        libc.fwrite((u8*)rt,1,rl,f);
+        libc.fwrite((u8*)" {\n",1,3,f);
+        for (u32 b = 0; b < fn.nblocks; b++)
+        {
+            ir_types.IrBlock* bb = fn.blocks[b];
+            const char* bn = bb.base.name ? bb.base.name : "bb";
+            libc.fwrite((u8*)"  block %",1,9,f);
+            u64 bl=0; while(bn[bl]) bl++; libc.fwrite((u8*)bn,1,bl,f);
+            libc.fwrite((u8*)":\n",1,2,f);
+            for (u32 k = 0; k < bb.ninsts; k++)
+            {
+                ir_types.IrInst* ins = bb.insts[k];
+                const char* op = ir_opcodes.irOpcodeStr(ins.opcode);
+                libc.fwrite((u8*)"    %",1,5,f);
+                u8 idb[32]; i32 nid = libc.snprintf(idb,32,"%u = ", ins.base.id);
+                if (nid>0) libc.fwrite(idb,1,(u64)nid,f);
+                u64 ol=0; while(op[ol]) ol++; libc.fwrite((u8*)op,1,ol,f);
+                if (ins.base.type)
+                {
+                    const char* ts = ir_types.irTypeStr(ins.base.type);
+                    libc.fwrite((u8*)" ",1,1,f);
+                    u64 tl=0; while(ts[tl]) tl++; libc.fwrite((u8*)ts,1,tl,f);
+                }
+                if (ins.nops > 0)
+                {
+                    libc.fwrite((u8*)" [",1,2,f);
+                    for (u32 o = 0; o < ins.nops; o++)
+                    {
+                        if (o>0) libc.fwrite((u8*)", ",1,2,f);
+                        ir_types.IrValue* v = ins.ops[o];
+                        if (v == null) { libc.fwrite((u8*)"null",1,4,f); continue; }
+                        if (v->kind == ir_types.IrValueKind::ConstInt)
+                        {
+                            // InlineAsm's first operand carries the asm text as
+                            // a pointer constant; render the string itself.
+                            if (ins.opcode == ir_opcodes.IrOpcode::InlineAsm && o == 0 && v.valData != 0)
+                            {
+                                const char* astr = (const char*)(u64)v.valData;
+                                libc.fwrite((u8*)"\"",1,1,f);
+                                u64 al = 0; while (astr[al]) al++;
+                                libc.fwrite((u8*)astr,1,al,f);
+                                libc.fwrite((u8*)"\"",1,1,f);
+                            }
+                            else
+                            {
+                                u8 nb[32]; i32 nn = libc.snprintf(nb,32,"%lu", v.valData);
+                                if (nn>0) libc.fwrite(nb,1,(u64)nn,f);
+                            }
+                        } else if (v->kind == ir_types.IrValueKind::ConstFloat)
+                        {
+                            libc.fwrite((u8*)"float",1,5,f);
+                        } else {
+                            u8 nb[32]; i32 nn = libc.snprintf(nb,32,"%%%u", v.id);
+                            if (nn>0) libc.fwrite(nb,1,(u64)nn,f);
+                            if (v->name) { libc.fwrite((u8*)"(",1,1,f);
+                                u64 vl=0;
+                                while(v->name[vl]) vl++;
+                                libc.fwrite((u8*)v->name,1,vl,f);
+                                libc.fwrite((u8*)")",1,1,f);
+                            }
+                        }
+                    }
+                    libc.fwrite((u8*)"]",1,1,f);
+                }
+                libc.fwrite((u8*)"\n",1,1,f);
+            }
+        }
+        libc.fwrite((u8*)"}\n\n",1,3,f);
+    }
+}
+
+pub ir_types.IrModule* buildModule(ast.Program* prog, scopes.Scope* top,
+                                    scopes.ModuleTable* mods, loader.Loader* ld,
+                                    str.strView path,
+                                    u32 optLevel, bool debug,
+                                    ir_types.IrContext** outCtx)
+{
+    ir_types.IrContext* ctx = ir_types.irCtxCreate();
+    char mn[256]; u32 ml = 0;
+    for (u32 i = 0; i < path.len && ml < 255; i++)
+    {
+        u8 c = path.ptr[i];
+        if (c == '/' || c == '\\') mn[ml++] = '_';
+        else if (c == '.' ) break;
+        else mn[ml++] = (char)c;
+    }
+    mn[ml]=0;
+    if (ml==0) { mn[0]='m'; mn[1]='o'; mn[2]='d'; mn[3]=0; }
+    ir_types.IrModule* irMod = ctx.createModule(mn);
+    *outCtx = ctx;
+
+    // pass 1: signatures. Every func/extern gets its IrFunc BEFORE any
+    // body is generated, so calls resolve regardless of decl order (forward
+    // refs and imported-module members included).
+    u32 nd = prog.ndecls;
+    ir_types.IrFunc** fns = mman.alloc<ir_types.IrFunc*>(nd > 0 ? nd : 1);
+    for (u32 i = 0; i < nd; i++) fns[i] = null;
+    for (u32 i = 0; i < nd; i++)
+    {
+        ast.Decl* d = prog.decls[i];
+        if (d == null) continue;
+        // struct types: reorder/pack layout, registered in the module
+        if (d->kind == ast.DT_STRUCT && d->ngenerics == 0)
+        {
+            bool isPacked = d->layoutMode == 2 || d->layoutMode == 3;
+            bool isReorder = d->layoutMode == 1 || d->layoutMode == 3;
+            u32 nf = d->nfields;
+            if (nf == 0) continue;
+            ir_types.IrType** fTypes = mman.alloc<ir_types.IrType*>(nf);
+            char** fNames = mman.alloc<char*>(nf);
+            u32* order = null;
+            if (isReorder && nf > 1)
+            {
+                order = mman.alloc<u32>(nf);
+                for (u32 f = 0; f < nf; f++) order[f] = f;
+                for (u32 a = 0; a < nf; a++)
+                    for (u32 b = a+1; b < nf; b++)
+                    {
+                        types.CType* ta = scopes.resolveTypeExpr(d->fields[order[a]].type, top, mods, null, 0);
+                        types.CType* tb = scopes.resolveTypeExpr(d->fields[order[b]].type, top, mods, null, 0);
+                        u32 sa = aggSizeOf(ta, top);
+                        u32 sb = aggSizeOf(tb, top);
+                        u32 aa = aggAlignOf(ta, top);
+                        u32 ab = aggAlignOf(tb, top);
+                        bool swap = false;
+                        if (aa != ab) swap = ab > aa;
+                        else swap = sb > sa;
+                        if (swap) { u32 tmp = order[a]; order[a]=order[b]; order[b]=tmp; }
+                    }
+            }
+            for (u32 idx = 0; idx < nf; idx++)
+            {
+                u32 f = isReorder ? order[idx] : idx;
+                types.CType* ft = scopes.resolveTypeExpr(d->fields[f].type, top, mods, null, 0);
+                ir_types.IrType* irt = ft ? null : ctx.tyInt(8);
+                if (ft != null)
+                {
+                    FuncGen tmpFg; tmpFg.ctx = ctx; tmpFg.top = top; tmpFg.mods = mods;
+                    irt = mapCType(&tmpFg, ft);
+                }
+                fTypes[idx] = irt ? irt : ctx.tyInt(8);
+                u32 nl = d->fields[f].name.len;
+                char* nc = mman.alloc<char>(nl+1);
+                for (u32 k = 0; k < nl; k++) nc[k] = (char)d->fields[f].name.ptr[k];
+                nc[nl]=0;
+                fNames[idx] = nc;
+            }
+            if (order) mman.dealloc<u32>(order);
+            char nb[256]; u32 nbl = 0;
+            for (u32 k = 0; k < d->name.len && nbl < 255; k++) nb[nbl++] = (char)d->name.ptr[k];
+            nb[nbl]=0;
+            ir_types.IrStructType* st = ctx.createStructType(nb, fTypes, fNames, nf);
+            if (isPacked)
+            {
+                // packed modes strip every gap; fieldTypes already in layout
+                // order (sorted when reorder is set).
+                u32 cur = 0;
+                for (u32 fi = 0; fi < st->nfields; fi++)
+                {
+                    st->offsets[fi] = cur;
+                    cur += ctx.irTypeSizeOf(st->fieldTypes[fi]);
+                }
+                st->size = cur;
+            }
+            irMod.addStruct(st);
+            continue;
+        }
+        if (d->kind == ast.DT_FLAG) continue;
+        // extern variables (linker-provided symbols like __bss_start,
+        // or exported module-level vars). Emitted as IrGlobals.
+        if (d->kind == ast.DT_EXTERN && d->isVar)
+        {
+            u32 vl = d->name.len;
+            if (vl == 0 || vl > 255) continue;
+            char vb[256]; u32 vbl = 0;
+            for (u32 k = 0; k < vl; k++) vb[vbl++] = (char)d->name.ptr[k];
+            vb[vbl]=0;
+            FuncGen vfg; mman.zero<FuncGen>(&vfg, 1); vfg.ctx = ctx; vfg.top = top; vfg.mods = mods; vfg.prog = prog; vfg.ld = ld;
+            types.CType* vct = d->type ? scopes.resolveTypeExpr(d->type, top, mods, null, 0) : null;
+            ir_types.IrType* vt = vct ? mapCType(&vfg, vct) : ctx.tyInt(64);
+            ir_types.IrGlobal* vg = ctx.createGlobal(vb, vt, false, true, null, 0);
+            irMod.addGlobal(vg);
+            continue;
+        }
+        // module-level variables: zero-initialised globals
+        if (d->kind == ast.DT_VAR && d->ngenerics == 0)
+        {
+            u32 vl = d->name.len;
+            if (vl == 0 || vl > 255) continue;
+            char vb[256]; u32 vbl = 0;
+            for (u32 k = 0; k < vl; k++) vb[vbl++] = (char)d->name.ptr[k];
+            vb[vbl]=0;
+            FuncGen vfg; mman.zero<FuncGen>(&vfg, 1); vfg.ctx = ctx; vfg.top = top; vfg.mods = mods; vfg.prog = prog; vfg.ld = ld;
+            types.CType* vct = d->type ? scopes.resolveTypeExpr(d->type, top, mods, null, 0) : null;
+            ir_types.IrType* vt = vct ? mapCType(&vfg, vct) : ctx.tyInt(64);
+            ir_types.IrGlobal* vg = ctx.createGlobal(vb, vt, false, false, null, 0);
+            irMod.addGlobal(vg);
+            continue;
+        }
+        bool isFunc = (d->kind == ast.DT_FUNC) || (d->kind == ast.DT_EXTERN && d->isVar == false);
+        if (!isFunc) continue;
+        if (d->ngenerics > 0) continue;
+        // inline fns and comptime-variadic generics expand at call sites;
+        // never emit standalone copies
+        if (d->isInline || (d->variadic && d->nparams > 0))
+        {
+            if (libc.getenv("CORAL_DEBUG_VARIADIC") != null)
+            {
+                char dbs[96];
+                i32 dns = libc.snprintf(dbs, 96, "[skip-stub] %.*s\n", (int)d->name.len, d->name.ptr);
+                if (dns > 0) libc.write(2, dbs, (u64)dns);
+            }
+            continue;
+        }
+        {
+            u32 nl9 = d->name.len;
+            bool skipN = nl9 > 8 && libc.memcmp((const void*)d->name.ptr, (const void*)"_fprint", 7) == 0;
+            if (skipN && libc.getenv("CORAL_DEBUG_VARIADIC") != null)
+            {
+                char dbs2[96];
+                i32 dns2 = libc.snprintf(dbs2, 96, "[pass1-see] %.*s\n", (int)nl9, d->name.ptr);
+                if (dns2 > 0) libc.write(2, dbs2, (u64)dns2);
+            }
+        }
+        u32 nl = d->name.len;
+        if (nl == 0 || nl > 255) continue;
+        char nb[256]; u32 nbl = 0;
+        for (u32 k = 0; k < nl; k++) nb[nbl++] = (char)d->name.ptr[k];
+        nb[nbl]=0;
+        FuncGen sfg; mman.zero<FuncGen>(&sfg, 1); sfg.ctx = ctx; sfg.top = top; sfg.mods = mods; sfg.prog = prog; sfg.ld = ld;
+        types.CType* rct = d->type ? scopes.resolveTypeExpr(d->type, top, mods, null, 0) : null;
+        ir_types.IrType* rt = rct ? mapCType(&sfg, rct) : ctx.tyVoid();
+        if (d->noreturn) rt = ctx.tyVoid();
+        bool sretP = rt != null && rt.kind == ir_types.IrTypeKind::Array && rt.elem != null
+            && rt.elem.kind == ir_types.IrTypeKind::Int && rt.elem.width == 8;
+        u32 sretOff = sretP ? 1u : 0u;
+        u32 np = d->nparams + sretOff;
+        ir_types.IrType** ptys = null;
+        if (np > 0)
+        {
+            ptys = mman.alloc<ir_types.IrType*>(np);
+            if (sretP) ptys[0] = sfg.ctx.tyPtr(rt);
+            for (u32 k = 0; k < d->nparams; k++)
+                ptys[k + sretOff] = d->params[k].type ? mapCType(&sfg, scopes.resolveTypeExpr(d->params[k].type, top, mods, null, 0)) : ctx.tyInt(64);
+        }
+        // dedupe: a name already present keeps the first entry
+        bool dup = false;
+        for (u32 k = 0; k < irMod.nfuncs; k++)
+            if (strEq(str.strView::fromCstr(irMod.funcs[k].base.name), str.strView::fromParts(nb, nl))) { dup = true; break; }
+        ir_types.IrFunc* fn = ctx.createFunc(nb, rt, ptys, np);
+        // createFunc hardcodes isVararg=false on the value's Func type; the
+        // x86_64 backend needs the real flag to emit %al setup for
+        // C-variadic calls (printf & friends).
+        if (d->variadic)
+            fn.base.type = ctx.tyFunc(rt, ptys, np, true);
+        bool isExternLinkage = (d->kind == ast.DT_EXTERN && d->isVar == false);
+        if (isExternLinkage)
+        {
+            fn.isExtern = true;
+            if (d->cc.len > 0)
+            {
+                char* cc = mman.alloc<char>(d->cc.len + 1);
+                for (u32 k = 0; k < d->cc.len; k++) cc[k] = (char)d->cc.ptr[k];
+                cc[d->cc.len]=0;
+                fn.externLib = cc;
+            }
+        }
+        irMod.addFunc(fn);
+        fns[i] = fn;
+        if (dup) { /* keep first; second entry unused for bodygen */ }
+    }
+
+    // pass 1b: methods (struct bodies + method blocks) and monomorphized
+    // generic instances become real IrFuncs under mangled names
+    // (<Struct>__<T>__<method>); call sites resolve the same names.
+    u32 jobCap = prog.ndecls * 4 + subst.gNInsts + 8;
+    ast.Decl** jobDecls = mman.alloc<ast.Decl*>(jobCap);
+    ir_types.IrFunc** jobFns = mman.alloc<ir_types.IrFunc*>(jobCap);
+    bool* jobMono = mman.alloc<bool>(jobCap);
+    types.CType*** jobTargs = mman.alloc<types.CType**>(jobCap);
+    u32* jobNt = mman.alloc<u32>(jobCap);
+    u64** jobCvals = mman.alloc<u64*>(jobCap);
+    u32* jobNc = mman.alloc<u32>(jobCap);
+    u32 nJobs = 0;
+
+    for (u32 i = 0; i < nd; i++)
+    {
+        ast.Decl* d = prog.decls[i];
+        if (d == null) continue;
+        if (d->kind != ast.DT_STRUCT) continue;
+        if (d->ngenerics > 0) continue; // generic structs come via subst registry
+        for (u32 mi = 0; mi < d->ndecls; mi++)
+        {
+            ast.Decl* md = d->decls[mi];
+            if (md == null || md->kind != ast.DT_FUNC || md->body == null) continue;
+            str.String mn = methodName3(d->name, str.strView::empty(), md->name);
+            bool dupm = false;
+            for (u32 k = 0; k < irMod.nfuncs; k++)
+                if (strEq(str.strView::fromCstr(irMod.funcs[k].base.name), str.strView::fromParts(mn.ptr, mn.len))) { dupm = true; break; }
+            if (dupm) { mn.free(); continue; }
+            FuncGen mfg; mman.zero<FuncGen>(&mfg, 1); mfg.ctx = ctx; mfg.top = top; mfg.mods = mods; mfg.prog = prog; mfg.ld = ld;
+            types.CType* rct2 = md->type ? scopes.resolveTypeExpr(md->type, top, mods, md->generics, md->ngenerics) : null;
+            ir_types.IrType* rt2 = rct2 ? mapCType(&mfg, rct2) : ctx.tyVoid();
+            bool needSelf2 = methodNeedsSelf(md);
+            bool sret2 = declHasAggRet(&mfg, md);
+            u32 base2 = (needSelf2 ? 1u : 0u) + (sret2 ? 1u : 0u);
+            u32 np2 = md->nparams + base2;
+            ir_types.IrType** ptys2 = null;
+            if (np2 > 0)
+            {
+                ptys2 = mman.alloc<ir_types.IrType*>(np2);
+                if (needSelf2)
+                {
+                    ast.Decl* sdOwn2 = findStructByName(prog, md->structName);
+                    types.CType* sel2 = sdOwn2 != null ? scopes.namedType(sdOwn2, md->structName, md->line, md->col) : null;
+                    types.CType* sptr2 = mman.alloc<types.CType>(1);
+                    sptr2.kind = types.TY_PTR;
+                    sptr2.elem = sel2;
+                    ptys2[sret2 ? 1u : 0u] = mapCType(&mfg, sptr2);
+                }
+                for (u32 k = 0; k < md->nparams; k++)
+                    ptys2[k + base2] = md->params[k].type ? mapCType(&mfg, scopes.resolveTypeExpr(md->params[k].type, top, mods, md->generics, md->ngenerics)) : ctx.tyInt(64);
+            }
+            ir_types.IrFunc* mfn = ctx.createFunc(mn.asCstr(), rt2, ptys2, np2);
+            irMod.addFunc(mfn);
+            if (nJobs < jobCap) { jobDecls[nJobs] = md; jobFns[nJobs] = mfn; jobMono[nJobs] = false; jobTargs[nJobs] = null; jobNt[nJobs] = 0; nJobs++; }
+            mn.free();
+        }
+    }
+    // method blocks: `Name { ... }` decls outside the struct body
+    for (u32 i = 0; i < nd; i++)
+    {
+        ast.Decl* d = prog.decls[i];
+        if (d == null || d->kind != ast.DT_METHODBLOCK || d->structName.len == 0) continue;
+        ast.Decl* sd = findStructByName(prog, d->structName);
+        if (sd == null || sd->ngenerics > 0) continue;
+        for (u32 mi = 0; mi < d->ndecls; mi++)
+        {
+            ast.Decl* md = d->decls[mi];
+            if (md == null || md->kind != ast.DT_FUNC || md->body == null) continue;
+            str.String mn = methodName3(sd->name, str.strView::empty(), md->name);
+            bool dupm = false;
+            for (u32 k = 0; k < irMod.nfuncs; k++)
+                if (strEq(str.strView::fromCstr(irMod.funcs[k].base.name), str.strView::fromParts(mn.ptr, mn.len))) { dupm = true; break; }
+            if (dupm) { mn.free(); continue; }
+            FuncGen mfg; mman.zero<FuncGen>(&mfg, 1); mfg.ctx = ctx; mfg.top = top; mfg.mods = mods; mfg.prog = prog; mfg.ld = ld;
+            types.CType* rct2 = md->type ? scopes.resolveTypeExpr(md->type, top, mods, md->generics, md->ngenerics) : null;
+            ir_types.IrType* rt2 = rct2 ? mapCType(&mfg, rct2) : ctx.tyVoid();
+            bool needSelf2 = methodNeedsSelf(md);
+            bool sret2 = declHasAggRet(&mfg, md);
+            u32 base2 = (needSelf2 ? 1u : 0u) + (sret2 ? 1u : 0u);
+            u32 np2 = md->nparams + base2;
+            ir_types.IrType** ptys2 = null;
+            if (np2 > 0)
+            {
+                ptys2 = mman.alloc<ir_types.IrType*>(np2);
+                if (needSelf2)
+                {
+                    ast.Decl* sdOwn2 = findStructByName(prog, md->structName);
+                    types.CType* sel2 = sdOwn2 != null ? scopes.namedType(sdOwn2, md->structName, md->line, md->col) : null;
+                    types.CType* sptr2 = mman.alloc<types.CType>(1);
+                    sptr2.kind = types.TY_PTR;
+                    sptr2.elem = sel2;
+                    ptys2[sret2 ? 1u : 0u] = mapCType(&mfg, sptr2);
+                }
+                for (u32 k = 0; k < md->nparams; k++)
+                    ptys2[k + base2] = md->params[k].type ? mapCType(&mfg, scopes.resolveTypeExpr(md->params[k].type, top, mods, md->generics, md->ngenerics)) : ctx.tyInt(64);
+            }
+            ir_types.IrFunc* mfn = ctx.createFunc(mn.asCstr(), rt2, ptys2, np2);
+            irMod.addFunc(mfn);
+            if (nJobs < jobCap) { jobDecls[nJobs] = md; jobFns[nJobs] = mfn; jobMono[nJobs] = false; jobTargs[nJobs] = null; jobNt[nJobs] = 0; nJobs++; }
+            mn.free();
+        }
+    }
+    // monomorphized instances from the registry
+    for (u32 si = 0; si < subst.gNInsts; si++)
+    {
+        subst.MonoInst itv = subst.gInsts[si];
+        ast.Decl* g = itv.g;
+        if (g == null || g->body == null) continue;
+        // inline fns and comptime-variadic generics expand at call sites
+        if (g.isInline || (g.variadic && g.nparams > 0)) continue;
+        if (libc.getenv("CORAL_DEBUG_VARIADIC") != null)
+        {
+            char db4[128];
+            i32 dn4 = libc.snprintf(db4, 128, "[cg-inst] g=%.*s nt=%u nc=%u\n",
+                (int)g->name.len, g->name.ptr, itv.nt, itv.nc);
+            if (dn4 > 0) libc.write(2, db4, (u64)dn4);
+            for (u32 ti2 = 0; ti2 < itv.nt; ti2++)
+            {
+                str.strView tn3 = itv.targs[ti2] != null ? types.typeName(itv.targs[ti2]) : str.strView::fromCstr("<null>");
+                char db5[96];
+                i32 dn5 = libc.snprintf(db5, 96, "[cg-inst]   targ%u=%.*s\n", ti2, (int)tn3.len, tn3.ptr);
+                if (dn5 > 0) libc.write(2, db5, (u64)dn5);
+            }
+        }
+        // targs display joined with ','
+        str.String tdisp = str.String::new();
+        for (u32 ti = 0; ti < itv.nt; ti++)
+        {
+            if (ti > 0) tdisp.pushChar(',');
+            if (itv.targs[ti] != null) tdisp.pushView(types.typeName(itv.targs[ti]));
+        }
+        for (u32 ci = 0; ci < itv.nc; ci++)
+        {
+            if (itv.nt + ci > 0) tdisp.pushChar(',');
+            char b[24];
+            i32 n2 = libc.snprintf(b, 24, "%llu", itv.cvals[ci]);
+            for (i32 k2 = 0; k2 < n2; k2++) tdisp.pushChar(b[k2]);
+        }
+        str.strView owner = g->structName.len > 0 ? g->structName : g->name;
+        str.String mn = methodName3(owner, tdisp.asView(), g->structName.len > 0 ? g->name : g->name);
+        tdisp.free();
+        bool dupm = false;
+        for (u32 k = 0; k < irMod.nfuncs; k++)
+            if (strEq(str.strView::fromCstr(irMod.funcs[k].base.name), str.strView::fromParts(mn.ptr, mn.len))) { dupm = true; break; }
+        if (dupm) { mn.free(); continue; }
+        // generic parameter names live on the OWNING STRUCT for methods
+        str.strView* gnamesE = g.generics;
+        u32 ngE = g.ngenerics;
+        {
+            ast.Decl* own9 = findStructByName(prog, g.structName);
+            if (own9 == null && ld != null)
+            {
+                for (u32 pi8 = 0; pi8 < ld.n && own9 == null; pi8++)
+                {
+                    ast.Program* pp8 = ld.progs[pi8];
+                    if (pp8 == null) continue;
+                    for (u32 di8 = 0; di8 < pp8.ndecls; di8++)
+                    {
+                        ast.Decl* cd8 = pp8.decls[di8];
+                        if (cd8 != null && cd8.kind == ast.DT_STRUCT && strEq(cd8.name, g.structName)) { own9 = cd8; break; }
+                    }
+                }
+            }
+            if (own9 != null) { gnamesE = own9.generics; ngE = own9.ngenerics; }
+        }
+        subst.push(gnamesE, itv.targs, ngE > itv.nt ? itv.nt : ngE);
+        if (itv.nc > 0 && ngE >= itv.nc)
+        {
+            str.strView cn3[16];
+            u64 cv3[16];
+            u32 base3c = ngE - itv.nc;
+            for (u32 k = 0; k < itv.nc && k < 16; k++)
+            {
+                cn3[k] = gnamesE[base3c + k];
+                cv3[k] = itv.cvals[k];
+            }
+            subst.pushConsts(cn3, cv3, itv.nc);
+        }
+        FuncGen mfg; mman.zero<FuncGen>(&mfg, 1); mfg.ctx = ctx; mfg.top = top; mfg.mods = mods; mfg.prog = prog; mfg.ld = ld;
+        types.CType* rct3 = g->type ? scopes.resolveTypeExpr(g->type, top, mods, g->generics, g->ngenerics) : null;
+        ir_types.IrType* rt3 = rct3 ? mapCType(&mfg, rct3) : ctx.tyVoid();
+        bool needSelf3 = methodNeedsSelf(g);
+        bool sret3 = rt3 != null && rt3.kind == ir_types.IrTypeKind::Array && rt3.elem != null
+            && rt3.elem.kind == ir_types.IrTypeKind::Int && rt3.elem.width == 8;
+        u32 sretOff3 = sret3 ? 1u : 0u;
+        u32 base3 = (needSelf3 ? 1u : 0u) + sretOff3;
+        u32 np3 = g->nparams + base3;
+        ir_types.IrType** ptys3 = null;
+        if (np3 > 0)
+        {
+            ptys3 = mman.alloc<ir_types.IrType*>(np3);
+            if (sret3) ptys3[0] = mfg.ctx.tyPtr(rt3);
+            if (needSelf3)
+            {
+                ast.Decl* sdOwn3 = findStructByName(prog, g->structName);
+                types.CType* sel3 = sdOwn3 != null ? scopes.namedType(sdOwn3, g->structName, g->line, g->col) : null;
+                types.CType* sptr3 = mman.alloc<types.CType>(1);
+                sptr3.kind = types.TY_PTR;
+                sptr3.elem = sel3;
+                ptys3[sret3 ? 1u : 0u] = mapCType(&mfg, sptr3);
+            }
+            for (u32 k = 0; k < g->nparams; k++)
+                ptys3[k + base3] = g->params[k].type ? mapCType(&mfg, scopes.resolveTypeExpr(g->params[k].type, top, mods, g->generics, g->ngenerics)) : ctx.tyInt(64);
+        }
+        subst.pop();
+        ir_types.IrFunc* mfn = ctx.createFunc(mn.asCstr(), rt3, ptys3, np3);
+        irMod.addFunc(mfn);
+        if (nJobs < jobCap)
+        {
+            types.CType** ta = mman.alloc<types.CType*>(itv.nt > 0 ? itv.nt : 1);
+            for (u32 ti2 = 0; ti2 < itv.nt; ti2++) ta[ti2] = itv.targs[ti2];
+            u64* ca = null;
+            if (itv.nc > 0)
+            {
+                ca = mman.alloc<u64>(itv.nc);
+                for (u32 k = 0; k < itv.nc; k++) ca[k] = itv.cvals[k];
+            }
+            jobDecls[nJobs] = g; jobFns[nJobs] = mfn; jobMono[nJobs] = true;
+            jobTargs[nJobs] = ta; jobNt[nJobs] = itv.nt;
+            jobCvals[nJobs] = ca; jobNc[nJobs] = itv.nc; nJobs++;
+        }
+        mn.free();
+    }
+
+    // pass 2: bodies into the pre-created IrFuncs.
+    for (u32 i = 0; i < nd; i++)
+    {
+        ast.Decl* d = prog.decls[i];
+        if (d == null) continue;
+        bool isFuncDecl = (d->kind == ast.DT_FUNC) || (d->kind == ast.DT_EXTERN && d->isVar == false);
+        if (!isFuncDecl || d->body == null || d->ngenerics > 0) continue;
+        if (d.isInline || (d.variadic && d.nparams > 0)) continue; // spliced at call sites
+        if (d->isVar) continue;
+        ir_types.IrFunc* fn = fns[i];
+        if (fn == null) continue;
+        const char* fname = fn.base.name;
+        if (fname == null || fname[0] == 0) continue;
+
+        FuncGen fg;
+        mman.zero<FuncGen>(&fg, 1);
+        fg.ctx = ctx; fg.irMod = irMod; fg.top = top; fg.mods = mods; fg.prog = prog; fg.ld = ld;
+        fg.filename = path;
+        fg.flagNames = null; fg.flagVals = null; fg.nflags = 0;
+        fg.debug = debug;
+        fg.localNames = null; fg.localPtrs = null; fg.nlocals = 0; fg.capLocals = 0; fg.terminated = false;
+        fg.func = fn;
+        ir_types.IrBlock* entry = ctx.createBlock("entry");
+        fn.addBlock(entry);
+        ir_builder.IrBuilder bd = ir_builder.IrBuilder::new(ctx);
+        bd.pos(entry, null);
+        fg.bd = &bd;
+
+        u32 nps = d->nparams;
+        u32 pOff = 0;
+        {
+            ir_types.IrType* frt = fn.retType;
+            bool aggR = frt != null && frt.kind == ir_types.IrTypeKind::Array
+                && frt.elem != null && frt.elem.kind == ir_types.IrTypeKind::Int && frt.elem.width == 8;
+            if (aggR && fn.nparams >= 1)
+            {
+                pOff = 1;
+                // hidden sret destination: synthesized as the first
+                // entry-store so backend seeds it from rdi.
+                ir_types.IrType* pt = fn.paramTypes != null && fn.paramTypes[0] ? fn.paramTypes[0] : fg.ctx.tyPtr(frt);
+                ir_types.IrInst* al = bd.alloca(pt);
+                ir_types.IrValue* pv = mman.alloc<ir_types.IrValue>(1);
+                pv.kind = (ir_types.IrValueKind)0;
+                pv.type = pt;
+                pv.id = ctx.nextValueId();
+                pv.valData = 0;
+                pv.name = null;
+                pv.users = null;
+                pv.nusers = 0;
+                pv.capUsers = 0;
+                bd.store(pv, &al.base);
+                addLocal(&fg, str.strView::fromCstr("__sret"), &al.base);
+            }
+        }
+        for (u32 pi = 0; pi < nps; pi++)
+        {
+            u32 fi2 = pi + pOff + ((d.structName.len > 0 && !d.isStatic && !(d.nparams > 0 && (d.params[0].name.len == 0 || strEq(d.params[0].name, str.strView::fromCstr("self"))))) ? 1u : 0u);
+            ir_types.IrType* pt = fn.paramTypes != null && fi2 < fn.nparams && fn.paramTypes[fi2] ? fn.paramTypes[fi2] : ctx.tyInt(64);
+            ir_types.IrInst* al = bd.alloca(pt);
+            char pb[64]; u32 pl=0;
+            for (u32 k=0;k<d->params[pi].name.len&&pl<63;k++) pb[pl++]=(char)d->params[pi].name.ptr[k];
+            pb[pl]=0;
+            ir_types.IrValue* pv = mman.alloc<ir_types.IrValue>(1);
+            pv.kind = (ir_types.IrValueKind)0;
+            pv.type = pt;
+            pv.id = ctx.nextValueId();
+            pv.valData = 0;
+            pv.name = null;
+            pv.users = null;
+            pv.nusers = 0;
+            pv.capUsers = 0;
+            if (pl>0)
+            {
+                char* nc = mman.alloc<char>(pl+1);
+                for (u32 k=0;k<pl;k++) nc[k]=pb[k];
+                nc[pl]=0;
+                pv.name = nc;
+            }
+            bd.store(pv, &al.base);
+            addLocal(&fg, d->params[pi].name, &al.base);
+        }
+
+        genBlockStmts(&fg, d->body);
+        ir_types.IrType* retTy = fn.retType;
+        if (!fg.terminated)
+        {
+            if (d->noreturn)
+            {
+                // [[noret]] body fell off the end: platform halt/exit.
+                bd.noret();
+                fg.terminated = true;
+            }
+            else if (retTy == null || retTy.kind == ir_types.IrTypeKind::Void) bd.retVoid();
+            else
+            {
+                ir_types.IrValue* z = null;
+                if (retTy.kind == ir_types.IrTypeKind::Float) z = ctx.constFloat(retTy, 0.0);
+                else z = ctx.constInt(retTy, 0);
+                bd.ret(z);
+            }
+        }
+        if (optLevel > 0) wallvm.irOptimize(fn, ctx, optLevel);
+        if (fg.localNames) mman.dealloc<str.strView>(fg.localNames);
+        if (fg.localPtrs) mman.dealloc<ir_types.IrValue*>(fg.localPtrs);
+    }
+
+    // pass 2b: method / monomorphized-instance bodies
+    for (u32 ji = 0; ji < nJobs; ji++)
+    {
+        ast.Decl* d = jobDecls[ji];
+        ir_types.IrFunc* fn = jobFns[ji];
+        if (d == null || fn == null || d->body == null) continue;
+        bool isMethod = d->structName.len > 0;
+        if (jobMono[ji])
+        {
+            str.strView* gnJ = d.generics; u32 ngJ = d.ngenerics;
+            ast.Decl* ownJ = findStructByName(prog, d.structName);
+            if (ownJ == null && ld != null)
+            {
+                for (u32 pj = 0; pj < ld.n && ownJ == null; pj++)
+                {
+                    ast.Program* ppj = ld.progs[pj];
+                    if (ppj == null) continue;
+                    for (u32 dj = 0; dj < ppj.ndecls; dj++)
+                    {
+                        ast.Decl* cdj = ppj.decls[dj];
+                        if (cdj != null && cdj.kind == ast.DT_STRUCT && strEq(cdj.name, d.structName)) { ownJ = cdj; break; }
+                    }
+                }
+            }
+            if (ownJ != null) { gnJ = ownJ.generics; ngJ = ownJ.ngenerics; }
+            subst.push(gnJ, jobTargs[ji], ngJ > jobNt[ji] ? jobNt[ji] : ngJ);
+            if (jobNc[ji] > 0 && ngJ >= jobNc[ji])
+            {
+                str.strView cn4[16]; u64 cv4[16];
+                u32 base4 = ngJ - jobNc[ji];
+                for (u32 k = 0; k < jobNc[ji] && k < 16; k++) { cn4[k]=gnJ[base4+k]; cv4[k]=jobCvals[ji][k]; }
+                subst.pushConsts(cn4, cv4, jobNc[ji]);
+            }
+        }
+        FuncGen fg;
+        mman.zero<FuncGen>(&fg, 1);
+        fg.ctx = ctx; fg.irMod = irMod; fg.top = top; fg.mods = mods; fg.prog = prog; fg.ld = ld;
+        fg.filename = path;
+        fg.flagNames = null; fg.flagVals = null; fg.nflags = 0;
+        fg.debug = debug;
+        fg.localNames = null; fg.localPtrs = null; fg.nlocals = 0; fg.capLocals = 0; fg.terminated = false;
+        fg.func = fn;
+        ir_types.IrBlock* entry = ctx.createBlock("entry");
+        fn.addBlock(entry);
+        ir_builder.IrBuilder bd = ir_builder.IrBuilder::new(ctx);
+        bd.pos(entry, null);
+        fg.bd = &bd;
+
+        // hidden sret destination: synthesized as the first param-slot store
+        // so the backend seeds it from the first ABI integer register.
+        {
+            ir_types.IrType* frt = fn.retType;
+            bool aggR = frt != null && frt.kind == ir_types.IrTypeKind::Array
+                && frt.elem != null && frt.elem.kind == ir_types.IrTypeKind::Int && frt.elem.width == 8;
+            bool isSretFn = false;
+            {
+                u32 extraHint = fn.nparams;
+                u32 declaredTotal = d.nparams + (d.structName.len > 0 && !d.isStatic ? 1u : 0u);
+                (void)extraHint; (void)declaredTotal;
+                isSretFn = aggR && fn.nparams >= 1;
+            }
+            if (isSretFn)
+            {
+                ir_types.IrType* pt = fn.paramTypes != null && fn.paramTypes[0] ? fn.paramTypes[0] : fg.ctx.tyPtr(frt);
+                ir_types.IrInst* al = bd.alloca(pt);
+                ir_types.IrValue* pv = mman.alloc<ir_types.IrValue>(1);
+                pv.kind = (ir_types.IrValueKind)0;
+                pv.type = pt;
+                pv.id = ctx.nextValueId();
+                pv.valData = 0;
+                pv.name = null;
+                pv.users = null;
+                pv.nusers = 0;
+                pv.capUsers = 0;
+                bd.store(pv, &al.base);
+                addLocal(&fg, str.strView::fromCstr("__sret"), &al.base);
+            }
+        }
+
+        // implicit self slot for instance methods: synthesize a local holding
+        // the incoming receiver pointer before declared params.
+        bool explicitSelf = d->nparams > 0 && (d->params[0].name.len == 0 || strEq(d->params[0].name, str.strView::fromCstr("self")));
+        if (isMethod && !d->isStatic && !explicitSelf)
+        {
+            ast.Decl* sdOwn = findStructByName(prog, d->structName);
+            types.CType* selem = sdOwn != null ? scopes.namedType(sdOwn, d->structName, d->line, d->col) : null;
+            types.CType* sptr = mman.alloc<types.CType>(1);
+            sptr.kind = types.TY_PTR;
+            sptr.elem = selem;
+            ir_types.IrType* spt = mapCType(&fg, sptr);
+            ir_types.IrInst* al = bd.alloca(spt);
+            ir_types.IrValue* pv = mman.alloc<ir_types.IrValue>(1);
+            pv.kind = (ir_types.IrValueKind)0;
+            pv.type = spt;
+            pv.id = ctx.nextValueId();
+            pv.valData = 0;
+            pv.name = null;
+            pv.users = null;
+            pv.nusers = 0;
+            pv.capUsers = 0;
+            bd.store(pv, &al.base);
+            addLocal(&fg, str.strView::fromCstr("self"), &al.base);
+        }
+
+        u32 nps = d->nparams;
+        u32 pOff = 0;
+        {
+            ir_types.IrType* frt = fn.retType;
+            bool aggR = frt != null && frt.kind == ir_types.IrTypeKind::Array
+                && frt.elem != null && frt.elem.kind == ir_types.IrTypeKind::Int && frt.elem.width == 8;
+            if (aggR && fn.nparams >= 1)
+            {
+                pOff = 1;
+                // hidden sret destination: synthesized as the first
+                // entry-store so backend seeds it from rdi.
+                ir_types.IrType* pt = fn.paramTypes != null && fn.paramTypes[0] ? fn.paramTypes[0] : fg.ctx.tyPtr(frt);
+                ir_types.IrInst* al = bd.alloca(pt);
+                ir_types.IrValue* pv = mman.alloc<ir_types.IrValue>(1);
+                pv.kind = (ir_types.IrValueKind)0;
+                pv.type = pt;
+                pv.id = ctx.nextValueId();
+                pv.valData = 0;
+                pv.name = null;
+                pv.users = null;
+                pv.nusers = 0;
+                pv.capUsers = 0;
+                bd.store(pv, &al.base);
+                addLocal(&fg, str.strView::fromCstr("__sret"), &al.base);
+            }
+        }
+        for (u32 pi = 0; pi < nps; pi++)
+        {
+            u32 fi2 = pi + pOff + ((d.structName.len > 0 && !d.isStatic && !(d.nparams > 0 && (d.params[0].name.len == 0 || strEq(d.params[0].name, str.strView::fromCstr("self"))))) ? 1u : 0u);
+            ir_types.IrType* pt = fn.paramTypes != null && fi2 < fn.nparams && fn.paramTypes[fi2] ? fn.paramTypes[fi2] : ctx.tyInt(64);
+            ir_types.IrInst* al = bd.alloca(pt);
+            char pb[64]; u32 pl=0;
+            str.strView pname = d->params[pi].name.len > 0 ? d->params[pi].name : str.strView::fromCstr("self");
+            for (u32 k=0;k<pname.len&&pl<63;k++) pb[pl++]=(char)pname.ptr[k];
+            pb[pl]=0;
+            ir_types.IrValue* pv = mman.alloc<ir_types.IrValue>(1);
+            pv.kind = (ir_types.IrValueKind)0;
+            pv.type = pt;
+            pv.id = ctx.nextValueId();
+            pv.valData = 0;
+            pv.name = null;
+            pv.users = null;
+            pv.nusers = 0;
+            pv.capUsers = 0;
+            if (pl>0)
+            {
+                char* nc = mman.alloc<char>(pl+1);
+                for (u32 k=0;k<pl;k++) nc[k]=pb[k];
+                nc[pl]=0;
+                pv.name = nc;
+            }
+            bd.store(pv, &al.base);
+            addLocal(&fg, pname, &al.base);
+        }
+
+        genBlockStmts(&fg, d->body);
+        ir_types.IrType* retTy = fn.retType;
+        if (!fg.terminated)
+        {
+            if (retTy == null || retTy.kind == ir_types.IrTypeKind::Void) bd.retVoid();
+            else
+            {
+                ir_types.IrValue* z = null;
+                if (retTy.kind == ir_types.IrTypeKind::Float) z = ctx.constFloat(retTy, 0.0);
+                else z = ctx.constInt(retTy, 0);
+                bd.ret(z);
+            }
+        }
+        if (optLevel > 0) wallvm.irOptimize(fn, ctx, optLevel);
+        if (fg.localNames) mman.dealloc<str.strView>(fg.localNames);
+        if (fg.localPtrs) mman.dealloc<ir_types.IrValue*>(fg.localPtrs);
+        if (jobMono[ji]) subst.pop();
+    }
+    return irMod;
+}
+pub void emitIR(ast.Program* prog, scopes.Scope* top, scopes.ModuleTable* mods, loader.Loader* ld, str.strView path, u32 optLevel, bool debug)
+{
+    str.String opath = str.String::new();
+    u32 lastDot = 0; bool dot = false;
+    for (u32 k = 0; k < path.len; k++) if (path.ptr[k] == (u8)'.') { lastDot = k; dot = true; }
+    if (dot) opath.pushView(str.strView::fromParts(path.ptr, lastDot));
+    else opath.pushView(path);
+    opath.pushCstr(".wir");
+    ir_types.IrContext* ctx = null;
+    ir_types.IrModule* irMod = buildModule(prog, top, mods, ld, path, optLevel, debug, &ctx);
+    void* f = libc.fopen(opath.asCstr(), (const u8*)"wb");
+    if (f != null)
+    {
+        dumpIR(irMod, f);
+        libc.fclose(f);
+        libc.write(1, (const u8*)"wrote ", 6);
+        libc.write(1, (const u8*)opath.asCstr(), opath.len);
+        libc.write(1, (const u8*)"\n", 1);
+    } else libc.write(2, (const u8*)"coralc: cannot write wallvm ir file\n", 28);
+    opath.free();
+}
