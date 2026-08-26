@@ -99,6 +99,9 @@ pub struct BorrowCheckPass
         p.violations = 0;
         p.maxParams = 0;
         p.caps = null;
+        p.funcParamKnown = null;
+        p.capAllocas = null;
+        p.capKnown = 0;
         if (options)
         {
             p.options.collect = options.collect;
@@ -335,6 +338,91 @@ pub struct BorrowCheckPass
         self.ufCap = 0;
     }
 
+    // ── Capability model (current-frontend aware) ──
+    // A function's params materialize as the FIRST nparams Alloca insts of
+    // its entry block. Param k has write capability when some Store's
+    // address operand reaches alloca-k THROUGH a Load (a store through the
+    // pointer), as opposed to the seed store that initializes the slot.
+    wallvm.ir_types.IrInst** capAllocas;
+    u32 capKnown;
+
+    void collectParamAllocas(wallvm.ir_types.IrFunc* f)
+    {
+        self.capKnown = 0;
+        if (f.nblocks == 0 || f.nparams == 0)
+        {
+            self.capAllocas = null;
+            return;
+        }
+        self.capAllocas = std.mman.alloc<wallvm.ir_types.IrInst*>(f.nparams);
+        wallvm.ir_types.IrBlock* eb = f.blocks[0];
+        for (u32 ii = 0; ii < eb.ninsts && self.capKnown < f.nparams; ii++)
+        {
+            wallvm.ir_types.IrInst* inst = eb.insts[ii];
+            if (inst.opcode == wallvm.irOps.IrOpcode::Alloca)
+                self.capAllocas[self.capKnown++] = inst;
+        }
+    }
+
+    // Root alloca (if any) for an address value; sets viaLoad when the
+    // path crossed a Load (meaning: a store here writes THROUGH memory).
+    wallvm.ir_types.IrInst* rootAlloca(wallvm.ir_types.IrValue* v, bool* viaLoad)
+    {
+        *viaLoad = false;
+        wallvm.ir_types.IrValue* cur = v;
+        u32 hops = 0;
+        while (cur != null && cur.kind == wallvm.ir_types.IrValueKind::Inst && hops < 16)
+        {
+            wallvm.ir_types.IrInst* inst = (wallvm.ir_types.IrInst*)cur;
+            if (inst.opcode == wallvm.irOps.IrOpcode::Gep)
+            {
+                if (inst.nops < 1) return null;
+                cur = inst.ops[0];
+                hops++;
+                continue;
+            }
+            if (inst.opcode == wallvm.irOps.IrOpcode::Load)
+            {
+                *viaLoad = true;
+                return null; // provenance beyond the load is unknown
+            }
+            if (inst.opcode == wallvm.irOps.IrOpcode::Alloca) return inst;
+            return null;
+        }
+        return null;
+    }
+
+    // Strip GEPs; return the first non-GEP value.
+    wallvm.ir_types.IrValue* stripGeps(wallvm.ir_types.IrValue* v)
+    {
+        u32 hops = 0;
+        while (v != null && v.kind == wallvm.ir_types.IrValueKind::Inst && hops < 16)
+        {
+            wallvm.ir_types.IrInst* inst = (wallvm.ir_types.IrInst*)v;
+            if (inst.opcode != wallvm.irOps.IrOpcode::Gep || inst.nops < 1) break;
+            v = inst.ops[0];
+            hops++;
+        }
+        return v;
+    }
+
+    // Underlying param-slot alloca for an address, if it reads a pointer
+    // out of one (Load over a gep-chain rooted at the alloca).
+    i32 storeCapIndex(wallvm.ir_types.IrFunc* f, wallvm.ir_types.IrValue* addr)
+    {
+        wallvm.ir_types.IrValue* core = self.stripGeps(addr);
+        if (core == null || core.kind != wallvm.ir_types.IrValueKind::Inst) return -1;
+        wallvm.ir_types.IrInst* ci = (wallvm.ir_types.IrInst*)core;
+        if (ci.opcode != wallvm.irOps.IrOpcode::Load || ci.nops < 1) return -1;
+        wallvm.ir_types.IrValue* slotAddr = self.stripGeps(ci.ops[0]);
+        if (slotAddr == null || slotAddr.kind != wallvm.ir_types.IrValueKind::Inst) return -1;
+        wallvm.ir_types.IrInst* sa = (wallvm.ir_types.IrInst*)slotAddr;
+        if (sa.opcode != wallvm.irOps.IrOpcode::Alloca) return -1;
+        for (u32 k = 0; k < self.capKnown && k < f.nparams; k++)
+            if (self.capAllocas[k] == sa) return (i32)k;
+        return -1;
+    }
+
     void buildCaps()
     {
         if (!self.module) return;
@@ -342,15 +430,38 @@ pub struct BorrowCheckPass
         for (u32 fi = 0; fi < self.module.nfuncs; fi++)
             if (self.module.funcs[fi].nparams > self.maxParams)
                 self.maxParams = self.module.funcs[fi].nparams;
-        if (self.maxParams == 0) return;
-        if (self.module.nfuncs == 0) return;
+        self.funcParamKnown = null;
+        if (self.maxParams == 0 || self.module.nfuncs == 0) return;
 
         self.caps = std.mman.alloc<bool>(self.module.nfuncs * self.maxParams);
         for (u64 i = 0; i < self.module.nfuncs * self.maxParams; i++)
             self.caps[i] = false;
 
-        // Fixed point, capabilities only turn on, so a bounded number of
-        // full sweeps converges.
+        // Direct evidence: stores through each fn's param pointers.
+        for (u32 fi = 0; fi < self.module.nfuncs; fi++)
+        {
+            wallvm.ir_types.IrFunc* f = self.module.funcs[fi];
+            if (f.isExtern || f.nblocks == 0) continue;
+            self.collectParamAllocas(f);
+            if (self.capKnown == 0) continue;
+            for (u32 bi = 0; bi < f.nblocks; bi++)
+            {
+                wallvm.ir_types.IrBlock* bb = f.blocks[bi];
+                for (u32 ii = 0; ii < bb.ninsts; ii++)
+                {
+                    wallvm.ir_types.IrInst* inst = bb.insts[ii];
+                    if (inst.opcode != wallvm.irOps.IrOpcode::Store || inst.nops < 2) continue;
+                    i32 pi = self.storeCapIndex(f, inst.ops[1]);
+                    if (pi < 0) continue;
+                    self.caps[(u64)fi * self.maxParams + (u64)pi] = true;
+                }
+            }
+            std.mman.dealloc<wallvm.ir_types.IrInst*>(self.capAllocas);
+            self.capAllocas = null;
+        }
+
+        // Propagation fixed point: passing a capable param into a callee
+        // position that itself writes marks the caller's param capable.
         bool changed = true;
         u32 guard = 0;
         while (changed && guard < self.module.nfuncs + 4)
@@ -361,48 +472,55 @@ pub struct BorrowCheckPass
             {
                 wallvm.ir_types.IrFunc* f = self.module.funcs[fi];
                 if (f.isExtern || f.nblocks == 0) continue;
-
+                self.collectParamAllocas(f);
+                if (self.capKnown == 0) { if (self.capAllocas) { std.mman.dealloc<wallvm.ir_types.IrInst*>(self.capAllocas); self.capAllocas = null; } continue; }
                 for (u32 bi = 0; bi < f.nblocks; bi++)
                 {
                     wallvm.ir_types.IrBlock* bb = f.blocks[bi];
                     for (u32 ii = 0; ii < bb.ninsts; ii++)
                     {
                         wallvm.ir_types.IrInst* inst = bb.insts[ii];
-                        if (inst.opcode == wallvm.irOps.IrOpcode::Store && inst.nops >= 2)
-                        {
-                            i32 pi = self.paramBaseIndexOf(f, inst.ops[1]);
-                            if (pi < 0) continue;
-                            u64 bit = (u64)fi * self.maxParams + (u64)pi;
-                            if (!self.caps[bit]) { self.caps[bit] = true; changed = true; }
-                        }
-                        else if (inst.opcode == wallvm.irOps.IrOpcode::Call && inst.nops >= 2)
-                        {
-                            wallvm.ir_types.IrValue* calleeVal = inst.ops[0];
-                            if (!calleeVal || calleeVal.kind != wallvm.ir_types.IrValueKind::Func) continue;
-                            wallvm.ir_types.IrFunc* g = (wallvm.ir_types.IrFunc*)calleeVal;
-                            if (g.isExtern || g.nblocks == 0) continue;
-                            i32 gi = -1;
-                            for (u32 x = 0; x < self.module.nfuncs; x++)
-                                if (self.module.funcs[x] == g) { gi = (i32)x; break; }
-                            if (gi < 0) continue;
+                        if (inst.opcode != wallvm.irOps.IrOpcode::Call || inst.nops < 2) continue;
+                        wallvm.ir_types.IrValue* cv = inst.ops[0];
+                        if (!cv || cv.kind != wallvm.ir_types.IrValueKind::Func) continue;
+                        wallvm.ir_types.IrFunc* g = (wallvm.ir_types.IrFunc*)cv;
+                        i32 gi = -1;
+                        for (u32 x = 0; x < self.module.nfuncs; x++)
+                            if (self.module.funcs[x] == g) { gi = (i32)x; break; }
+                        if (gi < 0) continue;
 
-                            for (u32 ai = 1; ai < inst.nops; ai++)
+                        for (u32 ai = 1; ai < inst.nops; ai++)
+                        {
+                            i32 pi = self.storeCapIndex(f, inst.ops[ai]);
+                            if (pi < 0)
                             {
-                                i32 pi = self.paramBaseIndexOf(f, inst.ops[ai]);
+                                // arg may be the param pointer VALUE itself
+                                wallvm.ir_types.IrValue* av = self.stripGeps(inst.ops[ai]);
+                                if (av == null || av.kind != wallvm.ir_types.IrValueKind::Inst) continue;
+                                wallvm.ir_types.IrInst* ai2 = (wallvm.ir_types.IrInst*)av;
+                                if (ai2.opcode != wallvm.irOps.IrOpcode::Load || ai2.nops < 1) continue;
+                                wallvm.ir_types.IrValue* slotAddr = self.stripGeps(ai2.ops[0]);
+                                if (slotAddr == null || slotAddr.kind != wallvm.ir_types.IrValueKind::Inst) continue;
+                                wallvm.ir_types.IrInst* sa = (wallvm.ir_types.IrInst*)slotAddr;
+                                if (sa.opcode != wallvm.irOps.IrOpcode::Alloca) continue;
+                                for (u32 k = 0; k < self.capKnown && k < f.nparams; k++)
+                                    if (self.capAllocas[k] == sa) { pi = (i32)k; break; }
                                 if (pi < 0) continue;
-                                u32 gk = ai - 1;
-                                if (gk >= g.nparams) continue;
-                                u64 fbit = (u64)fi * self.maxParams + (u64)pi;
-                                u64 gbit = (u64)gi * self.maxParams + (u64)gk;
-                                if (self.caps[gbit] && !self.caps[fbit])
-                                {
-                                    self.caps[fbit] = true;
-                                    changed = true;
-                                }
+                            }
+                            u32 gk = ai - 1;
+                            if (gk >= g.nparams) continue;
+                            u64 fbit = (u64)fi * self.maxParams + (u64)pi;
+                            u64 gbit = (u64)gi * self.maxParams + (u64)gk;
+                            if (self.caps[gbit] && !self.caps[fbit])
+                            {
+                                self.caps[fbit] = true;
+                                changed = true;
                             }
                         }
                     }
                 }
+                std.mman.dealloc<wallvm.ir_types.IrInst*>(self.capAllocas);
+                self.capAllocas = null;
             }
         }
     }
@@ -414,56 +532,34 @@ pub struct BorrowCheckPass
             std.mman.dealloc<bool>(self.caps);
             self.caps = null;
         }
+        if (self.funcParamKnown)
+        {
+            std.mman.dealloc<u32>(self.funcParamKnown);
+            self.funcParamKnown = null;
+        }
+        if (self.capAllocas)
+        {
+            std.mman.dealloc<wallvm.ir_types.IrInst*>(self.capAllocas);
+            self.capAllocas = null;
+        }
         self.maxParams = 0;
     }
 
-    // A parameter is one of the leading instructions of the entry block
-    // (the transpiler's convention; inlining maps them from there).
-    // Chase GEP chains to the region base before testing for a param:
-    // stores through `p.field` still prove write capability on p.
-    i32 paramBaseIndexOf(wallvm.ir_types.IrFunc* f, wallvm.ir_types.IrValue* v)
-    {
-        wallvm.ir_types.IrValue* cur = v;
-        u32 hops = 0;
-        while (cur != null && cur.kind == wallvm.ir_types.IrValueKind::Inst && hops < 8)
-        {
-            wallvm.ir_types.IrInst* inst = (wallvm.ir_types.IrInst*)cur;
-            if (inst.opcode != wallvm.irOps.IrOpcode::Gep || inst.nops < 1) break;
-            cur = inst.ops[0];
-            hops++;
-        }
-        return self.paramIndexOf(f, cur);
-    }
-
-    i32 paramIndexOf(wallvm.ir_types.IrFunc* f, wallvm.ir_types.IrValue* v)
-    {
-        if (!v || v.kind != wallvm.ir_types.IrValueKind::Inst) return -1;
-        if (f.nblocks == 0 || f.nparams == 0) return -1;
-        wallvm.ir_types.IrBlock* entry = f.blocks[0];
-        u32 n = f.nparams;
-        if (entry.ninsts < n) n = entry.ninsts;
-        for (u32 i = 0; i < n; i++)
-            if (entry.insts[i] == v) return (i32)i;
-        return -1;
-    }
-
     // Can the callee write through the argument at param position argIdx?
-    // Unknown callees (extern, bodyless, non-function values) are assumed
-    // to write, preserving the conservative baseline.
+    // Unknown callees are assumed to write, preserving conservatism.
     bool calleeWrites(wallvm.ir_types.IrValue* calleeVal, u32 argIdx)
     {
         if (!calleeVal || calleeVal.kind != wallvm.ir_types.IrValueKind::Func) return true;
         wallvm.ir_types.IrFunc* g = (wallvm.ir_types.IrFunc*)calleeVal;
         if (g.isExtern || g.nblocks == 0) return true;
-        if (self.caps == null) return true;
         if (argIdx >= g.nparams) return true;
-        if (!self.module) return true;
+        if (self.caps == null || !self.module) return true;
         for (u32 x = 0; x < self.module.nfuncs; x++)
         {
             if (self.module.funcs[x] == g)
             {
-                u64 bit = (u64)x * self.maxParams + (u64)argIdx;
-                return self.caps[bit];
+                if ((u64)argIdx >= self.maxParams) return true;
+                return self.caps[(u64)x * self.maxParams + (u64)argIdx];
             }
         }
         return true;
@@ -1072,7 +1168,7 @@ pub struct BorrowCheckPass
                             char det[160];
                             for (u32 z = 0; z < 160; z++) det[z] = 0;
                             self.composeArgs(det, 160, 0, ai, aj);
-                            i32 dn = std.libc.snprintf(det + detLen(det), 40, " (same region, +%lu / +%lu)", (unsigned long)ao2, (unsigned long)bo2);
+                            i32 dn = std.libc.snprintf(det + detLen(det), 40, " (same region, +%lu / +%lu)", ao2, bo2);
                             (void)dn;
                             self.recordViolationD(BorrowCheckKind::AliasingCallArgs, call, det);
                             continue;
