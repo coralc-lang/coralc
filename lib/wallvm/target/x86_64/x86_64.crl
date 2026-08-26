@@ -53,6 +53,10 @@ pub struct X86_64Codegen
     ir_types.IrValue** fusedAddends;
     u32 nFused;
     u32 capFused;
+    // Promoted params: prologue writes the ABI arg reg straight into the
+    // param's alloca slot; the intermediate pv spill slot + seed store are
+    // skipped. Indexed by param k; 0 = not promoted.
+    u32* paramDirectOff;
     char** allocIntNames;
     u32 numAllocInt;
     char** allocFloatNames;
@@ -107,6 +111,7 @@ pub struct X86_64Codegen
         c.fusedAddends = null;
         c.nFused = 0;
         c.capFused = 0;
+        c.paramDirectOff = null;
         c.allocIntNames = null;
         c.numAllocInt = 0;
         c.allocFloatNames = null;
@@ -364,29 +369,116 @@ pub struct X86_64Codegen
 
     void prescanStaticGeps(ir_types.IrFunc* func)
     {
+        // Optimizer passes can leave stale entries in users[] lists, so
+        // decide foldability by scanning live operands: a GEP is dead once
+        // every remaining mention of it is a Load/Store address that folds
+        // to its frame displacement.
         for (u32 bi = 0; bi < func->nblocks; bi++)
         {
             ir_types.IrBlock* bb = func->blocks[bi];
             for (u32 ii = 0; ii < bb.ninsts; ii++)
             {
                 ir_types.IrInst* ins = bb.insts[ii];
-                if (ins.opcode != ir_opcodes.IrOpcode::Gep) continue;
-                if (ins.base.nusers == 0 || ins.base.users == null) continue;
+                if (ins.opcode != ir_opcodes.IrOpcode::Gep
+                    && ins.opcode != ir_opcodes.IrOpcode::Alloca) continue;
                 u32 dummy = 0;
                 if (!self.staticMemRef((ir_types.IrValue*)ins, &dummy)) continue;
-                bool allFoldable = true;
-                for (u32 ui = 0; ui < ins.base.nusers; ui++)
+                if (ins.opcode == ir_opcodes.IrOpcode::Alloca && self.allocaOffsets[ins.base.id] == 0) continue;
+                u32 totalMentions = 0;
+                u32 okUses = 0;
+                // lsra spill copies of the address itself (gep -> slot)
+                // are dead once every real use folds; collect them.
+                ir_types.IrInst* spillWrites[16];
+                u32 nSpillWrites = 0;
+                for (u32 bj = 0; bj < func->nblocks; bj++)
                 {
-                    ir_types.IrInst* user = ins.base.users[ui];
-                    if (user == null
-                        || (user.opcode != ir_opcodes.IrOpcode::Load
-                            && user.opcode != ir_opcodes.IrOpcode::Store)
-                        || user.nops < 2
-                        || user.ops[1] != &ins.base)
-                    { allFoldable = false; break; }
+                    ir_types.IrBlock* bb2 = func->blocks[bj];
+                    for (u32 jj = 0; jj < bb2.ninsts; jj++)
+                    {
+                        ir_types.IrInst* cand = bb2.insts[jj];
+                        for (u32 opj = 0; opj < cand->nops; opj++)
+                        {
+                            if (cand->ops[opj] != &ins.base) continue;
+                            totalMentions++;
+                            // Load addresses the pointer at ops[0];
+                            // Store at ops[1].
+                            bool isMemUse =
+                                (cand.opcode == ir_opcodes.IrOpcode::Load
+                                 && opj == 0 && cand.nops >= 1)
+                                || (cand.opcode == ir_opcodes.IrOpcode::Store
+                                 && opj == 1 && cand.nops >= 2);
+                            bool isSpillWrite = cand.opcode == ir_opcodes.IrOpcode::Store
+                                && cand->nops >= 2 && opj == 0
+                                && cand.ops[1] != null
+                                && (self.valEnc(cand.ops[1]) & 0x80000000UL) != 0
+                                && nSpillWrites < 16;
+                            if (isMemUse) okUses++;
+                            else if (isSpillWrite) { okUses++; spillWrites[nSpillWrites++] = cand; }
+                        }
+                    }
                 }
-                if (allFoldable && !self.icmpSkipped(ins))
+                if (totalMentions > 0 && totalMentions == okUses
+                    && !self.icmpSkipped(ins))
+                {
                     self.icmpSkipAdd(ins.base.id);
+                    for (u32 sw = 0; sw < nSpillWrites; sw++)
+                        if (!self.icmpSkipped(spillWrites[sw]))
+                            self.icmpSkipAdd(spillWrites[sw].base.id);
+                }
+            }
+        }
+
+        // Phase 2: allocas whose remaining live mentions are all folded
+        // Load/Store addresses (uses from skipped insts don't count).
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            ir_types.IrBlock* bb = func->blocks[bi];
+            for (u32 ii = 0; ii < bb.ninsts; ii++)
+            {
+                ir_types.IrInst* ins = bb.insts[ii];
+                if (ins.opcode != ir_opcodes.IrOpcode::Alloca) continue;
+                if (ins.base.id >= self.allocaOffsetsCap || self.allocaOffsets[ins.base.id] == 0) continue;
+                u32 totalMentions = 0;
+                u32 okUses = 0;
+                ir_types.IrInst* spillWrites2[16];
+                u32 nSpillWrites2 = 0;
+                for (u32 bj = 0; bj < func->nblocks; bj++)
+                {
+                    ir_types.IrBlock* bb2 = func->blocks[bj];
+                    for (u32 jj = 0; jj < bb2.ninsts; jj++)
+                    {
+                        ir_types.IrInst* cand = bb2.insts[jj];
+                        if (self.icmpSkipped(cand)) continue;
+                        for (u32 opj = 0; opj < cand->nops; opj++)
+                        {
+                            if (cand->ops[opj] != &ins.base) continue;
+                            totalMentions++;
+                            // Load addresses the pointer at ops[0];
+                            // Store at ops[1].
+                            bool isMemUse =
+                                (cand.opcode == ir_opcodes.IrOpcode::Load
+                                 && opj == 0 && cand.nops >= 1)
+                                || (cand.opcode == ir_opcodes.IrOpcode::Store
+                                 && opj == 1 && cand.nops >= 2);
+                            bool isSpillWrite = cand.opcode == ir_opcodes.IrOpcode::Store
+                                && cand->nops >= 2 && opj == 0
+                                && cand.ops[1] != null
+                                && (self.valEnc(cand.ops[1]) & 0x80000000UL) != 0
+                                && nSpillWrites2 < 16;
+                            if (isMemUse) okUses++;
+                            else if (isSpillWrite) { okUses++; spillWrites2[nSpillWrites2++] = cand; }
+                        }
+                    }
+                }
+                // totalMentions may be 0: every use went through
+                // instructions already folded/skipped in phase 1.
+                if (totalMentions == okUses && !self.icmpSkipped(ins))
+                {
+                    self.icmpSkipAdd(ins.base.id);
+                    for (u32 sw = 0; sw < nSpillWrites2; sw++)
+                        if (!self.icmpSkipped(spillWrites2[sw]))
+                            self.icmpSkipAdd(spillWrites2[sw].base.id);
+                }
             }
         }
         // Single-use Loads feeding a float binop or Ret from a fixed slot:
@@ -2235,6 +2327,53 @@ pub struct X86_64Codegen
         self.maxSpillSeen = nextSlot > self.maxSpillSeen ? nextSlot : self.maxSpillSeen;
     }
 
+    // Single-stage param staging: redirect the prologue write straight
+    // into the param's alloca slot and drop the seed store, removing the
+    // pv spill slot round trip. Only when the alloca is never written
+    // again (param not reassigned) and its address is a fixed frame slot.
+    void promoteParamSeeds(ir_types.IrFunc* func)
+    {
+        if (self.numParamsFound == 0 || self.allocaOffsetsCap == 0) return;
+        u32 capP = self.numParamsFound;
+        u32* nd = mman.alloc<u32>(capP);
+        for (u32 k = 0; k < capP; k++) nd[k] = 0;
+        for (u32 k = 0; k < self.numParamsFound; k++)
+        {
+            ir_types.IrValue* src = self.paramVals[k];
+            if (!src) continue;
+            // find the seed store in the entry block
+            ir_types.IrInst* seed = null;
+            ir_types.IrBlock* eb = func->blocks[0];
+            for (u32 ii = 0; ii < eb->ninsts; ii++)
+            {
+                ir_types.IrInst* st = eb->insts[ii];
+                if (st->opcode != ir_opcodes.IrOpcode::Store || st->nops < 2) continue;
+                if (st->ops[0] == src) { seed = st; break; }
+            }
+            if (seed == null) continue;
+            u32 off = 0;
+            if (!self.staticMemRef(seed.ops[1], &off)) continue;
+            // no other writer to this alloca (directly or through a gep)
+            bool rewritten = false;
+            for (u32 bi = 0; bi < func->nblocks && !rewritten; bi++)
+            {
+                ir_types.IrBlock* bb = func->blocks[bi];
+                for (u32 ii = 0; ii < bb->ninsts && !rewritten; ii++)
+                {
+                    ir_types.IrInst* st2 = bb->insts[ii];
+                    if (st2 == seed || st2->opcode != ir_opcodes.IrOpcode::Store || st2->nops < 2) continue;
+                    u32 d4 = 0;
+                    if (st2.ops[1] == seed.ops[1] || self.staticMemRef(st2.ops[1], &d4) && d4 == off)
+                        rewritten = true;
+                }
+            }
+            if (rewritten) continue;
+            nd[k] = off;
+            if (!self.icmpSkipped(seed)) self.icmpSkipAdd(seed.base.id);
+        }
+        self.paramDirectOff = nd;
+    }
+
     void emitParamPrologue(ir_types.IrFunc* func)
     {
         u32 intPi = 0;
@@ -2249,6 +2388,12 @@ pub struct X86_64Codegen
                 const char* xr = flPi < self.abi.numFloatArgRegs ? self.abi.floatArgRegs[flPi] : null;
                 flPi++;
                 if (xr == null) continue;
+                if (self.paramDirectOff != null && self.paramDirectOff[k] > 0)
+                {
+                    if (self.att) { self.pad(); self.s("movq %"); self.s(xr); self.s(", "); self.opMemRbp(self.paramDirectOff[k]); self.c('\n'); }
+                    else { self.pad(); self.s("movq "); self.opMemRbp(self.paramDirectOff[k]); self.s(", "); self.s(xr); self.c('\n'); }
+                    continue;
+                }
                 if (self.att) { self.pad(); self.s("movq %"); self.s(xr); self.s(", "); self.emitSpillRef(e); self.c('\n'); }
                 else { self.pad(); self.s("movq "); self.emitSpillRef(e); self.s(", "); self.s(xr); self.c('\n'); }
             }
@@ -2257,6 +2402,12 @@ pub struct X86_64Codegen
                 if (intPi >= self.abi.numArgRegs) continue;
                 const char* ar = self.abi.argRegs[intPi];
                 intPi++;
+                if (self.paramDirectOff != null && self.paramDirectOff[k] > 0)
+                {
+                    if (self.att) { self.pad(); self.s("movq %"); self.s(ar); self.s(", "); self.opMemRbp(self.paramDirectOff[k]); self.c('\n'); }
+                    else { self.pad(); self.s("movq "); self.opMemRbp(self.paramDirectOff[k]); self.s(", "); self.s(ar); self.c('\n'); }
+                    continue;
+                }
                 if (self.att) { self.pad(); self.s("movq %"); self.s(ar); self.s(", "); self.emitSpillRef(e); self.c('\n'); }
                 else { self.pad(); self.s("movq "); self.emitSpillRef(e); self.s(", "); self.s(ar); self.c('\n'); }
             }
@@ -2363,6 +2514,7 @@ pub struct X86_64Codegen
         // materialization of the bool is skipped entirely.
         self.prescanBranchIcmps(func);
         self.prescanStaticGeps(func);
+        self.promoteParamSeeds(func);
 
         // Function label
         if (func->base.name && func->base.name[0])
@@ -2594,13 +2746,22 @@ pub struct X86_64Codegen
                 case ir_opcodes.IrOpcode::FSqrt: self.emitFSqrt(inst); break;
 
                 // Memory
-                case ir_opcodes.IrOpcode::Alloca: self.emitAlloca(inst); break;
+                case ir_opcodes.IrOpcode::Alloca:
+                    if (self.icmpSkipped(inst)) break; // folded into static slots
+                    self.emitAlloca(inst);
+                    break;
                 case ir_opcodes.IrOpcode::Load:
                     if (self.icmpSkipped(inst)) break; // fused into a store
                     self.emitLoad(inst);
                     break;
-                case ir_opcodes.IrOpcode::Store: self.emitStore(inst); break;
-                case ir_opcodes.IrOpcode::Gep: self.emitGep(inst); break;
+                case ir_opcodes.IrOpcode::Store:
+                    if (self.icmpSkipped(inst)) break; // promoted param seed / fused
+                    self.emitStore(inst);
+                    break;
+                case ir_opcodes.IrOpcode::Gep:
+                    if (self.icmpSkipped(inst)) break; // folded into static slots
+                    self.emitGep(inst);
+                    break;
 
                 // Cast
                 case ir_opcodes.IrOpcode::Trunc:

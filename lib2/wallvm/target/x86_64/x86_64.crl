@@ -49,6 +49,10 @@ pub struct X86_64Codegen
     wallvm.ir_types.IrValue** fusedAddends;
     u32 nFused;
     u32 capFused;
+    // Promoted params: prologue writes the ABI arg reg straight into the
+    // param's alloca slot; the intermediate pv spill slot + seed store are
+    // skipped. Indexed by param k; 0 = not promoted.
+    u32* paramDirectOff;
     char** allocIntNames;
     u32 numAllocInt;
     char** allocFloatNames;
@@ -103,6 +107,7 @@ pub struct X86_64Codegen
         c.fusedAddends = null;
         c.nFused = 0;
         c.capFused = 0;
+        c.paramDirectOff = null;
         c.allocIntNames = null;
         c.numAllocInt = 0;
         c.allocFloatNames = null;
@@ -302,6 +307,194 @@ pub struct X86_64Codegen
 
     // Prescan: mark ICmp results whose only user is the CondBr on them,
     // then fuse read-modify-write stores.
+    // ── Static frame folding ──
+    bool staticMemRef(wallvm.ir_types.IrValue* v, u32* offOut)
+    {
+        if (!v || v.kind != wallvm.ir_types.IrValueKind::Inst) return false;
+        wallvm.ir_types.IrInst* inst = (wallvm.ir_types.IrInst*)v;
+        u64 acc = 0;
+        while (inst != null)
+        {
+            if (inst.opcode == wallvm.irOps.IrOpcode::Gep)
+            {
+                if (inst.nops < 1) return false;
+                for (u32 i = 1; i < inst.nops; i++)
+                {
+                    wallvm.ir_types.IrValue* idx = inst.ops[i];
+                    if (!idx || idx.kind != wallvm.ir_types.IrValueKind::ConstInt) return false;
+                    acc += idx.valData;
+                }
+                if (inst.ops[0].kind != wallvm.ir_types.IrValueKind::Inst) return false;
+                inst = (wallvm.ir_types.IrInst*)inst.ops[0];
+                continue;
+            }
+            break;
+        }
+        if (inst.opcode != wallvm.irOps.IrOpcode::Alloca) return false;
+        u32 id = inst.base.id;
+        if (id >= self.allocaOffsetsCap || self.allocaOffsets[id] == 0) return false;
+        *offOut = self.allocaOffsets[id] + (u32)acc;
+        return true;
+    }
+
+    // Static frame slot producing this VALUE (a Load from a fixed slot).
+    bool valueStaticSlot(wallvm.ir_types.IrValue* v, u32* offOut)
+    {
+        if (!v || v.kind != wallvm.ir_types.IrValueKind::Inst) return false;
+        wallvm.ir_types.IrInst* i = (wallvm.ir_types.IrInst*)v;
+        if (i.opcode != wallvm.irOps.IrOpcode::Load || i.nops < 1) return false;
+        return self.staticMemRef(i.ops[0], offOut);
+    }
+
+    // The value's ONLY consumer is a store into a fixed frame slot.
+    bool singleUserStoreStatic(wallvm.ir_types.IrValue* v)
+    {
+        if (!v || v.nusers != 1 || v.users == null) return false;
+        wallvm.ir_types.IrInst* st = (wallvm.ir_types.IrInst*)v.users[0];
+        if (st == null || st.opcode != wallvm.irOps.IrOpcode::Store || st.nops < 2) return false;
+        if (st.ops[0] != v) return false;
+        u32 d3 = 0;
+        return self.staticMemRef(st.ops[1], &d3);
+    }
+
+    void prescanStaticGeps(wallvm.ir_types.IrFunc* func)
+    {
+        // Optimizer passes can leave stale entries in users[] lists, so
+        // decide foldability by scanning live operands: a GEP is dead once
+        // every remaining mention of it is a Load/Store address that folds
+        // to its frame displacement.
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            wallvm.ir_types.IrBlock* bb = func->blocks[bi];
+            for (u32 ii = 0; ii < bb.ninsts; ii++)
+            {
+                wallvm.ir_types.IrInst* ins = bb.insts[ii];
+                if (ins.opcode != wallvm.irOps.IrOpcode::Gep
+                    && ins.opcode != wallvm.irOps.IrOpcode::Alloca) continue;
+                u32 dummy = 0;
+                if (!self.staticMemRef((wallvm.ir_types.IrValue*)ins, &dummy)) continue;
+                if (ins.opcode == wallvm.irOps.IrOpcode::Alloca && self.allocaOffsets[ins.base.id] == 0) continue;
+                u32 totalMentions = 0;
+                u32 okUses = 0;
+                // lsra spill copies of the address itself (gep -> slot)
+                // are dead once every real use folds; collect them.
+                wallvm.ir_types.IrInst* spillWrites[16];
+                u32 nSpillWrites = 0;
+                for (u32 bj = 0; bj < func->nblocks; bj++)
+                {
+                    wallvm.ir_types.IrBlock* bb2 = func->blocks[bj];
+                    for (u32 jj = 0; jj < bb2.ninsts; jj++)
+                    {
+                        wallvm.ir_types.IrInst* cand = bb2.insts[jj];
+                        for (u32 opj = 0; opj < cand->nops; opj++)
+                        {
+                            if (cand->ops[opj] != &ins.base) continue;
+                            totalMentions++;
+                            // Load addresses the pointer at ops[0];
+                            // Store at ops[1].
+                            bool isMemUse =
+                                (cand.opcode == wallvm.irOps.IrOpcode::Load
+                                 && opj == 0 && cand.nops >= 1)
+                                || (cand.opcode == wallvm.irOps.IrOpcode::Store
+                                 && opj == 1 && cand.nops >= 2);
+                            bool isSpillWrite = cand.opcode == wallvm.irOps.IrOpcode::Store
+                                && cand->nops >= 2 && opj == 0
+                                && cand.ops[1] != null
+                                && (self.valEnc(cand.ops[1]) & 0x80000000UL) != 0
+                                && nSpillWrites < 16;
+                            if (isMemUse) okUses++;
+                            else if (isSpillWrite) { okUses++; spillWrites[nSpillWrites++] = cand; }
+                        }
+                    }
+                }
+                if (totalMentions > 0 && totalMentions == okUses
+                    && !self.icmpSkipped(ins))
+                {
+                    self.icmpSkipAdd(ins.base.id);
+                    for (u32 sw = 0; sw < nSpillWrites; sw++)
+                        if (!self.icmpSkipped(spillWrites[sw]))
+                            self.icmpSkipAdd(spillWrites[sw].base.id);
+                }
+            }
+        }
+
+        // Phase 2: allocas whose remaining live mentions are all folded
+        // Load/Store addresses (uses from skipped insts don't count).
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            wallvm.ir_types.IrBlock* bb = func->blocks[bi];
+            for (u32 ii = 0; ii < bb.ninsts; ii++)
+            {
+                wallvm.ir_types.IrInst* ins = bb.insts[ii];
+                if (ins.opcode != wallvm.irOps.IrOpcode::Alloca) continue;
+                if (ins.base.id >= self.allocaOffsetsCap || self.allocaOffsets[ins.base.id] == 0) continue;
+                u32 totalMentions = 0;
+                u32 okUses = 0;
+                wallvm.ir_types.IrInst* spillWrites2[16];
+                u32 nSpillWrites2 = 0;
+                for (u32 bj = 0; bj < func->nblocks; bj++)
+                {
+                    wallvm.ir_types.IrBlock* bb2 = func->blocks[bj];
+                    for (u32 jj = 0; jj < bb2.ninsts; jj++)
+                    {
+                        wallvm.ir_types.IrInst* cand = bb2.insts[jj];
+                        if (self.icmpSkipped(cand)) continue;
+                        for (u32 opj = 0; opj < cand->nops; opj++)
+                        {
+                            if (cand->ops[opj] != &ins.base) continue;
+                            totalMentions++;
+                            // Load addresses the pointer at ops[0];
+                            // Store at ops[1].
+                            bool isMemUse =
+                                (cand.opcode == wallvm.irOps.IrOpcode::Load
+                                 && opj == 0 && cand.nops >= 1)
+                                || (cand.opcode == wallvm.irOps.IrOpcode::Store
+                                 && opj == 1 && cand.nops >= 2);
+                            bool isSpillWrite = cand.opcode == wallvm.irOps.IrOpcode::Store
+                                && cand->nops >= 2 && opj == 0
+                                && cand.ops[1] != null
+                                && (self.valEnc(cand.ops[1]) & 0x80000000UL) != 0
+                                && nSpillWrites2 < 16;
+                            if (isMemUse) okUses++;
+                            else if (isSpillWrite) { okUses++; spillWrites2[nSpillWrites2++] = cand; }
+                        }
+                    }
+                }
+                // totalMentions may be 0: every use went through
+                // instructions already folded/skipped in phase 1.
+                if (totalMentions == okUses && !self.icmpSkipped(ins))
+                {
+                    self.icmpSkipAdd(ins.base.id);
+                    for (u32 sw = 0; sw < nSpillWrites2; sw++)
+                        if (!self.icmpSkipped(spillWrites2[sw]))
+                            self.icmpSkipAdd(spillWrites2[sw].base.id);
+                }
+            }
+        }
+        // Single-use Loads feeding a float binop or Ret from a fixed slot:
+        // the consumer reloads the displacement directly, so skip them.
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            wallvm.ir_types.IrBlock* bb = func.blocks[bi] if False else func->blocks[bi];
+            for (u32 ii = 0; ii < bb.ninsts; ii++)
+            {
+                wallvm.ir_types.IrInst* ins = bb.insts[ii];
+                if (ins.opcode != wallvm.irOps.IrOpcode::Load || ins.base.nusers != 1) continue;
+                if (ins.base.users == null) continue;
+                wallvm.ir_types.IrInst* user = ins.base.users[0];
+                if (user == null) continue;
+                if (user.opcode != wallvm.irOps.IrOpcode::FAdd
+                    && user.opcode != wallvm.irOps.IrOpcode::FSub
+                    && user.opcode != wallvm.irOps.IrOpcode::FMul
+                    && user.opcode != wallvm.irOps.IrOpcode::FDiv
+                    && user.opcode != wallvm.irOps.IrOpcode::Ret) continue;
+                u32 d2 = 0;
+                if (self.staticMemRef(ins.ops[0], &d2) && !self.icmpSkipped(ins))
+                    self.icmpSkipAdd(ins.base.id);
+            }
+        }
+    }
+
     void prescanBranchIcmps(wallvm.ir_types.IrFunc* func)
     {
         self.nIcmpSkip = 0;
@@ -1479,9 +1672,28 @@ pub struct X86_64Codegen
         u32 w = ty ? ty->width : 64;
         const char* dreg = self.destReg(res);
         const char* acc = dreg ? dreg : "rax";
-        // Pointer already resident in an allocated register: load through
-        // it directly instead of relaying the address through rax first.
-        if (ptr != null && self.isIntRegValue(ptr))
+        // Pointer resolves to a fixed frame slot: use the displacement
+        // directly — the address never touches a register.
+        u32 soff = 0;
+        if (self.staticMemRef(ptr, &soff))
+        {
+            if (ty != null && ty.kind == wallvm.ir_types.IrTypeKind::Float)
+            {
+                // Floats home via xmm0; int acc is meaningless here.
+                if (self.att)
+                { self.pad(); self.s(w == 64 ? "movsd" : "movss"); self.c(' '); self.opMemRbp(soff); self.s(", %xmm0"); self.c('\n'); }
+                else
+                { self.pad(); self.s("mov "); self.s(w == 64 ? "sd" : "ss"); self.s("xmm0, "); self.opMemRbp(soff); self.c('\n'); }
+                if (dreg) self.markDest(dreg, res);
+                else self.floatStore(res, "xmm0");
+                return;
+            }
+            if (self.att)
+            { self.pad(); self.s("mov"); self.s(self.szSuffix(w)); self.c(' '); self.opMemRbp(soff); self.s(", %"); self.emitRegW(acc, w); self.c('\n'); }
+            else
+            { self.pad(); self.s("mov "); self.emitRegW(acc, w); self.s(", "); self.emitSize(ty); self.opMemRbp(soff); self.c('\n'); }
+        }
+        else if (ptr != null && self.isIntRegValue(ptr))
         {
             u64 pe2 = self.valEnc(ptr);
             const char* pr = self.allocIntNames[self.valLow(pe2)];
@@ -1514,6 +1726,35 @@ pub struct X86_64Codegen
         // Fused read-modify-write: the skipped Load/Add pair feeding this
         // store collapses into one memory-operand add.
         i32 fIdx = self.fusedIndexFor(inst);
+        u32 fsoff = 0;
+        bool fStatic = ptr != null && self.staticMemRef(ptr, &fsoff);
+        if (fIdx >= 0 && fStatic)
+        {
+            wallvm.ir_types.IrValue* addend = self.fusedAddends[fIdx];
+            if (self.isConst(addend))
+            {
+                if (self.att)
+                { self.pad(); self.s("add"); self.s(self.szSuffix(w)); self.c(' '); self.opImmU(addend.valData); self.s(", "); self.opMemRbp(fsoff); self.c('\n'); }
+                else
+                { self.pad(); self.s("add "); self.emitSize(ty); self.opMemRbp(fsoff); self.s(", "); self.u(addend.valData); self.c('\n'); }
+                return;
+            }
+            u32 aoff = 0;
+            if (self.valueStaticSlot(addend, &aoff))
+            {
+                if (self.att)
+                { self.pad(); self.s("mov"); self.s(self.szSuffix(w)); self.c(' '); self.opMemRbp(aoff); self.s(", %"); self.emitRegW("rcx", w); self.c('\n'); }
+                else
+                { self.pad(); self.s("mov "); self.emitRegW("rcx", w); self.s(", "); self.emitSize(ty); self.opMemRbp(aoff); self.c('\n'); }
+            }
+            else
+                self.loadArith(addend, "rcx");
+            if (self.att)
+            { self.pad(); self.s("add"); self.s(self.szSuffix(w)); self.c(' '); self.c('%'); self.emitRegW("rcx", w); self.s(", "); self.opMemRbp(fsoff); self.c('\n'); }
+            else
+            { self.pad(); self.s("add "); self.emitSize(ty); self.opMemRbp(fsoff); self.s(", "); self.emitRegW("rcx", w); self.c('\n'); }
+            return;
+        }
         if (fIdx >= 0 && ptr != null && self.isIntRegValue(ptr))
         {
             wallvm.ir_types.IrValue* addend = self.fusedAddends[fIdx];
@@ -1535,8 +1776,34 @@ pub struct X86_64Codegen
             return;
         }
 
+        // Plain int store through a fixed frame slot: displacement direct.
+        u32 istoff = 0;
+        if (ptr != null && self.staticMemRef(ptr, &istoff)
+            && !(ty != null && ty.kind == wallvm.ir_types.IrTypeKind::Float))
+        {
+            const char* vreg = "rax";
+            if (val != null && self.isIntRegValue(val))
+                vreg = self.allocIntNames[self.valLow(self.valEnc(val))];
+            else
+                self.load(val, "rax");
+            if (self.att)
+            { self.pad(); self.s("mov"); self.s(self.szSuffix(w)); self.c(' '); self.c('%'); self.emitRegW(vreg, w); self.s(", "); self.opMemRbp(istoff); self.c('\n'); }
+            else
+            { self.pad(); self.s("mov "); self.emitSize(ty); self.opMemRbp(istoff); self.s(", "); self.emitRegW(vreg, w); self.c('\n'); }
+            return;
+        }
         if (ty && ty->kind == wallvm.ir_types.IrTypeKind::Float)
         {
+            u32 soff2 = 0;
+            if (self.staticMemRef(ptr, &soff2))
+            {
+                self.floatLoad(val, "xmm0");
+                if (self.att)
+                { self.pad(); self.s(w == 64 ? "movsd" : "movss"); self.c(' '); self.c('%'); self.s("xmm0"); self.s(", "); self.opMemRbp(soff2); self.c('\n'); }
+                else
+                { self.pad(); self.s("mov "); self.s(w == 64 ? "sd" : "ss"); self.opMemRbp(soff2); self.s(", xmm0\n"); }
+                return;
+            }
             // Pointer resident in an allocated register: no rcx relay.
             if (ptr != null && self.isIntRegValue(ptr))
             {
@@ -1892,10 +2159,41 @@ pub struct X86_64Codegen
         else if (mne[0] == 's') op = isDouble ? "subsd" : "subss";
         else if (mne[0] == 'm') op = isDouble ? "mulsd" : "mulss";
         else op = isDouble ? "divsd" : "divss";
-        self.floatLoad(lhs, "xmm0");
-        self.floatLoad(rhs, "xmm1");
-        self.inst2(op, "xmm0", "xmm1");
-        self.floatStore(res, "xmm0");
+        // gcc-style: load the left operand, then apply the op with a
+        // memory operand when the right side lives in a fixed frame slot.
+        u32 loff2 = 0;
+        bool lStatic = self.valueStaticSlot(lhs, &loff2);
+        const char* mn = isDouble ? "movsd" : "movss";
+        if (lStatic)
+        {
+            if (self.att)
+            { self.pad(); self.s(mn); self.c(' '); self.opMemRbp(loff2); self.s(", %xmm0"); self.c('\n'); }
+            else
+            { self.pad(); self.s("mov "); self.s(isDouble ? "sd" : "ss"); self.s("xmm0, "); self.opMemRbp(loff2); self.c('\n'); }
+            self.xmm0Hold = lhs.id + 1;
+        }
+        else
+            self.floatLoad(lhs, "xmm0");
+        u32 roff2 = 0;
+        bool rStatic = rhs != null && self.valueStaticSlot(rhs, &roff2);
+        if (rStatic)
+        {
+            if (self.att)
+            { self.pad(); self.s(op); self.c(' '); self.opMemRbp(roff2); self.s(", %xmm0"); self.c('\n'); }
+            else
+            { self.pad(); self.s(op); self.s(" xmm0, "); self.opMemRbp(roff2); self.c('\n'); }
+        }
+        else
+        {
+            self.floatLoad(rhs, "xmm1");
+            self.inst2(op, "xmm0", "xmm1");
+        }
+        // Result consumed only by a fixed-slot store: leave it in xmm0
+        // and let that store write the displacement directly.
+        if (!self.singleUserStoreStatic(res))
+            self.floatStore(res, "xmm0");
+        else
+            self.xmm0Hold = res.id + 1;
     }
 
     void emitFAbs(wallvm.ir_types.IrInst* inst)
@@ -2018,6 +2316,53 @@ pub struct X86_64Codegen
         self.maxSpillSeen = nextSlot > self.maxSpillSeen ? nextSlot : self.maxSpillSeen;
     }
 
+    // Single-stage param staging: redirect the prologue write straight
+    // into the param's alloca slot and drop the seed store, removing the
+    // pv spill slot round trip. Only when the alloca is never written
+    // again (param not reassigned) and its address is a fixed frame slot.
+    void promoteParamSeeds(wallvm.ir_types.IrFunc* func)
+    {
+        if (self.numParamsFound == 0 || self.allocaOffsetsCap == 0) return;
+        u32 capP = self.numParamsFound;
+        u32* nd = mman.alloc<u32>(capP);
+        for (u32 k = 0; k < capP; k++) nd[k] = 0;
+        for (u32 k = 0; k < self.numParamsFound; k++)
+        {
+            wallvm.ir_types.IrValue* src = self.paramVals[k];
+            if (!src) continue;
+            // find the seed store in the entry block
+            wallvm.ir_types.IrInst* seed = null;
+            wallvm.ir_types.IrBlock* eb = func->blocks[0];
+            for (u32 ii = 0; ii < eb->ninsts; ii++)
+            {
+                wallvm.ir_types.IrInst* st = eb->insts[ii];
+                if (st->opcode != wallvm.irOps.IrOpcode::Store || st->nops < 2) continue;
+                if (st->ops[0] == src) { seed = st; break; }
+            }
+            if (seed == null) continue;
+            u32 off = 0;
+            if (!self.staticMemRef(seed.ops[1], &off)) continue;
+            // no other writer to this alloca (directly or through a gep)
+            bool rewritten = false;
+            for (u32 bi = 0; bi < func->nblocks && !rewritten; bi++)
+            {
+                wallvm.ir_types.IrBlock* bb = func->blocks[bi];
+                for (u32 ii = 0; ii < bb->ninsts && !rewritten; ii++)
+                {
+                    wallvm.ir_types.IrInst* st2 = bb->insts[ii];
+                    if (st2 == seed || st2->opcode != wallvm.irOps.IrOpcode::Store || st2->nops < 2) continue;
+                    u32 d4 = 0;
+                    if (st2.ops[1] == seed.ops[1] || self.staticMemRef(st2.ops[1], &d4) && d4 == off)
+                        rewritten = true;
+                }
+            }
+            if (rewritten) continue;
+            nd[k] = off;
+            if (!self.icmpSkipped(seed)) self.icmpSkipAdd(seed.base.id);
+        }
+        self.paramDirectOff = nd;
+    }
+
     void emitParamPrologue(wallvm.ir_types.IrFunc* func)
     {
         u32 intPi = 0;
@@ -2032,6 +2377,12 @@ pub struct X86_64Codegen
                 const char* xr = flPi < self.abi.numFloatArgRegs ? self.abi.floatArgRegs[flPi] : null;
                 flPi++;
                 if (xr == null) continue;
+                if (self.paramDirectOff != null && self.paramDirectOff[k] > 0)
+                {
+                    if (self.att) { self.pad(); self.s("movq %"); self.s(xr); self.s(", "); self.opMemRbp(self.paramDirectOff[k]); self.c('\n'); }
+                    else { self.pad(); self.s("movq "); self.opMemRbp(self.paramDirectOff[k]); self.s(", "); self.s(xr); self.c('\n'); }
+                    continue;
+                }
                 if (self.att) { self.pad(); self.s("movq %"); self.s(xr); self.s(", "); self.emitSpillRef(e); self.c('\n'); }
                 else { self.pad(); self.s("movq "); self.emitSpillRef(e); self.s(", "); self.s(xr); self.c('\n'); }
             }
@@ -2040,6 +2391,12 @@ pub struct X86_64Codegen
                 if (intPi >= self.abi.numArgRegs) continue;
                 const char* ar = self.abi.argRegs[intPi];
                 intPi++;
+                if (self.paramDirectOff != null && self.paramDirectOff[k] > 0)
+                {
+                    if (self.att) { self.pad(); self.s("movq %"); self.s(ar); self.s(", "); self.opMemRbp(self.paramDirectOff[k]); self.c('\n'); }
+                    else { self.pad(); self.s("movq "); self.opMemRbp(self.paramDirectOff[k]); self.s(", "); self.s(ar); self.c('\n'); }
+                    continue;
+                }
                 if (self.att) { self.pad(); self.s("movq %"); self.s(ar); self.s(", "); self.emitSpillRef(e); self.c('\n'); }
                 else { self.pad(); self.s("movq "); self.emitSpillRef(e); self.s(", "); self.s(ar); self.c('\n'); }
             }
@@ -2145,6 +2502,8 @@ pub struct X86_64Codegen
         // re-emits the compare and jumps on flags, so the setcc/movzx
         // materialization of the bool is skipped entirely.
         self.prescanBranchIcmps(func);
+        self.prescanStaticGeps(func);
+        self.promoteParamSeeds(func);
 
         // Function label
         if (func->base.name && func->base.name[0])
@@ -2275,9 +2634,31 @@ pub struct X86_64Codegen
                     if (rv && rt && rt.kind != wallvm.ir_types.IrTypeKind::Void)
                     {
                         if (rt.kind == wallvm.ir_types.IrTypeKind::Float)
-                            self.floatLoad(rv, "xmm0");
+                        {
+                            u32 rso = 0;
+                            if (self.valueStaticSlot(rv, &rso))
+                            {
+                                if (self.att)
+                                { self.pad(); self.s(rt.width == 64 ? "movsd" : "movss"); self.c(' '); self.opMemRbp(rso); self.s(", %xmm0"); self.c('\n'); }
+                                else
+                                { self.pad(); self.s("mov "); self.s(rt.width == 64 ? "sd" : "ss"); self.s("xmm0, "); self.opMemRbp(rso); self.c('\n'); }
+                            }
+                            else
+                                self.floatLoad(rv, "xmm0");
+                        }
                         else
-                            self.load(rv, "rax");
+                        {
+                            u32 rso2 = 0;
+                            if (self.valueStaticSlot(rv, &rso2))
+                            {
+                                if (self.att)
+                                { self.pad(); self.s("mov"); self.s(self.szSuffix(rt.width)); self.c(' '); self.opMemRbp(rso2); self.s(", %"); self.emitRegW("rax", rt.width); self.c('\n'); }
+                                else
+                                { self.pad(); self.s("mov "); self.emitRegW("rax", rt.width); self.s(", "); self.emitSize(rt); self.opMemRbp(rso2); self.c('\n'); }
+                            }
+                            else
+                                self.load(rv, "rax");
+                        }
                     }
                     self.emitEpilogue();
                     lastBlockTerminates = true;
@@ -2354,13 +2735,22 @@ pub struct X86_64Codegen
                 case wallvm.irOps.IrOpcode::FSqrt: self.emitFSqrt(inst); break;
 
                 // Memory
-                case wallvm.irOps.IrOpcode::Alloca: self.emitAlloca(inst); break;
+                case wallvm.irOps.IrOpcode::Alloca:
+                    if (self.icmpSkipped(inst)) break; // folded into static slots
+                    self.emitAlloca(inst);
+                    break;
                 case wallvm.irOps.IrOpcode::Load:
                     if (self.icmpSkipped(inst)) break; // fused into a store
                     self.emitLoad(inst);
                     break;
-                case wallvm.irOps.IrOpcode::Store: self.emitStore(inst); break;
-                case wallvm.irOps.IrOpcode::Gep: self.emitGep(inst); break;
+                case wallvm.irOps.IrOpcode::Store:
+                    if (self.icmpSkipped(inst)) break; // promoted param seed / fused
+                    self.emitStore(inst);
+                    break;
+                case wallvm.irOps.IrOpcode::Gep:
+                    if (self.icmpSkipped(inst)) break; // folded into static slots
+                    self.emitGep(inst);
+                    break;
 
                 // Cast
                 case wallvm.irOps.IrOpcode::Trunc:
