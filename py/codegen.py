@@ -347,7 +347,7 @@ class Codegen:
         if isinstance(expr, ExprSizeof):
             return f'sizeof({self.type_to_c(expr.type_expr)})'
         if isinstance(expr, ExprParen):
-            return self.expr_to_c(expr.expr)
+            return f'({self.expr_to_c(expr.expr)})'
         if isinstance(expr, ExprTypeLiteral):
             return f'({self.type_to_c(expr.type_expr)})'
         if isinstance(expr, ExprModulePath):
