@@ -472,7 +472,7 @@ class Codegen:
             self.emit_h()
         # Emit enum, const, and typedef declarations first (structs depend on them)
         # Struct forward declarations must precede struct-typed typedefs
-        # (e.g. wallvm_PassFn references ir_types_IrFunc*).
+        # (e.g. function pointer typedefs referencing struct pointers).
         self._emit_struct_fwd_decls()
         self._const_names = {d.name for d in program.decls
                              if isinstance(d, DeclConst)}
