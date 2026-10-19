@@ -9,6 +9,7 @@ asks the collection for a count once, then asks for each element by index.
 ```coral
 for (var elem : value)              { ... }  // whole container
 for (T elem : value)                { ... }  // explicit element type
+for (var a, b : value)              { ... }  // tuple destructuring
 
 for (var elem : value(start, end))  { ... }  // half-open runtime bounds
 for (var elem : value.range(start, end)) { ... } // same, method spelling
@@ -23,6 +24,26 @@ for (var elem : value.range(start, end)) { ... } // same, method spelling
 
 The loop variable is a copy of the element. Assigning to it does not modify
 the collection. Use an index loop with `atPtr()` when mutation is required.
+
+Multiple `var` bindings destructure a tuple returned by `at()`:
+
+```coral
+pub extend Pairs : @iter
+{
+    usize count() { return self.n; }
+
+    struct(i32, i32) at(usize i)
+    {
+        return ((i32)i, (i32)(i * 10));
+    }
+}
+
+for (var index, value : pairs)
+    println("{} -> {}", index, value);
+```
+
+The tuple must have exactly one element per binding. The typed single-binding
+form still accepts a tuple type: `for (struct(i32, i32) pair : pairs)`.
 
 ## Arrays and slices
 
@@ -109,6 +130,15 @@ pub struct IterRange
 It is deliberately non-generic so importing a collection does not implicitly
 instantiate a container such as `Vec<T>` just because `range()` is declared.
 
+`IterRange` is an ordinary struct, not a builtin type like `str`, and it is
+not force-imported by the prelude. A bounded `for-in` does not need to name it:
+the compiler desugars the bounds to `range()` plus `at()`. Import it only when
+a declaration spells the return type:
+
+```coral
+import(lib) std::collections::range { IterRange };
+```
+
 ## Built-in implementations
 
 | Type | Iteration order | `at()` cost | Notes |
@@ -161,8 +191,8 @@ These functions accept `Vec<T>` or `const Vec<T>*`. They are not generic
 
 ## Current limitations
 
-- Only one loop binding is supported. `for (var a, b : iterable)` is not
-  implemented.
+- Multi-binding only applies to the `var` form and requires `at()` to return a
+  tuple with one element per binding.
 - `@iter` is structural and built in; user-defined traits cannot be used as
   for-in protocols.
 - Iteration yields copies. Mutation requires an explicit index loop.
