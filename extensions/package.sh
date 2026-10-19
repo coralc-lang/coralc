@@ -37,6 +37,11 @@ ZED_VERSION=$(python3 -c 'import sys,tomllib; print(tomllib.load(open(sys.argv[1
     "$ZED_DIR/extension.toml")
 ZED_REV=$(git -C "$ZED_DIR" rev-parse HEAD 2>/dev/null || echo unknown)
 
+if ! git -C "$ZED_DIR" cat-file -e "$ZED_REV:tree-sitter-coral/src/parser.c" 2>/dev/null; then
+    echo "warning: tree-sitter-coral/src/parser.c is not committed at $ZED_REV" >&2
+    echo "         commit the grammar move before publishing this artifact" >&2
+fi
+
 echo "== VS Code extension $VS_VERSION"
 python3 "$VSCODE_DIR/tools/package-vsix.py" \
     --out "$ROOT/vscode/coral-$VS_VERSION.vsix"
@@ -60,23 +65,40 @@ done
 python3 - "$ZED_DIR/extension.toml" "$STAGE" "$ZED_REV" <<'PY'
 import json, pathlib, re, sys, tomllib
 
-src, stage, rev = sys.argv[1:4]
+src, stage, zed_rev = sys.argv[1:4]
 toml_path = pathlib.Path(src)
 text = toml_path.read_text()
 data = tomllib.loads(text)
 
-# The artifact must be portable: never ship a file:// grammar URL or a stale
-# revision. `rev` is the local extension commit that produced the wasm.
-stamp = text
+ZED_URL = 'https://github.com/coralc-lang/coral-zed'
+GRAMMAR_REPO = ZED_URL
+GRAMMAR_PATH = 'tree-sitter-coral'
+
+# The artifact must be portable: never ship a file:// grammar URL or a local
+# revision. The grammar lives in the same repository as the extension; Zed
+# clones it into <extension>/grammars/coral and then appends `path`.
 stamp = re.sub(
     r'(?m)^(repository\s*=\s*)"[^"]*"',
-    r'\1"https://github.com/coralc-lang/coral-zed"',
-    stamp, count=1)
-stamp = re.sub(
-    r'(?m)^(repository\s*=\s*)"[^"]*"',
-    r'\1"https://github.com/coralc-lang/coral-zed"',
-    stamp)
-stamp = re.sub(r'(?m)^(rev\s*=\s*)"[^"]*"', rf'\1"{rev}"', stamp)
+    rf'\1"{ZED_URL}"', text, count=1)
+
+
+def set_block_key(document, header, key, value):
+    pattern = rf'(?ms)(^\[{re.escape(header)}\]\s*$.*?)(?=^\[|\Z)'
+    match = re.search(pattern, document)
+    if not match:
+        raise SystemExit(f'extension.toml has no [{header}] section')
+    block = match.group(1)
+    updated, count = re.subn(
+        rf'(?m)^{re.escape(key)}\s*=.*$',
+        f'{key} = "{value}"', block, count=1)
+    if count != 1:
+        raise SystemExit(f'[{header}] has no {key} field')
+    return document[:match.start(1)] + updated + document[match.end(1):]
+
+
+stamp = set_block_key(stamp, 'grammars.coral', 'repository', GRAMMAR_REPO)
+stamp = set_block_key(stamp, 'grammars.coral', 'rev', zed_rev)
+stamp = set_block_key(stamp, 'grammars.coral', 'path', GRAMMAR_PATH)
 stage = pathlib.Path(stage)
 (stage / 'extension.toml').write_text(stamp)
 
@@ -84,19 +106,26 @@ langs = pathlib.Path(stage) / 'languages' / 'coral'
 queries = sorted(langs.glob('*.scm'))
 query_lines = sum(len(p.read_text().splitlines()) for p in queries)
 
+grammar = dict(data.get('grammars', {}).get('coral', {}))
+grammar.update({
+    'repository': GRAMMAR_REPO,
+    'rev': zed_rev,
+    'path': GRAMMAR_PATH,
+})
+
 manifest = {
     'id': data['id'],
     'name': data['name'],
     'version': data['version'],
     'schema_version': data['schema_version'],
     'description': data.get('description', ''),
-    'repository': 'https://github.com/coralc-lang/coral-zed',
+    'repository': ZED_URL,
     'authors': data.get('authors', []),
     'lib': {'kind': 'Rust', 'version': data['version']},
     'themes': data.get('themes', []),
     'icon_themes': data.get('icon_themes', []),
     'languages': data.get('languages', []),
-    'grammars': data.get('grammars', {}),
+    'grammars': {'coral': grammar},
     'language_servers': {},
     'context_servers': {},
     'slash_commands': {},
@@ -137,7 +166,7 @@ index_entry = {
 
 (stage / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
 (stage / 'index-entry.json').write_text(json.dumps(index_entry, indent=2) + '\n')
-print(f"   manifest: {data['name']} {data['version']}, grammar rev {rev[:12]}")
+print(f"   manifest: {data['name']} {data['version']}, grammar rev {zed_rev[:12]}")
 PY
 
 echo "== Zed extension $ZED_VERSION"

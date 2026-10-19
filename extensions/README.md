@@ -63,5 +63,13 @@ extensions/package.sh
 
 Override locations with `CORAL_VSCODE_DIR` and `CORAL_ZED_DIR`. The script
 refuses to package a Zed artifact whose `extension.wasm` or grammar wasm is
-missing or not a WebAssembly binary, and stamps the Zed manifest with the
-extension checkout's current commit instead of a local `file://` URL.
+missing or not a WebAssembly binary. It stamps the metadata and grammar
+repositories as `coral-zed` and pins the grammar to the extension checkout's
+current commit.
+
+## Publishing to Zed
+
+The extension is prepared for the Zed registry. See
+[`zed/PUBLISHING.md`](zed/PUBLISHING.md) for the checklist, the public-repository
+requirements, and `zed/prepare-publish.sh`, which validates the grammar and
+stamps the correct revision.
