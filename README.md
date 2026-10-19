@@ -61,6 +61,19 @@ coralc --serve        # language server on stdio
 coralc --help
 ```
 
+## Iteration
+
+Arrays, slices, and `@iter` collections work with `for-in`:
+
+```coral
+for (var value : values) { ... }
+for (var value : values(start, end)) { ... }
+```
+
+See [`docs/iteration.md`](docs/iteration.md) for the full `@iter` protocol,
+bounded ranges, custom implementations, built-in collection behavior, and
+diagnostics.
+
 ## Editor extensions
 
 Prebuilt support is committed under [`extensions/`](extensions/README.md).
