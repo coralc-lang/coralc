@@ -44,6 +44,11 @@ fi
 
 cd "$SRC"
 
+# ADDED: stop any running coralc (e.g. editor language servers) so the
+# install copy can overwrite the binary instead of failing with ETXTBSY.
+pkill -f "$PREFIX/bin/coralc" 2>/dev/null || true
+rm -f "$PREFIX/bin/coralc"
+
 if command -v make >/dev/null 2>&1; then
     case "$(uname -s)" in
         MINGW*|MSYS*|CYGWIN*) make windows ;;
