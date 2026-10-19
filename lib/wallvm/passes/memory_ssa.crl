@@ -1,0 +1,389 @@
+#[[no_drop_all]]
+import(lib) wallvm::irtypes { IrFunc, IrBlock, IrInst, IrValue, IrContext, FunctionAnalysisCache };
+import(lib) wallvm::irOps { IrOpcode };
+import(lib) wallvm::passes::alias_analysis { AliasAnalysis, OBJECT_UNKNOWN };
+import(lib) std::mman { alloc, dealloc };
+
+// MemorySSA — a memory dependency web built on top of alias analysis.
+//
+// MemorySSA assigns a "memory version" to each instruction that reads or
+// writes memory. This allows efficient querying of:
+// - What is the last store that may have affected this load?
+// - Does a store kill a prior load?
+// - Is a load redundant after a prior store?
+//
+// Structure:
+// - MemoryDef — an instruction that writes memory (store, call, fence, etc.)
+//   Each MemoryDef gets a unique ID and tracks which objects it may modify.
+// - MemoryUse — an instruction that reads memory (load, call)
+//   Each MemoryUse points to the most recent MemoryDef it may read past.
+// - MemoryPhi — at control flow joins, merges MemoryDefs from predecessors.
+//
+// This enables GVN, DSE, and vectorizer to make correct aliasing decisions.
+// Without MemorySSA, these passes must conservatively assume all memory
+// operations alias each other.
+
+pub struct MemorySSA
+{
+    AliasAnalysis* aliasAnalysis;
+
+    // Per-instruction memory version numbers
+    // memVer[instruction_id] = memory version at this point
+    u32* memVer;
+    u32 memVerCap;
+
+    // Memory version -> definition info
+    // For versions that are MemoryDefs, store the instruction that defines them
+    IrInst** memDefInst;
+    u32* memDefBlock;
+    u32* memDefObjCount;
+    u32** memDefObjects;
+    u32 numMemVersions;
+    u32 memDefCap;
+
+    // Current memory version per block (at block exit)
+    u32* blockExitMemVer;
+    u32 numBlocks;
+
+    // Current live memory version during scan
+    u32 currentMemVer;
+
+    MemorySSA new(AliasAnalysis* aa)
+    {
+        return MemorySSA {
+            .aliasAnalysis = aa,
+            .memVer = null,
+            .memVerCap = 0,
+            .memDefInst = null,
+            .memDefBlock = null,
+            .memDefObjCount = null,
+            .memDefObjects = null,
+            .numMemVersions = 0,
+            .memDefCap = 0,
+            .blockExitMemVer = null,
+            .numBlocks = 0,
+            .currentMemVer = 0
+        };
+    }
+
+    void deinit()
+    {
+        if (self.memVer != null) dealloc<u32>(self.memVer);
+        if (self.memDefInst != null) dealloc<IrInst*>(self.memDefInst);
+        if (self.memDefBlock != null) dealloc<u32>(self.memDefBlock);
+        if (self.memDefObjCount != null) dealloc<u32>(self.memDefObjCount);
+        if (self.memDefObjects != null)
+        {
+            for (u32 i = 0; i < self.numMemVersions; i++)
+            {
+                if (self.memDefObjects[i] != null)
+                    dealloc<u32>(self.memDefObjects[i]);
+            }
+            dealloc<u32*>(self.memDefObjects);
+        }
+        if (self.blockExitMemVer != null) dealloc<u32>(self.blockExitMemVer);
+    }
+
+    void ensureMemVer(u32 id)
+    {
+        if (id < self.memVerCap) return;
+        u32 newCap = self.memVerCap != 0 ? self.memVerCap * 2 : 256;
+        while (newCap <= id) newCap = newCap * 2;
+        u32* newArr = alloc<u32>(newCap);
+        for (u32 i = 0; i < self.memVerCap; i++)
+            newArr[i] = self.memVer[i];
+        for (u32 i = self.memVerCap; i < newCap; i++)
+            newArr[i] = 0;
+        if (self.memVer != null) dealloc<u32>(self.memVer);
+        self.memVer = newArr;
+        self.memVerCap = newCap;
+    }
+
+    void ensureMemDef(u32 needed)
+    {
+        if (needed <= self.memDefCap) return;
+        u32 newCap = self.memDefCap != 0 ? self.memDefCap * 2 : 64;
+        while (newCap < needed) newCap = newCap * 2;
+        IrInst** newInst = alloc<IrInst*>(newCap);
+        u32* newBlock = alloc<u32>(newCap);
+        u32* newObjCount = alloc<u32>(newCap);
+        u32** newObjects = alloc<u32*>(newCap);
+        for (u32 i = 0; i < self.memDefCap; i++)
+        {
+            newInst[i] = self.memDefInst[i];
+            newBlock[i] = self.memDefBlock[i];
+            newObjCount[i] = self.memDefObjCount[i];
+            newObjects[i] = self.memDefObjects[i];
+        }
+        for (u32 i = self.memDefCap; i < newCap; i++)
+        {
+            newInst[i] = null;
+            newBlock[i] = 0;
+            newObjCount[i] = 0;
+            newObjects[i] = null;
+        }
+        if (self.memDefInst != null) dealloc<IrInst*>(self.memDefInst);
+        if (self.memDefBlock != null) dealloc<u32>(self.memDefBlock);
+        if (self.memDefObjCount != null) dealloc<u32>(self.memDefObjCount);
+        if (self.memDefObjects != null) dealloc<u32*>(self.memDefObjects);
+        self.memDefInst = newInst;
+        self.memDefBlock = newBlock;
+        self.memDefObjCount = newObjCount;
+        self.memDefObjects = newObjects;
+        self.memDefCap = newCap;
+    }
+
+    // Create a new MemoryDef for a memory-writing instruction.
+    // Returns the new memory version number.
+    u32 createMemoryDef(IrInst* inst, u32 blockIndex, u32 parentVersion)
+    {
+        u32 newVer = self.numMemVersions;
+        self.ensureMemDef(newVer + 1);
+        self.numMemVersions = newVer + 1;
+
+        self.memDefInst[newVer] = inst;
+        self.memDefBlock[newVer] = blockIndex;
+        self.memDefObjCount[newVer] = 0;
+        self.memDefObjects[newVer] = null;
+
+        // Determine which objects this def modifies
+        if (inst != null && self.aliasAnalysis != null)
+        {
+            if (inst->opcode == IrOpcode::Store && inst->nops >= 2)
+            {
+                u32 objId = self.aliasAnalysis->walkAddr(inst->ops[1]);
+                if (objId != OBJECT_UNKNOWN)
+                {
+                    self.memDefObjects[newVer] = alloc<u32>(1);
+                    self.memDefObjects[newVer][0] = objId;
+                    self.memDefObjCount[newVer] = 1;
+                }
+            }
+            else if (inst->opcode == IrOpcode::AtomicStore && inst->nops >= 2)
+            {
+                u32 objId = self.aliasAnalysis->walkAddr(inst->ops[1]);
+                if (objId != OBJECT_UNKNOWN)
+                {
+                    self.memDefObjects[newVer] = alloc<u32>(1);
+                    self.memDefObjects[newVer][0] = objId;
+                    self.memDefObjCount[newVer] = 1;
+                }
+            }
+            else
+            {
+                // Call, fence, asm — may modify anything
+                self.memDefObjCount[newVer] = 0;
+                self.memDefObjects[newVer] = null;
+            }
+        }
+
+        return newVer;
+    }
+
+    // Check if a MemoryDef at version 'defVer' may alias a load from address 'loadAddr'.
+    bool defMayAliasLoad(u32 defVer, IrValue* loadAddr)
+    {
+        if (defVer == 0) return false;
+        if (defVer >= self.numMemVersions) return true;
+
+        IrInst* defInst = self.memDefInst[defVer];
+        if (defInst == null) return true;
+
+        // Call, fence, asm may modify anything
+        if (defInst->opcode == IrOpcode::Call
+            || defInst->opcode == IrOpcode::Fence
+            || defInst->opcode == IrOpcode::InlineAsm)
+            return true;
+
+        // Store — check if it may alias the load address
+        if (defInst->opcode == IrOpcode::Store && defInst->nops >= 2)
+        {
+            if (self.aliasAnalysis != null)
+                return self.aliasAnalysis->mayClobber(loadAddr, defInst->ops[1]);
+            return true;
+        }
+
+        if (defInst->opcode == IrOpcode::AtomicStore && defInst->nops >= 2)
+        {
+            if (self.aliasAnalysis != null)
+                return self.aliasAnalysis->mayClobber(loadAddr, defInst->ops[1]);
+            return true;
+        }
+
+        return true;
+    }
+
+    // Find the nearest dominating MemoryDef that may alias with a load at the given address.
+    // Returns the memory version of that def, or 0 if no aliasing def found.
+    u32 findNearestDefForLoad(IrValue* loadAddr, u32 startingMemVer)
+    {
+        u32 ver = startingMemVer;
+        u32 visited = 0;
+        while (ver > 0 && visited < 256)
+        {
+            visited = visited + 1;
+            if (self.defMayAliasLoad(ver, loadAddr))
+                return ver;
+            ver = ver - 1;
+        }
+        return 0;
+    }
+
+    // Check if a store at version 'storeVer' kills a load at version 'loadVer'.
+    // (i.e., the store definitely overwrites the same memory the load reads)
+    bool doesStoreKillLoad(u32 storeVer, IrValue* loadAddr)
+    {
+        if (storeVer == 0 || storeVer >= self.numMemVersions) return false;
+        IrInst* storeInst = self.memDefInst[storeVer];
+        if (storeInst == null) return false;
+
+        if (storeInst->opcode == IrOpcode::Store && storeInst->nops >= 2)
+        {
+            if (self.aliasAnalysis != null)
+                return self.aliasAnalysis->isMustAlias(loadAddr, storeInst->ops[1]);
+        }
+        return false;
+    }
+
+    // Build MemorySSA for a function.
+    void build(IrFunc* func)
+    {
+        self.numMemVersions = 1; // Version 0 is the entry "live on entry"
+        self.currentMemVer = 0;
+        self.numBlocks = func->nblocks;
+        self.blockExitMemVer = alloc<u32>(func->nblocks);
+        for (u32 i = 0; i < func->nblocks; i++)
+            self.blockExitMemVer[i] = 0;
+
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+
+            // At block entry, if multiple predecessors, create a phi-like merge
+            if (bi > 0)
+            {
+                u32 predCount = 0;
+                for (u32 pi = 0; pi < func->nblocks; pi++)
+                {
+                    if (pi == bi) continue;
+                    IrBlock* pred = func->blocks[pi];
+                    for (u32 si = 0; si < pred->ninsts; si++)
+                    {
+                        IrInst* term = pred->insts[si];
+                        if (term->opcode == IrOpcode::Br && term->nops >= 1 && term->ops[0]->id == bb->base.id)
+                            predCount = predCount + 1;
+                        if (term->opcode == IrOpcode::CondBr && term->nops >= 3)
+                        {
+                            if (term->ops[1]->id == bb->base.id) predCount = predCount + 1;
+                            if (term->ops[2]->id == bb->base.id) predCount = predCount + 1;
+                        }
+                    }
+                }
+                if (predCount >= 2)
+                {
+                    // Create a phi memory version
+                    self.currentMemVer = self.numMemVersions;
+                    self.ensureMemDef(self.numMemVersions + 1);
+                    self.memDefInst[self.numMemVersions] = null;
+                    self.memDefBlock[self.numMemVersions] = bi;
+                    self.memDefObjCount[self.numMemVersions] = 0;
+                    self.memDefObjects[self.numMemVersions] = null;
+                    self.numMemVersions = self.numMemVersions + 1;
+                }
+            }
+
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+
+                // Assign memory version to this instruction
+                self.ensureMemVer(inst->base.id + 1);
+                self.memVer[inst->base.id] = self.currentMemVer;
+
+                // Memory-writing instructions create a new version
+                if (inst->opcode == IrOpcode::Store
+                    || inst->opcode == IrOpcode::AtomicStore
+                    || inst->opcode == IrOpcode::AtomicRmw
+                    || inst->opcode == IrOpcode::Fence
+                    || inst->opcode == IrOpcode::InlineAsm
+                    || inst->opcode == IrOpcode::Call)
+                {
+                    u32 newVer = self.createMemoryDef(inst, bi, self.currentMemVer);
+                    self.currentMemVer = newVer;
+                    self.ensureMemVer(inst->base.id + 1);
+                    self.memVer[inst->base.id] = self.currentMemVer;
+                }
+            }
+
+            self.blockExitMemVer[bi] = self.currentMemVer;
+        }
+    }
+
+    // Get the memory version at a given instruction.
+    u32 getVersionAtInst(IrInst* inst)
+    {
+        if (inst == null) return 0;
+        self.ensureMemVer(inst->base.id + 1);
+        return self.memVer[inst->base.id];
+    }
+
+    // Get the memory version at block exit.
+    u32 getVersionAtBlockExit(u32 blockIndex)
+    {
+        if (blockIndex >= self.numBlocks) return 0;
+        return self.blockExitMemVer[blockIndex];
+    }
+
+    // Check if a load at the given instruction is redundant after a prior store.
+    // Returns true if the load is guaranteed to return the value from the most
+    // recent store to the same address.
+    bool isLoadRedundant(IrInst* loadInst, IrInst* priorStore)
+    {
+        if (loadInst == null || priorStore == null) return false;
+        if (loadInst->opcode != IrOpcode::Load) return false;
+        if (priorStore->opcode != IrOpcode::Store) return false;
+        if (loadInst->nops < 1 || priorStore->nops < 2) return false;
+
+        return self.aliasAnalysis->isMustAlias(loadInst->ops[0], priorStore->ops[1]);
+    }
+
+    // Get the MemoryDef info for a given memory version.
+    // Returns null if the version is 0 (entry) or a phi.
+    IrInst* getDefInstForVersion(u32 memVersion)
+    {
+        if (memVersion == 0 || memVersion >= self.numMemVersions) return null;
+        return self.memDefInst[memVersion];
+    }
+}
+
+pub bool irMemorySSA(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (ctx == null || func == null) return false;
+
+    FunctionAnalysisCache* cache = ctx->getOrCreateAnalysisCache(func);
+
+    // I still don't publish the MSSA into the cache: an MSSA holds a
+    // pointer to its AliasAnalysis, so a cached one would dangle once the
+    // local analysis dies and a heap-copy keeps its buffers alive past the
+    // pointer they alias. Consumer passes (machine_opt) recompute per run.
+    AliasAnalysis* aaPtr = (AliasAnalysis*)cache->aliasAnalysis;
+    AliasAnalysis aa;
+    bool ownAA = false;
+    if (aaPtr != null && cache->generation == ctx->analysisGeneration)
+    {
+        aa = *aaPtr;
+    }
+    else
+    {
+        aa = AliasAnalysis::new(ctx);
+        aa.analyze(func);
+        ownAA = true;
+    }
+
+    MemorySSA mssa = MemorySSA::new(&aa);
+    mssa.build(func);
+    mssa.deinit();
+    if (ownAA) aa.deinit();
+    return false;
+}

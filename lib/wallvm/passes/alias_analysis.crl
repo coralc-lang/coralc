@@ -1,0 +1,693 @@
+#[[no_drop_all]]
+import(lib) wallvm::irtypes { IrContext, IrValue, IrInst, IrBlock, IrFunc, IrValueKind, FunctionAnalysisCache };
+import(lib) wallvm::irOps { IrOpcode };
+import(lib) std::mman { alloc, dealloc };
+
+// Points-to analysis and MemorySSA construction.
+//
+// This pass computes:
+// 1. Points-to sets — for each pointer value, which memory objects it may alias
+// 2. Alias queries — can two pointer values refer to the same memory?
+// 3. MemorySSA — a web of memory definitions and uses for efficient queries
+//
+// Memory objects are identified by:
+// - Alloca instructions (local variables)
+// - Global variables
+// - Unknown (returned by functions, loaded from pointers)
+//
+// The analysis is flow-insensitive within basic blocks but respects SSA form.
+// It handles:
+// - Alloca-based objects (distinct per alloca)
+// - GEP offsets (base object propagated)
+// - Bitcast (base object propagated)
+// - Phi nodes (union of incoming objects)
+// - Global variables (separate object per global)
+// - Function call returns (unknown provenance)
+// - Store through pointer (marks base object as modified)
+//
+// Integration — other passes query canAlias(a, b) or mayAlias(a, b) to
+// determine if two pointer operations can refer to the same memory.
+
+pub const u32 OBJECT_UNKNOWN = 0;
+const u32 OBJECT_MAX = 256;
+
+pub enum AliasResult
+{
+    NoAlias,    // Definitely don't alias
+    MayAlias,   // May alias (conservative)
+    MustAlias   // Definitely alias (same base, no offset difference)
+}
+
+pub struct MemoryObject
+{
+    u32 id;
+    IrValue* baseValue;  // The defining SSA value (alloca, global, etc.)
+    IrValue* baseAddr;   // The address (alloca result, global addr)
+    bool isGlobal;
+    bool isEscaped;   // Address taken or passed to callee
+    u32 sizeBytes;    // Known size (0 = unknown)
+}
+
+pub struct MemoryDef
+{
+    IrInst* inst;   // The store/atomicstore/fence/call that defines memory
+    u32 blockIndex;                  // Which block this is in
+    u32 instIndex;                   // Instruction index within block
+    u32 defId;                       // Unique ID for this definition
+    u32 objectCount;                 // Number of objects this def may modify
+    u32 objects[OBJECT_MAX];         // Object IDs this def may modify (or OBJECT_UNKNOWN for all)
+}
+
+pub struct MemoryUse
+{
+    IrInst* inst;   // The load/atomicload/call that reads memory
+    u32 blockIndex;
+    u32 instIndex;
+    u32 mayDefId;                    // The most recent MemoryDef this use may read past
+}
+
+pub struct MemoryPhi
+{
+    u32 blockIndex;
+    u32 defCount;                    // Number of incoming MemoryDefs
+    u32 incomingDefIds[16];          // Up to 16 predecessors
+}
+
+pub struct AliasAnalysis
+{
+    IrContext* ctx;
+    MemoryObject* objects;
+    u32 numObjects;
+    u32 capObjects;
+
+    MemoryDef* defs;
+    u32 numDefs;
+    u32 capDefs;
+
+    MemoryUse* uses;
+    u32 numUses;
+    u32 capUses;
+
+    MemoryPhi* phis;
+    u32 numPhis;
+    u32 capPhis;
+
+    u32 nextDefId;
+
+    // Mapping — SSA value id -> object id (or OBJECT_UNKNOWN)
+    u32* valToObject;
+    u32 valToObjectCap;
+
+    // Per-block — last MemoryDef that reaches the block start
+    u32* blockEntryDef;
+    u32 numBlocks;
+
+    AliasAnalysis new(IrContext* ctx)
+    {
+        return AliasAnalysis {
+            .ctx = ctx,
+            .objects = null,
+            .numObjects = 0,
+            .capObjects = 0,
+            .defs = null,
+            .numDefs = 0,
+            .capDefs = 0,
+            .uses = null,
+            .numUses = 0,
+            .capUses = 0,
+            .phis = null,
+            .numPhis = 0,
+            .capPhis = 0,
+            .nextDefId = 0,
+            .valToObject = null,
+            .valToObjectCap = 0,
+            .blockEntryDef = null,
+            .numBlocks = 0
+        };
+    }
+
+    void deinit()
+    {
+        if (self.objects != null) dealloc<MemoryObject>(self.objects);
+        if (self.defs != null) dealloc<MemoryDef>(self.defs);
+        if (self.uses != null) dealloc<MemoryUse>(self.uses);
+        if (self.phis != null) dealloc<MemoryPhi>(self.phis);
+        if (self.valToObject != null) dealloc<u32>(self.valToObject);
+        if (self.blockEntryDef != null) dealloc<u32>(self.blockEntryDef);
+    }
+
+    void ensureObjects(u32 needed)
+    {
+        if (needed <= self.capObjects) return;
+        u32 newCap = self.capObjects ? self.capObjects * 2 : 64;
+        while (newCap < needed) newCap *= 2;
+        MemoryObject* newArr = alloc<MemoryObject>(newCap);
+        if (self.objects != null)
+        {
+            for (u32 i = 0; i < self.numObjects; i++)
+                newArr[i] = self.objects[i];
+            dealloc<MemoryObject>(self.objects);
+        }
+        self.objects = newArr;
+        self.capObjects = newCap;
+    }
+
+    void ensureDefs(u32 needed)
+    {
+        if (needed <= self.capDefs) return;
+        u32 newCap = self.capDefs ? self.capDefs * 2 : 64;
+        while (newCap < needed) newCap *= 2;
+        MemoryDef* newArr = alloc<MemoryDef>(newCap);
+        if (self.defs != null)
+        {
+            for (u32 i = 0; i < self.numDefs; i++)
+                newArr[i] = self.defs[i];
+            dealloc<MemoryDef>(self.defs);
+        }
+        self.defs = newArr;
+        self.capDefs = newCap;
+    }
+
+    void ensureUses(u32 needed)
+    {
+        if (needed <= self.capUses) return;
+        u32 newCap = self.capUses ? self.capUses * 2 : 64;
+        while (newCap < needed) newCap *= 2;
+        MemoryUse* newArr = alloc<MemoryUse>(newCap);
+        if (self.uses != null)
+        {
+            for (u32 i = 0; i < self.numUses; i++)
+                newArr[i] = self.uses[i];
+            dealloc<MemoryUse>(self.uses);
+        }
+        self.uses = newArr;
+        self.capUses = newCap;
+    }
+
+    void ensurePhis(u32 needed)
+    {
+        if (needed <= self.capPhis) return;
+        u32 newCap = self.capPhis ? self.capPhis * 2 : 16;
+        while (newCap < needed) newCap *= 2;
+        MemoryPhi* newArr = alloc<MemoryPhi>(newCap);
+        if (self.phis != null)
+        {
+            for (u32 i = 0; i < self.numPhis; i++)
+                newArr[i] = self.phis[i];
+            dealloc<MemoryPhi>(self.phis);
+        }
+        self.phis = newArr;
+        self.capPhis = newCap;
+    }
+
+    void ensureValToObject(u32 needed)
+    {
+        if (needed < self.valToObjectCap) return;
+        u32 newCap = self.valToObjectCap ? self.valToObjectCap * 2 : 256;
+        while (newCap <= needed) newCap *= 2;
+        u32* newArr = alloc<u32>(newCap);
+        for (u32 i = 0; i < self.valToObjectCap; i++)
+            newArr[i] = self.valToObject[i];
+        for (u32 i = self.valToObjectCap; i < newCap; i++)
+            newArr[i] = OBJECT_UNKNOWN;
+        if (self.valToObject != null) dealloc<u32>(self.valToObject);
+        self.valToObject = newArr;
+        self.valToObjectCap = newCap;
+    }
+
+    u32 getObjectForValue(IrValue* val)
+    {
+        if (val == null) return OBJECT_UNKNOWN;
+        u32 id = val->id;
+        if (id >= self.valToObjectCap) return OBJECT_UNKNOWN;
+        return self.valToObject[id];
+    }
+
+    void setObjectForValue(IrValue* val, u32 objId)
+    {
+        if (val == null) return;
+        self.ensureValToObject(val->id + 1);
+        self.valToObject[val->id] = objId;
+    }
+
+    u32 createObject(IrValue* baseValue, IrValue* baseAddr, bool isGlobal, u32 sizeBytes)
+    {
+        self.ensureObjects(self.numObjects + 1);
+        u32 id = self.numObjects;
+        MemoryObject* obj = &self.objects[self.numObjects];
+        obj->id = id;
+        obj->baseValue = baseValue;
+        obj->baseAddr = baseAddr;
+        obj->isGlobal = isGlobal;
+        obj->isEscaped = false;
+        obj->sizeBytes = sizeBytes;
+        self.numObjects++;
+        return id;
+    }
+
+    bool isWriteBarrier(IrOpcode op)
+    {
+        switch (op)
+        {
+            IrOpcode::Store |
+            IrOpcode::AtomicStore |
+            IrOpcode::AtomicRmw |
+            IrOpcode::Fence |
+            IrOpcode::InlineAsm |
+            IrOpcode::Call => { return true; },
+
+            else => { return false; }
+        }
+    }
+
+    bool isMemoryRead(IrOpcode op)
+    {
+        switch (op)
+        {
+            IrOpcode::Load |
+            IrOpcode::AtomicLoad |
+            IrOpcode::Call => { return true; },
+
+            else => { return false; }
+        }
+    }
+
+    u32 resolveObjectForInst(IrInst* inst)
+    {
+        if (inst == null) return OBJECT_UNKNOWN;
+        IrValue base = inst->base;
+        u32 cached = self.getObjectForValue(&base);
+        if (cached != OBJECT_UNKNOWN) return cached;
+        return OBJECT_UNKNOWN;
+    }
+
+    // Walk the address operand to find the base object.
+    // Handles: alloca, global, GEP(base, ...), bitcast(x), phi(...)
+    u32 walkAddr(IrValue* addr)
+    {
+        if (addr == null) return OBJECT_UNKNOWN;
+
+        if (addr->kind == IrValueKind::Global)
+        {
+            u32 cached = self.getObjectForValue(addr);
+            if (cached != OBJECT_UNKNOWN) return cached;
+            u32 objId = self.createObject(addr, addr, true, 0);
+            self.setObjectForValue(addr, objId);
+            return objId;
+        }
+
+        if (addr->kind != IrValueKind::Inst) return OBJECT_UNKNOWN;
+
+        IrInst* inst = (IrInst*)addr;
+        u32 cached = self.getObjectForValue(addr);
+        if (cached != OBJECT_UNKNOWN) return cached;
+
+        switch (inst->opcode)
+        {
+            IrOpcode::Alloca => {
+                u32 sz = 0;
+                if (inst->nops > 0 && inst->ops[0] != null && inst->ops[0]->kind == IrValueKind::ConstInt)
+                    sz = (u32)inst->ops[0]->valData;
+                u32 objId = self.createObject(&inst->base, &inst->base, false, sz);
+                self.setObjectForValue(&inst->base, objId);
+                return objId;
+            },
+
+            IrOpcode::Gep => {
+                if (inst->nops > 0)
+                    return self.walkAddr(inst->ops[0]);
+                return OBJECT_UNKNOWN;
+            },
+
+            IrOpcode::Bitcast => {
+                if (inst->nops > 0)
+                    return self.walkAddr(inst->ops[0]);
+                return OBJECT_UNKNOWN;
+            },
+
+            IrOpcode::Phi => {
+                u32 result = OBJECT_UNKNOWN;
+                // Phi operands are interleaved value/block pairs, so step by 2
+                // and read only the value slot of each pair.
+                for (u32 j = 0; j + 1 < inst->nops; j += 2)
+                {
+                    IrValue* incoming = inst->ops[j];
+                    if (incoming == null)
+                        continue;
+                    u32 incomingObj = self.walkAddr(incoming);
+                    if (incomingObj == OBJECT_UNKNOWN) {
+                        result = OBJECT_UNKNOWN;
+                        break;
+                    }
+                    if (result == OBJECT_UNKNOWN)
+                        result = incomingObj;
+                    else if (result != incomingObj) {
+                        result = OBJECT_UNKNOWN;
+                        break;
+                    }
+                }
+                if (result != OBJECT_UNKNOWN)
+                    self.setObjectForValue(addr, result);
+                return result;
+            },
+
+            IrOpcode::Load | IrOpcode::Call => { return OBJECT_UNKNOWN; },
+
+            else => { return OBJECT_UNKNOWN; }
+        }
+    }
+
+    // Main analysis entry point.
+    // 1. Scan all allocas and globals to create objects
+    // 2. Walk all store/load addresses to build points-to sets
+    // 3. Build MemoryDef/MemoryUse chains
+    void analyze(IrFunc* func)
+    {
+        self.numObjects = 0;
+        self.numDefs = 0;
+        self.numUses = 0;
+        self.numPhis = 0;
+        self.nextDefId = 0;
+
+        self.numBlocks = func->nblocks;
+        self.blockEntryDef = alloc<u32>(func->nblocks);
+        for (u32 i = 0; i < func->nblocks; i++)
+            self.blockEntryDef[i] = OBJECT_UNKNOWN;
+
+        // Pass 1 — Create objects for all allocas
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst->opcode == IrOpcode::Alloca)
+                {
+                    u32 sz = 0;
+                    if (inst->nops > 0 && inst->ops[0] != null && inst->ops[0]->kind == IrValueKind::ConstInt)
+                        sz = (u32)inst->ops[0]->valData;
+                    u32 objId = self.createObject(&inst->base, &inst->base, false, sz);
+                    self.setObjectForValue(&inst->base, objId);
+                }
+            }
+        }
+
+        // Pass 2 — Walk all store/load/call addresses to discover objects
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+
+                // Store — walk the address operand (ops[1])
+                if (inst->opcode == IrOpcode::Store && inst->nops >= 2)
+                {
+                    IrValue* addr = inst->ops[1];
+                    u32 objId = self.walkAddr(addr);
+                    (void)objId;
+                }
+
+                // Load — walk the address operand (ops[0])
+                if (inst->opcode == IrOpcode::Load && inst->nops >= 1)
+                {
+                    IrValue* addr = inst->ops[0];
+                    u32 objId = self.walkAddr(addr);
+                    (void)objId;
+                }
+
+                // Gep — walk base to discover pointed-to objects
+                if (inst->opcode == IrOpcode::Gep && inst->nops > 0)
+                {
+                    u32 objId = self.walkAddr(inst->ops[0]);
+                    if (objId != OBJECT_UNKNOWN)
+                        self.setObjectForValue(&inst->base, objId);
+                }
+
+                // Bitcast — propagate
+                if (inst->opcode == IrOpcode::Bitcast && inst->nops > 0)
+                {
+                    u32 objId = self.walkAddr(inst->ops[0]);
+                    if (objId != OBJECT_UNKNOWN)
+                        self.setObjectForValue(&inst->base, objId);
+                }
+
+                // Phi — merge incoming objects
+                if (inst->opcode == IrOpcode::Phi)
+                {
+                    u32 firstObj = OBJECT_UNKNOWN;
+                    // Phi operands are interleaved value/block pairs, so step by 2
+                    // and read only the value slot of each pair.
+                    for (u32 j = 0; j + 1 < inst->nops; j += 2)
+                    {
+                        IrValue* incoming = inst->ops[j];
+                        if (incoming != null && incoming->kind == IrValueKind::Inst) {
+                            u32 objId = self.walkAddr(incoming);
+                            if (firstObj == OBJECT_UNKNOWN && objId != OBJECT_UNKNOWN)
+                                firstObj = objId;
+                        }
+                    }
+                    if (firstObj != OBJECT_UNKNOWN)
+                        self.setObjectForValue(&inst->base, firstObj);
+                }
+            }
+        }
+
+        // Pass 3 — Build MemoryDef and MemoryUse chains
+        // Walk each block in order. Track the last memory-def id.
+        u32* lastDefInBlock = alloc<u32>(func->nblocks);
+        for (u32 i = 0; i < func->nblocks; i++)
+            lastDefInBlock[i] = OBJECT_UNKNOWN;
+
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            u32 currentDefId = OBJECT_UNKNOWN;
+
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+
+                if (isMemoryRead(inst->opcode))
+                {
+                    self.ensureUses(self.numUses + 1);
+                    MemoryUse* mu = &self.uses[self.numUses];
+                    mu->inst = inst;
+                    mu->blockIndex = bi;
+                    mu->instIndex = ii;
+                    mu->mayDefId = currentDefId;
+                    self.numUses++;
+                }
+
+                if (isWriteBarrier(inst->opcode))
+                {
+                    self.ensureDefs(self.numDefs + 1);
+                    MemoryDef* md = &self.defs[self.numDefs];
+                    md->inst = inst;
+                    md->blockIndex = bi;
+                    md->instIndex = ii;
+                    md->defId = self.nextDefId++;
+                    md->objectCount = 0;
+
+                    // Determine which objects this def modifies
+                    if (inst->opcode == IrOpcode::Store && inst->nops >= 2) {
+                        u32 objId = self.walkAddr(inst->ops[1]);
+                        if (objId != OBJECT_UNKNOWN && md->objectCount < OBJECT_MAX) {
+                            md->objects[md->objectCount++] = objId;
+                        }
+                    }
+                    else if (inst->opcode == IrOpcode::AtomicStore && inst->nops >= 2) {
+                        u32 objId = self.walkAddr(inst->ops[1]);
+                        if (objId != OBJECT_UNKNOWN && md->objectCount < OBJECT_MAX) {
+                            md->objects[md->objectCount++] = objId;
+                        }
+                    }
+                    else {
+                        // Call, fence, asm — modifies everything
+                        md->objectCount = OBJECT_UNKNOWN;
+                    }
+
+                    currentDefId = md->defId;
+                    self.numDefs++;
+                }
+            }
+
+            lastDefInBlock[bi] = currentDefId;
+        }
+
+        // Pass 4 — Build MemoryPhis at block entries with multiple predecessors
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            if (bi == 0) continue;
+
+            u32 predecessorCount = 0;
+            for (u32 pi = 0; pi < func->nblocks; pi++)
+            {
+                if (pi == bi) continue;
+                IrBlock* pred = func->blocks[pi];
+                for (u32 si = 0; si < pred->ninsts; si++)
+                {
+                    IrInst* term = pred->insts[si];
+                    if (term->opcode == IrOpcode::Br && term->nops >= 1) {
+                        if (term->ops[0]->id == bb->base.id)
+                            predecessorCount++;
+                    }
+                    if (term->opcode == IrOpcode::CondBr && term->nops >= 3) {
+                        if (term->ops[1]->id == bb->base.id) predecessorCount++;
+                        if (term->ops[2]->id == bb->base.id) predecessorCount++;
+                    }
+                }
+            }
+
+            if (predecessorCount >= 2) {
+                self.ensurePhis(self.numPhis + 1);
+                MemoryPhi* mph = &self.phis[self.numPhis];
+                mph->blockIndex = bi;
+                mph->defCount = 0;
+
+                for (u32 pi = 0; pi < func->nblocks && mph->defCount < 16; pi++)
+                {
+                    if (pi == bi) continue;
+                    IrBlock* pred = func->blocks[pi];
+                    for (u32 si = 0; si < pred->ninsts; si++)
+                    {
+                        IrInst* term = pred->insts[si];
+                        bool targets = false;
+                        if (term->opcode == IrOpcode::Br && term->nops >= 1) {
+                            if (term->ops[0]->id == bb->base.id) targets = true; }
+                        if (term->opcode == IrOpcode::CondBr && term->nops >= 3) {
+                            if (term->ops[1]->id == bb->base.id) targets = true;
+                            if (term->ops[2]->id == bb->base.id) targets = true;
+                        }
+                        if (targets) {
+                            u32 predDefId = lastDefInBlock[pi];
+                            if (predDefId != OBJECT_UNKNOWN && mph->defCount < 16) {
+                                mph->incomingDefIds[mph->defCount++] = predDefId; }
+                        }
+                    }
+                }
+
+                if (mph->defCount > 0)
+                    self.numPhis++;
+            }
+        }
+
+        dealloc<u32>(lastDefInBlock);
+    }
+
+    // Query — do two values definitely not alias?
+    bool isNoAlias(IrValue* a, IrValue* b)
+    {
+        if (a == null || b == null) return true;
+        if (a->id == b->id) return false;
+
+        u32 objA = self.walkAddr(a);
+        u32 objB = self.walkAddr(b);
+
+        if (objA != OBJECT_UNKNOWN && objB != OBJECT_UNKNOWN && objA != objB)
+            return true;
+
+        if (objA != OBJECT_UNKNOWN && objB != OBJECT_UNKNOWN && objA == objB)
+            return false;
+
+        return false;
+    }
+
+    // Query — do two values definitely alias?
+    bool isMustAlias(IrValue* a, IrValue* b)
+    {
+        if (a == null || b == null) return false;
+        if (a->id == b->id) return true;
+        return false;
+    }
+
+    // Query — can a load at address 'loadAddr' be clobbered by a store at address 'storeAddr'?
+    // Returns true if the store may overwrite the memory read by the load.
+    bool mayClobber(IrValue* loadAddr, IrValue* storeAddr)
+    {
+        if (loadAddr == null || storeAddr == null) return true;
+        u32 loadObj = self.walkAddr(loadAddr);
+        u32 storeObj = self.walkAddr(storeAddr);
+
+        if (loadObj == OBJECT_UNKNOWN || storeObj == OBJECT_UNKNOWN) return true;
+        if (loadObj == storeObj) return true;
+        return false;
+    }
+
+    // Query — does a store to 'storeAddr' kill a prior load from 'loadAddr'?
+    // (i.e., do they definitely alias)
+    bool doesStoreKillLoad(IrValue* storeAddr, IrValue* loadAddr)
+    {
+        return self.isMustAlias(storeAddr, loadAddr);
+    }
+
+    // Get the MemoryDef that a given load may read from.
+    MemoryDef* getMayDefForUse(MemoryUse* mu)
+    {
+        if (mu == null) return null;
+        for (u32 i = 0; i < self.numDefs; i++) {
+            if (self.defs[i].defId == mu->mayDefId)
+                return &self.defs[i];
+        }
+        return null;
+    }
+
+    // Check if a store at the given MemoryDef may alias with a load at the given MemoryUse.
+    bool defMayAliasUse(MemoryDef* md, MemoryUse* mu)
+    {
+        if (md == null || mu == null) return true;
+        if (mu->inst == null || md->inst == null) return true;
+
+        if (md->inst->opcode == IrOpcode::Call || md->inst->opcode == IrOpcode::Fence
+            || md->inst->opcode == IrOpcode::InlineAsm)
+            return true;
+
+        if (md->inst->opcode == IrOpcode::Store && md->inst->nops >= 2
+            && mu->inst->opcode == IrOpcode::Load && mu->inst->nops >= 1)
+        {
+            return self.mayClobber(mu->inst->ops[0], md->inst->ops[1]);
+        }
+
+        return true;
+    }
+}
+
+// Registered as FunctionAnalysisCache.destroyAliasAnalysis: the cache owns
+// the published heap copy, so both the internal buffers (deinit) and the
+// copy itself (dealloc) are released here.
+void destroyCachedAliasAnalysis(rawptr p)
+{
+    AliasAnalysis* aa = (AliasAnalysis*)p;
+    aa->deinit();
+    dealloc<AliasAnalysis>(aa);
+}
+
+pub bool irAliasAnalysis(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (ctx == null || func == null) return false;
+
+    // Check if we already have cached results for this function
+    FunctionAnalysisCache* cache = ctx->getOrCreateAnalysisCache(func);
+    if (cache->aliasAnalysis != null)
+    {
+        if (cache->generation == ctx->analysisGeneration) return false;
+        // Stale — the IR mutated since this AA was built. Free it via the
+        // registered destroyer and rebuild below.
+        if (cache->destroyAliasAnalysis != null)
+            cache->destroyAliasAnalysis(cache->aliasAnalysis);
+        cache->aliasAnalysis = null;
+    }
+
+    AliasAnalysis aa = AliasAnalysis::new(ctx);
+    aa.analyze(func);
+
+    // Store in cache (heap-allocated copy)
+    AliasAnalysis* cached = alloc<AliasAnalysis>(1);
+    *cached = aa;
+    cache->aliasAnalysis = cached;
+    cache->generation = ctx->analysisGeneration;
+    cache->destroyAliasAnalysis = destroyCachedAliasAnalysis;
+    return false;
+}

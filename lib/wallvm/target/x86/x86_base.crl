@@ -1,0 +1,921 @@
+#[[no_drop_all]]
+// reserved registers for the 32-bit x86 allocator — the same contract
+// the 64-bit table keeps, in the 32-bit spelling. Same deal as the
+// 64-bit base, the drivers share it while verification is outstanding,
+// then we split each platform off permanently so no if-comparison
+// pile-up rides along asking who is running.
+pub str X86_RESERVED_INT[2] = {
+    "esp", "ebp"
+};
+
+pub str X86_RESERVED_FLOAT[2] = {
+    "xmm0", "xmm1"
+};
+
+pub str X86_FLOAT_REGS[2] = {
+    "st0", "st1"
+};
+
+pub str X86_INT_REGS[6] = {
+    "eax", "ecx", "edx", "ebx", "esi", "edi"
+};
+
+pub str X86_INT_CALLEE_SAVE[4] = {
+    "ebx", "esi", "edi", "ebp"
+};
+
+pub str X86_INT_CALLER_SAVE[3] = {
+    "eax", "ecx", "edx"
+};
+
+// I kept the register tables and the split note exactly as they sat at
+// the top and put the imports right below them, so their position and
+// spelling stay untouched.
+import(lib) wallvm::irtypes { IrContext, IrModule, IrFunc, IrBlock, IrInst, IrValue };
+import(lib) wallvm::irOps { IrOpcode, IrICmpPred };
+import(lib) std::mman { alloc, dealloc };
+import(lib) core::cchar { cchar };
+import(lib) platform::libc { strcmp };
+
+// x86 (32-bit/i386) base code generator
+
+static cchar _slotBuf[16][24];
+static int _slotI = 0;
+
+pub struct X86Emitter
+{
+    IrContext* ctx;
+    IrModule* modd;
+    bool useAtt;
+    cchar* output;
+    u32 outputLen;
+    u32 outputCap;
+    u32 labelCounter;
+
+    void init(IrContext* ctx, IrModule* modd, bool useAtt)
+    {
+        self.ctx = ctx;
+        self.modd = modd;
+        self.useAtt = useAtt;
+        self.output = null;
+        self.outputLen = 0;
+        self.outputCap = 0;
+        self.labelCounter = 0;
+    }
+
+    u32 nextLabel()
+    {
+        return self.labelCounter++;
+    }
+
+    void emit(const cchar* s)
+    {
+        u32 len = 0;
+        while (s[len] != 0) len++;
+        if (self.outputLen + len + 1 > self.outputCap)
+        {
+            u32 newCap = self.outputCap != 0 ? self.outputCap * 2 : 8192;
+            cchar* buf = alloc<cchar>(newCap);
+            if (self.output != null)
+            {
+                for (u32 i = 0; i < self.outputLen; i++)
+                    buf[i] = self.output[i];
+                dealloc<cchar>(self.output);
+            }
+            self.output = buf;
+            self.outputCap = newCap;
+        }
+        for (u32 i = 0; i < len; i++)
+            self.output[self.outputLen + i] = s[i];
+        self.outputLen += len;
+        self.output[self.outputLen] = 0;
+    }
+
+    void emitLine(const cchar* s)
+    {
+        self.emit(s);
+        self.emit("\n");
+    }
+
+    void emitTab(const cchar* instr)
+    {
+        self.emit("\t");
+        self.emitLine(instr);
+    }
+
+    const cchar* getOutput() { return self.output; }
+}
+
+pub struct X86CodeGen
+{
+    IrContext* ctx;
+    IrModule* modd;
+    X86Emitter emitter;
+    bool isWindows;
+    bool currentFuncHasFrame;
+    bool useRedZone;
+    bool savedCalleeSaves[4];
+    u32 numCalleeSaves;
+    str lastCallTarget;
+    IrValue* lastCallResult;
+    bool omitFramePointer;
+    bool calleeSavesPushed;
+    u32 spillSlotCount;
+    u32 spillFrameBytes;
+
+    void init(IrContext* ctx, IrModule* modd, bool isWindows, bool useAtt)
+    {
+        self.ctx = ctx;
+        self.modd = modd;
+        self.isWindows = isWindows;
+        self.omitFramePointer = true;
+        self.emitter.init(ctx, modd, useAtt);
+    }
+
+    static bool isCalleeSaved(str reg)
+    {
+        if (reg.equals("ebx")) return true;
+        if (reg.equals("esi")) return true;
+        if (reg.equals("edi")) return true;
+        if (reg.equals("ebp")) return true;
+        return false;
+    }
+
+    bool funcUsesReg(IrFunc* func, str reg)
+    {
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = &bb->insts[ii];
+                str dst = getRegName(&inst->base);
+                if (dst.equals(reg)) return true;
+                for (u32 oi = 0; oi < inst->nops; oi++)
+                {
+                    str op = getRegName(inst->ops[oi]);
+                    if (op.equals(reg)) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    bool blockUsesReg(IrBlock* bb, str reg)
+    {
+        for (u32 ii = 0; ii < bb->ninsts; ii++)
+        {
+            IrInst* inst = &bb->insts[ii];
+            str dst = getRegName(&inst->base);
+            if (dst.equals(reg)) return true;
+            for (u32 oi = 0; oi < inst->nops; oi++)
+            {
+                str op = getRegName(inst->ops[oi]);
+                if (op.equals(reg)) return true;
+            }
+        }
+        return false;
+    }
+
+    void emitPushCalleeSave(str reg)
+    {
+        if (self.emitter.useAtt)
+        {
+            self.emitter.emit("\tpushl %");
+            self.emitter.emit(reg.ptr);
+            self.emitter.emit("\n");
+        }
+        else
+        {
+            self.emitter.emit("\tpush ");
+            self.emitter.emit(reg.ptr);
+            self.emitter.emit("\n");
+        }
+    }
+
+    void emitDeferredCalleeSaves(IrBlock* bb)
+    {
+        if (self.calleeSavesPushed) return;
+
+        str calleeSaveRegs[4] = {"ebx", "esi", "edi", "ebp"};
+        bool needed = false;
+        for (u32 i = 0; i < 4; i++)
+        {
+            if (self.savedCalleeSaves[i])
+            {
+                if (self.blockUsesReg(bb, calleeSaveRegs[i]))
+                {
+                    needed = true;
+                    break;
+                }
+            }
+        }
+
+        if (!needed) return;
+
+        self.calleeSavesPushed = true;
+        for (u32 i = 0; i < 4; i++)
+        {
+            if (self.savedCalleeSaves[i])
+                self.emitPushCalleeSave(calleeSaveRegs[i]);
+        }
+    }
+
+    void emitPrologue(IrFunc* func)
+    {
+        if (self.isWindows)
+        {
+            self.emitter.emit("public _");
+            self.emitter.emitLine(func->base.name);
+            self.emitter.emit("_");
+        }
+        else
+        {
+            self.emitter.emit(".globl ");
+            self.emitter.emitLine(func->base.name);
+        }
+        self.emitter.emit(".type ");
+        self.emitter.emit(func->base.name);
+        self.emitter.emitLine(", @function");
+
+        self.emitter.emit(func->base.name);
+        self.emitter.emitLine(":");
+
+        self.useRedZone = false;
+        self.numCalleeSaves = 0;
+        self.lastCallTarget = "";
+        self.lastCallResult = null;
+        self.spillSlotCount = countSpillSlots(func);
+        self.spillFrameBytes = self.spillSlotCount * 8;
+
+        bool isLeaf = func->isLeaf();
+
+        // the slots hang off ebp, so a leaf keeps its frameless path
+        // only when the allocator spilled nothing
+        if (isLeaf && !self.isWindows && self.spillSlotCount == 0)
+        {
+            self.currentFuncHasFrame = false;
+            return;
+        }
+
+        bool hasFrame = !isLeaf && !self.omitFramePointer;
+        bool usesAnyCalleeSave = false;
+        str calleeSaveRegs[4] = {"ebx", "esi", "edi", "ebp"};
+        for (u32 i = 0; i < 4; i++)
+        {
+            str reg = calleeSaveRegs[i];
+            if (hasFrame && reg.equals("ebp"))
+                continue;
+            if (self.funcUsesReg(func, reg))
+            {
+                self.savedCalleeSaves[i] = true;
+                self.numCalleeSaves++;
+                usesAnyCalleeSave = true;
+            }
+            else
+            {
+                self.savedCalleeSaves[i] = false;
+            }
+        }
+
+        self.calleeSavesPushed = false;
+        // once slots exist the frame cannot shrink-wrap out of the
+        // prologue, so the saves go down ahead of it
+        bool canShrinkWrap = usesAnyCalleeSave && !hasFrame && self.spillSlotCount == 0;
+
+        if (!canShrinkWrap && (!isLeaf || self.spillSlotCount > 0))
+        {
+            self.calleeSavesPushed = true;
+            for (u32 i = 0; i < 4; i++)
+            {
+                if (self.savedCalleeSaves[i])
+                    self.emitPushCalleeSave(calleeSaveRegs[i]);
+            }
+        }
+
+        if (self.spillSlotCount > 0)
+        {
+            // the frame the slots are addressed from — mandatory even
+            // for a leaf, since the slot homes are ebp-relative
+            if (self.emitter.useAtt)
+            {
+                self.emitter.emitTab("pushl %ebp");
+                self.emitter.emitTab("movl %esp, %ebp");
+            }
+            else
+            {
+                self.emitter.emitTab("push ebp");
+                self.emitter.emitTab("mov ebp, esp");
+            }
+            self.currentFuncHasFrame = true;
+            cchar frameBuf[16];
+            u32ToStr(self.spillFrameBytes, frameBuf);
+            self.emitter.emit("\tsubl $");
+            self.emitter.emit(frameBuf);
+            self.emitter.emitLine(", %esp");
+        }
+        else if (!isLeaf && self.omitFramePointer)
+        {
+            self.currentFuncHasFrame = false;
+        }
+        else if (!isLeaf)
+        {
+            if (self.emitter.useAtt)
+            {
+                self.emitter.emitTab("pushl %ebp");
+                self.emitter.emitTab("movl %esp, %ebp");
+            }
+            else
+            {
+                self.emitter.emitTab("push ebp");
+                self.emitter.emitTab("mov ebp, esp");
+            }
+            self.currentFuncHasFrame = true;
+        }
+        else
+        {
+            self.currentFuncHasFrame = false;
+        }
+    }
+
+    void emitEpilogue()
+    {
+        if (self.currentFuncHasFrame)
+            self.emitter.emitTab("leave");
+
+        if (self.calleeSavesPushed)
+        {
+            str calleeSaveRegs[4] = {"ebx", "esi", "edi", "ebp"};
+            for (u32 i = 4; i > 0; i--)
+            {
+                u32 idx = i - 1;
+                if (self.savedCalleeSaves[idx])
+                {
+                    str reg = calleeSaveRegs[idx];
+                    if (self.emitter.useAtt)
+                    {
+                        self.emitter.emit("\tpopl %");
+                        self.emitter.emit(reg.ptr);
+                        self.emitter.emit("\n");
+                    }
+                    else
+                    {
+                        self.emitter.emit("\tpop ");
+                        self.emitter.emit(reg.ptr);
+                        self.emitter.emit("\n");
+                    }
+                }
+            }
+        }
+
+        self.emitter.emitTab("ret");
+    }
+
+    void emitRet(IrInst* inst)
+    {
+        if (inst->nops > 0 && inst->ops[0] != null)
+        {
+            const cchar* src = getRegForValue(inst->ops[0]);
+            if (strcmp(src, "eax") != 0)
+            {
+                self.emitter.emit("\tmovl ");
+                self.emitter.emit(src);
+                self.emitter.emitLine(", %eax");
+            }
+        }
+        // G34: the old tail heuristic fired after the call text was
+        // already out, so the jmp below ran the callee a second time, and
+        // a correct 32-bit tail call needs the callee's stack arguments
+        // shifted under the inherited return address, which needs
+        // signature knowledge this backend does not have. Off until then,
+        // the x86_64 backend has the real shape check.
+        emitEpilogue();
+    }
+
+    static void u32ToStr(u32 val, cchar* out)
+    {
+        if (val == 0) { out[0] = '0'; out[1] = 0; return; }
+        cchar tmp[10];
+        u32 i = 0;
+        while (val > 0) { tmp[i++] = (cchar)('0' + (val % 10)); val /= 10; }
+        for (u32 j = 0; j < i; j++) out[j] = tmp[i - 1 - j];
+        out[i] = 0;
+    }
+
+    str getRegName(IrValue* val)
+    {
+        if (val == null) return "eax";
+        u64 vd = val->valData;
+        if (vd & 0x80000000UL)
+            return "eax";
+        if (vd & 0x40000000UL)
+        {
+            u32 reg = (u32)(vd & 0x3FFFFFFF);
+            if (reg < 2) return X86_FLOAT_REGS[reg];
+            return "xmm0";
+        }
+        u32 reg = (u32)(vd & 0x3FFFFFFF);
+        if (reg < 6) return X86_INT_REGS[reg];
+        return "eax";
+    }
+
+    bool valueIsSpill(IrValue* val)
+    {
+        if (val == null) return false;
+        return (val->valData & 0x80000000UL) != 0;
+    }
+
+    // Slot i lives at -8*(i+1)(%ebp). I sized the slots at eight bytes
+    // rather than the old decode's four so an f64 fits, and ebp is
+    // established whenever anything spilled, so the homes are stable
+    // for the whole function. The rotating buffers keep one
+    // instruction from overwriting its own operand text.
+    const cchar* slotText(u32 slot)
+    {
+        cchar* buf = _slotBuf[_slotI++ & 15];
+        u32 off = (slot + 1) * 8;
+        cchar num[12];
+        u32ToStr(off, num);
+        u32 i = 0;
+        buf[i++] = '-';
+        u32 k = 0;
+        while (num[k] != 0) buf[i++] = num[k++];
+        const cchar* tail = "(%ebp)";
+        k = 0;
+        while (tail[k] != 0) buf[i++] = tail[k++];
+        buf[i] = 0;
+        return buf;
+    }
+
+    // Operand usable in hasAny position that accepts a memory operand —
+    // the value's register name, or its spill-slot address text.
+    const cchar* opFor(IrValue* v)
+    {
+        if (v == null) return "eax";
+        u64 vd = v->valData;
+        if (vd & 0x80000000UL)
+            return slotText((u32)(vd & 0x3FFFFFFF));
+        if (vd & 0x40000000UL)
+        {
+            u32 reg = (u32)(vd & 0x3FFFFFFF);
+            if (reg < 2) return X86_FLOAT_REGS[reg].ptr;
+            return "xmm0";
+        }
+        u32 reg = (u32)(vd & 0x3FFFFFFF);
+        if (reg < 6) return X86_INT_REGS[reg].ptr;
+        self.emitter.emit("; ERROR: out-of-range register index ");
+        cchar idxBuf[16];
+        u32ToStr(reg, idxBuf);
+        self.emitter.emitLine(idxBuf);
+        return "eax";
+    }
+
+    // the old name stays as an alias so every unconverted call site is
+    // spill-correct for memory-accepting positions; register-only
+    // positions go through opForReg instead
+    const cchar* getRegForValue(IrValue* v)
+    {
+        return self.opFor(v);
+    }
+
+    // Forced register operand — a spill slot reloads into the scratch
+    // first. I hand a register-resident value back untouched instead of
+    // always moving it like the 64-bit base, because the reserved table
+    // here holds only esp/ebp and an idle move into an allocatable
+    // scratch would cost a live value for nothing.
+    const cchar* opForReg(IrValue* v, const cchar* scratch)
+    {
+        if (v == null) return scratch;
+        if (valueIsSpill(v))
+        {
+            self.emitter.emit("\tmovl ");
+            self.emitter.emit(slotText((u32)(v->valData & 0x3FFFFFFF)));
+            self.emitter.emit(", ");
+            self.emitter.emitLine(scratch);
+            return scratch;
+        }
+        return opFor(v);
+    }
+
+    // A scratch out of the allocatable set that none of this
+    // instruction's register operands already sits in. lsra hands out
+    // all six of eax..edi — only esp/ebp are reserved — so no scratch
+    // is ever free; skipping the operands this instruction still has
+    // to read keeps a reload from landing on a sibling value.
+    const cchar* scratchAvoiding(const cchar* a, const cchar* b, const cchar* c)
+    {
+        for (u32 i = 0; i < 6; i++)
+        {
+            str cand = X86_INT_REGS[i];
+            if (a != null && strcmp(cand.ptr, a) == 0) continue;
+            if (b != null && strcmp(cand.ptr, b) == 0) continue;
+            if (c != null && strcmp(cand.ptr, c) == 0) continue;
+            return cand.ptr;
+        }
+        return "eax";
+    }
+
+    u32 countSpillSlots(IrFunc* func)
+    {
+        bool hasAny = false;
+        u32 max = 0;
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                u64 vd = inst->base.valData;
+                if ((vd & 0x80000000UL) != 0)
+                {
+                    u32 idx = (u32)(vd & 0x3FFFFFFF);
+                    if (!hasAny || idx > max) max = idx;
+                    hasAny = true;
+                }
+                for (u32 oi = 0; oi < inst->nops; oi++)
+                {
+                    IrValue* o = inst->ops[oi];
+                    if (o == null) continue;
+                    u64 ov = o->valData;
+                    if ((ov & 0x80000000UL) != 0)
+                    {
+                        u32 idx = (u32)(ov & 0x3FFFFFFF);
+                        if (!hasAny || idx > max) max = idx;
+                        hasAny = true;
+                    }
+                }
+            }
+        }
+        return hasAny ? max + 1 : 0;
+    }
+
+    void emitInst(IrInst* inst)
+    {
+        switch (inst->opcode)
+        {
+            IrOpcode::Add => { emitBinOp(inst, "addl"); },
+            IrOpcode::Sub => { emitBinOp(inst, "subl"); },
+            IrOpcode::Mul => { emitBinOp(inst, "imull"); },
+            IrOpcode::SDiv => { emitDiv(inst, true); },
+            IrOpcode::UDiv => { emitDiv(inst, false); },
+            IrOpcode::SRem => { emitRem(inst, true); },
+            IrOpcode::URem => { emitRem(inst, false); },
+            IrOpcode::And => { emitBinOp(inst, "andl"); },
+            IrOpcode::Or => { emitBinOp(inst, "orl"); },
+            IrOpcode::Xor => { emitBinOp(inst, "xorl"); },
+            IrOpcode::Shl => { emitShift(inst, "shll"); },
+            IrOpcode::Ashr => { emitShift(inst, "sarl"); },
+            IrOpcode::Lshr => { emitShift(inst, "shrl"); },
+            IrOpcode::Load => { emitLoad(inst); },
+            IrOpcode::Store => { emitStore(inst); },
+            IrOpcode::ICmp => { emitICmp(inst); },
+            IrOpcode::Br => { emitBr(inst); },
+            IrOpcode::CondBr => { emitCondBr(inst); },
+            IrOpcode::Ret => { emitRet(inst); },
+            IrOpcode::Call => { emitCall(inst); },
+            IrOpcode::SiToFp => {
+                const cchar* src = (inst->nops > 0) ? getRegForValue(inst->ops[0]) : "eax";
+                // Push integer onto CPU stack, load as FPU, clean up
+                self.emitter.emit("\tpushl ");
+                self.emitter.emitLine(src);
+                self.emitter.emitTab("fildl (%esp)");
+                self.emitter.emitTab("addl $4, %esp");
+            },
+            IrOpcode::FpToSi => {
+                const cchar* dst = getRegForValue(&inst->base);
+                // Float value is in ST(0), convert to integer and store to dest
+                self.emitter.emitTab("subl $4, %esp");
+                self.emitter.emitTab("fistpl (%esp)");
+                self.emitter.emit("\tpopl ");
+                self.emitter.emitLine(dst);
+            },
+            else => { self.emitter.emit("; unhandled"); },
+        }
+    }
+
+    void emitBinOp(IrInst* inst, const cchar* op)
+    {
+        const cchar* dst = getRegForValue(&inst->base);
+        const cchar* src1 = (inst->nops > 0) ? getRegForValue(inst->ops[0]) : "eax";
+        const cchar* src2 = (inst->nops > 1) ? getRegForValue(inst->ops[1]) : "ecx";
+        // a spilled destination rides a scratch through the op and
+        // stores back, x86 has no memory to memory form
+        bool dstSpill = valueIsSpill(&inst->base);
+        const cchar* work = dstSpill ? scratchAvoiding(src1, src2, null) : dst;
+        if (strcmp(src1, work) != 0)
+        {
+            self.emitter.emit("\tmovl ");
+            self.emitter.emit(src1);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(work);
+        }
+        self.emitter.emit("\t");
+        self.emitter.emit(op);
+        self.emitter.emit(" ");
+        self.emitter.emit(src2);
+        self.emitter.emit(", ");
+        self.emitter.emitLine(work);
+        if (dstSpill)
+        {
+            self.emitter.emit("\tmovl ");
+            self.emitter.emit(work);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(dst);
+        }
+    }
+
+    void emitDiv(IrInst* inst, bool isSigned)
+    {
+        const cchar* src1 = (inst->nops > 0) ? getRegForValue(inst->ops[0]) : "eax";
+        const cchar* src2 = (inst->nops > 1) ? getRegForValue(inst->ops[1]) : "ecx";
+        const cchar* dst = getRegForValue(&inst->base);
+        // If divisor is in eax, save it to ecx first before loading dividend
+        if (strcmp(src2, "eax") == 0)
+        {
+            self.emitter.emit("\tmovl %eax, %ecx");
+            self.emitter.emit("\tmovl ");
+            self.emitter.emit(src1);
+            self.emitter.emitLine(", %eax");
+        }
+        else
+        {
+            // Load dividend into eax
+            self.emitter.emit("\tmovl ");
+            self.emitter.emit(src1);
+            self.emitter.emitLine(", %eax");
+            // Move divisor to ecx if not already there
+            if (strcmp(src2, "ecx") != 0)
+            {
+                self.emitter.emit("\tmovl ");
+                self.emitter.emit(src2);
+                self.emitter.emitLine(", %ecx");
+            }
+        }
+        // Sign-extend or zero-extend edx:eax
+        if (isSigned)
+            self.emitter.emitTab("cltd");
+        else
+            self.emitter.emitTab("xorl %edx, %edx");
+        self.emitter.emit("\t");
+        self.emitter.emitLine(isSigned ? "idivl %ecx" : "divl %ecx");
+        if (strcmp(dst, "eax") != 0)
+        {
+            self.emitter.emit("\tmovl %eax, ");
+            self.emitter.emitLine(dst);
+        }
+    }
+
+    void emitRem(IrInst* inst, bool isSigned)
+    {
+        const cchar* src1 = (inst->nops > 0) ? getRegForValue(inst->ops[0]) : "eax";
+        const cchar* src2 = (inst->nops > 1) ? getRegForValue(inst->ops[1]) : "ecx";
+        const cchar* dst = getRegForValue(&inst->base);
+        // If divisor is in eax, save it to ecx first before loading dividend
+        if (strcmp(src2, "eax") == 0)
+        {
+            self.emitter.emit("\tmovl %eax, %ecx");
+            self.emitter.emit("\tmovl ");
+            self.emitter.emit(src1);
+            self.emitter.emitLine(", %eax");
+        }
+        else
+        {
+            self.emitter.emit("\tmovl ");
+            self.emitter.emit(src1);
+            self.emitter.emitLine(", %eax");
+            if (strcmp(src2, "ecx") != 0)
+            {
+                self.emitter.emit("\tmovl ");
+                self.emitter.emit(src2);
+                self.emitter.emitLine(", %ecx");
+            }
+        }
+        if (isSigned)
+            self.emitter.emitTab("cltd");
+        else
+            self.emitter.emitTab("xorl %edx, %edx");
+        self.emitter.emit("\t");
+        self.emitter.emitLine(isSigned ? "idivl %ecx" : "divl %ecx");
+        if (strcmp(dst, "edx") != 0)
+        {
+            self.emitter.emit("\tmovl %edx, ");
+            self.emitter.emitLine(dst);
+        }
+    }
+
+    void emitShift(IrInst* inst, const cchar* op)
+    {
+        const cchar* dst = getRegForValue(&inst->base);
+        const cchar* src1 = (inst->nops > 0) ? getRegForValue(inst->ops[0]) : "eax";
+        const cchar* amt = (inst->nops > 1) ? getRegForValue(inst->ops[1]) : "ecx";
+        // a spilled destination rides a scratch through the shift, and
+        // that scratch has to dodge %ecx too — the count lands there;
+        // a destination parked in %ecx itself would be stomped by the
+        // count reload, so it rides a scratch the same way
+        bool dstSpill = valueIsSpill(&inst->base);
+        bool dstIsCountReg = strcmp(dst, "ecx") == 0 && strcmp(amt, "ecx") != 0;
+        const cchar* work = (dstSpill || dstIsCountReg) ? scratchAvoiding(src1, amt, "ecx") : dst;
+        self.emitter.emit("\tmovl ");
+        self.emitter.emit(src1);
+        self.emitter.emit(", ");
+        self.emitter.emitLine(work);
+        // Shift count must be in %cl
+        if (strcmp(amt, "ecx") != 0)
+        {
+            self.emitter.emit("\tmovl ");
+            self.emitter.emit(amt);
+            self.emitter.emitLine(", %ecx");
+        }
+        self.emitter.emit("\t");
+        self.emitter.emit(op);
+        self.emitter.emit(" %cl, ");
+        self.emitter.emitLine(work);
+        if (dstSpill || dstIsCountReg)
+        {
+            self.emitter.emit("\tmovl ");
+            self.emitter.emit(work);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(dst);
+        }
+    }
+
+    void emitLoad(IrInst* inst)
+    {
+        const cchar* dst = getRegForValue(&inst->base);
+        // the address must be a register, and mov has no memory to
+        // memory form either, so a spilled destination collects in
+        // %eax before the slot store
+        if (valueIsSpill(&inst->base))
+        {
+            const cchar* src = (inst->nops > 0) ? self.opForReg(inst->ops[0], "eax") : "eax";
+            self.emitter.emit("\tmovl (");
+            self.emitter.emit(src);
+            self.emitter.emit("), %eax");
+            self.emitter.emitLine("");
+            self.emitter.emit("\tmovl %eax, ");
+            self.emitter.emitLine(dst);
+        }
+        else
+        {
+            // a spilled address reloads straight into the destination
+            const cchar* src = (inst->nops > 0) ? self.opForReg(inst->ops[0], dst) : "eax";
+            self.emitter.emit("\tmovl (");
+            self.emitter.emit(src);
+            self.emitter.emit("), ");
+            self.emitter.emitLine(dst);
+        }
+    }
+
+    void emitStore(IrInst* inst)
+    {
+        const cchar* src = (inst->nops > 0) ? getRegForValue(inst->ops[0]) : "eax";
+        bool srcSpill = inst->nops > 0 && valueIsSpill(inst->ops[0]);
+        // mov takes one memory operand at most, so a spilled value is
+        // reloaded before the store, and when both sides are memory
+        // the address takes a second scratch out of its way
+        if (srcSpill && inst->nops > 1 && valueIsSpill(inst->ops[1]))
+        {
+            const cchar* aReg = scratchAvoiding(null, null, null);
+            const cchar* sReg = scratchAvoiding(aReg, null, null);
+            self.emitter.emit("\tmovl ");
+            self.emitter.emit(getRegForValue(inst->ops[1]));
+            self.emitter.emit(", ");
+            self.emitter.emitLine(aReg);
+            self.emitter.emit("\tmovl ");
+            self.emitter.emit(src);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(sReg);
+            self.emitter.emit("\tmovl ");
+            self.emitter.emit(sReg);
+            self.emitter.emit(", (");
+            self.emitter.emit(aReg);
+            self.emitter.emitLine(")");
+        }
+        else if (srcSpill)
+        {
+            const cchar* addr = (inst->nops > 1) ? getRegForValue(inst->ops[1]) : "ebx";
+            const cchar* sReg = scratchAvoiding(addr, null, null);
+            self.emitter.emit("\tmovl ");
+            self.emitter.emit(src);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(sReg);
+            self.emitter.emit("\tmovl ");
+            self.emitter.emit(sReg);
+            self.emitter.emit(", (");
+            self.emitter.emit(addr);
+            self.emitter.emitLine(")");
+        }
+        else
+        {
+            const cchar* addr = (inst->nops > 1) ? self.opForReg(inst->ops[1], scratchAvoiding(src, null, null)) : "ebx";
+            self.emitter.emit("\tmovl ");
+            self.emitter.emit(src);
+            self.emitter.emit(", (");
+            self.emitter.emit(addr);
+            self.emitter.emitLine(")");
+        }
+    }
+
+    void emitICmp(IrInst* inst)
+    {
+        const cchar* dst = getRegForValue(&inst->base);
+        const cchar* src1 = (inst->nops > 0) ? getRegForValue(inst->ops[0]) : "eax";
+        const cchar* src2 = (inst->nops > 1) ? getRegForValue(inst->ops[1]) : "ecx";
+        // cmp takes one memory operand at most, two spills need a
+        // reload — into %eax, which the setcc below burns anyway
+        if (valueIsSpill(inst->ops[0]) && valueIsSpill(inst->ops[1]))
+            src1 = self.opForReg(inst->ops[0], "eax");
+        self.emitter.emit("\tcmpl ");
+        self.emitter.emit(src2);
+        self.emitter.emit(", ");
+        self.emitter.emitLine(src1);
+        const cchar* setOp;
+        switch (inst->icmpPred)
+        {
+            IrICmpPred::Eq => { setOp = "sete"; },
+            IrICmpPred::Ne => { setOp = "setne"; },
+            IrICmpPred::Slt => { setOp = "setl"; },
+            IrICmpPred::Sle => { setOp = "setle"; },
+            IrICmpPred::Sgt => { setOp = "setg"; },
+            IrICmpPred::Sge => { setOp = "setge"; },
+            IrICmpPred::Ult => { setOp = "setb"; },
+            IrICmpPred::Ule => { setOp = "setbe"; },
+            IrICmpPred::Ugt => { setOp = "seta"; },
+            IrICmpPred::Uge => { setOp = "setae"; },
+            else => { setOp = "sete"; },
+        }
+        self.emitter.emit("\t");
+        self.emitter.emit(setOp);
+        self.emitter.emitLine(" %al");
+        // setcc already wrecked %al, so %eax is the free landing spot
+        // for a spilled destination — movzbl cannot write memory
+        bool dstSpill = valueIsSpill(&inst->base);
+        const cchar* work = dstSpill ? "eax" : dst;
+        self.emitter.emit("\tmovzbl %al, ");
+        self.emitter.emitLine(work);
+        if (dstSpill)
+        {
+            self.emitter.emit("\tmovl %eax, ");
+            self.emitter.emitLine(dst);
+        }
+    }
+
+    void emitBr(IrInst* inst)
+    {
+        self.lastCallTarget = "";
+        self.lastCallResult = null;
+        if (inst->nops > 0 && inst->ops[0] != null)
+        {
+            self.emitter.emit("\tjmp ");
+            self.emitter.emitLine(inst->ops[0]->name);
+        }
+    }
+
+    void emitCondBr(IrInst* inst)
+    {
+        self.lastCallTarget = "";
+        self.lastCallResult = null;
+        if (inst->nops >= 3)
+        {
+            // test takes one memory operand at most, a spilled
+            // condition reloads into %eax first
+            const cchar* cond = self.opForReg(inst->ops[0], "eax");
+            self.emitter.emit("\ttestl ");
+            self.emitter.emit(cond);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(cond);
+            self.emitter.emit("\tjne ");
+            self.emitter.emitLine(inst->ops[1]->name);
+            self.emitter.emit("\tjmp ");
+            self.emitter.emitLine(inst->ops[2]->name);
+        }
+    }
+
+    void emitCall(IrInst* inst)
+    {
+        if (inst->nops > 0 && inst->ops[0] != null)
+        {
+            IrValue* callee = inst->ops[0];
+            u32 nargs = inst->nops - 1;
+
+            self.lastCallTarget = str::fromCstr(callee->name);
+            self.lastCallResult = &inst->base;
+
+            for (u32 i = 0; i < nargs; i++)
+            {
+                const cchar* src = getRegForValue(inst->ops[1 + i]);
+                self.emitter.emit("\tpushl ");
+                self.emitter.emitLine(src);
+            }
+            self.emitter.emit("\tcall ");
+            self.emitter.emitLine(callee->name);
+            if (nargs > 0)
+            {
+                cchar stackBuf[16];
+                u32ToStr(nargs * 4, stackBuf);
+                self.emitter.emit("\taddl $");
+                self.emitter.emitLine(stackBuf);
+            }
+        }
+    }
+}

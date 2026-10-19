@@ -1,0 +1,325 @@
+#[[no_drop_all]]
+import(lib) std::mman { alloc, dealloc, copy };
+
+// GC Runtime Support for wallvm
+// Provides runtime functions for GC operations marked by IR opcodes.
+
+// GC Configuration
+pub struct GcConfig
+{
+    usize heapInitialSize;
+    usize heapMaxSize;
+    usize allocationThreshold;
+    bool generationalEnabled;
+    bool concurrentEnabled;
+    u32 gcThreadCount;
+}
+
+pub GcConfig defaultGcConfig()
+{
+    return GcConfig {
+        .heapInitialSize = 1024 * 1024,  // 1MB
+        .heapMaxSize = 256 * 1024 * 1024, // 256MB
+        .allocationThreshold = 1024 * 1024, // 1MB between GC cycles
+        .generationalEnabled = true,
+        .concurrentEnabled = false,
+        .gcThreadCount = 1
+    }
+}
+
+// GC Heap Header - metadata for each allocated object
+pub struct GcHeader
+{
+    u32 size;
+    u32 flags;
+    u32 generation;
+    u32 color; // Tri-color: 0=white, 1=gray, 2=black
+    GcHeader* next;
+    void (*finalizer)(rawptr);
+}
+
+// GC constants
+const u32 GC_WHITE = 0;
+const u32 GC_GRAY = 1;
+const u32 GC_BLACK = 2;
+
+// GC flags
+const u32 GC_MARKED = 0x01;
+const u32 GC_PINNED = 0x02;
+const u32 GC_FINALIZER = 0x04;
+
+// GC Root - tracks roots for collection
+pub struct GcRoot
+{
+    rawptr pointer;
+    GcRoot* next;
+}
+
+// GC State - global GC state
+pub struct GcState
+{
+    GcConfig config;
+    u8* heapBase;
+    u8* heapEnd;
+    u8* heapPtr;
+    usize bytesAllocated;
+    usize bytesSinceGC;
+    GcHeader* allocatedList;
+    GcRoot* roots;
+    u32 generation;
+    bool collecting;
+}
+
+static GcState gGcState;
+
+// Initialize GC runtime
+pub void gcInit(GcConfig* config)
+{
+    GcState* s = &gGcState;
+    if (config != null) s->config = *config;
+    else s->config = defaultGcConfig();
+
+    s->heapBase = alloc<u8>(s->config.heapInitialSize);
+    s->heapEnd = s->heapBase + s->config.heapInitialSize;
+    s->heapPtr = s->heapBase;
+    s->bytesAllocated = 0;
+    s->bytesSinceGC = 0;
+    s->allocatedList = null;
+    s->roots = null;
+    s->generation = 0;
+    s->collecting = false;
+}
+
+// Shutdown GC runtime
+pub void gcShutdown()
+{
+    GcState* s = &gGcState;
+    if (s->heapBase != null) dealloc<u8>(s->heapBase);
+    s->heapBase = null;
+    s->heapEnd = null;
+    s->heapPtr = null;
+}
+
+// Allocate object with GC header
+pub rawptr gcAllocWithFinalizer(usize size, void (*finalizer)(rawptr))
+{
+    GcState* s = &gGcState;
+    usize totalSize = size + sizeof(GcHeader);
+    totalSize = (totalSize + 15) & ~15; // Align to 16 bytes
+
+    // Check if we need GC
+    if (s->bytesSinceGC + totalSize > s->config.allocationThreshold)
+    {
+        gcCollect();
+    }
+
+    // Check if heap has space
+    if (s->heapPtr + totalSize > s->heapEnd)
+    {
+        // Try to grow heap
+        usize newHeapSize = (s->heapEnd - s->heapBase) * 2;
+        if (newHeapSize > s->config.heapMaxSize) return null;
+
+        u8* newHeap = alloc<u8>(newHeapSize);
+        if (newHeap == null) return null;
+
+        usize oldSize = s->heapEnd - s->heapBase;
+        copy<u8>(newHeap, s->heapBase, oldSize);
+        dealloc<u8>(s->heapBase);
+
+        s->heapBase = newHeap;
+        s->heapEnd = newHeap + newHeapSize;
+        s->heapPtr = newHeap + oldSize;
+    }
+
+    // Allocate
+    GcHeader* header = (GcHeader*)s->heapPtr;
+    s->heapPtr += totalSize;
+
+    header->size = (u32)size;
+    header->flags = (finalizer != null) ? GC_FINALIZER : 0;
+    header->generation = s->generation;
+    header->color = GC_WHITE;
+    header->finalizer = finalizer;
+    header->next = s->allocatedList;
+    s->allocatedList = header;
+
+    s->bytesAllocated += totalSize;
+    s->bytesSinceGC += totalSize;
+
+    return (u8*)header + sizeof(GcHeader);
+}
+
+// Allocate object without finalizer
+pub rawptr gcAlloc(usize size)
+{
+    return gcAllocWithFinalizer(size, null);
+}
+
+// Register GC root
+pub void gcRootAdd(rawptr ptr)
+{
+    GcState* s = &gGcState;
+    GcRoot* root = alloc<GcRoot>(1);
+    root->pointer = ptr;
+    root->next = s->roots;
+    s->roots = root;
+}
+
+// Unregister GC root
+pub void gcRootRemove(rawptr ptr)
+{
+    GcState* s = &gGcState;
+    GcRoot** prev = &s->roots;
+    while (*prev != null)
+    {
+        if ((*prev)->pointer == ptr)
+        {
+            GcRoot* toRemove = *prev;
+            *prev = toRemove->next;
+            dealloc<GcRoot>(toRemove);
+            return;
+        }
+        prev = &(*prev)->next;
+    }
+}
+
+// Write barrier for generational GC
+pub void gcWriteBarrier(rawptr obj, rawptr field, rawptr value)
+{
+    GcState* s = &gGcState;
+    if (!s->config.generationalEnabled) return;
+
+    GcHeader* header = (GcHeader*)((u8*)obj - sizeof(GcHeader));
+
+    // If old generation object is writing to young generation, record it
+    if (header->generation > 0)
+    {
+        GcHeader* valueHeader = (GcHeader*)((u8*)value - sizeof(GcHeader));
+        if (valueHeader->generation == 0)
+        {
+            // Mark old object as having young references
+            header->flags |= GC_MARKED;
+        }
+    }
+}
+
+// Safepoint - check if GC is requested
+pub void gcSafepoint()
+{
+    GcState* s = &gGcState;
+    if (s->collecting)
+    {
+        // Wait for collection to complete
+        while (s->collecting) {}
+    }
+}
+
+// Mark phase - mark reachable objects
+void gcMark(rawptr ptr)
+{
+    if (ptr == null) return;
+
+    GcHeader* header = (GcHeader*)((u8*)ptr - sizeof(GcHeader));
+    if (header->color == GC_BLACK) return;
+    if ((header->flags & GC_PINNED) != 0) return;
+
+    header->color = GC_GRAY;
+}
+
+// Scan phase - process gray objects
+void gcScan()
+{
+    GcState* s = &gGcState;
+    bool changed = true;
+
+    while (changed)
+    {
+        changed = false;
+        GcHeader* current = s->allocatedList;
+
+        while (current != null)
+        {
+            if (current->color == GC_GRAY)
+            {
+                current->color = GC_BLACK;
+                changed = true;
+
+                // Scan object's references (simplified - would need type info)
+                // In a real implementation, this would walk the object graph
+            }
+            current = current->next;
+        }
+    }
+}
+
+// Sweep phase - collect white objects and call finalizers
+void gcSweep()
+{
+    GcState* s = &gGcState;
+    GcHeader** prev = &s->allocatedList;
+
+    while (*prev != null)
+    {
+        GcHeader* current = *prev;
+        if (current->color == GC_WHITE && (current->flags & GC_PINNED) == 0)
+        {
+            *prev = current->next;
+            s->bytesAllocated -= current->size + sizeof(GcHeader);
+
+            // Call finalizer if present
+            if (((current->flags & GC_FINALIZER) != 0) && (current->finalizer != null))
+            {
+                rawptr obj = (u8*)current + sizeof(GcHeader);
+                current->finalizer(obj);
+            }
+        }
+        else
+        {
+            current->color = GC_WHITE;
+            prev = &current->next;
+        }
+    }
+}
+
+// Perform garbage collection
+pub void gcCollect()
+{
+    GcState* s = &gGcState;
+    if (s->collecting) return;
+    s->collecting = true;
+
+    // Mark roots
+    GcRoot* root = s->roots;
+    while (root != null)
+    {
+        gcMark(root->pointer);
+        root = root->next;
+    }
+
+    // Scan reachable objects
+    gcScan();
+
+    // Sweep unreachable objects
+    gcSweep();
+
+    s->generation++;
+    s->bytesSinceGC = 0;
+    s->collecting = false;
+}
+
+// Get GC statistics
+pub usize gcBytesAllocated()
+{
+    return gGcState.bytesAllocated;
+}
+
+pub usize gcHeapSize()
+{
+    return gGcState.heapEnd - gGcState.heapBase;
+}
+
+pub u32 gcGeneration()
+{
+    return gGcState.generation;
+}

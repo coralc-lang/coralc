@@ -1,0 +1,678 @@
+#[[no_drop_all]]
+// parser/stmt.crl: statement parsing
+
+import base { Parser, ParserMark };
+import parser;
+import context::context { AstContext, NodeListBuilder, SwitchListBuilder };
+import common::token { Token, TokenKind };
+import ast {
+    id { NodeId },
+    stmt { Stmt, StmtKind, SwitchCase },
+    node { Node, NodeKind },
+    expr { Expr, ExprKind }
+};
+import diag::code { ErrorCode };
+
+pub extend Parser
+{
+    // attrs stay null; nothing past #[[condassign]] is recorded
+    NodeId storeStmt(StmtKind kind)
+    {
+        Stmt s;
+        s.kind = kind;
+        s.loc = self.tokenLoc(self.previous);
+        s.attrs = null;
+        s.attrsLen = 0;
+        return self.storeNode(NodeKind::Stmt{ .value = s });
+    }
+
+    /* storeStmt with an explicit location, used by parseForStmt so the
+     * error points at the `for` keyword, not the closing `}` of the body
+     * (which is what self.previous is after the statement is parsed). */
+    NodeId storeStmtAt(StmtKind kind, SourceLoc loc)
+    {
+        Stmt s;
+        s.kind = kind;
+        s.loc = loc;
+        s.attrs = null;
+        s.attrsLen = 0;
+        return self.storeNode(NodeKind::Stmt{ .value = s });
+    }
+
+    /* ── dispatch ── */
+
+    /* consumes any leading #[[...]] attrs (materialized onto the produced
+     * Stmt node), arms the condassign escape hatch, then dispatches on
+     * keyword; everything else is expr-or-decl */
+    NodeId parseStmt()
+    {
+        Attribute* attrs = null;
+        u32 attrsLen = 0;
+        self.condAssignAttr = false;
+        self.parseAttrListTo(&attrs, &attrsLen);
+        u32 ai = 0;
+        while (ai < attrsLen)
+        {
+            Str attrName = attrs[ai].name;
+            if (attrName == self.ctx.intern("condassign")) self.condAssignAttr = true;
+            else if (attrName != self.ctx.intern("fallthrough") && attrName != self.ctx.intern("no_drop"))
+                self.reportWarningAt(ErrorCode::ParseMisplacedAttr, attrs[ai].loc,
+                    "attribute has no meaning on a statement; attach it to a declaration instead");
+            ai++;
+        }
+        NodeId id = self.parseStmtBody();
+        self.attachAttrs(id, attrs, attrsLen);
+        return id;
+    }
+
+    /* the dispatch half of parseStmt, after the attribute lists were
+     * consumed */
+    NodeId parseStmtBody()
+    {
+        if (self.current.kind == TokenKind::Return)
+            return self.parseReturnStmt();
+        if (self.current.kind == TokenKind::If)
+            return self.parseIfStmt();
+        if (self.current.kind == TokenKind::While)
+            return self.parseWhileStmt();
+        if (self.current.kind == TokenKind::For)
+            return self.parseForStmt();
+        if (self.current.kind == TokenKind::Loop)
+            return self.parseLoopStmt();
+        if (self.current.kind == TokenKind::Switch)
+            return self.parseSwitchStmt();
+        if (self.current.kind == TokenKind::Defer)
+            return self.parseDeferStmt();
+        if (self.current.kind == TokenKind::Break)
+        {
+            self.advance();
+            self.expect(TokenKind::Semicolon);
+            return self.storeStmt(StmtKind::Break);
+        }
+        if (self.current.kind == TokenKind::Continue)
+        {
+            self.advance();
+            self.expect(TokenKind::Semicolon);
+            return self.storeStmt(StmtKind::Continue);
+        }
+        if (self.current.kind == TokenKind::LBrace)
+            return self.parseBlock();
+        if (self.current.kind == TokenKind::Comptime)
+            return self.parseComptimeStmt();
+        if (self.current.kind == TokenKind::Flag)
+            return self.parseFlagStmt();
+        if (self.current.kind == TokenKind::Asm || self.current.kind == TokenKind::Volatile)
+            return self.parseAsmStmt();
+        return self.parseExprOrDecl();
+    }
+
+    NodeId parseReturnStmt()
+    {
+        self.advance();
+        NodeId val = self.noneNode();
+        if (self.current.kind != TokenKind::Semicolon)
+            val = self.parseExpr();
+        self.expect(TokenKind::Semicolon);
+        return self.storeStmt(StmtKind::Return{ .value = val });
+    }
+
+    /* `=` at the top level of a condition is rejected unless the
+     * statement carries #[[condassign]]. lastAssignPtr holds the op's
+     * text pointers (set by expr.crl for both plain and compound assigns,
+     * `~=` included since it desugars to Assign); the synthetic token is
+     * only here to point the diagnostic at the right columns */
+    void checkCondAssign(NodeId cond)
+    {
+        if (self.condAssignAttr) return;
+        Node* n = self.ctx.nodes + cond.index;
+        if (n.kind.tag != NodeKind::Expr) return;
+        u32 k = (u32)n.kind.payload.Expr.value.kind.tag;
+        if (k != ExprKind::Assign && k != ExprKind::AssignAdd &&
+            k != ExprKind::AssignSub && k != ExprKind::AssignMul &&
+            k != ExprKind::AssignDiv && k != ExprKind::AssignMod &&
+            k != ExprKind::AssignBitAnd && k != ExprKind::AssignBitOr &&
+            k != ExprKind::AssignBitXor && k != ExprKind::AssignShl &&
+            k != ExprKind::AssignShr) return;
+        Token t;
+        t.kind = TokenKind::Equal;
+        t.number = 0;
+        t.data.ptr = self.lastAssignPtr;
+        t.data.len = 1;
+        self.reportError(ErrorCode::ParseCondAssign, t, "use of '=' in condition; mark with #[[condassign]] to allow it");
+    }
+
+    NodeId parseIfStmt()
+    {
+        self.advance();
+        self.expect(TokenKind::LParen);
+        NodeId cond = self.parseExpr();
+        self.checkCondAssign(cond);
+        self.expect(TokenKind::RParen);
+        NodeId thenBody = self.parseStmt();
+        NodeId elseBody = self.noneNode();
+        
+        if (self.match(TokenKind::Else))
+            elseBody = self.parseStmt();
+        return self.storeStmt(StmtKind::If{ .cond = cond, .thenBody = thenBody, .elseBody = elseBody });
+    }
+
+    NodeId parseWhileStmt()
+    {
+        self.advance();
+        self.expect(TokenKind::LParen);
+        NodeId cond = self.parseExpr();
+        self.checkCondAssign(cond);
+        self.expect(TokenKind::RParen);
+        NodeId body = self.parseStmt();
+        return self.storeStmt(StmtKind::While{ .cond = cond, .body = body });
+    }
+
+    /* ── for / for-in ── */
+
+    /* three shapes hide behind `for (`:
+     *   for (var i = 0; …)   classic, `var`-init (flags 1)
+     *   for (var x : iter)   for-in, inferred binding
+     *   for (T x : iter)     for-in, typed binding
+     *   for (i = 0; …)       classic, expr init
+     * the typed form needs speculation: `x` could be either the type or
+     * the loop variable, so parse T name and commit only on `:`, else
+     * rewind and let the classic-C path re-read it. flags 2/4 = has
+     * cond/post. ForIn flags: 1 = `var` binding */
+    NodeId parseForStmt()
+    {
+        SourceLoc forLoc = self.tokenLoc(self.current);
+        self.advance();
+        self.expect(TokenKind::LParen);
+        NodeId init = self.noneNode();
+        NodeId cond = self.noneNode();
+        NodeId post = self.noneNode();
+        u8 flags = 0;
+        if (self.current.kind == TokenKind::Var || self.current.kind == TokenKind::Const)
+        {
+            bool isVar = self.match(TokenKind::Var);
+            if (!isVar) self.advance();
+            Token name = self.expectName();
+            Str bindName = self.ctx.intern(name.data.asStr());
+            if (self.match(TokenKind::Colon))
+            {
+                NodeId iterExpr = self.parseExpr();
+                self.expect(TokenKind::RParen);
+                NodeId body = self.parseStmt();
+                u8 forInFlags = 0;
+                if (isVar) forInFlags = 1;
+                return self.storeStmtAt(StmtKind::ForIn{ .bindName = bindName, .bindType = 0, .iterExpr = iterExpr, .body = body, .flags = forInFlags }, forLoc);
+            }
+            self.expect(TokenKind::Equal);
+            init = self.parseExpr();
+            self.expect(TokenKind::Semicolon);
+            flags = 1;
+        }
+        else if (self.isTypeStart())
+        {
+            ParserMark mark = self.save();
+            Ty bindType = self.parseType();
+            Token name = self.expectName();
+            Str bindName = self.ctx.intern(name.data.asStr());
+            if (self.match(TokenKind::Colon))
+            {
+                NodeId iterExpr = self.parseExpr();
+                self.expect(TokenKind::RParen);
+                NodeId body = self.parseStmt();
+                self.endSpeculation();
+                return self.storeStmtAt(StmtKind::ForIn{ .bindName = bindName, .bindType = bindType, .iterExpr = iterExpr, .body = body, .flags = 0 }, forLoc);
+            }
+            self.restore(mark);
+        }
+
+        if (flags == 0)
+        {
+            if (self.current.kind != TokenKind::Semicolon)
+                init = self.parseExprOrDecl();
+            else
+                self.advance();
+        }
+        if (self.current.kind != TokenKind::Semicolon)
+        {
+            cond = self.parseExpr();
+            self.checkCondAssign(cond);
+            flags |= 2;
+        }
+        self.expect(TokenKind::Semicolon);
+        if (self.current.kind != TokenKind::RParen)
+        {
+            post = self.parseExpr();
+            flags |= 4;
+        }
+        self.expect(TokenKind::RParen);
+        NodeId body = self.parseStmt();
+        return self.storeStmt(StmtKind::For{ .init = init, .cond = cond, .post = post, .body = body, .flags = flags });
+    }
+
+    NodeId parseLoopStmt()
+    {
+        self.advance();
+        NodeId body = self.parseStmt();
+        return self.storeStmt(StmtKind::Loop{ .body = body });
+    }
+
+    /* same loop shape as parseBlock: track errors and cursor progress so
+     * a case that eats nothing (and reports nothing) can't spin forever;
+     * after any error, sync to the next `,`/`=>`/`}` */
+    NodeId parseSwitchStmt()
+    {
+        self.advance();
+        self.expect(TokenKind::LParen);
+        NodeId sexpr = self.parseExpr();
+        self.checkCondAssign(sexpr);
+        self.expect(TokenKind::RParen);
+        self.expect(TokenKind::LBrace);
+        SwitchListBuilder cases;
+        self.ctx.switchListInit(&cases);
+        while (self.current.kind != TokenKind::RBrace && !self.atEnd())
+        {
+            u32 errorsBefore = self.errorCount();
+            u8* cursorBefore = self.lexer.getCur();
+            Token tokenBefore = self.current;
+            SwitchCase c = self.parseSwitchStmtCase();
+            if (!self.ctx.switchListAppend(&cases, c)) self.reportAllocFailed();
+            bool progressed = self.lexer.getCur() != cursorBefore ||
+                              self.current.kind != tokenBefore.kind ||
+                              self.current.data.ptr != tokenBefore.data.ptr;
+            if (!progressed && !self.atEnd()) self.advance();
+            if (self.errorCount() > errorsBefore) self.synchronizeCase();
+        }
+        self.expect(TokenKind::RBrace);
+        u32 count = cases.len;
+        SwitchCase* values = self.ctx.switchListFinish(&cases);
+        return self.storeStmt(StmtKind::Switch{ .expr = sexpr, .cases = values, .casesLen = count });
+    }
+
+    /* one arm, statement flavour: `pat | pat, pat if guard => body`.
+     * flags bit 0 = guard, bit 2 (4) = else arm (see expr.crl) */
+    SwitchCase parseSwitchStmtCase()
+    {
+        SwitchCase c;
+        c.patterns = null;
+        c.patternsLen = 0;
+        c.guard = self.noneNode();
+        c.body = self.noneNode();
+        c.flags = 0;
+
+        if (self.match(TokenKind::Else))
+        {
+            c.flags = 4;
+            self.expect(TokenKind::FatArrow);
+            c.body = self.parseSwitchCaseBody();
+            self.match(TokenKind::Comma);
+            return c;
+        }
+
+        NodeListBuilder patterns;
+        self.ctx.nodeListInit(&patterns);
+        NodeId pattern = self.parseSwitchPattern();
+        if (!self.ctx.nodeListAppend(&patterns, pattern)) self.reportAllocFailed();
+        while (self.match(TokenKind::Pipe))
+        {
+            pattern = self.parseSwitchPattern();
+            if (!self.ctx.nodeListAppend(&patterns, pattern)) self.reportAllocFailed();
+        }
+        while (self.match(TokenKind::Comma))
+        {
+            pattern = self.parseSwitchPattern();
+            if (!self.ctx.nodeListAppend(&patterns, pattern)) self.reportAllocFailed();
+        }
+        c.patternsLen = patterns.len;
+        c.patterns = self.ctx.nodeListFinish(&patterns);
+        if (self.match(TokenKind::If))
+        {
+            c.guard = self.parseExpr();
+            c.flags |= 1;
+        }
+        self.expect(TokenKind::FatArrow);
+        c.body = self.parseSwitchCaseBody();
+        self.match(TokenKind::Comma);
+        return c;
+    }
+
+    // `=> { ... }` or `=> single stmt`: both produce one body
+    NodeId parseSwitchCaseBody()
+    {
+        if (self.current.kind == TokenKind::LBrace) return self.parseBlock();
+        return self.parseStmt();
+    }
+
+    NodeId parseSwitchStmtPattern() { return self.parseSwitchPattern(); }
+
+    NodeId parseDeferStmt()
+    {
+        self.advance();
+        NodeId stmt = self.parseStmt();
+        return self.storeStmt(StmtKind::Defer{ .stmt = stmt });
+    }
+
+    /* block loop with the standard progress + error guard: if a stmt ate
+     * nothing (and reported nothing) force one token, and after any error
+     * skip to the next `;`/closer before trying again */
+    NodeId parseBlock()
+    {
+         self.expect(TokenKind::LBrace);
+        NodeListBuilder stmts;
+        self.ctx.nodeListInit(&stmts);
+        while (self.current.kind != TokenKind::RBrace && !self.atEnd())
+        {
+            u32 errorsBefore = self.errorCount();
+            u8* cursorBefore = self.lexer.getCur();
+            Token tokenBefore = self.current;
+            NodeId stmt = self.parseStmt();
+            if (!self.ctx.nodeListAppend(&stmts, stmt)) self.reportAllocFailed();
+            bool progressed = self.lexer.getCur() != cursorBefore ||
+                              self.current.kind != tokenBefore.kind ||
+                              self.current.data.ptr != tokenBefore.data.ptr;
+            if (!progressed && !self.atEnd()) self.advance();
+            if (self.errorCount() > errorsBefore) self.synchronizeStatement();
+        }
+        self.expect(TokenKind::RBrace);
+        u32 count = stmts.len;
+        NodeId* values = self.ctx.nodeListFinish(&stmts);
+        return self.storeStmt(StmtKind::Block{ .stmts = values, .stmtsLen = count });
+    }
+
+    /* flag (NAME) { key => { stmts }, else => { stmts } }: statement form.
+
+     * The matching arm is selected at parse time by the compiler's flag
+     * table (CLI `--flag NAME=VALUE`); the other arms are dead code. No
+     * else-arm is an error if nothing matches. */
+    NodeId parseFlagStmt()
+    {
+        self.advance(); // flag
+        self.expect(TokenKind::LParen);
+        Token tknn = self.expect(TokenKind::Ident);
+        Str nameStr = self.ctx.intern(tknn.data.asStr());
+        self.expect(TokenKind::RParen);
+        self.expect(TokenKind::LBrace);
+
+        NodeId chosenNodeId = self.noneNode();
+        NodeId elseNodeId = self.noneNode();
+
+        while (!self.atEnd() && self.current.kind != TokenKind::RBrace)
+        {
+            bool isElse = false;
+            Str keyStr = 0;
+            if (self.match(TokenKind::Else)) isElse = true;
+            else
+            {
+                Token ky = self.expect(TokenKind::Ident);
+                keyStr = self.ctx.intern(ky.data.asStr());
+            }
+            self.expect(TokenKind::FatArrow);
+            // branch body: either a block `{ ... }` or a single statement
+            NodeId bl = self.noneNode();
+            if (self.match(TokenKind::LBrace))
+            {
+                NodeListBuilder stl;
+                self.ctx.nodeListInit(&stl);
+                while (!self.atEnd() && self.current.kind != TokenKind::RBrace)
+                {
+                    NodeId st = self.parseStmt();
+                    if (!self.ctx.nodeListAppend(&stl, st)) self.reportAllocFailed();
+                }
+                self.expect(TokenKind::RBrace);
+                u32 countIdx = stl.len;
+                NodeId* vals = self.ctx.nodeListFinish(&stl);
+                bl = self.storeStmt(StmtKind::Block{ .stmts = vals, .stmtsLen = countIdx });
+            }
+            else
+            {
+                bl = self.parseStmt();
+            }
+
+            // match logic
+            if (isElse) elseNodeId = bl;
+            else
+            {
+                Str flagValStr = 0;
+                u32 ii = 0;
+                while (ii < self.ctx->flagsLen)
+                {
+                    if (self.ctx->flagNames[ii] == nameStr) { flagValStr = self.ctx->flagValues[ii]; break; }
+                    ii++;
+                }
+                if (flagValStr != 0 && flagValStr == keyStr) chosenNodeId = bl;
+            }
+            if (!self.match(TokenKind::Comma)) break;
+        }
+        self.expect(TokenKind::RBrace);
+        if (chosenNodeId.index != 0) return chosenNodeId;
+        if (elseNodeId.index != 0) return elseNodeId;
+        self.reportCurrentError(ErrorCode::ParseExpectedStmt, "no arm of this flag statement matched; add an `else` arm");
+        return self.noneNode();
+    }
+    // like parseComptimeStmt's, but the DeclKind-level `comptime` is the
+    // stub; here a real StmtKind::Comptime node is built
+    NodeId parseComptimeStmt()
+    {
+        self.advance();
+        self.expect(TokenKind::LBrace);
+        NodeListBuilder stmts;
+        self.ctx.nodeListInit(&stmts);
+        while (self.current.kind != TokenKind::RBrace && !self.atEnd())
+        {
+            u32 errorsBefore = self.errorCount();
+            u8* cursorBefore = self.lexer.getCur();
+            Token tokenBefore = self.current;
+            NodeId stmt = self.parseStmt();
+            if (!self.ctx.nodeListAppend(&stmts, stmt)) self.reportAllocFailed();
+            bool progressed = self.lexer.getCur() != cursorBefore ||
+                              self.current.kind != tokenBefore.kind ||
+                              self.current.data.ptr != tokenBefore.data.ptr;
+            if (!progressed && !self.atEnd()) self.advance();
+            if (self.errorCount() > errorsBefore) self.synchronizeStatement();
+        }
+        self.expect(TokenKind::RBrace);
+        u32 count = stmts.len;
+        NodeId* values = self.ctx.nodeListFinish(&stmts);
+        return self.storeStmt(StmtKind::Comptime{ .stmts = values, .stmtsLen = count });
+    }
+
+     NodeId parseAsmStmt()
+     {
+         u8 flags = 0;
+         if (self.match(TokenKind::Volatile)) flags = 1;
+         self.expect(TokenKind::Asm);
+         // `volatile` may precede or follow `asm`; either way bit 0 gets set
+         if (self.match(TokenKind::Volatile)) flags = 1;
+         self.expect(TokenKind::LBrace);
+         NodeListBuilder template;
+         self.ctx.nodeListInit(&template);
+         /* template pieces: string literals only; the comma is optional so
+          * adjacent strings join (codegen concatenates them) */
+         while (self.current.kind == TokenKind::String)
+         {
+             NodeId item = self.parsePrimaryExpr();
+             if (!self.ctx.nodeListAppend(&template, item)) self.reportAllocFailed();
+             self.match(TokenKind::Comma);
+         }
+         NodeListBuilder outputs;
+         NodeListBuilder inputs;
+         NodeListBuilder clobbers;
+         self.ctx.nodeListInit(&outputs);
+         self.ctx.nodeListInit(&inputs);
+         self.ctx.nodeListInit(&clobbers);
+         /* GCC extended asm: `: outputs : inputs : clobbers`; sections are
+          * optional; a `::` (lexed as one ColonColon token) closes the
+          * section and marks the next one empty, e.g.
+          * `"xchgq %0, %1" : "+r"(a), "+m"(*p) :: "memory"` and the
+          * `asm("" ::: "memory")` barrier. Outputs/inputs items are
+          * `"constraint"(operand)` pairs, clobbers are bare strings */
+         bool wantClobbers = false;
+         if (self.current.kind == TokenKind::ColonColon)
+         {
+             // `tpl::…`: outputs and inputs both empty
+             self.advance();
+             wantClobbers = true;
+         }
+         else if (self.match(TokenKind::Colon))
+         {
+             while (self.current.kind != TokenKind::Colon &&
+                    self.current.kind != TokenKind::ColonColon &&
+                    self.current.kind != TokenKind::RBrace && !self.atEnd())
+             {
+                 NodeId con = self.parsePrimaryExpr();
+                 if (!self.ctx.nodeListAppend(&outputs, con)) self.reportAllocFailed();
+                 if (self.match(TokenKind::LParen))
+                 {
+                     NodeId operand = self.parseExpr();
+                     if (!self.ctx.nodeListAppend(&outputs, operand)) self.reportAllocFailed();
+                     self.expect(TokenKind::RParen);
+                 }
+                 if (!self.match(TokenKind::Comma)) break;
+             }
+             if (self.current.kind == TokenKind::ColonColon)
+             {
+                 // outputs done, inputs empty; clobbers follow
+                 self.advance();
+                 wantClobbers = true;
+             }
+             else if (self.match(TokenKind::Colon))
+             {
+                 while (self.current.kind != TokenKind::Colon &&
+                        self.current.kind != TokenKind::ColonColon &&
+                        self.current.kind != TokenKind::RBrace && !self.atEnd())
+                 {
+                     NodeId con = self.parsePrimaryExpr();
+                     if (!self.ctx.nodeListAppend(&inputs, con)) self.reportAllocFailed();
+                     if (self.match(TokenKind::LParen))
+                     {
+                         NodeId operand = self.parseExpr();
+                         if (!self.ctx.nodeListAppend(&inputs, operand)) self.reportAllocFailed();
+                         self.expect(TokenKind::RParen);
+                     }
+                     if (!self.match(TokenKind::Comma)) break;
+                 }
+                 if (self.current.kind == TokenKind::ColonColon)
+                 {
+                     self.advance();
+                     wantClobbers = true;
+                 }
+                 else if (self.match(TokenKind::Colon)) wantClobbers = true;
+             }
+         }
+         if (wantClobbers)
+         {
+             self.match(TokenKind::Colon); // `tpl:::`: extra section colon
+             while (self.current.kind != TokenKind::RBrace && !self.atEnd())
+             {
+                 NodeId cb = self.parsePrimaryExpr();
+                 if (!self.ctx.nodeListAppend(&clobbers, cb)) self.reportAllocFailed();
+                 if (!self.match(TokenKind::Comma)) break;
+             }
+         }
+         self.expect(TokenKind::RBrace);
+         u32 count = template.len;
+         NodeId* values = self.ctx.nodeListFinish(&template);
+         u32 outputsLen = outputs.len;
+         NodeId* outputsItems = self.ctx.nodeListFinish(&outputs);
+         u32 inputsLen = inputs.len;
+         NodeId* inputsItems = self.ctx.nodeListFinish(&inputs);
+         u32 clobbersLen = clobbers.len;
+         NodeId* clobbersItems = self.ctx.nodeListFinish(&clobbers);
+         return self.storeStmt(StmtKind::Asm{
+             .template = values, .templateLen = count,
+             .outputs = outputsItems, .outputsLen = outputsLen,
+             .inputs = inputsItems, .inputsLen = inputsLen,
+             .clobbers = clobbersItems, .clobbersLen = clobbersLen,
+             .flags = flags });
+     }
+
+    /* ── expr-or-decl (the statement ambiguity) ── */
+
+    /* `var`/`const`/`static` are unambiguous here. the general `T name …`
+     * form is not: peek `type ident` and call it a decl only when `=`,
+     * `;` or `[` follows; everything else is an expression statement.
+     * VarDecl flags: 1 const, 2 hasInit, 4 static (ast/stmt.crl) */
+    NodeId parseExprOrDecl()
+    {
+        if (self.current.kind == TokenKind::Var || self.current.kind == TokenKind::Const ||
+            self.current.kind == TokenKind::Static)
+        {
+            bool isConst = false;
+            bool isStatic = false;
+            if (self.current.kind == TokenKind::Const) { self.advance(); isConst = true; }
+            else if (self.current.kind == TokenKind::Static) { self.advance(); isStatic = true; }
+            else self.advance();
+            Ty typeNode = 0;
+            if (self.isTypeStart())
+            {
+                ParserMark mark = self.save();
+                Ty candidate = self.parseType();
+                if (self.current.kind == TokenKind::Ident)
+                {
+                    typeNode = candidate;
+                    self.endSpeculation();
+                } else {
+                    self.restore(mark);
+                }
+            }
+            Token name = self.expectName();
+            if (typeNode != 0) typeNode = self.parseDeclaratorArray(typeNode);
+            Str nameId = self.ctx.intern(name.data.asStr());
+            NodeId init = self.noneNode();
+            if (isStatic)
+            {
+                /* `static T name [= expr];`: storage persists across calls;
+                 * an omitted initializer means zero (C static semantics) */
+                if (self.match(TokenKind::Equal)) init = self.parseInitExpr();
+            }
+            else
+            {
+                self.expect(TokenKind::Equal);
+                init = self.parseInitExpr();
+            }
+            typeNode = self.inferArrayFromInit(typeNode, init);
+            self.expect(TokenKind::Semicolon);
+            u8 flags = 0;
+            if (init.index != 0) flags |= 2;
+            if (isConst) flags |= 1;
+            if (isStatic) flags |= 4;
+            return self.storeStmt(StmtKind::VarDecl{ .name = nameId, .typeNode = typeNode, .init = init, .nameLoc = self.tokenLoc(name), .flags = flags, .dropMethod = NodeId{ .index = 0 } });
+        }
+
+        /* a statement starting `(` is a cast expression (`(void)ctx;`,
+         * `(i32)x;`), not a tuple declaration; tuple locals are written
+         * `struct(...)` and no declaration in the corpus starts with a
+         * parenthesized type, so never speculatively parse it as one */
+        if (self.isTypeStart() && self.current.kind != TokenKind::LParen)
+        {
+            ParserMark mark = self.save();
+            Ty typeNode = self.parseType();
+            bool isDecl = false;
+            if (self.current.kind == TokenKind::Ident)
+            {
+                Token name = self.expectName();
+                isDecl = self.current.kind == TokenKind::Equal || self.current.kind == TokenKind::Semicolon || self.current.kind == TokenKind::LBracket;
+            }
+            self.restore(mark);
+            if (isDecl)
+            {
+                typeNode = self.parseType();
+                Token name = self.expectName();
+                typeNode = self.parseDeclaratorArray(typeNode);
+                Str nameId = self.ctx.intern(name.data.asStr());
+                NodeId init = self.noneNode();
+                u8 flags = 0;
+                if (self.match(TokenKind::Equal))
+                {
+                      init = self.parseInitExpr();
+                      flags = 2;
+                }
+                typeNode = self.inferArrayFromInit(typeNode, init);
+                self.expect(TokenKind::Semicolon);
+                return self.storeStmt(StmtKind::VarDecl{ .name = nameId, .typeNode = typeNode, .init = init, .nameLoc = self.tokenLoc(name), .flags = flags, .dropMethod = NodeId{ .index = 0 } });
+            }
+        }
+
+         NodeId expr = self.parseExpr();
+         self.expect(TokenKind::Semicolon);
+         return self.storeStmt(StmtKind::ExprStmt{ .expr = expr });
+     }
+}

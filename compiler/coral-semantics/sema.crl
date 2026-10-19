@@ -1,0 +1,639 @@
+#[[no_drop_all]]
+
+/* sema.crl: the Sema state object shared by the whole semantics pass:
+ * scope stack, error counters, import/alias/extends bookkeeping, and the
+ * diagnostic-message / Ty-spelling helpers the other sema files lean on. */
+import ast::id { Str, NodeId, SourceLoc, locFile };
+import ast::types { Ty };
+import ast::node { Node, NodeKind };
+import ast::stmt { Stmt, StmtKind };
+import context::context { AstContext, InternEntry };
+import common::slice { Slice };
+import scope { ScopeStack, Symbol };
+import diag::engine { DiagnosticEngine };
+import diag::code { ErrorCode };
+
+import(lib) std::mman { alloc, dealloc, realloc, zero };
+
+pub struct Sema
+{
+    AstContext* ctx;
+    ScopeStack* scopes;
+    Ty currentReturnType;
+    u32 errors;
+    NodeId* extends;
+    u32 extendsLen;
+    u32 extendsCap;
+    DiagnosticEngine* diag;
+    /* --allow-int-ptr: int→pointer assignments are reported (TC-0009)
+     * but non-fatal; without it they fail the build */
+    bool allowIntPtr;
+    /* locals that are declared and never read always warn (T0012) */
+    bool warnUnused;
+    /* locals of the function currently being checked: interned name,
+     * declaration site, and whether an Ident has resolved to it yet */
+    Str* unusedNames;
+    SourceLoc* unusedLocs;
+    u8* unusedUsed;
+    u32 unusedLen;
+    u32 unusedCap;
+    /* direct (unqualified) import bindings by (file, local name): a
+     * second direct pull of the same name in one file conflicts */
+    Str* directNames;
+    u32* directFiles;
+    u32 directLen;
+    u32 directCap;
+    /* import `as` renames: local alias → the aliased declaration, so the
+     * backend can bridge `path__alias__name` refs to `path__name` */
+    Str* aliasNames;
+    NodeId* aliasDecls;
+    u32 aliasLen;
+    u32 aliasCap;
+    /* nesting depth of `comptime { … }` blocks currently being checked.
+     * `@typeof` is only legal inside one */
+    u32 comptimeDepth;
+    /* the builder's module table (module/alias::name → resolved file path),
+     * authoritative for picking the right candidate when a flat-merged name
+     * collides (ast's struct File vs std::io::fs's distinct File) */
+    Slice* modKeys;
+    Slice* modVals;
+    u32 modLen;
+    /* `#[[no_drop_all]]` on the function (or its file, propagated at
+     * parse time): skip resolving drop methods for locals in this body */
+    bool fileNoDropAll;
+    /* nesting depth of `#[[no_drop]]` blocks: locals inside are not
+     * auto-dropped */
+    u32 noDropDepth;
+}
+
+/* ── state ─────────────────────────────────────────────────────────── */
+
+pub extend Sema
+{
+    // diagnostic file id of the node's source file: 0 for absent ids
+    u32 fileOf(NodeId id)
+    {
+        if (id.index == 0) return 0;
+        Node* n = self.ctx.nodes + id.index;
+        return locFile(n->loc);
+    }
+
+    /* name lookup that prefers the symbol declared in the use-site's own
+     * file (same-name symbols from other merged files mangle apart) */
+    Symbol* lookupAt(Str name, NodeId id)
+    {
+        return self.scopes.lookupFrom(name, self.fileOf(id));
+    }
+
+    /* like lookupAt for a type reference: Named types carry the site they
+     * were spelled at (TypeEntry.loc), so a same-named type declared in
+     * another merged file resolves to its own decl. Entries without a
+     * recorded site (sema-created) keep the plain scope behaviour. */
+    Symbol* lookupType(Str name, SourceLoc loc)
+    {
+        if (loc.data == 0) return self.scopes.lookup(name);
+        return self.scopes.lookupFrom(name, locFile(loc));
+    }
+
+    /* everything here is process-lifetime: the name/alias/extends tables
+     * start empty and grow on first use, deinit hands it all back. the one
+     * alloc<ScopeStack>(1) is element-counted, matching deinit's dealloc. */
+    void init(AstContext* ctx, DiagnosticEngine* diag)
+    {
+        self.ctx = ctx;
+        self.scopes = alloc<ScopeStack>(1);
+        if (self.scopes != null)
+        {
+            zero<ScopeStack>(self.scopes, 1);
+            self.scopes.init(64);
+        }
+        self.currentReturnType = 0;
+        self.errors = 0;
+        self.extends = null;
+        self.allowIntPtr = false;
+        self.warnUnused = true;
+        self.unusedNames = null;
+        self.unusedLocs = null;
+        self.unusedUsed = null;
+        self.unusedLen = 0;
+        self.unusedCap = 0;
+        self.extendsLen = 0;
+        self.extendsCap = 0;
+        self.diag = diag;
+        self.directNames = null;
+        self.directFiles = null;
+        self.directLen = 0;
+        self.directCap = 0;
+        self.aliasNames = null;
+        self.aliasDecls = null;
+        self.aliasLen = 0;
+        self.aliasCap = 0;
+        self.comptimeDepth = 0;
+        self.modKeys = null;
+        self.modVals = null;
+        self.modLen = 0;
+        self.fileNoDropAll = false;
+        self.noDropDepth = 0;
+    }
+
+    void deinit()
+    {
+        if (self.scopes != null)
+        {
+            self.scopes.deinit();
+            dealloc<ScopeStack>(self.scopes);
+        }
+        if (self.extends != null) dealloc<NodeId>(self.extends);
+        if (self.directNames != null) dealloc<Str>(self.directNames);
+        if (self.directFiles != null) dealloc<u32>(self.directFiles);
+        if (self.aliasNames != null) dealloc<Str>(self.aliasNames);
+        if (self.aliasDecls != null) dealloc<NodeId>(self.aliasDecls);
+        self.scopes = null;
+        self.ctx = null;
+        self.currentReturnType = 0;
+        self.errors = 0;
+        self.extends = null;
+        self.diag = null;
+        self.directNames = null;
+        self.directFiles = null;
+        self.directLen = 0;
+        self.directCap = 0;
+        self.aliasNames = null;
+        self.aliasDecls = null;
+        self.aliasLen = 0;
+        self.aliasCap = 0;
+    }
+
+    /* record a direct (unqualified) import binding; false if this file
+     * already pulled the same local name (conflict; alias with `as`) */
+    bool claimDirectImport(u32 fileId, Str name)
+    {
+        u32 i = 0;
+        while (i < self.directLen)
+        {
+            if (self.directFiles[i] == fileId && self.directNames[i] == name) return false;
+            i++;
+        }
+        if (self.directLen >= self.directCap)
+        {
+            u32 newCap = 16;
+            if (self.directCap != 0) newCap = self.directCap * 2;
+            Str* n1 = realloc<Str>(self.directNames, (usize)newCap);
+            // OOM: claim success and drop the binding. names may have grown
+            // while files didn't; mismatched arrays, but the run is doomed
+            // anyway, no point in a half-recovery here.
+            if (n1 == null) return true;
+            self.directNames = n1;
+            u32* n2 = realloc<u32>(self.directFiles, (usize)newCap);
+            if (n2 == null) return true;
+            self.directFiles = n2;
+            self.directCap = newCap;
+        }
+        self.directNames[self.directLen] = name;
+        self.directFiles[self.directLen] = fileId;
+        self.directLen++;
+        return true;
+    }
+
+    // record an import `as` rename: dedup by (alias, decl)
+    void addAliasPair(Str alias, NodeId declId)
+    {
+        // no alias, or the target is anonymous (module/reexport): nothing to bridge
+        if (alias == 0 || declId.index == 0) return;
+        u32 i = 0;
+        while (i < self.aliasLen)
+        {
+            if (self.aliasNames[i] == alias && self.aliasDecls[i].index == declId.index) return;
+            i++;
+        }
+        if (self.aliasLen >= self.aliasCap)
+        {
+            u32 newCap = 16;
+            if (self.aliasCap != 0) newCap = self.aliasCap * 2;
+            Str* n1 = realloc<Str>(self.aliasNames, (usize)newCap);
+            if (n1 == null) return;
+            self.aliasNames = n1;
+            NodeId* n2 = realloc<NodeId>(self.aliasDecls, (usize)newCap);
+            if (n2 == null) return;
+            self.aliasDecls = n2;
+            self.aliasCap = newCap;
+        }
+        self.aliasNames[self.aliasLen] = alias;
+        self.aliasDecls[self.aliasLen] = declId;
+        self.aliasLen++;
+    }
+
+    /* extends are collected during the declare pass so findMethod can scan
+     * them no matter which file/module order the bodies run in */
+    void addExtend(NodeId id)
+    {
+        if (self.extendsLen >= self.extendsCap)
+        {
+            u32 newCap = 8;
+            if (self.extendsCap != 0) newCap = self.extendsCap * 2;
+            NodeId* fresh = realloc<NodeId>(self.extends, (usize)newCap);
+            if (fresh == null) return;
+            self.extends = fresh;
+            self.extendsCap = newCap;
+        }
+        self.extends[self.extendsLen] = id;
+        self.extendsLen++;
+    }
+
+    void addError()
+    {
+        // both counters: scopes.errors catches writes that never went through
+        // semaError (scope.declare counts its own failures), and checkFile
+        // syncs self.errors back to it at the end of the file.
+        if (self.scopes != null) self.scopes.errors++;
+        self.errors++;
+    }
+
+    void semaError(ErrorCode code, SourceLoc loc, str msg)
+    {
+        self.addError();
+        if (self.diag == null) return;
+        self.diag.emitError(code, loc, msg, "");
+    }
+
+    /* warning at a recorded location; warnings never fail the build */
+    void semaWarn(ErrorCode code, SourceLoc loc, str msg)
+    {
+        if (self.diag == null) return;
+        self.diag.emitWarning(code, loc, msg, "");
+    }
+
+    /* emit a diagnostic without counting again; used when the failing
+     * operation (e.g. scopes.declare) already incremented the counter */
+    void semaErrorCounted(ErrorCode code, NodeId id, str msg)
+    {
+        if (self.diag == null) return;
+        SourceLoc loc;
+        loc.data = 0;
+        if (id.index != 0)
+        {
+            Node* node = self.ctx.nodes + id.index;
+            loc = node->loc;
+        }
+        self.diag.emitError(code, loc, msg, "");
+    }
+
+    void semaErrorNode(ErrorCode code, NodeId id, str msg)
+    {
+        SourceLoc loc;
+        loc.data = 0;
+        if (id.index != 0)
+        {
+            Node* node = self.ctx.nodes + id.index;
+            loc = node->loc;
+        }
+        self.semaError(code, loc, msg);
+    }
+
+    /* like semaErrorNode, but the help line is specific to this message
+     * instead of the code-wide default (CLI and LSP both prefer it) */
+    void semaErrorNodeHelp(ErrorCode code, NodeId id, str msg, str help)
+    {
+        self.addError();
+        if (self.diag == null) return;
+        SourceLoc loc;
+        loc.data = 0;
+        if (id.index != 0)
+        {
+            Node* node = self.ctx.nodes + id.index;
+            loc = node->loc;
+        }
+        self.diag.emitError(code, loc, msg, help);
+    }
+
+    /* ── diagnostics plumbing ────────────────────────────────────────── */
+
+    /* "<prefix><interned name>": diagnostics name the offending
+     * identifier instead of a bare generic message.
+     * the buffer is deliberately never freed: emitError renders the message
+     * synchronously (copies the bytes out) and the compiler is one-shot, so
+     * freeing here would only be ceremony. */
+    str nameMsg(str prefix, Str name)
+    {
+        InternEntry* ie = self.ctx.interns + name;
+        u8* m = alloc<u8>(prefix.len + ie->len);
+        if (m == null) return prefix;
+        usize i = 0;
+        while (i < prefix.len) { m[i] = prefix.ptr[i]; i++; }
+        i = 0;
+        while (i < ie->len) { m[prefix.len + i] = ie->ptr[i]; i++; }
+        return str { .ptr = m, .len = prefix.len + ie->len };
+    }
+
+    // "<prefix><interned name><suffix>"
+    str nameMsgS(str prefix, Str name, str suffix)
+    {
+        InternEntry* ie = self.ctx.interns + name;
+        u8* m = alloc<u8>(prefix.len + ie->len + suffix.len);
+        if (m == null) return prefix;
+        usize i = 0;
+        while (i < prefix.len) { m[i] = prefix.ptr[i]; i++; }
+        i = 0;
+        while (i < ie->len) { m[prefix.len + i] = ie->ptr[i]; i++; }
+        i = 0;
+        while (i < suffix.len) { m[prefix.len + ie->len + i] = suffix.ptr[i]; i++; }
+        return str { .ptr = m, .len = prefix.len + ie->len + suffix.len };
+    }
+
+    // NUL-terminated scratch buffer → str view (tySpelling sub-buffers)
+    // also the free-standing one: alloc<u8>(n) counts *bytes*, not elements
+    str zStr(u8* s)
+    {
+        usize n = 0;
+        while (s[n] != 0) n++;
+        return str { .ptr = s, .len = n };
+    }
+
+    // append to a fixed diagnostic buffer (truncates, never overflows)
+    void tyAppend(u8* buf, usize cap, usize* len, str s)
+    {
+        usize i = 0;
+        while (i < s.len && *len + 1 < cap) { buf[*len] = s.ptr[i]; *len += 1; i++; }
+        buf[*len] = 0;
+    }
+
+    void tyAppendCh(u8* buf, usize cap, usize* len, u8 c)
+    {
+        if (*len + 1 < cap) { buf[*len] = c; *len += 1; buf[*len] = 0; }
+    }
+
+    void tyAppendName(u8* buf, usize cap, usize* len, Str name)
+    {
+        if (name == 0 || name >= self.ctx.internsLen) return;
+        InternEntry* ie = self.ctx.interns + name;
+        usize i = 0;
+        while (i < ie->len && *len + 1 < cap) { buf[*len] = ie->ptr[i]; *len += 1; i++; }
+        buf[*len] = 0;
+    }
+
+    /* render a Ty the way the user spelled it (i32, u8*, const cchar*,
+     * str, Vec<i32>, T) into buf; returns buf. used by mismatch diags.
+     * punctuation goes through tyAppendCh as decimal byte codes: 60 '<',
+     * 62 '>', 42 '*', 91 '[', 93 ']', 40 '(', 41 ')'; read them as ASCII. */
+    u8* tySpelling(Ty t, u8* buf, usize cap)
+    {
+        usize len = 0;
+        u8* sub = alloc<u8>(128);
+        u8* digits = alloc<u8>(12);
+        buf[0] = 0;
+        if (sub == null || digits == null)
+        {
+            dealloc<u8>(sub);
+            dealloc<u8>(digits);
+            buf[0] = 63; buf[1] = 0; // '?': no room to say anything smarter
+            return buf;
+        }
+        sub[0] = 0;
+        if (t == 0) { self.tyAppend(buf, cap, &len, "void"); dealloc<u8>(sub); dealloc<u8>(digits); return buf; }
+        TypeEntry* e = self.ctx.types + t;
+        TypeKind k = e.kind;
+        switch (k.tag)
+        {
+            TypeKind::Void => { self.tyAppend(buf, cap, &len, "void"); },
+            TypeKind::Bool => { self.tyAppend(buf, cap, &len, "bool"); },
+            TypeKind::Char => { self.tyAppend(buf, cap, &len, "char"); },
+            TypeKind::I8 => { self.tyAppend(buf, cap, &len, "i8"); },
+            TypeKind::U8 => { self.tyAppend(buf, cap, &len, "u8"); },
+            TypeKind::I16 => { self.tyAppend(buf, cap, &len, "i16"); },
+            TypeKind::U16 => { self.tyAppend(buf, cap, &len, "u16"); },
+            TypeKind::I32 => { self.tyAppend(buf, cap, &len, "i32"); },
+            TypeKind::U32 => { self.tyAppend(buf, cap, &len, "u32"); },
+            TypeKind::I64 => { self.tyAppend(buf, cap, &len, "i64"); },
+            TypeKind::U64 => { self.tyAppend(buf, cap, &len, "u64"); },
+            TypeKind::I128 => { self.tyAppend(buf, cap, &len, "i128"); },
+            TypeKind::U128 => { self.tyAppend(buf, cap, &len, "u128"); },
+            TypeKind::F32 => { self.tyAppend(buf, cap, &len, "f32"); },
+            TypeKind::F64 => { self.tyAppend(buf, cap, &len, "f64"); },
+            TypeKind::Isize => { self.tyAppend(buf, cap, &len, "isize"); },
+            TypeKind::Usize => { self.tyAppend(buf, cap, &len, "usize"); },
+            TypeKind::Rawptr => { self.tyAppend(buf, cap, &len, "rawptr"); },
+            TypeKind::Str => { self.tyAppend(buf, cap, &len, "str"); },
+            TypeKind::Error => { self.tyAppend(buf, cap, &len, "error"); },
+            TypeKind::Named => {
+                self.tyAppendName(buf, cap, &len, k.payload.Named.name);
+                if (k.payload.Named.genericArgsLen > 0)
+                {
+                    self.tyAppendCh(buf, cap, &len, 60);
+                    u32 g = 0;
+                    while (g < k.payload.Named.genericArgsLen)
+                    {
+                        if (g > 0) self.tyAppend(buf, cap, &len, ", ");
+                        self.tySpelling(k.payload.Named.genericArgs[g], sub, 128);
+                        self.tyAppend(buf, cap, &len, self.zStr(sub));
+                        g++;
+                    }
+                    self.tyAppendCh(buf, cap, &len, 62);
+                }
+            },
+            TypeKind::Pointer => {
+                self.tySpelling(k.payload.Pointer.base, sub, 128);
+                self.tyAppend(buf, cap, &len, self.zStr(sub));
+                self.tyAppendCh(buf, cap, &len, 42);
+            },
+            TypeKind::Const => {
+                self.tyAppend(buf, cap, &len, "const ");
+                self.tySpelling(k.payload.Const.base, sub, 128);
+                self.tyAppend(buf, cap, &len, self.zStr(sub));
+            },
+            TypeKind::Comptime => {
+                self.tyAppend(buf, cap, &len, "comptime ");
+                self.tySpelling(k.payload.Comptime.base, sub, 128);
+                self.tyAppend(buf, cap, &len, self.zStr(sub));
+            },
+            TypeKind::Slice => {
+                self.tySpelling(k.payload.Slice.base, sub, 128);
+                self.tyAppend(buf, cap, &len, self.zStr(sub));
+                self.tyAppend(buf, cap, &len, "[]");
+            },
+            TypeKind::Array => {
+                self.tySpelling(k.payload.Array.base, sub, 128);
+                self.tyAppend(buf, cap, &len, self.zStr(sub));
+                self.tyAppendCh(buf, cap, &len, 91);
+                if (k.payload.Array.sizeName != 0 && k.payload.Array.sizeParam != 4294967295)
+                {
+                    self.tyAppend(buf, cap, &len, self.nameTextView(k.payload.Array.sizeName));
+                }
+                else
+                {
+                    u32 n = k.payload.Array.len;
+                    u32 di = 0;
+                    if (n == 0) { digits[0] = 48; di = 1; } // "0"
+                    while (n > 0 && di < 11) { digits[di] = (u8)(48 + (n % 10)); n /= 10; di++; } // u32 → decimal, backwards
+                    while (di > 0) { di--; self.tyAppendCh(buf, cap, &len, digits[di]); }
+                }
+                self.tyAppendCh(buf, cap, &len, 93);
+            },
+            TypeKind::FnPtr => {
+                self.tySpelling(k.payload.FnPtr.returnType, sub, 128);
+                self.tyAppend(buf, cap, &len, self.zStr(sub));
+                self.tyAppend(buf, cap, &len, "(");
+                u32 p = 0;
+                while (p < k.payload.FnPtr.paramsLen)
+                {
+                    if (p > 0) self.tyAppend(buf, cap, &len, ", ");
+                    self.tySpelling(k.payload.FnPtr.params[p], sub, 128);
+                    self.tyAppend(buf, cap, &len, self.zStr(sub));
+                    p++;
+                }
+                self.tyAppendCh(buf, cap, &len, 41);
+            },
+            TypeKind::Tuple => {
+                self.tyAppendCh(buf, cap, &len, 40);
+                u32 p = 0;
+                while (p < k.payload.Tuple.elemsLen)
+                {
+                    if (p > 0) self.tyAppend(buf, cap, &len, ", ");
+                    self.tySpelling(k.payload.Tuple.elems[p], sub, 128);
+                    self.tyAppend(buf, cap, &len, self.zStr(sub));
+                    p++;
+                }
+                self.tyAppendCh(buf, cap, &len, 41);
+            },
+            TypeKind::TypeParam => { self.tyAppendName(buf, cap, &len, k.payload.TypeParam.name); },
+            TypeKind::ValueInt => {
+                /* comptime value argument (`Arr<i32, 4>`) */
+                u8* vd = alloc<u8>(24);
+                if (vd != null)
+                {
+                    u64 v = k.payload.ValueInt.value;
+                    u32 di = 0;
+                    if (v == 0) { vd[0] = 48; di = 1; }
+                    while (v > 0 && di < 24) { vd[di] = (u8)(48 + (v % 10)); v /= 10; di++; }
+                    while (di > 0) { di--; self.tyAppendCh(buf, cap, &len, vd[di]); }
+                    dealloc<u8>(vd);
+                }
+            },
+            else => { self.tyAppend(buf, cap, &len, "?"); }
+        }
+        dealloc<u8>(sub);
+        dealloc<u8>(digits);
+        return buf;
+    }
+
+    // "argument `name`: got `<from>`, expected `<to>`"
+    str paramMismatchMsg(Str paramName, Ty fromTy, Ty toTy)
+    {
+        u8* fb = alloc<u8>(128);
+        u8* tb = alloc<u8>(128);
+        if (fb == null || tb == null) return "argument type mismatch";
+        self.tySpelling(fromTy, fb, 128);
+        self.tySpelling(toTy, tb, 128);
+        InternEntry* pe = self.ctx.interns + paramName;
+        usize fl = 0;
+        while (fb[fl] != 0) fl++;
+        usize tl = 0;
+        while (tb[tl] != 0) tl++;
+        u8* m = alloc<u8>(pe->len + fl + tl + 40);
+        if (m == null) { dealloc<u8>(fb); dealloc<u8>(tb); return "argument type mismatch"; }
+        usize n = 0;
+        usize i = 0;
+        str p1 = "argument `";
+        
+        i = 0;
+        while (i < p1.len) { m[n] = p1.ptr[i]; n++; i++; }
+        i = 0;
+        while (i < pe->len) { m[n] = pe->ptr[i]; n++; i++; }
+        str p2 = "`: got `";
+        i = 0;
+        while (i < p2.len) { m[n] = p2.ptr[i]; n++; i++; }
+        i = 0;
+        while (i < fl) { m[n] = fb[i]; n++; i++; }
+        str p3 = "`, expected `";
+        i = 0;
+        while (i < p3.len) { m[n] = p3.ptr[i]; n++; i++; }
+        i = 0;
+        while (i < tl) { m[n] = tb[i]; n++; i++; }
+        m[n] = 96; n++; // closing backtick; 96 is ASCII '`'
+        dealloc<u8>(fb);
+        dealloc<u8>(tb);
+        return str { .ptr = m, .len = n };
+    }
+
+    // "<what>: got `<from>`, expected `<to>`"
+    str typeMismatchMsg(str what, Ty fromTy, Ty toTy)
+    {
+        u8* fb = alloc<u8>(128);
+        u8* tb = alloc<u8>(128);
+        if (fb == null || tb == null) return what;
+        self.tySpelling(fromTy, fb, 128);
+        self.tySpelling(toTy, tb, 128);
+        usize wl = what.len;
+        usize fl = 0;
+        while (fb[fl] != 0) fl++;
+        usize tl = 0;
+        while (tb[tl] != 0) tl++;
+        u8* m = alloc<u8>(wl + fl + tl + 40);
+        if (m == null) { dealloc<u8>(fb); dealloc<u8>(tb); return what; }
+        usize n = 0;
+        usize i = 0;
+        while (i < wl) { m[n] = what.ptr[i]; n++; i++; }
+        str mid = ": got `";
+        i = 0;
+        while (i < mid.len) { m[n] = mid.ptr[i]; n++; i++; }
+        i = 0;
+        while (i < fl) { m[n] = fb[i]; n++; i++; }
+        str mid2 = "`, expected `";
+        i = 0;
+        while (i < mid2.len) { m[n] = mid2.ptr[i]; n++; i++; }
+        i = 0;
+        while (i < tl) { m[n] = tb[i]; n++; i++; }
+        m[n] = 96; n++;
+        dealloc<u8>(fb);
+        dealloc<u8>(tb);
+        return str { .ptr = m, .len = n };
+    }
+
+    /* declarations store the *end* of the construct in node.loc; put the
+     * diagnostic on the name the user wrote instead */
+    SourceLoc declNameLoc(NodeId id)
+    {
+        SourceLoc loc;
+        loc.data = 0;
+        if (id.index == 0) return loc;
+        Node* node = self.ctx.nodes + id.index;
+        if (node->kind.tag == NodeKind::Decl) return node->kind.payload.Decl.value.nameLoc;
+        if (node->kind.tag == NodeKind::Stmt)
+        {
+            Stmt* st = &node->kind.payload.Stmt.value;
+            if (st->kind.tag == StmtKind::VarDecl) return st->kind.payload.VarDecl.nameLoc;
+        }
+        return node->loc;
+    }
+
+    // duplicate declaration: name it and note where the first one is
+    void dupDeclDiagKind(Str name, NodeId id, str prefix)
+    {
+        // counted already: scopes.declare bumped both error counters when it
+        // refused, so emitting through semaError would count the same dup twice
+        if (self.diag != null)
+            self.diag.emitError(ErrorCode::SemaDuplicateDecl, self.declNameLoc(id),
+                self.nameMsgS(prefix, name, "`"), "");
+        if (self.scopes.dupSymbol != null && self.scopes.dupSymbol->declaration.index != 0 && self.diag != null)
+        {
+            NodeId prevId = self.scopes.dupSymbol->declaration;
+            self.diag.emitNote(ErrorCode::SemaDuplicateDecl, self.declNameLoc(prevId),
+                self.nameMsgS("previous declaration of `", name, "` is here"), "");
+        }
+    }
+
+    void dupDeclDiag(Str name, NodeId id)
+    {
+        self.dupDeclDiagKind(name, id, "duplicate declaration of `");
+    }
+
+    /* duplicate members are not scope declarations (fields, cases): report
+     * and count through semaError; prevLoc is the earlier member's name */
+    void dupNamedDiag(Str name, SourceLoc loc, str prefix, SourceLoc prevLoc)
+    {
+        self.semaError(ErrorCode::SemaDuplicateDecl, loc,
+            self.nameMsgS(prefix, name, "`"));
+        if (self.diag != null)
+            self.diag.emitNote(ErrorCode::SemaDuplicateDecl, prevLoc,
+                self.nameMsgS("previous declaration of `", name, "` is here"), "");
+    }
+}

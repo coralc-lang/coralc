@@ -1,0 +1,390 @@
+#[[no_drop_all]]
+/* frontend/map.crl: `coralc map` discovers lib.crl folders under the build
+ * file's root and splices them into the modules = [...] array as commented
+ * entries. Line splice on raw text, no reserialize, formatting preserved.
+ */
+
+import common::slice { Slice };
+import build::arena { Arena };
+import build::ast { CrlbNode, CrlbNodeKind };
+import build::builder {
+    bEq, bCStr, bFileExists, bFieldStr, bFieldList, bListDir, bJoinStr, bWriteFile,
+    DirEnt, builderRun, Builder
+};
+import args { Options };
+import(lib) core::cchar { cchar };
+import(lib) platform::libc { printf };
+import(lib) std::mman { alloc, dealloc, copy };
+
+struct MapArr
+{
+    usize open;
+    usize close;
+    usize insPos;
+    usize eiLen;
+    usize modsIndent;
+    bool multiline;
+}
+
+bool mIdentChar(u8 c)
+{
+    if (c >= 97 && c <= 122) return true;
+    if (c >= 65 && c <= 90) return true;
+    if (c >= 48 && c <= 57) return true;
+    if (c == 95) return true;
+    return false;
+}
+
+bool mHasAt(Slice s, usize i, str sub)
+{
+    if (i + sub.len > s.len) return false;
+    usize k = 0;
+    while (k < sub.len)
+    {
+        if (s.ptr[i + k] != sub.ptr[k]) return false;
+        k++;
+    }
+    return true;
+}
+
+bool mSliceEq(Slice a, Slice b)
+{
+    if (a.len != b.len) return false;
+    usize i = 0;
+    while (i < a.len)
+    {
+        if (a.ptr[i] != b.ptr[i]) return false;
+        i++;
+    }
+    return true;
+}
+
+bool mInList(Slice name, Slice* list, u32 len)
+{
+    u32 i = 0;
+    while (i < len)
+    {
+        if (bEq(name, list[i].asStr())) return true;
+        i++;
+    }
+    return false;
+}
+
+// locate the first `modules = [` array and its closing ']' (quote/comment aware)
+bool mFindModules(Slice raw, MapArr* out)
+{
+    str kw = "modules";
+    usize i = 0;
+    usize open = 0;
+    bool foundOpen = false;
+    while (i < raw.len)
+    {
+        if (mHasAt(raw, i, kw))
+        {
+            bool okBefore = i == 0 || !mIdentChar(raw.ptr[i - 1]);
+            usize j = i + 7;
+            while (j < raw.len && (raw.ptr[j] == 32 || raw.ptr[j] == 9)) j++;
+            if (okBefore && j < raw.len && raw.ptr[j] == 61)
+            {
+                j++;
+                while (j < raw.len && (raw.ptr[j] == 32 || raw.ptr[j] == 9)) j++;
+                if (j < raw.len && raw.ptr[j] == 91)
+                {
+                    open = j;
+                    foundOpen = true;
+                    break;
+                }
+            }
+        }
+        i++;
+    }
+    if (!foundOpen) return false;
+
+    usize k = open + 1;
+    bool inStr = false;
+    usize close = 0;
+    bool foundClose = false;
+    while (k < raw.len)
+    {
+        u8 ch = raw.ptr[k];
+        if (inStr)
+        {
+            if (ch == 92)
+            {
+                k += 2;
+                continue;
+            }
+            if (ch == 34) inStr = false;
+        }
+        else
+        {
+            if (ch == 34) inStr = true;
+            else if (ch == 47 && k + 1 < raw.len && raw.ptr[k + 1] == 47)
+            {
+                while (k < raw.len && raw.ptr[k] != 10) k++;
+                continue;
+            }
+            else if (ch == 93)
+            {
+                close = k;
+                foundClose = true;
+                break;
+            }
+        }
+        k++;
+    }
+    if (!foundClose) return false;
+
+    out->open = open;
+    out->close = close;
+    out->insPos = close;
+    out->eiLen = 0;
+    out->modsIndent = 0;
+    out->multiline = false;
+
+    usize nl = open + 1;
+    while (nl < close && raw.ptr[nl] != 10) nl++;
+    if (nl < close)
+    {
+        out->multiline = true;
+        usize p = nl + 1;
+        while (p < close && (raw.ptr[p] == 32 || raw.ptr[p] == 9)) p++;
+        out->eiLen = p - (nl + 1);
+
+        usize q = close;
+        while (q > open && (raw.ptr[q - 1] == 32 || raw.ptr[q - 1] == 9)) q--;
+        usize ci = 0;
+        if (q > open && raw.ptr[q - 1] == 10) ci = close - q;
+        out->insPos = close - ci;
+    }
+    else
+    {
+        usize ls = open;
+        while (ls > 0 && raw.ptr[ls - 1] != 10) ls--;
+        usize m = ls;
+        while (m < open && (raw.ptr[m] == 32 || raw.ptr[m] == 9)) m++;
+        out->modsIndent = m - ls;
+    }
+    return true;
+}
+
+// true when `"name"` appears anywhere inside the array (live or commented)
+bool mListed(Slice raw, usize from, usize to, Slice name)
+{
+    usize i = from;
+    while (i < to)
+    {
+        if (raw.ptr[i] == 34)
+        {
+            i++;
+            usize st = i;
+            while (i < to && raw.ptr[i] != 34) i++;
+            Slice got = Slice::from(raw.ptr + st, i - st);
+            if (mSliceEq(got, name)) return true;
+        }
+        i++;
+    }
+    return false;
+}
+
+void mWalk(Arena* a, Slice root, Slice rel, Slice* found, u32* foundLen, u32 cap, Slice* skips, u32 skipLen)
+{
+    str dir = bJoinStr(a, root, rel);
+    if (dir.ptr == null) return;
+    u32 n = 0;
+    DirEnt* ents = bListDir(a, dir, &n);
+    if (ents == null) return;
+    u32 i = 0;
+    while (i < n)
+    {
+        usize nameLen = 0;
+        while (ents[i].name[nameLen] != 0) nameLen++;
+        Slice nm = Slice::from(ents[i].name, nameLen);
+        bool hidden = nm.len > 0 && nm.ptr[0] == 46;
+        if (!hidden && !mInList(nm, skips, skipLen))
+        {
+            if (ents[i].dtype == 4)
+            {
+                str child = bJoinStr(a, rel, nm);
+                if (child.ptr == null) return;
+                Slice childRel = Slice::fromStr(child);
+
+                str libDir = bJoinStr(a, Slice::from(dir.ptr, dir.len), nm);
+                str libP = bJoinStr(a, Slice::from(libDir.ptr, libDir.len), Slice::fromStr("lib.crl"));
+                if (libDir.ptr != null && libP.ptr != null && bFileExists(libP) && *foundLen < cap)
+                {
+                    found[*foundLen] = childRel;
+                    *foundLen += 1;
+                }
+                mWalk(a, root, childRel, found, foundLen, cap, skips, skipLen);
+            }
+        }
+        i++;
+    }
+}
+
+bool mLess(Slice a, Slice b)
+{
+    usize i = 0;
+    while (i < a.len && i < b.len)
+    {
+        if (a.ptr[i] != b.ptr[i]) return a.ptr[i] < b.ptr[i];
+        i++;
+    }
+    return a.len < b.len;
+}
+
+void mSort(Slice* arr, u32 len)
+{
+    u32 i = 1;
+    while (i < len)
+    {
+        Slice key = arr[i];
+        i32 j = (i32)i - 1;
+        while (j >= 0 && mLess(key, arr[j]))
+        {
+            arr[j + 1] = arr[j];
+            j--;
+        }
+        arr[j + 1] = key;
+        i++;
+    }
+}
+
+void mAppend(u8* buf, usize* len, str src)
+{
+    usize i = 0;
+    while (i < src.len)
+    {
+        buf[*len] = src.ptr[i];
+        *len += 1;
+        i++;
+    }
+}
+
+void mAppendSpaces(u8* buf, usize* len, usize n)
+{
+    usize i = 0;
+    while (i < n)
+    {
+        buf[*len] = 32;
+        *len += 1;
+        i++;
+    }
+}
+
+bool mSplice(Options* opts, Arena* a, Slice raw, MapArr* arr, Slice* adds, u32 addLen)
+{
+    u8* insert = alloc<u8>(raw.len + 4096);
+    if (insert == null) return false;
+    usize ilen = 0;
+    u32 i = 0;
+    while (i < addLen)
+    {
+        if (arr->multiline)
+        {
+            mAppendSpaces(insert, &ilen, arr->eiLen);
+            mAppend(insert, &ilen, "# \"");
+            mAppend(insert, &ilen, adds[i].asStr());
+            mAppend(insert, &ilen, "\",\n");
+        }
+        else
+        {
+            mAppend(insert, &ilen, "\n");
+            mAppendSpaces(insert, &ilen, arr->modsIndent + 4);
+            mAppend(insert, &ilen, "# \"");
+            mAppend(insert, &ilen, adds[i].asStr());
+            mAppend(insert, &ilen, "\",\n");
+            mAppendSpaces(insert, &ilen, arr->modsIndent);
+        }
+        i++;
+    }
+
+    usize total = raw.len + ilen;
+    u8* buf = alloc<u8>(total + 1);
+    if (buf == null)
+    {
+        dealloc<u8>(insert);
+        return false;
+    }
+    copy<u8>(buf, raw.ptr, arr->insPos);
+    copy<u8>(buf + arr->insPos, insert, ilen);
+    copy<u8>(buf + arr->insPos + ilen, raw.ptr + arr->insPos, raw.len - arr->insPos);
+    dealloc<u8>(insert);
+    bool ok = bWriteFile(opts->buildFile.asStr(), buf, total);
+    dealloc<u8>(buf);
+    return ok;
+}
+
+pub i32 runMap(Options* opts, CrlbNode* root, Arena* a, Slice raw)
+{
+    CrlbNode* build = null;
+    usize i = 0;
+    while (i < root.children.len)
+    {
+        CrlbNode* c = root.children.data + i;
+        if (c.kind == CrlbNodeKind::Build)
+        {
+            build = c;
+            break;
+        }
+        i++;
+    }
+    if (build == null)
+    {
+        printf(C"coralc: no build block in build file\n");
+        return 2;
+    }
+    Slice rootDir;
+    if (!bFieldStr(build, Slice::fromStr("root"), &rootDir))
+    {
+        printf(C"coralc: build block has no root\n");
+        return 2;
+    }
+
+    MapArr arr;
+    if (!mFindModules(raw, &arr))
+    {
+        printf(C"coralc: no modules = [...] in build file\n");
+        return 2;
+    }
+
+    Slice* skips = (Slice*)a.alloc(512 * @sizeof(Slice), 8);
+    u32 skipLen = bFieldList(build, Slice::fromStr("skip"), a, skips, 512);
+
+    Slice* found = (Slice*)a.alloc(512 * @sizeof(Slice), 8);
+    u32 foundLen = 0;
+    mWalk(a, rootDir, Slice::fromStr(""), found, &foundLen, 512, skips, skipLen);
+    mSort(found, foundLen);
+
+    Slice* adds = (Slice*)a.alloc(512 * @sizeof(Slice), 8);
+    u32 addLen = 0;
+    i = 0;
+    while (i < (usize)foundLen)
+    {
+        if (!mListed(raw, arr.open + 1, arr.close, found[i]))
+        {
+            adds[addLen] = found[i];
+            addLen++;
+            printf(C"+ added   %s\n", bCStr(a, found[i]));
+        }
+        i++;
+    }
+
+    if (opts->dryRun)
+    {
+        printf(C"~ dry run, build file not written\n");
+        return 0;
+    }
+
+    if (addLen > 0 && !mSplice(opts, a, raw, &arr, adds, addLen))
+    {
+        printf(C"coralc: failed to write build file\n");
+        return 1;
+    }
+
+    Builder bOut;
+    i32 errs = builderRun(root, a, false, true, &bOut);
+    if (errs != 0) return 3;
+    return 0;
+}

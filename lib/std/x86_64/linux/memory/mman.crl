@@ -1,0 +1,1001 @@
+#[[no_drop_all]]
+import(lib) std::allocator { Allocator, mimalloc::{ MiAlloc }, tlsf::{ Tlsf } };
+import(lib) std::intrinsics { mmap, munmap, memmove, memcpy, memcmp };
+import(lib) platform::libc;
+
+// Reported by user-facing inits whose initial backing allocation genuinely
+// fails (the allocator fn pointers themselves stay rawptr/null — that is
+// their contract, not an error case).
+/// Reported when a user-facing allocator init cannot allocate.
+pub variant AllocError
+{
+    AllocFailed { str msg; }
+}
+
+// global default allocator
+/// Global default allocator used by alloc/dealloc.
+pub Allocator* defaultAllocator;
+
+rawptr _defaultAllocHeap;
+usize _defaultAllocHeapSize;
+
+// Tear down the default allocator and return the heap to the OS.
+// Only call this when nothing allocated through it is still in use.
+/// Tear down the default allocator and return its heap to the OS.
+pub void deinitDefaultAllocator()
+{
+    if (defaultAllocator == null) return;
+    defaultAllocator = null;
+    if (_defaultAllocHeap != null)
+    {
+        munmap(_defaultAllocHeap, _defaultAllocHeapSize);
+        _defaultAllocHeap = null;
+        _defaultAllocHeapSize = 0;
+    }
+    // mimalloc cleanup is handled by the OS reclaiming mmap'd pages
+}
+
+rawptr _libcAlloc(rawptr ctx, usize size)
+{
+    (void)ctx;
+    return libc::malloc(size);
+}
+
+void _libcFree(rawptr ctx, rawptr ptr)
+{
+    (void)ctx;
+    if (ptr) libc::free(ptr);
+}
+
+rawptr _libcRealloc(rawptr ctx, rawptr ptr, usize newSize)
+{
+    (void)ctx;
+    return libc::realloc(ptr, newSize);
+}
+
+/// Allocator backed by the C library's malloc/free/realloc.
+pub Allocator libcAllocator = Allocator {
+    .ctx = null,
+    .alloc = _libcAlloc,
+    .free = _libcFree,
+    .realloc = _libcRealloc
+};
+
+// Mimalloc wrapper
+static MiAlloc _miAllocInstance;
+
+rawptr _miStdAlloc(rawptr ctx, usize size)
+{
+    (void)ctx;
+    return _miAllocInstance.alloc(size);
+}
+
+void _miStdFree(rawptr ctx, rawptr ptr)
+{
+    (void)ctx;
+    _miAllocInstance.free(ptr);
+}
+
+rawptr _miStdRealloc(rawptr ctx, rawptr ptr, usize newSize)
+{
+    (void)ctx;
+    return _miAllocInstance.realloc(ptr, newSize);
+}
+
+/// Allocator backed by a global mimalloc instance.
+pub Allocator miAllocator = Allocator {
+    .ctx = null,
+    .alloc = _miStdAlloc,
+    .free = _miStdFree,
+    .realloc = _miStdRealloc
+};
+
+// Fallback — use mimalloc if not initialized
+/// Initialize the default allocator if it is not set.
+pub void ensureDefaultAllocator()
+{
+    if (defaultAllocator == null)
+        initDefaultAllocator();
+}
+
+// Initialize default allocator with libc malloc
+// Call this once at program start (or use -flag=def)
+/// Set the default allocator to the libc-backed one.
+pub void initDefaultAllocator()
+{
+    if (defaultAllocator != null) return;
+    defaultAllocator = &libcAllocator;
+    // _miAllocInstance.init(64 * 1024 * 1024);
+    // defaultAllocator = &miAllocator;
+}
+
+rawptr _tlsfAlloc(rawptr ctx, usize size)
+{
+    return ((Tlsf*)ctx)->alloc(size);
+}
+
+void _tlsfFree(rawptr ctx, rawptr ptr)
+{
+    if (ctx && ptr) ((Tlsf*)ctx)->free(ptr);
+}
+
+rawptr _tlsfRealloc(rawptr ctx, rawptr ptr, usize newSize)
+{
+    return ((Tlsf*)ctx)->realloc(ptr, newSize);
+}
+
+// libc-free fallback heap (free-list allocator)
+// this heap was shitty to get right, but it has to work before mimalloc exists.
+
+const usize _HB_ALIGN = 16;
+const usize _HB_HDR = 16;
+const usize _HB_FREE = 1;
+
+struct _HeapBlock
+{
+    usize sizeAndFlags; // full block size incl. header; bit0 = free
+    usize prevPhysSize; // full size of preceding block, 0 for the first
+}
+
+_HeapBlock* _heapFreeHead;
+
+#[[inline]] usize _hbSize(_HeapBlock* b) { return b->sizeAndFlags & ~(usize)_HB_FREE; }
+#[[inline]] bool _hbIsFree(_HeapBlock* b) { return (b->sizeAndFlags & _HB_FREE) != 0; }
+
+usize _hbAlign(usize v)
+{
+    return (v + _HB_ALIGN - 1u) & ~(_HB_ALIGN - 1u);
+}
+
+_HeapBlock* _hbNext(_HeapBlock* b)
+{
+    return (_HeapBlock*)((u8*)b + _hbSize(b));
+}
+
+void _heapPushFree(_HeapBlock* b)
+{
+    *(_HeapBlock**)((u8*)b + _HB_HDR) = _heapFreeHead;
+    _heapFreeHead = b;
+}
+
+void _heapUnlink(_HeapBlock* b)
+{
+    _HeapBlock* prev = null;
+    _HeapBlock* cur = _heapFreeHead;
+    while (cur != null && cur != b)
+    {
+        prev = cur;
+        cur = *(_HeapBlock**)((u8*)cur + _HB_HDR);
+    }
+    if (cur == null) return;
+    if (prev != null)
+        *(_HeapBlock**)((u8*)prev + _HB_HDR) = *(_HeapBlock**)((u8*)cur + _HB_HDR);
+    else
+        _heapFreeHead = *(_HeapBlock**)((u8*)cur + _HB_HDR);
+}
+
+rawptr _heapAlloc(rawptr ctx, usize size)
+{
+    (void)ctx;
+    if (size == 0) return null;
+    usize need = _hbAlign(size) + _HB_HDR;
+    loop {
+        _HeapBlock* prev = null;
+        _HeapBlock* cur = _heapFreeHead;
+        while (cur != null)
+        {
+            usize curSize = _hbSize(cur);
+            if (curSize >= need)
+            {
+                if (prev != null)
+                    *(_HeapBlock**)((u8*)prev + _HB_HDR) = *(_HeapBlock**)((u8*)cur + _HB_HDR);
+                else
+                    _heapFreeHead = *(_HeapBlock**)((u8*)cur + _HB_HDR);
+                usize rem = curSize - need;
+                if (rem >= _HB_HDR + _HB_ALIGN)
+                {
+                    _HeapBlock* tail = (_HeapBlock*)((u8*)cur + need);
+                    tail->sizeAndFlags = rem | _HB_FREE;
+                    tail->prevPhysSize = need;
+                    cur->sizeAndFlags = need;
+                    _HeapBlock* nn = _hbNext(tail);
+                    nn->prevPhysSize = rem;
+                    _heapPushFree(tail);
+                }
+                else {
+                    cur->sizeAndFlags = curSize;
+                }
+                return (rawptr)((u8*)cur + _HB_HDR);
+            }
+            prev = cur;
+            cur = *(_HeapBlock**)((u8*)cur + _HB_HDR);
+        }
+        // No fit, map a new region (big free block + sentinel) and retry
+        usize reg = _hbAlign(need + _HB_HDR + _HB_ALIGN);
+        if (reg < 4096) reg = 4096;
+        u8* mem = (u8*)mmap(null, reg, 3, 0x22, -1, 0);
+        if (mem == null) return null;
+        _HeapBlock* big = (_HeapBlock*)mem;
+        big->sizeAndFlags = (reg - _HB_HDR) | _HB_FREE;
+        big->prevPhysSize = 0;
+        _HeapBlock* sent = (_HeapBlock*)(mem + reg - _HB_HDR);
+        sent->sizeAndFlags = _HB_HDR;
+        sent->prevPhysSize = reg - _HB_HDR;
+        _heapPushFree(big);
+    }
+}
+
+void _heapFree(rawptr ctx, rawptr ptr)
+{
+    (void)ctx;
+    if (ptr == null) return;
+    _HeapBlock* b = (_HeapBlock*)((u8*)ptr - _HB_HDR);
+    _HeapBlock* next = _hbNext(b);
+    if (_hbIsFree(next))
+    {
+        _heapUnlink(next);
+        usize sz = _hbSize(b) + _hbSize(next);
+        b->sizeAndFlags = sz | _HB_FREE;
+        _HeapBlock* nn = _hbNext(next);
+        nn->prevPhysSize = sz;
+    }
+    else {
+        b->sizeAndFlags = _hbSize(b) | _HB_FREE;
+    }
+    if (b->prevPhysSize != 0)
+    {
+        _HeapBlock* prev = (_HeapBlock*)((u8*)b - b->prevPhysSize);
+        if (_hbIsFree(prev))
+        {
+            _heapUnlink(prev);
+            usize sz = _hbSize(prev) + _hbSize(b);
+            prev->sizeAndFlags = sz | _HB_FREE;
+            _HeapBlock* nn = _hbNext(b);
+            nn->prevPhysSize = sz;
+            b = prev;
+        }
+    }
+    _heapPushFree(b);
+}
+
+rawptr _heapRealloc(rawptr ctx, rawptr ptr, usize newSize)
+{
+    (void)ctx;
+    if (ptr == null) return _heapAlloc(null, newSize);
+    if (newSize == 0) { _heapFree(null, ptr); return null; }
+    _HeapBlock* b = (_HeapBlock*)((u8*)ptr - _HB_HDR);
+    usize curSize = _hbSize(b);
+    usize need = _hbAlign(newSize) + _HB_HDR;
+    if (need <= curSize)
+    {
+        usize rem = curSize - need;
+        if (rem >= _HB_HDR + _HB_ALIGN)
+        {
+            _HeapBlock* tail = (_HeapBlock*)((u8*)b + need);
+            tail->sizeAndFlags = rem | _HB_FREE;
+            tail->prevPhysSize = need;
+            b->sizeAndFlags = need;
+            _HeapBlock* nn = _hbNext(tail);
+            nn->prevPhysSize = rem;
+            _heapPushFree(tail);
+        }
+        return ptr;
+    }
+    _HeapBlock* next = _hbNext(b);
+    if (_hbIsFree(next) && curSize + _hbSize(next) >= need)
+    {
+        _heapUnlink(next);
+        usize total = curSize + _hbSize(next);
+        usize rem = total - need;
+        if (rem >= _HB_HDR + _HB_ALIGN)
+        {
+            _HeapBlock* tail = (_HeapBlock*)((u8*)b + need);
+            tail->sizeAndFlags = rem | _HB_FREE;
+            tail->prevPhysSize = need;
+            b->sizeAndFlags = need;
+            _HeapBlock* nn = _hbNext(tail);
+            nn->prevPhysSize = rem;
+            _heapPushFree(tail);
+        }
+        else {
+            b->sizeAndFlags = total;
+            _HeapBlock* nn = _hbNext(b);
+            nn->prevPhysSize = total;
+        }
+        return ptr;
+    }
+    rawptr np = _heapAlloc(null, newSize);
+    if (np == null) return null;
+    usize copyLen = (curSize - _HB_HDR) < newSize ? (curSize - _HB_HDR) : newSize;
+    memcpy(np, ptr, copyLen);
+    _heapFree(null, ptr);
+    return np;
+}
+
+// Coral free-list heap as the fallback allocator
+
+/// Fallback free-list heap allocator that needs no libc.
+pub Allocator cAllocator = Allocator {
+    .ctx = null,
+    .alloc = _heapAlloc,
+    .free = _heapFree,
+    .realloc = _heapRealloc
+};
+
+/// Page size assumed by the page allocator.
+pub const usize pageSize = 4096u;
+
+rawptr _pageAlloc(rawptr ctx, usize size)
+{
+    (void)ctx;
+    if (size == 0) return null;
+    usize aligned = (size + pageSize - 1u) & ~(pageSize - 1u);
+    rawptr region = mmap(null, aligned + pageSize, 3, 0x22, -1, 0);
+    if (region == null) return null;
+    *(usize*)region = aligned;
+    return (rawptr)((u8*)region + pageSize);
+}
+
+void _pageFree(rawptr ctx, rawptr ptr)
+{
+    (void)ctx;
+    if (!ptr) return;
+    u8* region = (u8*)ptr - pageSize;
+    usize size = *(usize*)region;
+    munmap(region, size + pageSize);
+}
+
+rawptr _pageRealloc(rawptr ctx, rawptr ptr, usize newSize)
+{
+    (void)ctx;
+    if (newSize == 0)
+    {
+        _pageFree(null, ptr);
+        return null;
+    }
+    rawptr newPtr = _pageAlloc(null, newSize);
+    if (newPtr == null) return null;
+    if (ptr != null)
+    {
+        usize oldAligned = *(usize*)((u8*)ptr - pageSize);
+        usize newAligned = *(usize*)((u8*)newPtr - pageSize);
+        usize copyLen = oldAligned < newAligned ? oldAligned : newAligned;
+        memcpy(newPtr, ptr, copyLen);
+        _pageFree(null, ptr);
+    }
+    return newPtr;
+}
+
+/// Allocator that maps whole pages for each allocation.
+pub Allocator pageAllocator = Allocator {
+    .ctx = null,
+    .alloc = _pageAlloc,
+    .free = _pageFree,
+    .realloc = _pageRealloc
+};
+
+/// Allocator that carves allocations from a fixed caller buffer.
+pub struct FixedBufferAllocator
+{
+    u8* buffer;
+    usize cap;
+    usize used;
+
+    /// Set the backing buffer and its size.
+    void init(u8* buffer, usize size)
+    {
+        self.buffer = buffer;
+        self.cap = size;
+        self.used = 0;
+    }
+
+    /// Allocator vtable backed by this buffer.
+    Allocator allocator()
+    {
+        return Allocator {
+            .ctx = (rawptr)self,
+            .alloc = _fbaAlloc,
+            .free = _fbaFree,
+            .realloc = _fbaRealloc
+        };
+    }
+
+    /// Reclaim all allocations made from the buffer.
+    void reset()
+    {
+        self.used = 0;
+    }
+
+    /// Bytes still available in the buffer.
+    usize remaining(const self*)
+    {
+        return self.cap - self.used;
+    }
+}
+
+rawptr _fbaAlloc(rawptr ctx, usize size)
+{
+    if (!ctx || size == 0) return null;
+    FixedBufferAllocator* alloc = (FixedBufferAllocator*)ctx;
+    usize aligned = (size + 7u) & ~(usize)7u;
+    if (alloc->used + 8u + aligned > alloc->cap) return null;
+    *(usize*)(alloc->buffer + alloc->used) = aligned;
+    rawptr ptr = (rawptr)(alloc->buffer + alloc->used + 8u);
+    alloc->used += 8u + aligned;
+    return ptr;
+}
+
+void _fbaFree(rawptr ctx, rawptr ptr)
+{
+    (void)ctx;
+    (void)ptr;
+}
+
+rawptr _fbaRealloc(rawptr ctx, rawptr ptr, usize newSize)
+{
+    if (!ctx) return null;
+    if (newSize == 0) return null;
+    usize oldAligned = ptr != null ? *(usize*)((u8*)ptr - 8u) : 0;
+    rawptr newPtr = _fbaAlloc(ctx, newSize);
+    if (newPtr == null) return null;
+    usize copyLen = oldAligned < newSize ? oldAligned : newSize;
+    if (ptr != null && copyLen > 0) memcpy(newPtr, ptr, copyLen);
+    return newPtr;
+}
+
+/// Allocator that uses a small stack buffer, falling back to another.
+pub struct StackFallbackAllocator
+{
+    FixedBufferAllocator fba;
+    Allocator* fallback;
+    u8 stackBuf[1024];
+
+    /// Set the fallback allocator for oversized requests.
+    void init(Allocator* fallback)
+    {
+        self.fba.init(self.stackBuf, 1024u);
+        self.fallback = fallback;
+    }
+
+    /// Allocator vtable backed by this allocator.
+    Allocator allocator()
+    {
+        return Allocator {
+            .ctx = (rawptr)self,
+            .alloc = _sfaAlloc,
+            .free = _sfaFree,
+            .realloc = _sfaRealloc
+        };
+    }
+}
+
+rawptr _sfaAlloc(rawptr ctx, usize size)
+{
+    if (!ctx) return null;
+    StackFallbackAllocator* alloc = (StackFallbackAllocator*)ctx;
+    rawptr ptr = _fbaAlloc((rawptr)&alloc->fba, size);
+    if (ptr != null) return ptr;
+    if (!alloc->fallback) return null;
+    return alloc->fallback->alloc(alloc->fallback->ctx, size);
+}
+
+void _sfaFree(rawptr ctx, rawptr ptr)
+{
+    if (!ctx || !ptr) return;
+    StackFallbackAllocator* alloc = (StackFallbackAllocator*)ctx;
+    u8* p = (u8*)ptr;
+    if (p >= alloc->stackBuf && p < alloc->stackBuf + 1024u) return;
+    if (alloc->fallback) alloc->fallback->free(alloc->fallback->ctx, ptr);
+}
+
+rawptr _sfaRealloc(rawptr ctx, rawptr ptr, usize newSize)
+{
+    if (!ctx) return null;
+    StackFallbackAllocator* alloc = (StackFallbackAllocator*)ctx;
+    if (newSize == 0)
+    {
+        _sfaFree(ctx, ptr);
+        return null;
+    }
+    u8* p = (u8*)ptr;
+    bool inStack = p >= alloc->stackBuf && p < alloc->stackBuf + 1024u;
+    usize oldAligned = inStack ? *(usize*)(p - 8u) : 0;
+    rawptr newPtr = _sfaAlloc(ctx, newSize);
+    if (newPtr == null) return null;
+    usize copyLen = oldAligned < newSize ? oldAligned : newSize;
+    if (ptr != null && copyLen > 0) memcpy(newPtr, ptr, copyLen);
+    if (!inStack && alloc->fallback)
+        alloc->fallback->free(alloc->fallback->ctx, ptr);
+    return newPtr;
+}
+
+/// Bump allocator that grows its buffer through a backing allocator.
+pub struct ArenaAllocator
+{
+    Allocator* backing;
+    u8* base;
+    usize cap;
+    usize used;
+
+    // A failed initial buffer allocation leaves the arena empty (cap 0),
+    // which still grows lazily from the backing allocator on first use, so
+    // push degrades to null-returning instead of writing through a null base.
+    /// Initialize with a backing allocator and initial capacity.
+    void init(Allocator* backing, usize initialCap)
+    {
+        self.backing = backing;
+        self.base = null;
+        self.cap = 0;
+        self.used = 0;
+        if (initialCap == 0) return;
+        self.base = (u8*)backing->alloc(backing->ctx, initialCap);
+        if (self.base == null) return;
+        self.cap = initialCap;
+    }
+
+    /// Release the arena's buffer back to the backing allocator.
+    void deinit()
+    {
+        if (self.backing != null) self.backing->free(self.backing->ctx, (rawptr)self.base);
+        self.base = null;
+        self.cap = 0;
+        self.used = 0;
+    }
+
+    /// Allocator vtable backed by this arena.
+    Allocator allocator()
+    {
+        return Allocator {
+            .ctx = (rawptr)self,
+            .alloc = _arenaAlloc,
+            .free = _arenaFree,
+            .realloc = _arenaRealloc
+        };
+    }
+
+    /// Bump-allocate size bytes from the arena; null on failure.
+    #[[inline]] rawptr push(usize size) { return _arenaAlloc((rawptr)self, size); }
+    /// Bump-allocate count T objects from the arena.
+    #[[inline]] T* pushType<T>(usize count) { return (T*)self.push(@sizeof(T) * count); }
+    /// Reclaim all arena allocations without freeing the buffer.
+    void reset() { self.used = 0; }
+    /// Bytes still available in the arena.
+    usize remaining() { return self.cap - self.used; }
+}
+
+rawptr _arenaAlloc(rawptr ctx, usize size)
+{
+    if (!ctx || size == 0) return null;
+    ArenaAllocator* alloc = (ArenaAllocator*)ctx;
+    if (!alloc->backing) return null;
+    usize aligned = (size + 7u) & ~(usize)7u;
+    if (alloc->used + 8u + aligned > alloc->cap) {
+        usize newCap = alloc->cap * 2u;
+        usize need = alloc->used + 8u + aligned;
+        if (newCap < need) newCap = need;
+        u8* newBase = (u8*)alloc->backing->realloc(
+            alloc->backing->ctx, (rawptr)alloc->base, newCap);
+        if (newBase == null) return null;
+        alloc->base = newBase;
+        alloc->cap = newCap;
+    }
+    *(usize*)(alloc->base + alloc->used) = aligned;
+    rawptr ptr = (rawptr)(alloc->base + alloc->used + 8u);
+    alloc->used += 8u + aligned;
+    return ptr;
+}
+
+void _arenaFree(rawptr ctx, rawptr ptr)
+{
+    (void)ctx; (void)ptr;
+}
+
+rawptr _arenaRealloc(rawptr ctx, rawptr ptr, usize newSize)
+{
+    if (!ctx) return null;
+    ArenaAllocator* alloc = (ArenaAllocator*)ctx;
+    if (newSize == 0) return null;
+    usize oldAligned = 0;
+    usize off = 0;
+    if (ptr != null)
+    {
+        oldAligned = *(usize*)((u8*)ptr - 8u);
+        off = (usize)((u8*)ptr - (u8*)alloc->base);
+    }
+    rawptr newPtr = _arenaAlloc(ctx, newSize);
+    if (newPtr == null) return null;
+    usize copyLen = oldAligned < newSize ? oldAligned : newSize;
+    if (ptr != null && copyLen > 0) memcpy(newPtr, (u8*)alloc->base + off, copyLen);
+    return newPtr;
+}
+
+/// Allocator handing out fixed-size blocks from one backing region.
+pub struct PoolAllocator
+{
+    rawptr freeList;
+    usize blockSize;
+    usize blockCount;
+    u8* backing;
+    Allocator* source;
+
+    /// Reserve blockCount blocks of blockSize from source.
+    void init(Allocator* source, usize blockSize, usize blockCount)
+    {
+        self.source = source;
+        self.blockSize = blockSize > @sizeof(rawptr) ? blockSize : @sizeof(rawptr);
+        self.blockCount = 0;
+        self.backing = source != null
+            ? (u8*)source->alloc(source->ctx, self.blockSize * blockCount)
+            : null;
+        self.freeList = null;
+        if (self.backing == null) return;
+
+        self.blockCount = blockCount;
+        for (usize i = 0; i < blockCount; i++) {
+            rawptr block = (rawptr)(self.backing + i * self.blockSize);
+            *(rawptr*)block = self.freeList;
+            self.freeList = block;
+        }
+    }
+
+    /// Release the backing region to the source allocator.
+    void deinit()
+    {
+        if (self.source != null && self.backing != null)
+            self.source->free(self.source->ctx, (rawptr)self.backing);
+        self.backing = null;
+        self.freeList = null;
+        self.blockSize = 0;
+        self.blockCount = 0;
+    }
+
+    /// Allocator vtable backed by this pool.
+    Allocator allocator()
+    {
+        return Allocator {
+            .ctx = (rawptr)self,
+            .alloc = _poolAlloc,
+            .free = _poolFree,
+            .realloc = _poolRealloc
+        };
+    }
+
+    /// Allocate one block; null when the pool is exhausted.
+    rawptr allocBlock()
+    {
+        return _poolAlloc((rawptr)self, self.blockSize);
+    }
+
+    /// Return a block to the pool.
+    void freeBlock(rawptr block)
+    {
+        _poolFree((rawptr)self, block);
+    }
+}
+
+rawptr _poolAlloc(rawptr ctx, usize size)
+{
+    if (!ctx) return null;
+    PoolAllocator* alloc = (PoolAllocator*)ctx;
+    if (size > alloc->blockSize) return null;
+    if (alloc->freeList == null) return null;
+    rawptr block = alloc->freeList;
+    alloc->freeList = *(rawptr*)block;
+    return block;
+}
+
+void _poolFree(rawptr ctx, rawptr ptr)
+{
+    if (!ctx || !ptr) return;
+    PoolAllocator* alloc = (PoolAllocator*)ctx;
+    *(rawptr*)ptr = alloc->freeList;
+    alloc->freeList = ptr;
+}
+
+rawptr _poolRealloc(rawptr ctx, rawptr ptr, usize newSize)
+{
+    if (!ctx) return null;
+    PoolAllocator* alloc = (PoolAllocator*)ctx;
+    if (newSize > alloc->blockSize) return null;
+    return ptr;
+}
+
+/// Allocator that tracks allocations so they can be freed together.
+pub struct ScopeAlloc
+{
+    Allocator* backing;
+    rawptr* ptrs;
+    usize* sizes;
+    usize len;
+    usize cap;
+
+    /// Initialize with a backing allocator and initial tracking capacity.
+    void init(Allocator* backing, usize cap)
+    {
+        self.backing = backing;
+        self.ptrs = backing != null
+            ? (rawptr*)backing->alloc(backing->ctx, cap * @sizeof(rawptr))
+            : null;
+        self.sizes = backing != null
+            ? (usize*)backing->alloc(backing->ctx, cap * @sizeof(usize))
+            : null;
+        self.len = 0;
+        if (self.ptrs == null || self.sizes == null)
+        {
+            if (self.ptrs != null) backing->free(backing->ctx, (rawptr)self.ptrs);
+            if (self.sizes != null) backing->free(backing->ctx, (rawptr)self.sizes);
+            self.ptrs = null;
+            self.sizes = null;
+            cap = 0;
+        }
+        self.cap = cap;
+    }
+
+    void _grow()
+    {
+        usize newCap = self.cap > 0 ? self.cap * 2 : 64;
+        rawptr* newPtrs = (rawptr*)self.backing->alloc(self.backing->ctx, newCap * @sizeof(rawptr));
+        if (newPtrs == null) return;
+        usize* newSizes = (usize*)self.backing->alloc(self.backing->ctx, newCap * @sizeof(usize));
+        if (newSizes == null) { self.backing->free(self.backing->ctx, (rawptr)newPtrs); return; }
+        if (self.len > 0)
+        {
+            copy<rawptr>(newPtrs, self.ptrs, self.len);
+            copy<usize>(newSizes, self.sizes, self.len);
+        }
+        if (self.ptrs != null) self.backing->free(self.backing->ctx, (rawptr)self.ptrs);
+        if (self.sizes != null) self.backing->free(self.backing->ctx, (rawptr)self.sizes);
+        self.ptrs = newPtrs;
+        self.sizes = newSizes;
+        self.cap = newCap;
+    }
+
+    /// Allocate size bytes and record them for freeAll.
+    rawptr alloc(usize size)
+    {
+        if (self.backing == null) return null;
+        if (self.ptrs == null || self.len >= self.cap) self._grow();
+        if (self.ptrs == null || self.len >= self.cap) return null;
+        rawptr ptr = self.backing->alloc(self.backing->ctx, size);
+        if (ptr != null) {
+            self.ptrs[self.len] = ptr;
+            self.sizes[self.len] = size;
+            self.len++;
+        }
+        return ptr;
+    }
+
+    /// Allocate count T objects and record them for freeAll.
+    T* allocType<T>(usize count)
+    {
+        return (T*)self.alloc(@sizeof(T) * count);
+    }
+
+    /// Free every allocation recorded so far.
+    void freeAll()
+    {
+        for (usize i = 0; i < self.len; i++) {
+            self.backing->free(self.backing->ctx, self.ptrs[i]);
+        }
+        self.len = 0;
+    }
+
+    /// Free all recorded allocations and the tracking arrays.
+    void deinit()
+    {
+        self.freeAll();
+        self.backing->free(self.backing->ctx, (rawptr)self.ptrs);
+        self.backing->free(self.backing->ctx, (rawptr)self.sizes);
+        self.ptrs = null;
+        self.sizes = null;
+        self.cap = 0;
+    }
+
+    /// Total bytes currently held by recorded allocations.
+    usize bytesUsed(const self*)
+    {
+        usize total = 0;
+        for (usize i = 0; i < self.len; i++) total += self.sizes[i];
+        return total;
+    }
+}
+
+/// Allocator that wraps another and tracks allocation statistics.
+pub struct LoggingAllocator
+{
+    Allocator* parent;
+    usize totalAlloced;
+    usize totalFreed;
+    usize currentUsed;
+    usize allocCount;
+    usize freeCount;
+    rawptr* trackPtrs;
+    usize* trackSizes;
+    usize trackLen;
+    usize trackCap;
+
+    /// Wrap parent and begin tracking its allocations.
+    void init(Allocator* parent)
+    {
+        self.parent = parent;
+        self.totalAlloced = 0;
+        self.totalFreed = 0;
+        self.currentUsed = 0;
+        self.allocCount = 0;
+        self.freeCount = 0;
+        self.trackPtrs = parent != null ? (rawptr*)parent->alloc(parent->ctx, 64 * @sizeof(rawptr)) : null;
+        self.trackSizes = parent != null ? (usize*)parent->alloc(parent->ctx, 64 * @sizeof(usize)) : null;
+        self.trackLen = 0;
+        if (self.trackPtrs == null || self.trackSizes == null)
+        {
+            if (self.trackPtrs != null && parent != null) parent->free(parent->ctx, (rawptr)self.trackPtrs);
+            if (self.trackSizes != null && parent != null) parent->free(parent->ctx, (rawptr)self.trackSizes);
+            self.trackPtrs = null;
+            self.trackSizes = null;
+            self.trackCap = 0;
+        }
+        else self.trackCap = 64;
+    }
+
+    void _trackGrow()
+    {
+        usize newCap = self.trackCap > 0 ? self.trackCap * 2 : 64;
+        rawptr* newPtrs = (rawptr*)self.parent->alloc(self.parent->ctx, newCap * @sizeof(rawptr));
+        if (newPtrs == null) return;
+        usize* newSizes = (usize*)self.parent->alloc(self.parent->ctx, newCap * @sizeof(usize));
+        if (newSizes == null) { self.parent->free(self.parent->ctx, (rawptr)newPtrs); return; }
+        if (self.trackLen > 0)
+        {
+            copy<rawptr>(newPtrs, self.trackPtrs, self.trackLen);
+            copy<usize>(newSizes, self.trackSizes, self.trackLen);
+        }
+        if (self.trackPtrs != null) self.parent->free(self.parent->ctx, (rawptr)self.trackPtrs);
+        if (self.trackSizes != null) self.parent->free(self.parent->ctx, (rawptr)self.trackSizes);
+        self.trackPtrs = newPtrs;
+        self.trackSizes = newSizes;
+        self.trackCap = newCap;
+    }
+
+    void _track(rawptr ptr, usize size)
+    {
+        if (self.trackPtrs == null || self.trackLen >= self.trackCap) self._trackGrow();
+        if (self.trackPtrs == null || self.trackLen >= self.trackCap) return;
+        self.trackPtrs[self.trackLen] = ptr;
+        self.trackSizes[self.trackLen] = size;
+        self.trackLen++;
+    }
+
+    usize _untrack(rawptr ptr)
+    {
+        for (usize i = 0; i < self.trackLen; i++)
+        {
+            if (self.trackPtrs[i] == ptr)
+            {
+                usize size = self.trackSizes[i];
+                self.trackLen--;
+                self.trackPtrs[i] = self.trackPtrs[self.trackLen];
+                self.trackSizes[i] = self.trackSizes[self.trackLen];
+                return size;
+            }
+        }
+        return 0;
+    }
+
+    /// Allocator vtable backed by this logging allocator.
+    Allocator allocator()
+    {
+        return Allocator {
+            .ctx = (rawptr)self,
+            .alloc = _logAlloc,
+            .free = _logFree,
+            .realloc = _logRealloc
+        };
+    }
+
+    /// Print allocation statistics.
+    void printStats()
+    {    // TODO!
+         // platform::libc::write
+         // i'd need to write a function or system to capture stats
+    }
+}
+
+rawptr _logAlloc(rawptr ctx, usize size)
+{
+    if (!ctx || size == 0) return null;
+    LoggingAllocator* alloc = (LoggingAllocator*)ctx;
+    if (!alloc->parent) return null;
+    rawptr ptr = alloc->parent->alloc(alloc->parent->ctx, size);
+    if (ptr != null) {
+        alloc->totalAlloced += size;
+        alloc->currentUsed += size;
+        alloc->allocCount++;
+        alloc->_track(ptr, size);
+    }
+    return ptr;
+}
+
+void _logFree(rawptr ctx, rawptr ptr)
+{
+    if (!ctx || !ptr) return;
+    LoggingAllocator* alloc = (LoggingAllocator*)ctx;
+    if (ptr == null) return;
+    alloc->freeCount++;
+    usize size = alloc->_untrack(ptr);
+    if (size > alloc->currentUsed) size = alloc->currentUsed;
+    alloc->totalFreed += size;
+    alloc->currentUsed -= size;
+    if (alloc->parent) alloc->parent->free(alloc->parent->ctx, ptr);
+}
+
+rawptr _logRealloc(rawptr ctx, rawptr ptr, usize newSize)
+{
+    if (!ctx || newSize == 0) return null;
+    LoggingAllocator* alloc = (LoggingAllocator*)ctx;
+    if (!alloc->parent) return null;
+    usize oldSize = ptr != null ? alloc->_untrack(ptr) : 0;
+    rawptr newPtr = alloc->parent->realloc(alloc->parent->ctx, ptr, newSize);
+    if (newPtr == null)
+    {
+        if (oldSize > 0) alloc->_track(ptr, oldSize);
+        return null;
+    }
+    if (newSize > oldSize) alloc->totalAlloced += newSize - oldSize;
+    else alloc->totalFreed += oldSize - newSize;
+    if (newSize > oldSize) alloc->currentUsed += newSize - oldSize;
+    else alloc->currentUsed -= oldSize - newSize;
+    if (ptr == null) alloc->allocCount++;
+    alloc->_track(newPtr, newSize);
+    return newPtr;
+}
+
+/// Allocate count T objects from the default allocator.
+pub T* alloc<T>(usize count)
+{
+    if (count == 0) return null;
+    ensureDefaultAllocator();
+    if (defaultAllocator == null) return null;
+    return (T*)defaultAllocator->alloc(defaultAllocator->ctx, @sizeof(T) * count);
+}
+
+/// Free a block previously returned by alloc.
+pub void dealloc<T>(T* ptr)
+{
+    if (!ptr) return;
+    ensureDefaultAllocator();
+    if (defaultAllocator == null) return;
+    defaultAllocator->free(defaultAllocator->ctx, (rawptr)ptr);
+}
+
+/// Resize a block to count T objects; frees when newCount is 0.
+pub T* realloc<T>(T* ptr, usize newCount)
+{
+    if (newCount == 0) { dealloc<T>(ptr); return null; }
+    ensureDefaultAllocator();
+    if (defaultAllocator == null) return null;
+    return (T*)defaultAllocator->realloc(defaultAllocator->ctx, (rawptr)ptr, @sizeof(T) * newCount);
+}
+
+/// Copy count T objects from src to dst.
+pub void copy<T>(T* dst, T* src, usize count)
+{
+    if (dst && src && count > 0) memcpy((rawptr)dst, (const rawptr)src, @sizeof(T) * count);
+}
+
+#[[inline]]
+/// Move count T objects from src to dst, allowing overlap.
+pub void move<T>(T* dst, T* src, usize count) {
+    memmove((rawptr)dst, (rawptr)src, @sizeof(T) * count);
+}
+
+#[[inline]]
+/// Zero count T objects at ptr.
+pub void zero<T>(T* ptr, usize count) {
+    memset((rawptr)ptr, 0, @sizeof(T) * count);
+}
+
+#[[inline]]
+/// True when count T objects at a and b are byte-equal.
+pub bool equal<T>(const T* a, const T* b, usize count) {
+    return memcmp((const rawptr)a, (const rawptr)b, @sizeof(T) * count) == 0;
+}

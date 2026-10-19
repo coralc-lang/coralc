@@ -1,0 +1,1077 @@
+#[[no_drop_all]]
+import(lib) wallvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrType, IrTypeKind, IrValueKind, FunctionAnalysisCache };
+import(lib) wallvm::irOps { IrOpcode, IrICmpPred };
+import(lib) wallvm::passes::alias_analysis { AliasAnalysis };
+import(lib) wallvm::passes::loop_detect { IrLoop, irLoopDetectNatural };
+import(lib) std::mman { alloc, dealloc };
+
+// SIMD auto-vectorization pass, a constant-trip-count widening vectorizer.
+//
+// The pass finds natural loops whose induction variable starts at zero,
+// steps by one and exits on a header or latch `phi < const` test with a
+// bound that splits into whole vector iterations, then rewrites eligible
+// element-wise load/op/store chains in the body to 128-bit vector ops and
+// widens the step so each iteration covers one vector of elements.
+//
+// Supported patterns
+//   - Element-wise arithmetic, add, sub, mul, fadd, fsub, fmul, fdiv
+//   - Plain copies, a[i] = b[i]
+//   - Scalar operand broadcast for loop-invariant operands
+//   - Multiple vectorizable chains per loop, uniform element width
+//
+// Rejected outright, conservative but correct
+//   - Trip counts that are not a constant divisible by the vector width
+//   - Any induction-variable use the widening does not own, including
+//     leftover scalar chains, side branches on the bound and early exits
+//   - Calls, atomics and fences anywhere in the loop
+//   - Non-contiguous or multi-level GEP indexing, shifted patterns
+//   - Mixed element widths within one loop
+//
+// Integer reductions (sum, unsigned min/max) run as a vector accumulator
+// phi plus a horizontal combine in the exit block, all associative on
+// wrapping integers. Float reductions are not transformed because
+// reassociation changes rounding, and signed integer min/max stay scalar,
+// the backend VecMin/VecMax contract is unsigned.
+
+const u32 MAX_VEC_OPS = 64;
+
+pub enum VecPattern
+{
+    ElemwiseLoadOpStore,  // a[i] = a[i] op b[i], op == null is the plain copy
+    ElemwiseLoadOpScalar, // reserved, not generated
+    ReductionSum,         // int sum via a vector accumulator phi + exit combine
+    ReductionMin,         // unsigned int min, i32/i64 elements only
+    ReductionMax,         // unsigned int max, i32/i64 elements only
+    BroadcastMul,         // reserved, subsumed by ElemwiseLoadOpStore
+}
+
+pub struct VecCandidate
+{
+    VecPattern pattern;
+    IrInst* loadA;       // primary array load
+    IrInst* loadB;       // secondary array load (if any)
+    IrInst* op;          // the arithmetic operation
+    IrInst* store;       // the store (if any)
+    IrInst* gepA;        // GEP for loadA
+    IrInst* gepB;        // GEP for loadB (if any)
+    IrInst* gepStore;    // GEP for store
+    IrInst* reduceDest;  // reduction accumulator phi (reductions only)
+    IrInst* compareOp;   // comparison for conditional store
+    IrValue* loopIV;     // loop induction variable
+    u32 tripCount;       // trip count if known, 0xFFFFFFFF if not constant
+    u32 elemBits;                        // element width in bits
+    bool isFloat;
+    bool isSigned;
+}
+
+pub struct LoopInfo
+{
+    IrBlock* header;
+    IrBlock* latch;
+    IrBlock* exit;
+    IrInst* phi;         // induction variable phi
+    IrInst* increment;   // IV increment
+    IrInst* compare;     // loop exit compare
+    u32 depth;
+    u32 tripCount;       // 0xFFFFFFFF when the trip count is not a constant
+    bool safe;                           // no side effects that prevent vectorization
+}
+
+pub struct VecAnalysisResult
+{
+    VecCandidate candidates[MAX_VEC_OPS];
+    u32 ncandidates;
+    LoopInfo loopInfo;
+    bool canVectorize;
+    u32 vectorWidth;
+
+    VecAnalysisResult new()
+    {
+        return VecAnalysisResult {
+            .ncandidates = 0,
+            .canVectorize = false,
+            .vectorWidth = 4
+        };
+    }
+}
+
+pub struct AutoVectorizePass
+{
+    IrContext* ctx;
+    AliasAnalysis* aliasAnalysis;
+    bool ownAA;
+    u64 vecOps;
+    u64 peepholes;
+
+    AutoVectorizePass new(IrContext* ctx)
+    {
+        return AutoVectorizePass {
+            .ctx = ctx,
+            .aliasAnalysis = null,
+            .ownAA = false,
+            .vecOps = 0,
+            .peepholes = 0
+        };
+    }
+
+    bool run(IrFunc* func)
+    {
+        self.vecOps = 0;
+        self.peepholes = 0;
+
+        // Check for cached AA first
+        FunctionAnalysisCache* cache = self.ctx->getOrCreateAnalysisCache(func);
+        AliasAnalysis* aaPtr = (AliasAnalysis*)cache->aliasAnalysis;
+        if (aaPtr != null && cache->generation == self.ctx->analysisGeneration)
+        {
+            self.aliasAnalysis = aaPtr;
+            self.ownAA = false;
+        }
+        else
+        {
+            AliasAnalysis aa = AliasAnalysis::new(self.ctx);
+            aa.analyze(func);
+            self.aliasAnalysis = &aa;
+            self.ownAA = true;
+        }
+
+        bool changed = false;
+
+        IrLoop** loops = irLoopDetectNatural(func);
+        if (loops != null)
+        {
+            for (u32 li = 0; loops[li] != null; li++)
+            {
+                IrLoop* lp = loops[li];
+
+                LoopInfo info = self.analyzeLoop(lp);
+                if (!info.safe) continue;
+
+                VecAnalysisResult result = VecAnalysisResult::new();
+                result.loopInfo = info;
+                self.findCandidates(lp, &info, &result);
+
+                // every candidate shares one widened step, so one element
+                // width per loop
+                self.keepUniformWidth(&result);
+                if (result.ncandidates == 0) continue;
+
+                result.vectorWidth = self.chooseVectorWidth(&result);
+                if (!self.verifyWidening(lp, &info, &result)) continue;
+
+                self.applyVectorization(lp, &result);
+                changed = true;
+            }
+
+            // I free only the pointer array here, the other loop consumers
+            // in this tree never freed the loops themselves either
+            dealloc<IrLoop*>(loops);
+        }
+
+        // Post-vectorization peephole cleanup. Repeated because a dead load
+        // sits before the op it feeds in block order, so one forward pass
+        // can erase the op but not yet the load behind it.
+        if (changed)
+        {
+            for (u32 it = 0; it < 4; it++)
+            {
+                u64 cleaned = self.runPeepholeCleanup(func);
+                self.peepholes += cleaned;
+                if (cleaned == 0) break;
+            }
+        }
+
+        if (self.ownAA && self.aliasAnalysis != null)
+        {
+            self.aliasAnalysis->deinit();
+            self.aliasAnalysis = null;
+        }
+        return self.vecOps > 0;
+    }
+
+    bool inLoop(IrLoop* lp, IrBlock* b)
+    {
+        if (b == null) return false;
+        for (u32 i = 0; i < lp->nblocks; i++)
+            if (lp->blocks[i] == b) return true;
+        return false;
+    }
+
+    // A loop is only vectorizable when its induction variable is a header
+    // phi fed zero from outside and stepped by one from the latch, and the
+    // exit test sits in the header or the latch where the widened step
+    // still visits exactly tripCount / vectorWidth iterations. The side
+    // effect scan covers every loop block, header and latch included.
+    LoopInfo analyzeLoop(IrLoop* lp)
+    {
+        LoopInfo li = LoopInfo {
+            .header = lp->header,
+            .latch = lp->latch,
+            .exit = null,
+            .phi = null,
+            .increment = null,
+            .compare = null,
+            .depth = 1,
+            .safe = false,
+            .tripCount = 0xFFFFFFFF
+        };
+
+        for (u32 bi = 0; bi < lp->nblocks; bi++)
+        {
+            IrBlock* bb = lp->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst->opcode == IrOpcode::Call ||
+                    inst->opcode == IrOpcode::AtomicLoad ||
+                    inst->opcode == IrOpcode::AtomicStore ||
+                    inst->opcode == IrOpcode::AtomicRmw ||
+                    inst->opcode == IrOpcode::AtomicCmpXchg ||
+                    inst->opcode == IrOpcode::Fence)
+                    return li;
+            }
+        }
+
+        for (u32 ii = 0; ii < lp->header->ninsts; ii++)
+        {
+            IrInst* phi = lp->header->insts[ii];
+            if (phi->opcode != IrOpcode::Phi) continue;
+
+            IrInst* inc = null;
+            bool startZero = false;
+            bool bad = false;
+
+            for (u32 pi = 0; pi + 1 < phi->nops; pi += 2)
+            {
+                IrValue* val = phi->ops[pi];
+                IrBlock* pred = (IrBlock*)phi->ops[pi + 1];
+                if (pred == lp->latch)
+                {
+                    if (val == null || val->kind != IrValueKind::Inst) { bad = true; break; }
+                    IrInst* step = (IrInst*)val;
+                    if (step->opcode != IrOpcode::Add || step->nops != 2) { bad = true; break; }
+                    bool usesPhi = step->ops[0] == &phi->base || step->ops[1] == &phi->base;
+                    if (!usesPhi) { bad = true; break; }
+                    IrValue* k = (step->ops[0] == &phi->base) ? step->ops[1] : step->ops[0];
+                    if (k == null || k->kind != IrValueKind::ConstInt || k->valData != 1)
+                    { bad = true; break; }
+                    inc = step;
+                }
+                else if (self.inLoop(lp, pred))
+                {
+                    // an in-loop pred that is not the latch, not a simple IV
+                    bad = true;
+                    break;
+                }
+                else
+                {
+                    if (val == null || val->kind != IrValueKind::ConstInt || val->valData != 0)
+                    { bad = true; break; }
+                    startZero = true;
+                }
+            }
+
+            if (bad || inc == null || !startZero) continue;
+
+            // The exit test, phi < bound with the branch that leaves the
+            // loop. Header tests are safe in either polarity, the body is
+            // entered while phi < bound or not at all; a latch test must
+            // re-enter on the true side or the body would run a single
+            // iteration that no longer matches the scalar element range.
+            IrInst* cmp = null;
+            u64 bound = 0;
+            for (u32 pass = 0; pass < 2 && cmp == null; pass++)
+            {
+                IrBlock* bb = (pass == 0) ? lp->header : lp->latch;
+                for (u32 ci = 0; ci < bb->ninsts; ci++)
+                {
+                    IrInst* inst = bb->insts[ci];
+                    if (inst->opcode != IrOpcode::ICmp || inst->nops != 2) continue;
+
+                    bool phiFirst = inst->ops[0] == &phi->base;
+                    bool phiSecond = inst->ops[1] == &phi->base;
+                    if (!phiFirst && !phiSecond) continue;
+
+                    IrValue* other = phiFirst ? inst->ops[1] : inst->ops[0];
+                    if (other == null || other->kind != IrValueKind::ConstInt) continue;
+
+                    bool dirOk = phiFirst
+                        ? (inst->icmpPred == IrICmpPred::Slt || inst->icmpPred == IrICmpPred::Ult)
+                        : (inst->icmpPred == IrICmpPred::Sgt || inst->icmpPred == IrICmpPred::Ugt);
+                    if (!dirOk) continue;
+
+                    if (other->valData == 0 || other->valData > 0xFFFFFFFE) continue;
+                    if (inst->base.nusers != 1) continue;
+                    if (bb->ninsts == 0 || inst != bb->insts[bb->ninsts - 1]) continue;
+
+                    IrInst* br = inst->base.users[0];
+                    if (br->opcode != IrOpcode::CondBr || br->nops < 3) continue;
+
+                    IrBlock* tTgt = (IrBlock*)br->ops[1];
+                    IrBlock* fTgt = (IrBlock*)br->ops[2];
+                    bool tIn = self.inLoop(lp, tTgt);
+                    bool fIn = self.inLoop(lp, fTgt);
+                    if (tIn == fIn) continue;
+
+                    if (bb == lp->latch && (tTgt == null || tTgt != lp->header)) continue;
+
+                    cmp = inst;
+                    bound = other->valData;
+                    break;
+                }
+            }
+
+            if (cmp == null) continue;
+
+            li.phi = phi;
+            li.increment = inc;
+            li.compare = cmp;
+            li.tripCount = (u32)bound;
+            li.safe = true;
+            return li;
+        }
+
+        return li;
+    }
+
+    // Every load in the loop body, not just the header's, must be a
+    // contiguous phi-indexed access with exactly one consumer chain that
+    // ends in a store of its own, so the widened step owns the whole
+    // chain. Shared stores are claimed once.
+    void findCandidates(IrLoop* lp, LoopInfo* li, VecAnalysisResult* result)
+    {
+        for (u32 bi = 0; bi < lp->nblocks; bi++)
+        {
+            IrBlock* bb = lp->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst->opcode != IrOpcode::Load) continue;
+                if (inst->nops < 1) continue;
+                if (inst->base.nusers != 1) continue;
+
+                IrValue* addr = inst->ops[0];
+                if (addr == null || addr->kind != IrValueKind::Inst) continue;
+                IrInst* addrInst = (IrInst*)addr;
+                if (addrInst->opcode != IrOpcode::Gep || addrInst->nops != 2) continue;
+                if (addrInst->ops[1] != &li->phi->base) continue;
+
+                IrType* elemTy = inst->base.type;
+                if (elemTy == null) continue;
+
+                bool isFloat = false;
+                bool isSigned = false;
+                u32 elemBits = 0;
+                if (elemTy->kind == IrTypeKind::Int)
+                {
+                    elemBits = elemTy->width;
+                    isSigned = true;
+                }
+                else if (elemTy->kind == IrTypeKind::Float)
+                {
+                    elemBits = elemTy->width;
+                    isFloat = true;
+                }
+                else continue;
+
+                // the backend vector stems only come in 8/16/32/64 lanes,
+                // floats ride on the single precision / double precision paths
+                if (elemBits != 8 && elemBits != 16 && elemBits != 32 && elemBits != 64) continue;
+                if (isFloat && elemBits != 32 && elemBits != 64) continue;
+
+                IrInst* user = inst->base.users[0];
+                if (!self.inLoop(lp, user->parent)) continue;
+
+                // Pattern 1, load -> store (element-wise copy)
+                if (user->opcode == IrOpcode::Store && user->nops >= 2)
+                {
+                    if (self.storeClaimed(result, user)) continue;
+
+                    IrValue* dest = user->ops[1];
+                    if (dest == null || dest->kind != IrValueKind::Inst) continue;
+                    IrInst* destGep = (IrInst*)dest;
+                    if (destGep->opcode != IrOpcode::Gep || destGep->nops != 2) continue;
+                    if (destGep->ops[1] != &li->phi->base) continue;
+
+                    if (!self.aliasAnalysis->isNoAlias(inst->ops[0], dest)) continue;
+
+                    if (result->ncandidates < MAX_VEC_OPS)
+                    {
+                        VecCandidate* c = &result->candidates[result->ncandidates++];
+                        c->pattern = VecPattern::ElemwiseLoadOpStore;
+                        c->loadA = inst;
+                        c->gepA = addrInst;
+                        c->op = null;
+                        c->store = user;
+                        c->gepStore = destGep;
+                        c->loadB = null;
+                        c->gepB = null;
+                        c->reduceDest = null;
+                        c->compareOp = null;
+                        c->elemBits = elemBits;
+                        c->isFloat = isFloat;
+                        c->isSigned = isSigned;
+                        c->loopIV = &li->phi->base;
+                        c->tripCount = li->tripCount;
+                        result->canVectorize = true;
+                    }
+                    continue;
+                }
+
+                // Pattern 2, load -> binary_op -> store, the second operand
+                // is either a second phi-indexed load or loop invariant. An
+                // int add whose other operand is a phi is the reduction
+                // shape, it falls through to pattern 3 below.
+                IrValue* otherOperand = (user->nops == 2)
+                    ? ((user->ops[0] == &inst->base) ? user->ops[1] : user->ops[0]) : null;
+                bool accShape = !isFloat && user->opcode == IrOpcode::Add &&
+                    otherOperand != null && otherOperand->kind == IrValueKind::Inst &&
+                    ((IrInst*)otherOperand)->opcode == IrOpcode::Phi;
+                if (self.isVectorizableBinOp(user->opcode, isFloat) && user->nops == 2 && !accShape)
+                {
+                    if (user->base.nusers != 1) continue;
+
+                    IrInst* storeUser = user->base.users[0];
+                    if (storeUser == null || storeUser->opcode != IrOpcode::Store) continue;
+                    if (storeUser->nops < 2) continue;
+                    if (!self.inLoop(lp, storeUser->parent)) continue;
+                    if (self.storeClaimed(result, storeUser)) continue;
+
+                    IrValue* dest = storeUser->ops[1];
+                    if (dest == null || dest->kind != IrValueKind::Inst) continue;
+                    IrInst* destGep = (IrInst*)dest;
+                    if (destGep->opcode != IrOpcode::Gep || destGep->nops != 2) continue;
+                    if (destGep->ops[1] != &li->phi->base) continue;
+
+                    if (!self.aliasAnalysis->isNoAlias(inst->ops[0], dest)) continue;
+
+                    IrValue* otherOp = (user->ops[0] == &inst->base) ? user->ops[1] : user->ops[0];
+                    IrInst* loadB = null;
+                    IrInst* gepB = null;
+                    if (otherOp != null && otherOp->kind == IrValueKind::Inst)
+                    {
+                        IrInst* otherInst = (IrInst*)otherOp;
+                        if (self.inLoop(lp, otherInst->parent))
+                        {
+                            // defined in the loop, only a second indexed
+                            // load keeps the chain contiguous
+                            if (otherInst->opcode != IrOpcode::Load || otherInst->base.nusers != 1) continue;
+                            if (otherInst->nops < 1) continue;
+                            IrValue* bAddr = otherInst->ops[0];
+                            if (bAddr == null || bAddr->kind != IrValueKind::Inst) continue;
+                            IrInst* bGep = (IrInst*)bAddr;
+                            if (bGep->opcode != IrOpcode::Gep || bGep->nops != 2) continue;
+                            if (bGep->ops[1] != &li->phi->base) continue;
+                            if (otherInst->base.type != inst->base.type) continue;
+                            loadB = otherInst;
+                            gepB = bGep;
+                        }
+                    }
+
+                    if (result->ncandidates < MAX_VEC_OPS)
+                    {
+                        VecCandidate* c = &result->candidates[result->ncandidates++];
+                        c->pattern = VecPattern::ElemwiseLoadOpStore;
+                        c->loadA = inst;
+                        c->gepA = addrInst;
+                        c->op = user;
+                        c->store = storeUser;
+                        c->gepStore = destGep;
+                        c->loadB = loadB;
+                        c->gepB = gepB;
+                        c->reduceDest = null;
+                        c->compareOp = null;
+                        c->elemBits = elemBits;
+                        c->isFloat = isFloat;
+                        c->isSigned = isSigned;
+                        c->loopIV = &li->phi->base;
+                        c->tripCount = li->tripCount;
+                        result->canVectorize = true;
+                    }
+                    continue;
+                }
+
+                // Pattern 3, load -> add/umin/umax into a phi accumulator that
+                // carries the op back from the latch, widened into a vector
+                // accumulator phi plus a horizontal combine in the exit block.
+                // The signed min/max ops are excluded, the backend VecMin/
+                // VecMax and the scalar cmov combine contract is unsigned.
+                if ((user->opcode == IrOpcode::Add ||
+                     user->opcode == IrOpcode::UMin ||
+                     user->opcode == IrOpcode::UMax) && user->nops == 2)
+                {
+                    // the backend scalar min/max combine is a 64-bit cmov,
+                    // which only sees clean zeros in the upper half for
+                    // 32- and 64-bit elements
+                    if (user->opcode != IrOpcode::Add && elemBits < 32) continue;
+                    if (user->base.nusers != 1) continue;
+
+                    IrValue* accOp = (user->ops[0] == &inst->base) ? user->ops[1] : user->ops[0];
+                    if (accOp == null || accOp->kind != IrValueKind::Inst) continue;
+                    IrInst* accPhi = (IrInst*)accOp;
+                    if (accPhi->opcode != IrOpcode::Phi) continue;
+                    if (accPhi == li->phi) continue;
+                    if (!self.inLoop(lp, accPhi->parent)) continue;
+                    if (accPhi->nops != 4) continue;
+
+                    // a simple loop phi, one value from outside, the op back
+                    // from the latch
+                    IrValue* init = null;
+                    bool bad = false;
+                    for (u32 pi = 0; pi + 1 < accPhi->nops; pi += 2)
+                    {
+                        IrValue* val = accPhi->ops[pi];
+                        IrBlock* pred = (IrBlock*)accPhi->ops[pi + 1];
+                        if (pred == lp->latch)
+                        {
+                            if (val != &user->base) { bad = true; break; }
+                        }
+                        else if (self.inLoop(lp, pred))
+                        {
+                            bad = true;
+                            break;
+                        }
+                        else
+                        {
+                            if (val == null) { bad = true; break; }
+                            init = val;
+                        }
+                    }
+                    if (bad || init == null) continue;
+
+                    // the in-loop uses of the accumulator are just this op,
+                    // and the exit users all sit in the exit block where the
+                    // horizontal combine lands
+                    IrBlock* exitBlk = self.findExitBlock(lp, li);
+                    if (exitBlk == null) continue;
+                    bool badUsers = false;
+                    for (u32 ui = 0; ui < accPhi->base.nusers; ui++)
+                    {
+                        IrInst* au = accPhi->base.users[ui];
+                        if (au == user) continue;
+                        if (self.inLoop(lp, au->parent)) { badUsers = true; break; }
+                        if (au->parent != exitBlk) { badUsers = true; break; }
+                    }
+                    if (badUsers) continue;
+
+                    VecPattern rpat = VecPattern::ReductionSum;
+                    if (user->opcode == IrOpcode::UMin) rpat = VecPattern::ReductionMin;
+                    if (user->opcode == IrOpcode::UMax) rpat = VecPattern::ReductionMax;
+
+                    if (result->ncandidates < MAX_VEC_OPS)
+                    {
+                        VecCandidate* c = &result->candidates[result->ncandidates++];
+                        c->pattern = rpat;
+                        c->loadA = inst;
+                        c->gepA = addrInst;
+                        c->op = user;
+                        c->reduceDest = accPhi;
+                        c->store = null;
+                        c->gepStore = null;
+                        c->loadB = null;
+                        c->gepB = null;
+                        c->compareOp = null;
+                        c->elemBits = elemBits;
+                        c->isFloat = isFloat;
+                        c->isSigned = isSigned;
+                        c->loopIV = &li->phi->base;
+                        c->tripCount = li->tripCount;
+                        result->canVectorize = true;
+                    }
+                    continue;
+                }
+            }
+        }
+    }
+
+    // The out-of-loop target of the loop's exit compare, the block the
+    // horizontal reduction combine is placed in
+    IrBlock* findExitBlock(IrLoop* lp, LoopInfo* li)
+    {
+        IrInst* br = li->compare->base.users[0];
+        IrBlock* tTgt = (IrBlock*)br->ops[1];
+        IrBlock* fTgt = (IrBlock*)br->ops[2];
+        if (!self.inLoop(lp, tTgt)) return tTgt;
+        return fTgt;
+    }
+
+    bool storeClaimed(VecAnalysisResult* result, IrInst* store)
+    {
+        for (u32 ci = 0; ci < result->ncandidates; ci++)
+            if (result->candidates[ci].store == store) return true;
+        return false;
+    }
+
+    bool isVectorizableBinOp(IrOpcode op, bool isFloat)
+    {
+        if (isFloat)
+            return op == IrOpcode::FAdd || op == IrOpcode::FSub ||
+                   op == IrOpcode::FMul || op == IrOpcode::FDiv;
+        return op == IrOpcode::Add || op == IrOpcode::Sub ||
+               op == IrOpcode::Mul;
+    }
+
+    void keepUniformWidth(VecAnalysisResult* result)
+    {
+        if (result->ncandidates == 0) return;
+        u32 want = result->candidates[0].elemBits;
+        u32 n = 0;
+        for (u32 ci = 0; ci < result->ncandidates; ci++)
+        {
+            if (result->candidates[ci].elemBits != want) continue;
+            if (n != ci) result->candidates[n] = result->candidates[ci];
+            n++;
+        }
+        result->ncandidates = n;
+        result->canVectorize = n > 0;
+    }
+
+    u32 chooseVectorWidth(VecAnalysisResult* result)
+    {
+        if (result->ncandidates == 0) return 4;
+        u32 elemBits = result->candidates[0].elemBits;
+        // Choose width to fit in 128-bit or 256-bit SIMD
+        if (elemBits <= 8) return 16;
+        if (elemBits <= 16) return 8;
+        if (elemBits <= 32) return 4;
+        if (elemBits <= 64) return 2;
+        return 1;
+    }
+
+    // Read-only legality gate, run after candidate selection and before the
+    // first mutation. The bound must split into whole vectors and every
+    // in-loop use of the induction variable, plus every use of a claimed
+    // GEP, must belong to the widening, otherwise a scalar leftover would
+    // silently re-run at the widened step.
+    bool verifyWidening(IrLoop* lp, LoopInfo* li, VecAnalysisResult* result)
+    {
+        u32 vf = result->vectorWidth;
+        if (vf == 0) return false;
+
+        u32 bound = li->tripCount;
+        if (bound == 0xFFFFFFFF || bound == 0) return false;
+        if ((bound % vf) != 0) return false;
+
+        // A vector loop pays setup overhead, broadcast the init, and
+        // a horizontal combine in the exit block for reductions, so below
+        // a couple of vectors of elements the scalar loop wins
+        if (bound < vf * 2) return false;
+
+        for (u32 ui = 0; ui < li->phi->base.nusers; ui++)
+        {
+            IrInst* u = li->phi->base.users[ui];
+            if (!self.inLoop(lp, u->parent)) continue;
+            if (u == li->increment) continue;
+            if (u == li->compare) continue;
+            if (self.claimedGep(result, u)) continue;
+            return false;
+        }
+
+        for (u32 ui = 0; ui < li->increment->base.nusers; ui++)
+            if (li->increment->base.users[ui] != &li->phi->base) return false;
+
+        if (li->compare->base.nusers != 1) return false;
+        IrInst* exitBr = li->compare->base.users[0];
+        if (exitBr->opcode != IrOpcode::CondBr) return false;
+        if (exitBr->nops < 3 || exitBr->ops[0] != &li->compare->base) return false;
+
+        for (u32 ci = 0; ci < result->ncandidates; ci++)
+        {
+            VecCandidate* c = &result->candidates[ci];
+            IrInst* geps[3];
+            geps[0] = c->gepA;
+            geps[1] = c->gepB;
+            geps[2] = c->gepStore;
+            for (u32 gi = 0; gi < 3; gi++)
+            {
+                IrInst* g = geps[gi];
+                if (g == null) continue;
+                for (u32 gu = 0; gu < g->base.nusers; gu++)
+                    if (!self.consumerAllowed(result, g->base.users[gu])) return false;
+            }
+        }
+
+        return true;
+    }
+
+    bool claimedGep(VecAnalysisResult* result, IrInst* g)
+    {
+        for (u32 ci = 0; ci < result->ncandidates; ci++)
+        {
+            VecCandidate* c = &result->candidates[ci];
+            if (g == c->gepA || g == c->gepB || g == c->gepStore) return true;
+        }
+        return false;
+    }
+
+    bool consumerAllowed(VecAnalysisResult* result, IrInst* u)
+    {
+        for (u32 ci = 0; ci < result->ncandidates; ci++)
+        {
+            VecCandidate* c = &result->candidates[ci];
+            if (u == c->loadA || u == c->loadB || u == c->store) return true;
+        }
+        return false;
+    }
+
+    void applyVectorization(IrLoop* lp, VecAnalysisResult* result)
+    {
+        u32 vecWidth = result->vectorWidth;
+
+        // Widen the trip, the increment now steps a whole vector at a time.
+        // ctx->constInt interns by value, so this replaces the operand
+        // instead of mutating a constant other instructions may share.
+        IrInst* inc = result->loopInfo.increment;
+        IrValue* oldK = (inc->ops[0]->kind == IrValueKind::ConstInt) ? inc->ops[0] : inc->ops[1];
+        oldK->removeUser(inc);
+        IrValue* newK = self.ctx->constInt(oldK->type, (u64)vecWidth);
+        if (inc->ops[0] == oldK) { inc->ops[0] = newK; } else { inc->ops[1] = newK; }
+        newK->addUser(inc);
+
+        for (u32 ci = 0; ci < result->ncandidates; ci++)
+        {
+            VecCandidate* c = &result->candidates[ci];
+            IrType* elemTy = c->loadA->base.type;
+            IrType* vecTy = self.ctx->tyVector(elemTy, vecWidth);
+
+            switch (c->pattern)
+            {
+                #[[fallthrough]]
+                VecPattern::ElemwiseLoadOpStore =>
+                {
+                    self.vectorizeElemwise(c, vecTy, vecWidth);
+                    self.vecOps++;
+                }
+                VecPattern::ReductionSum | VecPattern::ReductionMin | VecPattern::ReductionMax =>
+                {
+                    self.vectorizeReduction(lp, &result->loopInfo, c, vecTy, vecWidth);
+                    self.vecOps++;
+                }
+            }
+        }
+    }
+
+    void vectorizeElemwise(VecCandidate* c, IrType* vecTy, u32 vecWidth)
+    {
+        IrBlock* block = c->loadA->parent;
+
+        // A real vector load at the widened index, the gep result already
+        // advances a whole vector per step once the increment is widened.
+        IrInst* vecLoad = self.ctx->createInst(
+            IrOpcode::Load, vecTy, &c->gepA->base, 1, 0, 0);
+        c->gepA->base.addUser(vecLoad);
+        block->insertBefore(vecLoad, c->loadA);
+
+        if (c->op == null)
+        {
+            // Simple copy, replace the store with a vector store at the
+            // scalar store's own position so it keeps its ordering with
+            // other stores in the block
+            IrInst* vecStore = self.ctx->createInst(
+                IrOpcode::Store, self.ctx->tyVoid(), null, 2, 0, 0);
+            // Store layout, ops[0]=value, ops[1]=address
+            vecStore->ops[0] = &vecLoad->base;
+            vecStore->ops[1] = c->store->ops[1];
+            vecLoad->base.addUser(vecStore);
+            c->store->ops[1]->addUser(vecStore);
+            c->store->parent->insertBefore(vecStore, c->store);
+            self.neuterScalarStore(c);
+            return;
+        }
+
+        // Create vector operation
+        IrOpcode vecOp = self.scalarToVecOp(c->op->opcode, c->isFloat);
+        IrInst* vecOpInst = self.ctx->createInst(vecOp, vecTy, null, 0, 0, 0);
+
+        // Allocate operands
+        u32 nops = c->op->nops;
+        vecOpInst->ops = alloc<IrValue*>(nops);
+        vecOpInst->nops = nops;
+        vecOpInst->capOps = nops;
+
+        for (u32 oi = 0; oi < nops; oi++)
+        {
+            IrValue* opVal = c->op->ops[oi];
+            if (opVal == &c->loadA->base)
+            {
+                vecOpInst->ops[oi] = &vecLoad->base;
+                vecLoad->base.addUser(vecOpInst);
+            }
+            else if (c->loadB != null && opVal == &c->loadB->base)
+            {
+                // Second vector load at the same widened index, anchored at
+                // the op because the two loads may sit in different blocks
+                // and only the op is dominated by both geps
+                IrInst* vecLoad2 = self.ctx->createInst(
+                    IrOpcode::Load, vecTy, &c->gepB->base, 1, 0, 0);
+                c->gepB->base.addUser(vecLoad2);
+                c->op->parent->insertBefore(vecLoad2, c->op);
+                vecOpInst->ops[oi] = &vecLoad2->base;
+                vecLoad2->base.addUser(vecOpInst);
+            }
+            else
+            {
+                // verifyWidening guaranteed every other operand is a
+                // constant or computed outside the loop, so one scalar
+                // read splatted over the vector is the same value the
+                // scalar chain produced on each iteration
+                IrInst* bcast = self.ctx->createInst(
+                    IrOpcode::VecBroadcast, vecTy, &opVal, 1, 0, 0);
+                opVal->addUser(bcast);
+                c->op->parent->insertBefore(bcast, c->op);
+                vecOpInst->ops[oi] = &bcast->base;
+                bcast->base.addUser(vecOpInst);
+            }
+        }
+
+        c->op->parent->insertBefore(vecOpInst, c->op);
+
+        // Create vector store at the scalar store's position
+        if (c->store != null)
+        {
+            IrInst* vecStore = self.ctx->createInst(
+                IrOpcode::Store, self.ctx->tyVoid(), null, 2, 0, 0);
+            // Store layout, ops[0]=value, ops[1]=address
+            vecStore->ops[0] = &vecOpInst->base;
+            vecStore->ops[1] = c->store->ops[1];
+            vecOpInst->base.addUser(vecStore);
+            c->store->ops[1]->addUser(vecStore);
+            c->store->parent->insertBefore(vecStore, c->store);
+            self.neuterScalarStore(c);
+        }
+    }
+
+    // A reduction widens the accumulator phi into a second vector phi in
+    // the header: the entry value is the scalar init broadcast, the latch
+    // value is the vector combine of the vector load. The lanes are then
+    // combined horizontally in the exit block and the scalar init is folded
+    // in front. Wrapping integer adds and unsigned min/max are associative
+    // and commutative, so the order change is exact, the init stays a
+    // separate operand so its upper bits can be arbitrary. The scalar op is
+    // neutered to Noret, its load chain dies with the peephole cleanup, and
+    // the scalar accumulator phi is erased right away while its latch pair
+    // still names the neutered op, which keeps every operand link consistent.
+    void vectorizeReduction(IrLoop* lp, LoopInfo* li, VecCandidate* c, IrType* vecTy, u32 vecWidth)
+    {
+        IrInst* accPhi = c->reduceDest;
+        IrType* elemTy = c->loadA->base.type;
+
+        // vector load of the reduced elements, at the widened index the gep
+        // result already advances a whole vector per step
+        IrInst* vecLoad = self.ctx->createInst(
+            IrOpcode::Load, vecTy, &c->gepA->base, 1, 0, 0);
+        c->gepA->base.addUser(vecLoad);
+        c->loadA->parent->insertBefore(vecLoad, c->loadA);
+
+        IrValue* init = accPhi->ops[0];
+        IrBlock* entryPred = (IrBlock*)accPhi->ops[1];
+        IrBlock* latch = (IrBlock*)accPhi->ops[3];
+        IrBlock* header = accPhi->parent;
+
+        // splat the scalar accumulator start into a vector one, in the same
+        // outside block the scalar phi takes its init from
+        IrInst* initB = self.ctx->createInst(
+            IrOpcode::VecBroadcast, vecTy, &init, 1, 0, 0);
+        init->addUser(initB);
+        entryPred->insertBefore(initB, entryPred->insts[entryPred->ninsts - 1]);
+
+        // vector accumulator phi beside the scalar one, same two preds, it
+        // must sit after the other phis and before the first non-phi
+        u32 ai = 0;
+        while (ai < header->ninsts && header->insts[ai]->opcode == IrOpcode::Phi) ai++;
+        IrInst* vecPhi = self.ctx->createInst(IrOpcode::Phi, vecTy, null, 4, 0, 0);
+        vecPhi->ops[0] = &initB->base;
+        vecPhi->ops[1] = accPhi->ops[1];
+        initB->base.addUser(vecPhi);
+        accPhi->ops[1]->addUser(vecPhi);
+        header->insertBefore(vecPhi, header->insts[ai]);
+
+        // the vector combine reuses the scalar op opcode, the backend Vec*
+        // arms cover Add/UMin/UMax with the unsigned min/max contract
+        IrOpcode vrop = c->op->opcode == IrOpcode::Add ? IrOpcode::VecAdd
+            : (c->op->opcode == IrOpcode::UMin ? IrOpcode::VecMin : IrOpcode::VecMax);
+        IrInst* vecComb = self.ctx->createInst(vrop, vecTy, null, 2, 0, 0);
+        vecComb->ops[0] = &vecPhi->base;
+        vecComb->ops[1] = &vecLoad->base;
+        vecPhi->base.addUser(vecComb);
+        vecLoad->base.addUser(vecComb);
+        latch->insertBefore(vecComb, latch->insts[latch->ninsts - 1]);
+        vecPhi->ops[2] = &vecComb->base;
+        vecComb->base.addUser(vecPhi);
+        vecPhi->ops[3] = accPhi->ops[3];
+        accPhi->ops[3]->addUser(vecPhi);
+
+        // horizontal combine of the lanes in the exit block after its phis,
+        // then fold the scalar init in front of the combined lanes
+        IrBlock* exitBlk = self.findExitBlock(lp, li);
+        u32 ei = 0;
+        while (ei < exitBlk->ninsts && exitBlk->insts[ei]->opcode == IrOpcode::Phi) ei++;
+        IrInst* anchor = exitBlk->insts[ei];
+
+        IrValue* h = null;
+        for (u32 lane = 0; lane < vecWidth; lane++)
+        {
+            IrValue* idx = self.ctx->constInt(self.ctx->tyInt(32), (u64)lane);
+            IrInst* ex = self.ctx->createInst(
+                IrOpcode::ExtractElement, elemTy, null, 2, 0, 0);
+            ex->ops[0] = &vecPhi->base;
+            ex->ops[1] = idx;
+            vecPhi->base.addUser(ex);
+            exitBlk->insertBefore(ex, anchor);
+            if (h == null)
+            {
+                h = &ex->base;
+                continue;
+            }
+            IrInst* comb = self.ctx->createInst(c->op->opcode, elemTy, null, 2, 0, 0);
+            comb->ops[0] = h;
+            comb->ops[1] = &ex->base;
+            h->addUser(comb);
+            ex->base.addUser(comb);
+            exitBlk->insertBefore(comb, anchor);
+            h = &comb->base;
+        }
+
+        IrInst* fin = self.ctx->createInst(c->op->opcode, elemTy, null, 2, 0, 0);
+        fin->ops[0] = init;
+        fin->ops[1] = h;
+        init->addUser(fin);
+        h->addUser(fin);
+        exitBlk->insertBefore(fin, anchor);
+
+        // reroute every out-of-loop user of the scalar accumulator to the
+        // horizontal result, one operand slot per pass so a user that
+        // names the phi twice stays in the list until both slots move.
+        // match-time checks guaranteed the only other user is the op itself
+        while (true)
+        {
+            IrInst* u = null;
+            for (u32 ui = 0; ui < accPhi->base.nusers; ui++)
+            {
+                IrInst* cand = accPhi->base.users[ui];
+                if (cand == c->op) continue;
+                u = cand;
+                break;
+            }
+            if (u == null) break;
+            bool replaced = false;
+            for (u32 oi = 0; oi < u->nops; oi++)
+            {
+                if (u->ops[oi] != &accPhi->base) continue;
+                accPhi->base.removeUser(u);
+                u->ops[oi] = &fin->base;
+                fin->base.addUser(u);
+                replaced = true;
+                break;
+            }
+            if (!replaced) break;
+        }
+
+        // neuter the scalar op so its load chain dies with the peephole,
+        // Noret stays a legal transient terminator until the sweep erases it
+        for (u32 oi = 0; oi < c->op->nops; oi++)
+            if (c->op->ops[oi]) c->op->ops[oi]->removeUser(c->op);
+        c->op->opcode = IrOpcode::Noret;
+        c->op->nops = 0;
+
+        // the scalar phi goes now, erase() unlinks its pair operands,
+        // including the neutered op's user side, while the op is still alive
+        accPhi->erase();
+    }
+
+    IrOpcode scalarToVecOp(IrOpcode op, bool isFloat)
+    {
+        if (isFloat)
+        {
+            switch (op)
+            {
+                IrOpcode::FAdd => { return IrOpcode::VecFAdd; },
+                IrOpcode::FSub => { return IrOpcode::VecFSub; },
+                IrOpcode::FMul => { return IrOpcode::VecFMul; },
+                IrOpcode::FDiv => { return IrOpcode::VecFDiv; },
+                else => { return IrOpcode::VecFAdd; },
+            }
+        }
+        else
+        {
+            switch (op)
+            {
+                IrOpcode::Add => { return IrOpcode::VecAdd; },
+                IrOpcode::Sub => { return IrOpcode::VecSub; },
+                IrOpcode::Mul => { return IrOpcode::VecMul; },
+                else => { return IrOpcode::VecAdd; },
+            }
+        }
+    }
+
+    // Neuter the scalar store left behind by a vectorized candidate, with
+    // removeUser on its old operands so user lists stay accurate, then let
+    // the dead scalar chain (store -> op -> load) be reclaimed by the
+    // peephole cleanup below. Noret is a terminator, so the cleanup has to
+    // erase it before the pipeline's final validate sees the block.
+    void neuterScalarStore(VecCandidate* c)
+    {
+        if (c->store == null) return;
+        for (u32 oi = 0; oi < c->store->nops; oi++)
+            if (c->store->ops[oi]) c->store->ops[oi]->removeUser(c->store);
+        c->store->opcode = IrOpcode::Noret;
+        c->store->nops = 0;
+    }
+
+    u64 runPeepholeCleanup(IrFunc* func)
+    {
+        u64 cleaned = 0;
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+
+                // Remove dead broadcast instructions and Noret'd
+                // instructions, then dead scalar chains with no users
+                if (inst->opcode == IrOpcode::Noret ||
+                    (inst->base.nusers == 0 &&
+                     (inst->opcode == IrOpcode::VecBroadcast ||
+                      inst->opcode == IrOpcode::Load ||
+                      inst->opcode == IrOpcode::Gep ||
+                      inst->opcode == IrOpcode::Add ||
+                      inst->opcode == IrOpcode::Sub ||
+                      inst->opcode == IrOpcode::Mul ||
+                      inst->opcode == IrOpcode::FAdd ||
+                      inst->opcode == IrOpcode::FSub ||
+                      inst->opcode == IrOpcode::FMul ||
+                      inst->opcode == IrOpcode::FDiv ||
+                      inst->opcode == IrOpcode::SMin ||
+                      inst->opcode == IrOpcode::SMax ||
+                      inst->opcode == IrOpcode::UMin ||
+                      inst->opcode == IrOpcode::UMax)))
+                {
+                    inst->erase();
+                    cleaned++;
+                    ii--;
+                    continue;
+                }
+
+                // Fold vec_broadcast(const) -> vec_const if single use
+                if (inst->opcode == IrOpcode::VecBroadcast && inst->nops == 1 &&
+                    inst->base.nusers == 1 &&
+                    (inst->ops[0]->kind == IrValueKind::ConstInt ||
+                     inst->ops[0]->kind == IrValueKind::ConstFloat))
+                {
+                    // This is a broadcast of a constant, might be foldable
+                    // depending on backend capabilities
+                }
+            }
+        }
+        return cleaned;
+    }
+}
+
+pub bool irPassAutoVectorize(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (ctx == null || func == null) return false;
+    AutoVectorizePass pass = AutoVectorizePass::new(ctx);
+    return pass.run(func);
+}

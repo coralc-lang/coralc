@@ -1,0 +1,269 @@
+#[[no_drop_all]]
+// Winsock — ws2_32 must be linked; close() is gone, sockets use
+// closesocket(). recvfrom/sendto take a rawptr SOCKET in win32.crl.
+import(lib) platform::win32 { socket, bind, listen, accept, connect, send, recv, closesocket, setsockopt, htonl, WSAStartup, sendto, recvfrom, WSAGetLastError };
+import(lib) std::result { Result };
+import(lib) std::io::fs { IoError };
+
+// winsock reports through WSAGetLastError, not the Win32 last-error.
+IoError _netErr(str op)
+{
+    return IoError::Os { .code = (i32)WSAGetLastError(), .op = op };
+}
+
+// htons isn't on the surface — file-local byte swap in coral (x86 is
+// little endian); libc's extern htons plays this role on linux.
+u16 htons(u16 v)
+{
+    return (u16)((v << 8) | (v >> 8));
+}
+
+// AF_INET/SOCK_*/IPPROTO_* match POSIX on Windows; SOL_SOCKET (0xFFFF)
+// and SO_REUSEADDR (4) do not — converted.
+const i32 AF_INET = 2;
+const i32 SOCK_STREAM = 1;
+const i32 SOCK_DGRAM = 2;
+const i32 IPPROTO_TCP = 6;
+const i32 IPPROTO_UDP = 17;
+const i32 SOL_SOCKET = 0xFFFF; // POSIX is 1; winsock uses 0xFFFF
+const i32 SO_REUSEADDR = 4;    // POSIX is 2; winsock uses 4
+
+// One-time WSAStartup guard, called from the socket-creating paths
+// (tcpConnect/tcpListen/udpSocket). ws2_32 must be linked.
+// had to search for this, winsock wants one init before any socket call works.
+static bool _wsaStarted = false;
+
+void _ensureWsa()
+{
+    if (_wsaStarted) return;
+    // WSADATA is ~408B; only the version handshake matters, so an opaque
+    // 512B buffer stands in (FLAG size) and is never read back.
+    u8 wsa[512];
+    if (WSAStartup(0x0202, (rawptr)wsa) == 0) _wsaStarted = true;
+}
+
+// INVALID_SOCKET = (rawptr)(-1), winsock's failure value.
+bool _badSock(rawptr s)
+{
+    return s == (rawptr)(-1);
+}
+
+// Layout is identical to Windows' sockaddr_in (16 bytes), u16 family,
+// u16 port (network order), u32 address (network order), 8 bytes padding.
+/// IPv4 socket address matching the platform's 16-byte sockaddr_in layout.
+pub struct sockaddr_in
+{
+    u16 sinFamily;
+    u16 sinPort;
+    u32 sinAddr;
+    u8 sinZero[8];
+}
+
+bool _parseIp(str ip, u32* out)
+{
+    u32 octet = 0;
+    u32 addrVal = 0;
+    u32 shift = 24;
+    u32 octets = 0;
+    bool octetHasDigit = false;
+    for (usize i = 0; i <= ip.len; i++)
+    {
+        if (i == ip.len || ip.ptr[i] == '.')
+        {
+            if (!octetHasDigit || octet > 255) return false;
+            addrVal |= (octet << shift);
+            octet = 0;
+            octetHasDigit = false;
+            octets++;
+            if (shift > 0) shift -= 8;
+        }
+        else
+        {
+            if (ip.ptr[i] < '0' || ip.ptr[i] > '9') return false;
+            octet = octet * 10 + (u32)(ip.ptr[i] - '0');
+            if (octet > 255) return false;
+            octetHasDigit = true;
+        }
+    }
+    if (octets != 4) return false;
+    // FLAG, win32.crl types htonl as u64 — cast back to u32.
+    *out = (u32)htonl(addrVal);
+    return true;
+}
+
+void _zeroSockaddr(sockaddr_in* a)
+{
+    for (usize i = 0; i < 8; i++) a->sinZero[i] = 0;
+}
+
+// FLAG, was distinct TcpSocket = i32; a Win64 SOCKET is 64-bit, so the
+// base is rawptr (invalid (rawptr)(-1), was -1).
+/// A connected TCP socket handle.
+pub distinct TcpSocket = rawptr;
+
+/// Connect to `ip`:`port` over TCP, returning a connected socket.
+pub Result<TcpSocket, IoError> tcpConnect(str ip, u16 port)
+{
+    _ensureWsa();
+    rawptr s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (_badSock(s)) return Result<TcpSocket, IoError>::Err { .error = _netErr("socket") };
+
+    u32 ipAddr;
+    if (!_parseIp(ip, &ipAddr))
+    {
+        closesocket(s);
+        return Result<TcpSocket, IoError>::Err { .error = IoError::BadUsage { .msg = "invalid ip address" } };
+    }
+
+    sockaddr_in addr;
+    _zeroSockaddr(&addr);
+    addr.sinFamily = AF_INET;
+    addr.sinPort = htons(port);
+    addr.sinAddr = ipAddr;
+
+    if (connect(s, (const rawptr)&addr, 16) < 0)
+    {
+        closesocket(s);
+        return Result<TcpSocket, IoError>::Err { .error = _netErr("connect") };
+    }
+    return Result<TcpSocket, IoError>::Ok { .value = (TcpSocket)s };
+}
+
+/// Bind and listen on `port` for incoming TCP connections.
+pub Result<TcpSocket, IoError> tcpListen(u16 port)
+{
+    _ensureWsa();
+    rawptr s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (_badSock(s)) return Result<TcpSocket, IoError>::Err { .error = _netErr("socket") };
+
+    // source bug, was a 5-arg sendto (6 params) — the shape is
+    // setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, ...).
+    i32 optval = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const cchar*)&optval, 4);
+
+    sockaddr_in addr;
+    _zeroSockaddr(&addr);
+    addr.sinFamily = AF_INET;
+    addr.sinPort = htons(port);
+    addr.sinAddr = (u32)htonl(0u);
+    if (bind(s, (const rawptr)&addr, 16) < 0)
+    {
+        closesocket(s);
+        return Result<TcpSocket, IoError>::Err { .error = _netErr("bind") };
+    }
+    if (listen(s, 128) < 0)
+    {
+        closesocket(s);
+        return Result<TcpSocket, IoError>::Err { .error = _netErr("listen") };
+    }
+    return Result<TcpSocket, IoError>::Ok { .value = (TcpSocket)s };
+}
+
+/// Accept one pending connection on a listening socket.
+pub Result<TcpSocket, IoError> tcpAccept(TcpSocket server)
+{
+    sockaddr_in addr;
+    i32 addrLen = 16;
+    rawptr s = accept((rawptr)server, (rawptr)&addr, &addrLen);
+    if (_badSock(s)) return Result<TcpSocket, IoError>::Err { .error = _netErr("accept") };
+    return Result<TcpSocket, IoError>::Ok { .value = (TcpSocket)s };
+}
+
+// Err only on a send error; a short count (Ok) means the peer closed
+/// Send exactly `len` bytes; Ok(n) with n < len means the peer closed.
+pub Result<isize, IoError> tcpSend(TcpSocket sock, const u8* buf, usize len)
+{
+    usize sent = 0;
+    while (sent < len)
+    {
+        i32 n = send((rawptr)sock, (const cchar*)(buf + sent), (i32)(len - sent), 0);
+        if (n < 0) return Result<isize, IoError>::Err { .error = _netErr("send") };
+        if (n == 0) break;
+        sent += (usize)n;
+    }
+    return Result<isize, IoError>::Ok { .value = (isize)sent };
+}
+
+// Err only on a recv error; Ok(0) means the peer closed
+/// Receive up to `len` bytes; Ok(0) means the peer closed.
+pub Result<isize, IoError> tcpRecv(TcpSocket sock, u8* buf, usize len)
+{
+    usize got = 0;
+    while (got < len)
+    {
+        i32 n = recv((rawptr)sock, (cchar*)(buf + got), (i32)(len - got), 0);
+        if (n < 0) return Result<isize, IoError>::Err { .error = _netErr("recv") };
+        if (n == 0) break;
+        got += (usize)n;
+    }
+    return Result<isize, IoError>::Ok { .value = (isize)got };
+}
+
+/// Close a TCP socket.
+pub void tcpClose(TcpSocket sock)
+{
+    closesocket((rawptr)sock);
+}
+
+// FLAG, was i32 fd; rawptr Win64 SOCKET now (invalid (rawptr)(-1)).
+/// A UDP socket handle.
+pub struct UdpSocket
+{
+    rawptr fd;
+}
+
+/// Create an unbound UDP socket.
+pub Result<UdpSocket, IoError> udpSocket()
+{
+    _ensureWsa();
+    rawptr s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (_badSock(s)) return Result<UdpSocket, IoError>::Err { .error = _netErr("socket") };
+    return Result<UdpSocket, IoError>::Ok { .value = UdpSocket { .fd = s } };
+}
+
+/// Bind `s` to `port` on all IPv4 interfaces.
+pub Result<bool, IoError> udpBind(UdpSocket* s, u16 port)
+{
+    if (_badSock(s->fd)) return Result<bool, IoError>::Err { .error = IoError::BadUsage { .msg = "socket not open" } };
+    sockaddr_in addr;
+    _zeroSockaddr(&addr);
+    addr.sinFamily = AF_INET;
+    addr.sinPort = htons(port);
+    addr.sinAddr = (u32)htonl(0u);
+    if (bind(s->fd, (const rawptr)&addr, 16) != 0)
+        return Result<bool, IoError>::Err { .error = _netErr("bind") };
+    return Result<bool, IoError>::Ok { .value = true };
+}
+
+/// Send a datagram from `s` to `ip`:`port`.
+pub Result<isize, IoError> udpSendTo(UdpSocket* s, const u8* buf, usize len, str ip, u16 port)
+{
+    if (_badSock(s->fd)) return Result<isize, IoError>::Err { .error = IoError::BadUsage { .msg = "socket not open" } };
+    u32 ipAddr;
+    if (!_parseIp(ip, &ipAddr))
+        return Result<isize, IoError>::Err { .error = IoError::BadUsage { .msg = "invalid ip address" } };
+    sockaddr_in addr;
+    _zeroSockaddr(&addr);
+    addr.sinFamily = AF_INET;
+    addr.sinPort = htons(port);
+    addr.sinAddr = ipAddr;
+    isize n = (isize)sendto(s->fd, (const cchar*)buf, (u64)len, 0, (const rawptr)&addr, 16);
+    if (n < 0) return Result<isize, IoError>::Err { .error = _netErr("sendto") };
+    return Result<isize, IoError>::Ok { .value = n };
+}
+
+/// Receive one datagram into `buf`.
+pub Result<isize, IoError> udpRecvFrom(UdpSocket* s, u8* buf, usize len)
+{
+    if (_badSock(s->fd)) return Result<isize, IoError>::Err { .error = IoError::BadUsage { .msg = "socket not open" } };
+    isize n = (isize)recvfrom(s->fd, (cchar*)buf, (u64)len, 0, null, null);
+    if (n < 0) return Result<isize, IoError>::Err { .error = _netErr("recvfrom") };
+    return Result<isize, IoError>::Ok { .value = n };
+}
+
+/// Close a UDP socket.
+pub void udpClose(UdpSocket* s)
+{
+    if (!_badSock(s->fd)) closesocket(s->fd);
+    s->fd = (rawptr)(-1);
+}

@@ -1,0 +1,566 @@
+#[[no_drop_all]]
+// legacy SSE/SSE2/SSE3/SSSE3/SSE4 encoder: the non-VEX packed table and
+// its emitter. Rows carry the full mnemonic (paddb must not split into
+// padd+b the way the GPR walker would), the mandatory prefix, the 0F38/
+// 0F3A escape when the opcode needs one, a /digit for group opcodes, and
+// a register-class policy for the rm and reg positions. Emission mirrors
+// the legacy branch of encodeVector: [user prefixes] [mandatory prefix]
+// [REX] 0F [escape] opcode, then a ModRM tail parked in a scratch buffer
+// so the R/X/B extension bits are known before the prefix is written.
+import(lib) wallvm::asm::common { AsmLine, AsmOperand, AsmOpKind, AsmParseError };
+import(lib) wallvm::asm::x86::common { X86Reg, X86RegClass, lookupReg, AsmBytes, X86Rex, encodeMem, encodeRegReg };
+import(lib) wallvm::asm::x86::obj { AsmRelocKind, asmAddReloc };
+import(lib) wallvm::asm::x86::x86_avx { EncodeCtx };
+
+// form signatures, AT&T operand order (src, dst)
+enum SseSig
+{
+    SS_R_RM,    // rm, reg — load/arith-to-reg forms
+    SS_RM_R,    // reg, rm — store forms
+    SS_XRM_I,   // imm, rm, reg — shuf/blend/pinsrw/round imm8 forms
+    SS_XR_RM,   // imm, reg, rm — pextrb/pextrd/extractps: reg field is
+                // the xmm source, rm the gpr/mem destination
+    SS_XRM      // imm, rm — shift-imm group: ModRM.reg carries row.ext
+}
+
+// rm register classes (the rm operand may always be memory)
+const u8 RC_XM = 0;   // xmm
+const u8 RC_GP = 1;   // any gpr
+const u8 RC_G32 = 2;  // 32-bit gpr
+const u8 RC_G64 = 3;  // 64-bit gpr
+// reg-position classes for SS_R_RM destinations
+const u8 DC_XM = 0;
+const u8 DC_G32 = 2;
+const u8 DC_G64 = 3;
+
+const u8 SSE_NOREG = 0xFF;
+
+// SSE row: full mnemonic + prefix/escape/opcode + class policy
+// ext: /digit in ModRM.reg, SSE_NOREG = reg field from the reg operand
+// immW: 1 = trailing imm8, 0 = none
+// rmCls/dstCls: RC_/DC_ codes above
+// forceW: REX.W always; wFromGpr: REX.W when the gpr reg operand is 64-bit
+// regIsGpr: SS_RM_R rows whose reg operand is a gpr (movnti), which also
+// forces the rm operand to be memory
+struct SseRow
+{
+    str base;
+    u8 sig;
+    u8 op;
+    u8 esc;
+    u8 pfx;
+    u8 ext;
+    u8 immW;
+    u8 rmCls;
+    u8 dstCls;
+    bool forceW;
+    bool wFromGpr;
+    bool regIsGpr;
+}
+
+static SseRow _sseForms[] = {
+    // --- moves: load (SS_R_RM) and store (SS_RM_R) pairs ---
+    { "movaps", SS_R_RM, 0x28, 0, 0, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "movaps", SS_RM_R, 0x29, 0, 0, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "movups", SS_R_RM, 0x10, 0, 0, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "movups", SS_RM_R, 0x11, 0, 0, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "movapd", SS_R_RM, 0x28, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "movapd", SS_RM_R, 0x29, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "movupd", SS_R_RM, 0x10, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "movupd", SS_RM_R, 0x11, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "movdqa", SS_R_RM, 0x6F, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "movdqa", SS_RM_R, 0x7F, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "movdqu", SS_R_RM, 0x6F, 0, 0xF3, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "movdqu", SS_RM_R, 0x7F, 0, 0xF3, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "movss", SS_R_RM, 0x10, 0, 0xF3, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "movss", SS_RM_R, 0x11, 0, 0xF3, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "movsd", SS_R_RM, 0x10, 0, 0xF2, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "movsd", SS_RM_R, 0x11, 0, 0xF2, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "movlps", SS_R_RM, 0x12, 0, 0, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "movlps", SS_RM_R, 0x13, 0, 0, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "movhps", SS_R_RM, 0x16, 0, 0, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "movhps", SS_RM_R, 0x17, 0, 0, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "movlpd", SS_R_RM, 0x12, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "movlpd", SS_RM_R, 0x13, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "movhpd", SS_R_RM, 0x16, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "movhpd", SS_RM_R, 0x17, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    // movd/movq gpr<->xmm forms. movq ordering matters: a mem source
+    // takes F3 0F 7E (the F3 row sits first), a gpr source 66 REX.W 0F
+    // 6E; a mem destination takes 66 0F D6, a gpr destination REX.W
+    // 66 0F 7E.
+    { "movd", SS_R_RM, 0x6E, 0, 0x66, SSE_NOREG, 0, RC_G32, DC_XM, false, false, false },
+    { "movd", SS_RM_R, 0x7E, 0, 0x66, SSE_NOREG, 0, RC_G32, DC_XM, false, false, false },
+    { "movq", SS_R_RM, 0x7E, 0, 0xF3, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "movq", SS_R_RM, 0x6E, 0, 0x66, SSE_NOREG, 0, RC_GP, DC_XM, true, false, false },
+    { "movq", SS_RM_R, 0xD6, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "movq", SS_RM_R, 0x7E, 0, 0x66, SSE_NOREG, 0, RC_GP, DC_XM, true, false, false },
+    // mask extracts and non-temporal stores
+    { "movmskps", SS_R_RM, 0x50, 0, 0, SSE_NOREG, 0, RC_XM, DC_G32, false, false, false },
+    { "movmskpd", SS_R_RM, 0x50, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_G32, false, false, false },
+    { "pmovmskb", SS_R_RM, 0xD7, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_G32, false, false, false },
+    { "movntps", SS_RM_R, 0x2B, 0, 0, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "movntpd", SS_RM_R, 0x2B, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "movntdq", SS_RM_R, 0xE7, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "movnti", SS_RM_R, 0xC3, 0, 0, SSE_NOREG, 0, RC_XM, DC_XM, false, true, true },
+    { "movntil", SS_RM_R, 0xC3, 0, 0, SSE_NOREG, 0, RC_XM, DC_XM, false, false, true },
+    { "movntiq", SS_RM_R, 0xC3, 0, 0, SSE_NOREG, 0, RC_XM, DC_XM, true, false, true },
+    { "lddqu", SS_R_RM, 0xF0, 0, 0xF2, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+
+    // --- packed/scalar float arith ---
+    { "addps", SS_R_RM, 0x58, 0, 0, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "addpd", SS_R_RM, 0x58, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "addss", SS_R_RM, 0x58, 0, 0xF3, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "addsd", SS_R_RM, 0x58, 0, 0xF2, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "subps", SS_R_RM, 0x5C, 0, 0, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "subpd", SS_R_RM, 0x5C, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "subss", SS_R_RM, 0x5C, 0, 0xF3, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "subsd", SS_R_RM, 0x5C, 0, 0xF2, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "mulps", SS_R_RM, 0x59, 0, 0, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "mulpd", SS_R_RM, 0x59, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "mulss", SS_R_RM, 0x59, 0, 0xF3, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "mulsd", SS_R_RM, 0x59, 0, 0xF2, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "divps", SS_R_RM, 0x5E, 0, 0, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "divpd", SS_R_RM, 0x5E, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "divss", SS_R_RM, 0x5E, 0, 0xF3, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "divsd", SS_R_RM, 0x5E, 0, 0xF2, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "minps", SS_R_RM, 0x5D, 0, 0, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "minpd", SS_R_RM, 0x5D, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "minss", SS_R_RM, 0x5D, 0, 0xF3, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "minsd", SS_R_RM, 0x5D, 0, 0xF2, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "maxps", SS_R_RM, 0x5F, 0, 0, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "maxpd", SS_R_RM, 0x5F, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "maxss", SS_R_RM, 0x5F, 0, 0xF3, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "maxsd", SS_R_RM, 0x5F, 0, 0xF2, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "sqrtps", SS_R_RM, 0x51, 0, 0, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "sqrtpd", SS_R_RM, 0x51, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "sqrtss", SS_R_RM, 0x51, 0, 0xF3, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "sqrtsd", SS_R_RM, 0x51, 0, 0xF2, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "rsqrtps", SS_R_RM, 0x52, 0, 0, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "rsqrtss", SS_R_RM, 0x52, 0, 0xF3, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "rcpps", SS_R_RM, 0x53, 0, 0, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "rcpss", SS_R_RM, 0x53, 0, 0xF3, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "haddps", SS_R_RM, 0x7C, 0, 0xF2, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "haddpd", SS_R_RM, 0x7C, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "hsubps", SS_R_RM, 0x7D, 0, 0xF2, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "hsubpd", SS_R_RM, 0x7D, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "addsubps", SS_R_RM, 0xD0, 0, 0xF2, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "addsubpd", SS_R_RM, 0xD0, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+
+    // --- logic and unpack ---
+    { "andps", SS_R_RM, 0x54, 0, 0, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "andpd", SS_R_RM, 0x54, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "andnps", SS_R_RM, 0x55, 0, 0, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "andnpd", SS_R_RM, 0x55, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "orps", SS_R_RM, 0x56, 0, 0, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "orpd", SS_R_RM, 0x56, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "xorps", SS_R_RM, 0x57, 0, 0, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "xorpd", SS_R_RM, 0x57, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "unpcklps", SS_R_RM, 0x14, 0, 0, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "unpckhps", SS_R_RM, 0x15, 0, 0, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "unpcklpd", SS_R_RM, 0x14, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "unpckhpd", SS_R_RM, 0x15, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+
+    // --- compares and immediates ---
+    { "comiss", SS_R_RM, 0x2F, 0, 0, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "comisd", SS_R_RM, 0x2F, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "ucomiss", SS_R_RM, 0x2E, 0, 0, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "ucomisd", SS_R_RM, 0x2E, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "shufps", SS_XRM_I, 0xC6, 0, 0, SSE_NOREG, 1, RC_XM, DC_XM, false, false, false },
+    { "shufpd", SS_XRM_I, 0xC6, 0, 0x66, SSE_NOREG, 1, RC_XM, DC_XM, false, false, false },
+    { "pshufd", SS_XRM_I, 0x70, 0, 0x66, SSE_NOREG, 1, RC_XM, DC_XM, false, false, false },
+    { "pshuflw", SS_XRM_I, 0x70, 0, 0xF2, SSE_NOREG, 1, RC_XM, DC_XM, false, false, false },
+    { "pshufhw", SS_XRM_I, 0x70, 0, 0xF3, SSE_NOREG, 1, RC_XM, DC_XM, false, false, false },
+    { "cmpps", SS_XRM_I, 0xC2, 0, 0, SSE_NOREG, 1, RC_XM, DC_XM, false, false, false },
+    { "cmppd", SS_XRM_I, 0xC2, 0, 0x66, SSE_NOREG, 1, RC_XM, DC_XM, false, false, false },
+    { "cmpss", SS_XRM_I, 0xC2, 0, 0xF3, SSE_NOREG, 1, RC_XM, DC_XM, false, false, false },
+    { "cmpsd", SS_XRM_I, 0xC2, 0, 0xF2, SSE_NOREG, 1, RC_XM, DC_XM, false, false, false },
+
+    // --- converts. gpr-width variants are full mnemonics: the unsuffixed
+    // and l forms default to 32-bit, the q form takes REX.W ---
+    { "cvtps2pd", SS_R_RM, 0x5A, 0, 0, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "cvtdq2pd", SS_R_RM, 0xE6, 0, 0xF3, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "cvtpd2ps", SS_R_RM, 0x5A, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "cvtdq2ps", SS_R_RM, 0x5B, 0, 0, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "cvtps2dq", SS_R_RM, 0x5B, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "cvttps2dq", SS_R_RM, 0x5B, 0, 0xF3, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "cvtpd2dq", SS_R_RM, 0xE6, 0, 0xF2, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "cvttpd2dq", SS_R_RM, 0xE6, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "cvtss2sd", SS_R_RM, 0x5A, 0, 0xF3, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "cvtsd2ss", SS_R_RM, 0x5A, 0, 0xF2, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "cvtsi2ss", SS_R_RM, 0x2A, 0, 0xF3, SSE_NOREG, 0, RC_G32, DC_XM, false, false, false },
+    { "cvtsi2ssl", SS_R_RM, 0x2A, 0, 0xF3, SSE_NOREG, 0, RC_G32, DC_XM, false, false, false },
+    { "cvtsi2ssq", SS_R_RM, 0x2A, 0, 0xF3, SSE_NOREG, 0, RC_G64, DC_XM, true, false, false },
+    { "cvtsi2sd", SS_R_RM, 0x2A, 0, 0xF2, SSE_NOREG, 0, RC_G32, DC_XM, false, false, false },
+    { "cvtsi2sdl", SS_R_RM, 0x2A, 0, 0xF2, SSE_NOREG, 0, RC_G32, DC_XM, false, false, false },
+    { "cvtsi2sdq", SS_R_RM, 0x2A, 0, 0xF2, SSE_NOREG, 0, RC_G64, DC_XM, true, false, false },
+    { "cvttss2si", SS_R_RM, 0x2C, 0, 0xF3, SSE_NOREG, 0, RC_XM, DC_G32, false, false, false },
+    { "cvttss2sil", SS_R_RM, 0x2C, 0, 0xF3, SSE_NOREG, 0, RC_XM, DC_G32, false, false, false },
+    { "cvttss2siq", SS_R_RM, 0x2C, 0, 0xF3, SSE_NOREG, 0, RC_XM, DC_G64, true, false, false },
+    { "cvttsd2si", SS_R_RM, 0x2C, 0, 0xF2, SSE_NOREG, 0, RC_XM, DC_G32, false, false, false },
+    { "cvttsd2sil", SS_R_RM, 0x2C, 0, 0xF2, SSE_NOREG, 0, RC_XM, DC_G32, false, false, false },
+    { "cvttsd2siq", SS_R_RM, 0x2C, 0, 0xF2, SSE_NOREG, 0, RC_XM, DC_G64, true, false, false },
+    { "cvtss2si", SS_R_RM, 0x2D, 0, 0xF3, SSE_NOREG, 0, RC_XM, DC_G32, false, false, false },
+    { "cvtss2sil", SS_R_RM, 0x2D, 0, 0xF3, SSE_NOREG, 0, RC_XM, DC_G32, false, false, false },
+    { "cvtss2siq", SS_R_RM, 0x2D, 0, 0xF3, SSE_NOREG, 0, RC_XM, DC_G64, true, false, false },
+    { "cvtsd2si", SS_R_RM, 0x2D, 0, 0xF2, SSE_NOREG, 0, RC_XM, DC_G32, false, false, false },
+    { "cvtsd2sil", SS_R_RM, 0x2D, 0, 0xF2, SSE_NOREG, 0, RC_XM, DC_G32, false, false, false },
+    { "cvtsd2siq", SS_R_RM, 0x2D, 0, 0xF2, SSE_NOREG, 0, RC_XM, DC_G64, true, false, false },
+
+    // --- packed integer arithmetic (66 0F) ---
+    { "paddb", SS_R_RM, 0xFC, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "paddw", SS_R_RM, 0xFD, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "paddd", SS_R_RM, 0xFE, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "paddq", SS_R_RM, 0xD4, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "psubb", SS_R_RM, 0xF8, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "psubw", SS_R_RM, 0xF9, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "psubd", SS_R_RM, 0xFA, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "psubq", SS_R_RM, 0xFB, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "paddsb", SS_R_RM, 0xEC, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "paddsw", SS_R_RM, 0xED, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "psubsb", SS_R_RM, 0xE8, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "psubsw", SS_R_RM, 0xE9, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pmullw", SS_R_RM, 0xD5, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pmulhw", SS_R_RM, 0xE5, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pmulhuw", SS_R_RM, 0xE4, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pmuludq", SS_R_RM, 0xF4, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pmaddwd", SS_R_RM, 0xF5, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pavgb", SS_R_RM, 0xE0, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pavgw", SS_R_RM, 0xE3, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pmaxsw", SS_R_RM, 0xEE, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pmaxub", SS_R_RM, 0xDE, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pminsw", SS_R_RM, 0xEA, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pminub", SS_R_RM, 0xDA, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pand", SS_R_RM, 0xDB, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pandn", SS_R_RM, 0xDF, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "por", SS_R_RM, 0xEB, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pxor", SS_R_RM, 0xEF, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pcmpeqb", SS_R_RM, 0x74, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pcmpeqw", SS_R_RM, 0x75, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pcmpeqd", SS_R_RM, 0x76, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pcmpgtb", SS_R_RM, 0x64, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pcmpgtw", SS_R_RM, 0x65, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pcmpgtd", SS_R_RM, 0x66, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "psadbw", SS_R_RM, 0xF6, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "punpcklbw", SS_R_RM, 0x60, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "punpcklwd", SS_R_RM, 0x61, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "punpckldq", SS_R_RM, 0x62, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "punpcklqdq", SS_R_RM, 0x6C, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "punpckhbw", SS_R_RM, 0x68, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "punpckhwd", SS_R_RM, 0x69, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "punpckhdq", SS_R_RM, 0x6A, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "punpckhqdq", SS_R_RM, 0x6D, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "packsswb", SS_R_RM, 0x63, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "packssdw", SS_R_RM, 0x6B, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "packuswb", SS_R_RM, 0x67, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "psllw", SS_R_RM, 0xF1, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pslld", SS_R_RM, 0xF2, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "psllq", SS_R_RM, 0xF3, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "psrlw", SS_R_RM, 0xD1, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "psrld", SS_R_RM, 0xD2, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "psrlq", SS_R_RM, 0xD3, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "psraw", SS_R_RM, 0xE1, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "psrad", SS_R_RM, 0xE2, 0, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+
+    // shift by immediate, two-operand in-place form: 66 0F 71/72/73 /digit
+    // with the count in imm8 (gas rejects the three-operand form in AT&T)
+    { "psllw", SS_XRM, 0x71, 0, 0x66, 6, 1, RC_XM, DC_XM, false, false, false },
+    { "pslld", SS_XRM, 0x72, 0, 0x66, 6, 1, RC_XM, DC_XM, false, false, false },
+    { "psllq", SS_XRM, 0x73, 0, 0x66, 6, 1, RC_XM, DC_XM, false, false, false },
+    { "psrlw", SS_XRM, 0x71, 0, 0x66, 2, 1, RC_XM, DC_XM, false, false, false },
+    { "psrld", SS_XRM, 0x72, 0, 0x66, 2, 1, RC_XM, DC_XM, false, false, false },
+    { "psrlq", SS_XRM, 0x73, 0, 0x66, 2, 1, RC_XM, DC_XM, false, false, false },
+    { "psraw", SS_XRM, 0x71, 0, 0x66, 4, 1, RC_XM, DC_XM, false, false, false },
+    { "psrad", SS_XRM, 0x72, 0, 0x66, 4, 1, RC_XM, DC_XM, false, false, false },
+
+    // word extract/insert: legacy pextrw puts the gpr in ModRM.reg and
+    // the xmm in rm; the SSE4.1 memory form uses 3A 15 with the xmm in
+    // the reg field instead
+    { "pextrw", SS_XRM_I, 0xC5, 0, 0x66, SSE_NOREG, 1, RC_XM, DC_G32, false, false, false },
+    { "pinsrw", SS_XRM_I, 0xC4, 0, 0x66, SSE_NOREG, 1, RC_G32, DC_XM, false, false, false },
+
+    // --- SSSE3 (66 0F 38) ---
+    { "pshufb", SS_R_RM, 0x00, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "phaddw", SS_R_RM, 0x01, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "phaddd", SS_R_RM, 0x02, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "phaddsw", SS_R_RM, 0x03, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pmaddubsw", SS_R_RM, 0x04, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "phsubw", SS_R_RM, 0x05, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "phsubd", SS_R_RM, 0x06, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "phsubsw", SS_R_RM, 0x07, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "psignb", SS_R_RM, 0x08, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "psignw", SS_R_RM, 0x09, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "psignd", SS_R_RM, 0x0A, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pmulhrsw", SS_R_RM, 0x0B, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pabsb", SS_R_RM, 0x1C, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pabsw", SS_R_RM, 0x1D, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pabsd", SS_R_RM, 0x1E, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "palignr", SS_XRM_I, 0x0F, 0x3A, 0x66, SSE_NOREG, 1, RC_XM, DC_XM, false, false, false },
+
+    // --- SSE4.1 (66 0F 38 / 66 0F 3A). blendv*/pblendvb take the mask in
+    // the implicit xmm0, so they encode as plain two-operand forms ---
+    { "pblendvb", SS_R_RM, 0x10, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "blendvps", SS_R_RM, 0x14, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "blendvpd", SS_R_RM, 0x15, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "ptest", SS_R_RM, 0x17, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pcmpeqq", SS_R_RM, 0x29, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "movntdqa", SS_R_RM, 0x2A, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "packusdw", SS_R_RM, 0x2B, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pminsb", SS_R_RM, 0x38, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pminuw", SS_R_RM, 0x3A, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pminud", SS_R_RM, 0x3B, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pmaxsb", SS_R_RM, 0x3C, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pmaxuw", SS_R_RM, 0x3E, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pmaxud", SS_R_RM, 0x3F, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pmulld", SS_R_RM, 0x40, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "phminposuw", SS_R_RM, 0x41, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pmovsxbw", SS_R_RM, 0x20, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pmovsxbd", SS_R_RM, 0x21, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pmovsxbq", SS_R_RM, 0x22, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pmovsxwd", SS_R_RM, 0x23, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pmovsxwq", SS_R_RM, 0x24, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pmovsxdq", SS_R_RM, 0x25, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pmovzxbw", SS_R_RM, 0x30, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pmovzxbd", SS_R_RM, 0x31, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pmovzxbq", SS_R_RM, 0x32, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pmovzxwd", SS_R_RM, 0x33, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pmovzxwq", SS_R_RM, 0x34, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "pmovzxdq", SS_R_RM, 0x35, 0x38, 0x66, SSE_NOREG, 0, RC_XM, DC_XM, false, false, false },
+    { "blendps", SS_XRM_I, 0x0C, 0x3A, 0x66, SSE_NOREG, 1, RC_XM, DC_XM, false, false, false },
+    { "blendpd", SS_XRM_I, 0x0D, 0x3A, 0x66, SSE_NOREG, 1, RC_XM, DC_XM, false, false, false },
+    { "pblendw", SS_XRM_I, 0x0E, 0x3A, 0x66, SSE_NOREG, 1, RC_XM, DC_XM, false, false, false },
+    { "roundps", SS_XRM_I, 0x08, 0x3A, 0x66, SSE_NOREG, 1, RC_XM, DC_XM, false, false, false },
+    { "roundpd", SS_XRM_I, 0x09, 0x3A, 0x66, SSE_NOREG, 1, RC_XM, DC_XM, false, false, false },
+    { "roundss", SS_XRM_I, 0x0A, 0x3A, 0x66, SSE_NOREG, 1, RC_XM, DC_XM, false, false, false },
+    { "roundsd", SS_XRM_I, 0x0B, 0x3A, 0x66, SSE_NOREG, 1, RC_XM, DC_XM, false, false, false },
+    { "pextrb", SS_XR_RM, 0x14, 0x3A, 0x66, SSE_NOREG, 1, RC_G32, DC_XM, false, false, false },
+    { "pextrw", SS_XR_RM, 0x15, 0x3A, 0x66, SSE_NOREG, 1, RC_G32, DC_XM, false, false, false },
+    { "pextrd", SS_XR_RM, 0x16, 0x3A, 0x66, SSE_NOREG, 1, RC_G32, DC_XM, false, false, false },
+    { "extractps", SS_XR_RM, 0x17, 0x3A, 0x66, SSE_NOREG, 1, RC_G32, DC_XM, false, false, false },
+    { "pinsrb", SS_XRM_I, 0x20, 0x3A, 0x66, SSE_NOREG, 1, RC_G32, DC_XM, false, false, false },
+    { "insertps", SS_XRM_I, 0x21, 0x3A, 0x66, SSE_NOREG, 1, RC_XM, DC_XM, false, false, false },
+    { "pinsrd", SS_XRM_I, 0x22, 0x3A, 0x66, SSE_NOREG, 1, RC_G32, DC_XM, false, false, false },
+    { "pcmpestrm", SS_XRM_I, 0x60, 0x3A, 0x66, SSE_NOREG, 1, RC_XM, DC_XM, false, false, false },
+    { "pcmpestri", SS_XRM_I, 0x61, 0x3A, 0x66, SSE_NOREG, 1, RC_XM, DC_XM, false, false, false },
+    { "pcmpistrm", SS_XRM_I, 0x62, 0x3A, 0x66, SSE_NOREG, 1, RC_XM, DC_XM, false, false, false },
+    { "pcmpistri", SS_XRM_I, 0x63, 0x3A, 0x66, SSE_NOREG, 1, RC_XM, DC_XM, false, false, false }
+};
+
+// class check for one register operand against an RC_/DC_ code
+bool sseRegClsOk(X86Reg* r, u8 cls)
+{
+    if (r == null) return false;
+    if (cls == RC_XM) return r.cls == X86RegClass::RcXmm;
+    if (cls == RC_GP) return r.cls == X86RegClass::RcGpr;
+    if (cls == RC_G32) return r.cls == X86RegClass::RcGpr && r.size == 4;
+    return r.cls == X86RegClass::RcGpr && r.size == 8;
+}
+
+// signature match: operand count, kinds, register classes. Memory is
+// accepted wherever an RC_ code allows a register, except SS_XR_RM
+// destinations which may also be plain memory for the pextr/extractps
+// store forms.
+bool sseSigOk(AsmLine* line, SseRow* row)
+{
+    switch (row.sig)
+    {
+        SseSig::SS_R_RM => {
+            if (line.nops != 2 || line.ops[1].kind != AsmOpKind::Reg) return false;
+            X86Reg* d = lookupReg(line.ops[1].text);
+            if (!sseRegClsOk(d, row.dstCls)) return false;
+            if (line.ops[0].kind == AsmOpKind::Reg)
+            {
+                X86Reg* s = lookupReg(line.ops[0].text);
+                return sseRegClsOk(s, row.rmCls);
+            }
+            return line.ops[0].kind == AsmOpKind::Mem;
+        },
+        SseSig::SS_RM_R => {
+            if (line.nops != 2 || line.ops[0].kind != AsmOpKind::Reg) return false;
+            if (line.ops[1].kind != AsmOpKind::Reg && line.ops[1].kind != AsmOpKind::Mem) return false;
+            X86Reg* s = lookupReg(line.ops[0].text);
+            if (row.regIsGpr)
+            {
+                if (s == null || s.cls != X86RegClass::RcGpr) return false;
+                // movnti stores to memory only
+                return line.ops[1].kind == AsmOpKind::Mem;
+            }
+            if (!sseRegClsOk(s, RC_XM)) return false;
+            if (line.ops[1].kind == AsmOpKind::Reg)
+            {
+                X86Reg* d = lookupReg(line.ops[1].text);
+                return sseRegClsOk(d, row.rmCls);
+            }
+            return true;
+        },
+        SseSig::SS_XRM_I => {
+            if (line.nops != 3 || line.ops[0].kind != AsmOpKind::Imm) return false;
+            if (line.ops[0].imm < -128 || line.ops[0].imm > 255) return false;
+            if (line.ops[2].kind != AsmOpKind::Reg) return false;
+            X86Reg* d = lookupReg(line.ops[2].text);
+            if (!sseRegClsOk(d, row.dstCls)) return false;
+            if (line.ops[1].kind == AsmOpKind::Reg)
+            {
+                X86Reg* s = lookupReg(line.ops[1].text);
+                return sseRegClsOk(s, row.rmCls);
+            }
+            return line.ops[1].kind == AsmOpKind::Mem;
+        },
+        SseSig::SS_XR_RM => {
+            // imm, xmm source (reg field), gpr/mem destination (rm)
+            if (line.nops != 3 || line.ops[0].kind != AsmOpKind::Imm) return false;
+            if (line.ops[0].imm < -128 || line.ops[0].imm > 255) return false;
+            if (line.ops[1].kind != AsmOpKind::Reg) return false;
+            X86Reg* s = lookupReg(line.ops[1].text);
+            if (!sseRegClsOk(s, RC_XM)) return false;
+            if (line.ops[2].kind == AsmOpKind::Reg)
+            {
+                X86Reg* d = lookupReg(line.ops[2].text);
+                return sseRegClsOk(d, row.rmCls);
+            }
+            return line.ops[2].kind == AsmOpKind::Mem;
+        },
+        SseSig::SS_XRM => {
+            if (line.nops != 2 || line.ops[0].kind != AsmOpKind::Imm) return false;
+            if (line.ops[0].imm < -128 || line.ops[0].imm > 255) return false;
+            if (line.ops[1].kind == AsmOpKind::Reg)
+            {
+                X86Reg* s = lookupReg(line.ops[1].text);
+                return sseRegClsOk(s, row.rmCls);
+            }
+            return line.ops[1].kind == AsmOpKind::Mem;
+        },
+        else => { return false; },
+    }
+}
+
+// legacy SSE encode: user prefixes, mandatory prefix, REX, 0F escape,
+// opcode, then the parked ModRM tail and optional imm8. The ModRM tail
+// is built in a scratch buffer first so R/X/B are known before the
+// prefix bytes are written.
+bool encodeSse(AsmLine* line, SseRow* row, EncodeCtx* ctx, AsmParseError* err)
+{
+    AsmBytes* out = ctx.out;
+
+    AsmOperand* rmOp = null;
+    AsmOperand* regOp = null;
+    AsmOperand* immOp = null;
+    switch (row.sig)
+    {
+        SseSig::SS_R_RM => { rmOp = &line.ops[0]; regOp = &line.ops[1]; },
+        SseSig::SS_RM_R => { regOp = &line.ops[0]; rmOp = &line.ops[1]; },
+        SseSig::SS_XRM_I => { immOp = &line.ops[0]; rmOp = &line.ops[1]; regOp = &line.ops[2]; },
+        SseSig::SS_XR_RM => { immOp = &line.ops[0]; regOp = &line.ops[1]; rmOp = &line.ops[2]; },
+        SseSig::SS_XRM => { immOp = &line.ops[0]; rmOp = &line.ops[1]; },
+        else => { err.msg = "bad SSE signature"; return false; },
+    }
+
+    X86Reg* regR = regOp != null && regOp.kind == AsmOpKind::Reg ? lookupReg(regOp.text) : null;
+    X86Reg* rmR = rmOp != null && rmOp.kind == AsmOpKind::Reg ? lookupReg(rmOp.text) : null;
+
+    AsmBytes tail = AsmBytes::new();
+    u8 highB = 0;
+    u8 highX = 0;
+    // group forms pin ModRM.reg to the /digit; everything else takes it
+    // from the register operand
+    u8 regField = row.ext == SSE_NOREG ? (regR != null ? (regR.num & 7) : 0) : row.ext;
+    bool regExt = row.ext == SSE_NOREG && regR != null && (regR.num & 8) != 0;
+
+    if (rmOp != null)
+    {
+        if (rmOp.kind == AsmOpKind::Mem)
+        {
+            X86Reg* base = null;
+            X86Reg* index = null;
+            if (!rmOp.rip)
+            {
+                if (rmOp.hasSym) { tail.deinit(); err.msg = "symbolic displacement needs %rip"; return false; }
+                if (!rmOp.base.isEmpty())
+                {
+                    base = lookupReg(rmOp.base);
+                    if (base == null) { tail.deinit(); err.msg = "bad base register"; return false; }
+                }
+                if (!rmOp.index.isEmpty())
+                {
+                    index = lookupReg(rmOp.index);
+                    if (index == null) { tail.deinit(); err.msg = "bad index register"; return false; }
+                }
+            }
+            u8 xb = 0;
+            u8 xx = 0;
+            // imm8 bytes that follow the displacement feed the PC32 addend
+            u32 immTail = row.immW != 0 ? 1 : 0;
+            i64 wdisp = rmOp.disp;
+            if (rmOp.hasSym && rmOp.rip) wdisp = rmOp.disp - 4 - (i64)immTail;
+            if (!encodeMem(&tail, base, index, rmOp.scale, rmOp.hasDisp || rmOp.hasSym,
+                           wdisp, rmOp.rip, regField, &xb, &xx))
+            {
+                tail.deinit();
+                return false;
+            }
+            highB = xb;
+            highX = xx;
+        }
+        else
+        {
+            if (rmR == null) { tail.deinit(); err.msg = "missing rm operand"; return false; }
+            if (!tail.u8b(encodeRegReg(regField, rmR.num))) { tail.deinit(); return false; }
+            highB = (rmR.num & 8) != 0 ? 1 : 0;
+        }
+    }
+
+    // user prefixes, then the instruction's own prefix/REX/opcode bytes
+    if (line.pfxLock) { if (!out.u8b(0xF0)) { tail.deinit(); return false; } }
+    if (line.pfxRep) { if (!out.u8b(0xF3)) { tail.deinit(); return false; } }
+    if (line.pfxRepne) { if (!out.u8b(0xF2)) { tail.deinit(); return false; } }
+    if (line.pfxData16) { if (!out.u8b(0x66)) { tail.deinit(); return false; } }
+    if (line.pfxData32 || line.pfxAddr32) { if (!out.u8b(0x67)) { tail.deinit(); return false; } }
+    if (row.pfx != 0) { if (!out.u8b(row.pfx)) { tail.deinit(); return false; } }
+    bool w = row.forceW || (row.wFromGpr && regR != null && regR.size == 8);
+    if (regExt || highB != 0 || highX != 0 || w)
+    {
+        X86Rex rex = X86Rex::new();
+        rex.r = regExt;
+        rex.b = highB != 0;
+        rex.x = highX != 0;
+        rex.w = w;
+        if (!out.u8b(rex.byte())) { tail.deinit(); return false; }
+    }
+    if (!out.u8b(0x0F)) { tail.deinit(); return false; }
+    if (row.esc != 0) { if (!out.u8b(row.esc)) { tail.deinit(); return false; } }
+    if (!out.u8b(row.op)) { tail.deinit(); return false; }
+    for (u32 i = 0; i < tail.len; i++)
+    {
+        if (!out.u8b(tail.data[i])) { tail.deinit(); return false; }
+    }
+    tail.deinit();
+
+    // rip-relative symbol displacement: the disp is the last 4 bytes
+    if (rmOp != null && rmOp.kind == AsmOpKind::Mem && rmOp.hasSym && rmOp.rip && ctx.obj != null)
+    {
+        u64 at = out.len >= 4 ? out.len - 4 : 0;
+        i64 addend = rmOp.disp - 4;
+        if (immOp != null && row.immW != 0) addend -= 1;
+        if (!asmAddReloc(ctx.obj, at, rmOp.sym, AsmRelocKind::RelPc32, addend, ctx.sec)) return false;
+    }
+
+    if (immOp != null && row.immW != 0)
+    {
+        return out.immv(immOp.imm, 1);
+    }
+    return true;
+}
+
+// walk the SSE table; 1 encoded, 0 no match, -1 hard error
+pub i32 trySseTable(AsmLine* line, str base, EncodeCtx* ctx, AsmParseError* err)
+{
+    u32 n = sizeof(_sseForms) / sizeof(_sseForms[0]);
+    for (u32 i = 0; i < n; i++)
+    {
+        SseRow* row = &_sseForms[i];
+        if (!row.base.equals(base)) continue;
+        if (!sseSigOk(line, row)) continue;
+        if (!encodeSse(line, row, ctx, err)) return -1;
+        return 1;
+    }
+    return 0;
+}

@@ -1,0 +1,468 @@
+#[[no_drop_all]]
+/* reloc.crl for linker
+ * Applies input relocations to the emitted image. Each Reloc carries
+ * fmt: 0 = ELF type numbers, 1 = COFF type numbers (native, not
+ * translated). x86_64 takes GOTPCREL/GOTPCRELX as a PC32 relaxation
+ * (static output has no GOT); dynamic relocation types are hard
+ * errors. REL addends are read in-field, RELA addends come from the
+ * entry; COFF is always in-field. When fixups is non-null, absolute
+ * writes are recorded for PE base relocations or ELF-dyn RELATIVE
+ * entries - 32-bit absolute writes into ELF-dyn output are rejected
+ * (they cannot slide).
+ */
+
+import(lib) std::vec { Vec };
+import(lib) std::text::string { String };
+import(lib) std::mman { alloc, dealloc };
+import elf { SHT_NOBITS, SHF_ALLOC, STB_LOCAL, SHN_ABS, SHN_UNDEF, OUT_NONE, EM_X86_64, FMT_ELF_DYN, FMT_PE_EXE, FMT_PE_DLL, R_X86_64_64, R_X86_64_PC32, R_X86_64_PLT32, R_X86_64_COPY, R_X86_64_GLOB_DAT, R_X86_64_JUMP_SLOT, R_X86_64_RELATIVE, R_X86_64_GOTPCREL, R_X86_64_32, R_X86_64_32S, R_X86_64_PC64, R_X86_64_GOTPCRELX, R_X86_64_REX_GOTPCRELX, R_386_32, R_386_PC32, R_386_GOT32, R_386_PLT32, R_386_COPY, R_386_GLOB_DAT, R_386_JUMP_SLOT, fits, leU32, leU64, putU16, putU32, putU64, pushDec, pushHex };
+import coff { IMAGE_REL_AMD64_ADDR64, IMAGE_REL_AMD64_ADDR32, IMAGE_REL_AMD64_ADDR32NB, IMAGE_REL_AMD64_REL32, IMAGE_REL_AMD64_SECREL, IMAGE_REL_AMD64_SECREL7, IMAGE_REL_AMD64_SECTION, IMAGE_REL_I386_DIR32, IMAGE_REL_I386_DIR32NB, IMAGE_REL_I386_SECTION, IMAGE_REL_I386_SECREL, IMAGE_REL_I386_REL32 };
+import object { ObjFile, Section, Sym, Reloc };
+import resolve { GlobalDef, findDef };
+import layout { Layout, OutSec, defAddress };
+
+void _relErrBase(String* err, str objName)
+{
+    err->pushView("linker: ");
+    err->pushView(objName);
+}
+
+bool _rangeErr(String* err, str objName, u32 type, u64 vaddr)
+{
+    _relErrBase(err, objName);
+    err->pushView(": relocation type ");
+    pushDec(err, type);
+    err->pushView(" out of range at ");
+    pushHex(err, vaddr);
+    err->pushView(" (S+A-P does not fit)");
+    return false;
+}
+
+bool _dynErr(String* err, str objName, u32 type)
+{
+    _relErrBase(err, objName);
+    err->pushView(": dynamic relocation type ");
+    pushDec(err, type);
+    err->pushView(" is not supported by this linker mode");
+    return false;
+}
+
+bool _supErr(String* err, str objName, u32 type)
+{
+    _relErrBase(err, objName);
+    err->pushView(": unsupported relocation type ");
+    pushDec(err, type);
+    return false;
+}
+
+/* Records an absolute write for base relocation / RELATIVE tables.
+ * Returns false when the write cannot be represented in the output
+ * (32-bit absolute references in ELF-dyn output).
+ */
+bool _recordFixup(Vec<u32>* fixups, u8 outFmt, bool is64, usize fileOff, bool abs8)
+{
+    if (fixups == null) return true;
+    bool pe = outFmt == FMT_PE_EXE || outFmt == FMT_PE_DLL;
+    if (pe)
+    {
+        fixups->push((u32)fileOff);
+        return true;
+    }
+    if (outFmt == FMT_ELF_DYN)
+    {
+        if (!abs8 && is64) return false;
+        fixups->push((u32)fileOff);
+        return true;
+    }
+    return true;
+}
+
+bool _dyn32Err(String* err, str objName, u32 type, u64 vaddr)
+{
+    _relErrBase(err, objName);
+    err->pushView(": relocation type ");
+    pushDec(err, type);
+    err->pushView(" is a 32-bit absolute write at ");
+    pushHex(err, vaddr);
+    err->pushView(" which cannot slide in shared object output");
+    return false;
+}
+
+/* Output-section base of the reloc's target symbol (for SECREL). */
+u64 _targetSecBase(ObjFile* obj, Layout* L, u32 symIdx)
+{
+    if (symIdx >= (u32)obj->syms.count()) return 0;
+    Sym* ts = obj->syms.atPtr(symIdx);
+    if (ts->shndx == SHN_ABS || ts->shndx == SHN_UNDEF) return 0;
+    if ((usize)ts->shndx >= obj->secs.count()) return 0;
+    Section* tin = obj->secs.atPtr(ts->shndx);
+    if (tin->outIdx == OUT_NONE) return 0;
+    return L->secs.atPtr(tin->outIdx)->addr;
+}
+
+u16 _targetSecIndex(ObjFile* obj, u32 symIdx)
+{
+    if (symIdx >= (u32)obj->syms.count()) return 0;
+    Sym* ts = obj->syms.atPtr(symIdx);
+    if ((usize)ts->shndx >= obj->secs.count()) return 0;
+    Section* tin = obj->secs.atPtr(ts->shndx);
+    if (tin->outIdx == OUT_NONE) return 0;
+    return (u16)(tin->outIdx + 1); /* COFF section numbers are 1-based */
+}
+
+pub bool applyRels(u16 machine, u8 outFmt, Vec<ObjFile>* objs, Vec<GlobalDef>* defs, Layout* L, u8* img, usize imgLen, Vec<u32>* fixups, String* err)
+{
+    bool is64 = machine == EM_X86_64;
+    for (usize o = 0; o < objs->count(); o++)
+    {
+        ObjFile* obj = objs->atPtr(o);
+        usize nsyms = obj->syms.count();
+        u64* addrs = alloc<u64>(nsyms > 0 ? nsyms : 1);
+        for (usize i = 0; i < nsyms; i++)
+        {
+            Sym* sym = obj->syms.atPtr(i);
+            if (sym->bind != STB_LOCAL)
+            {
+                i64 di = findDef(defs, sym->name);
+                if (di < 0)
+                {
+                    addrs[i] = 0;
+                    continue;
+                }
+                if (!defAddress(objs, L, defs->atPtr((usize)di), &addrs[i], err))
+                {
+                    dealloc<u64>(addrs);
+                    return false;
+                }
+                continue;
+            }
+            if (sym->shndx == SHN_UNDEF || sym->shndx == SHN_ABS)
+            {
+                addrs[i] = sym->shndx == SHN_ABS ? sym->value : 0;
+                continue;
+            }
+            if ((usize)sym->shndx >= obj->secs.count())
+            {
+                addrs[i] = 0;
+                continue;
+            }
+            Section* in = obj->secs.atPtr(sym->shndx);
+            if (in->outIdx == OUT_NONE)
+            {
+                addrs[i] = 0;
+                continue;
+            }
+            addrs[i] = L->secs.atPtr(in->outIdx)->addr + sym->value;
+        }
+
+        for (usize si = 0; si < obj->secs.count(); si++)
+        {
+            Section* sec = obj->secs.atPtr(si);
+            Vec<Reloc>* bucket = obj->rels.atPtr(si);
+            if (bucket->count() == 0) continue;
+            if (sec->outIdx == OUT_NONE) continue;
+            if (sec->type == SHT_NOBITS)
+            {
+                _relErrBase(err, obj->name);
+                err->pushView(": relocation against NOBITS section ");
+                err->pushView(sec->name);
+                dealloc<u64>(addrs);
+                return false;
+            }
+            OutSec* out = L->secs.atPtr(sec->outIdx);
+            /* non-allocated (debug/metadata) sections relocate as if
+             * P were zero: the stored value is S+A, the form debug
+             * consumers expect; they never get base fixups either. */
+            bool allocd = (out->flags & SHF_ALLOC) != 0;
+            Vec<u32>* rec = allocd ? fixups : null;
+            for (usize k = 0; k < bucket->count(); k++)
+            {
+                Reloc* r = bucket->atPtr(k);
+                u64 S = addrs[r->sym];
+                u64 P = allocd ? out->addr + r->offset : 0;
+                usize fileOff = (usize)(out->offset + r->offset);
+                u32 t = r->type;
+
+                /* field width, format-aware */
+                u64 w = 4;
+                if (r->fmt == 1)
+                {
+                    if (is64)
+                    {
+                        if (t == IMAGE_REL_AMD64_ADDR64) w = 8;
+                        else if (t == IMAGE_REL_AMD64_SECTION) w = 2;
+                        else if (t == IMAGE_REL_AMD64_SECREL7) w = 1;
+                    }
+                    else
+                    {
+                        if (t == IMAGE_REL_I386_SECTION) w = 2;
+                    }
+                }
+                else
+                {
+                    if (is64 && (t == R_X86_64_64 || t == R_X86_64_PC64)) w = 8;
+                }
+                if (r->offset + w > out->size || !fits(fileOff, (usize)w, imgLen))
+                {
+                    _relErrBase(err, obj->name);
+                    err->pushView(": relocation target out of section bounds at ");
+                    pushHex(err, P);
+                    dealloc<u64>(addrs);
+                    return false;
+                }
+
+                i64 A = r->addend;
+                if (!r->rela && w != 2)
+                {
+                    if (w == 8) A = (i64)leU64(img + fileOff);
+                    else if (w == 1) A = (i64)img[fileOff];
+                    else A = (i32)leU32(img + fileOff);
+                }
+                u8* patch = img + fileOff;
+
+                if (r->fmt == 1)
+                {
+                    /* COFF relocation */
+                    if (is64)
+                    {
+                        if (t == IMAGE_REL_AMD64_ADDR64)
+                        {
+                            putU64(patch, S + (u64)A);
+                            if (!_recordFixup(rec, outFmt, true, fileOff, true))
+                            {
+                                dealloc<u64>(addrs);
+                                return _dyn32Err(err, obj->name, t, P);
+                            }
+                        }
+                        else if (t == IMAGE_REL_AMD64_ADDR32)
+                        {
+                            u64 v = S + (u64)A;
+                            if (v > 0xffffffffu)
+                            {
+                                dealloc<u64>(addrs);
+                                return _rangeErr(err, obj->name, t, P);
+                            }
+                            putU32(patch, (u32)v);
+                            if (!_recordFixup(rec, outFmt, true, fileOff, false))
+                            {
+                                dealloc<u64>(addrs);
+                                return _dyn32Err(err, obj->name, t, P);
+                            }
+                        }
+                        else if (t == IMAGE_REL_AMD64_ADDR32NB)
+                        {
+                            u64 sv = S + (u64)A;
+                            if (sv < L->imageBase || sv - L->imageBase > 0xffffffffu)
+                            {
+                                dealloc<u64>(addrs);
+                                return _rangeErr(err, obj->name, t, P);
+                            }
+                            putU32(patch, (u32)(sv - L->imageBase));
+                        }
+                        else if ((t >= IMAGE_REL_AMD64_REL32 && t <= IMAGE_REL_AMD64_REL32 + 5) ||
+                                 t == 0x000c || t == 0x000d)
+                        {
+                            i64 v = (i64)S + A - (i64)P - (i64)t;
+                            if (v < -2147483647 - 1 || v > 2147483647)
+                            {
+                                dealloc<u64>(addrs);
+                                return _rangeErr(err, obj->name, t, P);
+                            }
+                            putU32(patch, (i32)v);
+                        }
+                        else if (t == IMAGE_REL_AMD64_SECREL)
+                        {
+                            u64 secBase = _targetSecBase(obj, L, r->sym);
+                            i64 v = (i64)S + A - (i64)secBase;
+                            if (v < 0 || v > 0xffffffffu)
+                            {
+                                dealloc<u64>(addrs);
+                                return _rangeErr(err, obj->name, t, P);
+                            }
+                            putU32(patch, (u32)v);
+                        }
+                        else if (t == IMAGE_REL_AMD64_SECTION)
+                        {
+                            putU16(patch, _targetSecIndex(obj, r->sym));
+                        }
+                        else
+                        {
+                            dealloc<u64>(addrs);
+                            return _supErr(err, obj->name, t);
+                        }
+                    }
+                    else
+                    {
+                        if (t == IMAGE_REL_I386_DIR32)
+                        {
+                            u64 v = S + (u64)A;
+                            if (v > 0xffffffffu)
+                            {
+                                dealloc<u64>(addrs);
+                                return _rangeErr(err, obj->name, t, P);
+                            }
+                            putU32(patch, (u32)v);
+                            if (!_recordFixup(rec, outFmt, false, fileOff, false))
+                            {
+                                dealloc<u64>(addrs);
+                                return _dyn32Err(err, obj->name, t, P);
+                            }
+                        }
+                        else if (t == IMAGE_REL_I386_DIR32NB)
+                        {
+                            u64 sv = S + (u64)A;
+                            if (sv < L->imageBase || sv - L->imageBase > 0xffffffffu)
+                            {
+                                dealloc<u64>(addrs);
+                                return _rangeErr(err, obj->name, t, P);
+                            }
+                            putU32(patch, (u32)(sv - L->imageBase));
+                        }
+                        else if (t == IMAGE_REL_I386_REL32)
+                        {
+                            i64 v = (i64)S + A - (i64)P - 4;
+                            if (v < -2147483647 - 1 || v > 2147483647)
+                            {
+                                dealloc<u64>(addrs);
+                                return _rangeErr(err, obj->name, t, P);
+                            }
+                            putU32(patch, (i32)v);
+                        }
+                        else if (t == IMAGE_REL_I386_SECREL)
+                        {
+                            u64 secBase = _targetSecBase(obj, L, r->sym);
+                            i64 v = (i64)S + A - (i64)secBase;
+                            if (v < 0 || v > 0xffffffffu)
+                            {
+                                dealloc<u64>(addrs);
+                                return _rangeErr(err, obj->name, t, P);
+                            }
+                            putU32(patch, (u32)v);
+                        }
+                        else if (t == IMAGE_REL_I386_SECTION)
+                        {
+                            putU16(patch, _targetSecIndex(obj, r->sym));
+                        }
+                        else
+                        {
+                            dealloc<u64>(addrs);
+                            return _supErr(err, obj->name, t);
+                        }
+                    }
+                    continue;
+                }
+
+                /* ELF relocation */
+                if (is64)
+                {
+                    if (t == R_X86_64_64)
+                    {
+                        putU64(patch, S + (u64)A);
+                        if (!_recordFixup(rec, outFmt, true, fileOff, true))
+                        {
+                            dealloc<u64>(addrs);
+                            return _dyn32Err(err, obj->name, t, P);
+                        }
+                    }
+                    else if (t == R_X86_64_PC64)
+                    {
+                        putU64(patch, S + (u64)A - P);
+                    }
+                    else if (t == R_X86_64_PC32 || t == R_X86_64_PLT32 ||
+                             t == R_X86_64_GOTPCREL || t == R_X86_64_GOTPCRELX ||
+                             t == R_X86_64_REX_GOTPCRELX)
+                    {
+                        i64 v = (i64)S + A - (i64)P;
+                        if (v < -2147483647 - 1 || v > 2147483647)
+                        {
+                            dealloc<u64>(addrs);
+                            return _rangeErr(err, obj->name, t, P);
+                        }
+                        putU32(patch, (i32)v);
+                    }
+                    else if (t == R_X86_64_32)
+                    {
+                        u64 v = S + (u64)A;
+                        if (v > 0xffffffffu)
+                        {
+                            dealloc<u64>(addrs);
+                            return _rangeErr(err, obj->name, t, P);
+                        }
+                        putU32(patch, (u32)v);
+                        if (!_recordFixup(rec, outFmt, true, fileOff, false))
+                        {
+                            dealloc<u64>(addrs);
+                            return _dyn32Err(err, obj->name, t, P);
+                        }
+                    }
+                    else if (t == R_X86_64_32S)
+                    {
+                        i64 v = (i64)S + A;
+                        if (v < -2147483647 - 1 || v > 2147483647)
+                        {
+                            dealloc<u64>(addrs);
+                            return _rangeErr(err, obj->name, t, P);
+                        }
+                        putU32(patch, (i32)v);
+                        if (!_recordFixup(rec, outFmt, true, fileOff, false))
+                        {
+                            dealloc<u64>(addrs);
+                            return _dyn32Err(err, obj->name, t, P);
+                        }
+                    }
+                    else if (t == R_X86_64_GLOB_DAT || t == R_X86_64_JUMP_SLOT ||
+                             t == R_X86_64_COPY || t == R_X86_64_RELATIVE)
+                    {
+                        dealloc<u64>(addrs);
+                        return _dynErr(err, obj->name, t);
+                    }
+                    else
+                    {
+                        dealloc<u64>(addrs);
+                        return _supErr(err, obj->name, t);
+                    }
+                }
+                else
+                {
+                    if (t == R_386_32)
+                    {
+                        u64 v = S + (u64)A;
+                        if (v > 0xffffffffu)
+                        {
+                            dealloc<u64>(addrs);
+                            return _rangeErr(err, obj->name, t, P);
+                        }
+                        putU32(patch, (u32)v);
+                        if (!_recordFixup(rec, outFmt, false, fileOff, false))
+                        {
+                            dealloc<u64>(addrs);
+                            return _dyn32Err(err, obj->name, t, P);
+                        }
+                    }
+                    else if (t == R_386_PC32 || t == R_386_PLT32)
+                    {
+                        i64 v = (i64)S + A - (i64)P;
+                        if (v < -2147483647 - 1 || v > 2147483647)
+                        {
+                            dealloc<u64>(addrs);
+                            return _rangeErr(err, obj->name, t, P);
+                        }
+                        putU32(patch, (i32)v);
+                    }
+                    else if (t == R_386_GLOB_DAT || t == R_386_JUMP_SLOT ||
+                             t == R_386_COPY || t == R_386_GOT32)
+                    {
+                        dealloc<u64>(addrs);
+                        return _dynErr(err, obj->name, t);
+                    }
+                    else
+                    {
+                        dealloc<u64>(addrs);
+                        return _supErr(err, obj->name, t);
+                    }
+                }
+            }
+        }
+        dealloc<u64>(addrs);
+    }
+    return true;
+}

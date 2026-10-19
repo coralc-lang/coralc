@@ -1,0 +1,866 @@
+#[[no_drop_all]]
+
+/* decl.crl: declaration checking, two passes over a file's decls:
+ * declareAll binds names/types/signatures first (so extends and cross-file
+ * references resolve in any order), checkBodies then checks bodies. import
+ * binding lives here too. */
+import ast {
+    id { Str, NodeId },
+    types { Ty, TypeEntry, TypeKind },
+    node { Node, NodeKind },
+    decl { File, Decl, DeclKind, ImportSymbol, GenericParam, Field, EnumVariant, VariantVariant }
+};
+import context::context { InternEntry };
+import common::slice { Slice };
+import scope { Symbol, ScopeStack };
+import sema { Sema };
+import diag::code { ErrorCode };
+import(lib) std::mman { alloc, dealloc };
+
+pub extend Sema
+{
+    /* check one decl. `bodies=false` is the declare pass (bind the name and
+     * type, skip bodies); `bodies=true` checks the body. returns false only
+     * for a hard stop (import failure); ordinary errors are counted and
+     * this still returns true so the walk goes on. */
+    bool checkDecl(NodeId id, bool bodies)
+    {
+        if (id.index == 0) return true;
+        Node* node = self.ctx.nodes + id.index;
+        if (node->kind.tag != NodeKind::Decl) return true;
+        Decl* decl = &node->kind.payload.Decl.value;
+        u8 symbolFlags = 0;
+        // scope kind codes (see scope.crl Symbol): 1 var/const, 2 func,
+        // 3 type, 4 generic param, 5 module namespace; filled below
+        u8 kind = 0;
+        Str name = 0;
+        Ty typeNode = 0;
+        
+        switch (decl->kind.tag)
+        {
+            DeclKind::Func => {
+                kind = 2;
+                name = decl->kind.payload.Func.name;
+                typeNode = decl->kind.payload.Func.returnType;
+            },
+            DeclKind::Struct => {
+                kind = 3;
+                name = decl->kind.payload.Struct.name;
+                typeNode = self.namedType(name);
+            },
+            DeclKind::Variant => {
+                kind = 3;
+                name = decl->kind.payload.Variant.name;
+                typeNode = self.namedType(name);
+            },
+            DeclKind::Enum => {
+                kind = 3;
+                name = decl->kind.payload.Enum.name;
+                typeNode = self.namedType(name);
+            },
+            DeclKind::Union => {
+                kind = 3;
+                name = decl->kind.payload.Union.name;
+                typeNode = self.namedType(name);
+            },
+            DeclKind::Trait => {
+                kind = 3;
+                name = decl->kind.payload.Trait.name;
+                typeNode = self.namedType(name);
+            },
+            DeclKind::TypeAlias => {
+                kind = 3;
+                name = decl->kind.payload.TypeAlias.name;
+                typeNode = decl->kind.payload.TypeAlias.target;
+            },
+            DeclKind::Distinct => {
+                kind = 3;
+                name = decl->kind.payload.Distinct.name;
+                typeNode = decl->kind.payload.Distinct.baseType;
+            },
+            DeclKind::Constant => {
+                kind = 1;
+                name = decl->kind.payload.Constant.name;
+                typeNode = decl->kind.payload.Constant.typeNode;
+                /* parser flags bit 16 = `const`: mark the symbol const so
+                 * assignments to it are rejected (TC-0008) */
+                if ((decl->kind.payload.Constant.flags & 16) != 0) symbolFlags |= 1;
+                if (typeNode == 0 && decl->kind.payload.Constant.value.index != 0)
+                {
+                    if (self.checkExpr(decl->kind.payload.Constant.value))
+                    {
+                        Ty inferred = self.exprType(decl->kind.payload.Constant.value);
+                        if (inferred != 0)
+                        {
+                            typeNode = inferred;
+                            decl->kind.payload.Constant.typeNode = inferred;
+                        }
+                    }
+                }
+                if (bodies && typeNode != 0 && decl->kind.payload.Constant.value.index != 0)
+                    self.checkIntLitFit(decl->kind.payload.Constant.value, typeNode);
+            },
+            DeclKind::ModReexport => {
+                kind = 5;
+                name = decl->kind.payload.ModReexport.alias;
+            },
+            DeclKind::Import => {
+                if (!bodies && !self.checkImportDecl(id, decl)) return false;
+            },
+            else => {}
+        }
+        /* symbols are declared once, on the declareAll pass; checkBodies
+         * would only repeat the declaration (and re-count its failure) */
+        if (name != 0 && !bodies)
+        {
+            /* a C-style prototype plus its later definition is one
+             * function, not a duplicate; the backend emits the prototype
+             * for mutual recursion */
+            bool protoPair = false;
+            if (kind == 2)
+            {
+                Symbol* prev = self.scopes.lookup(name);
+                if (prev != null && prev->declaration.index != 0 && prev->fileId == self.fileOf(id))
+                {
+                    Node* pn = self.ctx.nodes + prev->declaration.index;
+                    if (pn->kind.tag == NodeKind::Decl)
+                    {
+                        Decl* pd = &pn->kind.payload.Decl.value;
+                        // func flags bit 8 = has a body; one bodyless side
+                        // makes this a prototype/definition pair, one function
+                        if (pd->kind.tag == DeclKind::Func &&
+                            ((pd->kind.payload.Func.flags & 8) == 0 ||
+                             (decl->kind.payload.Func.flags & 8) == 0))
+                            protoPair = true;
+                    }
+                }
+            }
+            if (!self.scopes.declare(name, kind, typeNode, id, symbolFlags, self.fileOf(id)))
+            {
+                if (protoPair && self.scopes.lastDeclFail == 1)
+                {
+                    /* prototype + later definition is one function, not a
+                     * duplicate — the failed declare already counted an
+                     * error, so take it back (nothing is reported) */
+                    if (self.scopes.errors > 0) self.scopes.errors = self.scopes.errors - 1;
+                }
+                else if (self.scopes.lastDeclFail == 1)
+                {
+                    self.dupDeclDiag(name, id);
+                }
+            }
+        }
+        if (!bodies)
+        {
+            /* the method registry must be complete before any body runs:
+             * merged modules put extends in files checked later, and calls
+             * cross module boundaries freely */
+            if (decl->kind.tag == DeclKind::Extend || decl->kind.tag == DeclKind::ExtendTrait)
+                self.addExtend(id);
+            return true;
+        }
+        if (decl->kind.tag == DeclKind::Func)
+            return self.checkFunction(decl, 0);
+        self.checkMemberDups(decl);
+        if (decl->kind.tag == DeclKind::Struct)
+            return self.checkMethods(decl->kind.payload.Struct.methods,
+                                     decl->kind.payload.Struct.methodsLen,
+                                     self.selfNamedType(decl->kind.payload.Struct.name,
+                                                        decl->kind.payload.Struct.genericParams,
+                                                        decl->kind.payload.Struct.genericParamsLen),
+                                     decl->kind.payload.Struct.genericParams,
+                                     decl->kind.payload.Struct.genericParamsLen);
+        if (decl->kind.tag == DeclKind::Union)
+            return self.checkMethods(decl->kind.payload.Union.methods,
+                                     decl->kind.payload.Union.methodsLen,
+                                     self.selfNamedType(decl->kind.payload.Union.name,
+                                                        decl->kind.payload.Union.genericParams,
+                                                        decl->kind.payload.Union.genericParamsLen),
+                                     decl->kind.payload.Union.genericParams,
+                                     decl->kind.payload.Union.genericParamsLen);
+        if (decl->kind.tag == DeclKind::Trait)
+            return self.checkMethods(decl->kind.payload.Trait.methods,
+                                     decl->kind.payload.Trait.methodsLen,
+                                     self.selfNamedType(decl->kind.payload.Trait.name,
+                                                        decl->kind.payload.Trait.genericParams,
+                                                        decl->kind.payload.Trait.genericParamsLen),
+                                     decl->kind.payload.Trait.genericParams,
+                                     decl->kind.payload.Trait.genericParamsLen);
+        if (decl->kind.tag == DeclKind::Variant)
+            return self.checkMethods(decl->kind.payload.Variant.methods,
+                                     decl->kind.payload.Variant.methodsLen,
+                                    self.selfNamedType(decl->kind.payload.Variant.name,
+                                                       decl->kind.payload.Variant.genericParams,
+                                                       decl->kind.payload.Variant.genericParamsLen),
+                                    decl->kind.payload.Variant.genericParams,
+                                    decl->kind.payload.Variant.genericParamsLen);
+        if (decl->kind.tag == DeclKind::Extend)
+        {
+            return self.checkMethods(decl->kind.payload.Extend.methods, decl->kind.payload.Extend.methodsLen,
+                                     decl->kind.payload.Extend.selfType, decl->kind.payload.Extend.genericParams, decl->kind.payload.Extend.genericParamsLen);
+        }
+        if (decl->kind.tag == DeclKind::ExtendTrait)
+        {
+            return self.checkMethods(decl->kind.payload.ExtendTrait.methods, decl->kind.payload.ExtendTrait.methodsLen,
+                                    decl->kind.payload.ExtendTrait.selfType, decl->kind.payload.ExtendTrait.genericParams, decl->kind.payload.ExtendTrait.genericParamsLen);
+        }
+        return true;
+    }
+
+    /* duplicate generic params on a type declaration have no scope of
+     * their own, so compare the lists directly */
+    void checkGenericDups(NodeId* params, u32 len)
+    {
+        u32 i = 0;
+        while (i < len)
+        {
+            Node* a = self.ctx.nodes + params[i].index;
+            if (a->kind.tag != NodeKind::GenericParam) { i++; continue; }
+            Str name = a->kind.payload.GenericParam.value.name;
+            u32 j = 0;
+            while (j < i)
+            {
+                Node* b = self.ctx.nodes + params[j].index;
+                if (b->kind.tag == NodeKind::GenericParam &&
+                    b->kind.payload.GenericParam.value.name == name)
+                {
+                    self.dupNamedDiag(name, a->loc, "duplicate generic parameter `", b->loc);
+                    break;
+                }
+                j++;
+            }
+            i++;
+        }
+    }
+
+    /* duplicate fields / enum cases / variant cases: these are not scope
+     * declarations, but C rejects them, so sema must report them first */
+    void checkMemberDups(Decl* decl)
+    {
+        if (decl->kind.tag == DeclKind::Struct)
+        {
+            self.checkGenericDups(decl->kind.payload.Struct.genericParams,
+                                  decl->kind.payload.Struct.genericParamsLen);
+            NodeId* fields = decl->kind.payload.Struct.fields;
+            u32 len = decl->kind.payload.Struct.fieldsLen;
+            u32 i = 0;
+            while (i < len)
+            {
+                Node* a = self.ctx.nodes + fields[i].index;
+                if (a->kind.tag != NodeKind::Field) { i++; continue; }
+                Field fa = a->kind.payload.Field.value;
+                u32 j = 0;
+                while (j < i)
+                {
+                    Node* b = self.ctx.nodes + fields[j].index;
+                    if (b->kind.tag == NodeKind::Field &&
+                        b->kind.payload.Field.value.name == fa.name)
+                    {
+                        self.dupNamedDiag(fa.name, fa.loc, "duplicate field `",
+                                          b->kind.payload.Field.value.loc);
+                        break;
+                    }
+                    j++;
+                }
+                i++;
+            }
+        }
+        else if (decl->kind.tag == DeclKind::Union)
+        {
+            self.checkGenericDups(decl->kind.payload.Union.genericParams,
+                                  decl->kind.payload.Union.genericParamsLen);
+            NodeId* fields = decl->kind.payload.Union.fields;
+            u32 len = decl->kind.payload.Union.fieldsLen;
+            u32 i = 0;
+            while (i < len)
+            {
+                Node* a = self.ctx.nodes + fields[i].index;
+                if (a->kind.tag != NodeKind::Field) { i++; continue; }
+                Field fa = a->kind.payload.Field.value;
+                u32 j = 0;
+                while (j < i)
+                {
+                    Node* b = self.ctx.nodes + fields[j].index;
+                    if (b->kind.tag == NodeKind::Field &&
+                        b->kind.payload.Field.value.name == fa.name)
+                    {
+                        self.dupNamedDiag(fa.name, fa.loc, "duplicate field `",
+                                          b->kind.payload.Field.value.loc);
+                        break;
+                    }
+                    j++;
+                }
+                i++;
+            }
+        }
+        else if (decl->kind.tag == DeclKind::Enum)
+        {
+            NodeId* variants = decl->kind.payload.Enum.variants;
+            u32 len = decl->kind.payload.Enum.variantsLen;
+            u32 i = 0;
+            while (i < len)
+            {
+                Node* a = self.ctx.nodes + variants[i].index;
+                if (a->kind.tag != NodeKind::EnumVariant) { i++; continue; }
+                EnumVariant ea = a->kind.payload.EnumVariant.value;
+                u32 j = 0;
+                while (j < i)
+                {
+                    Node* b = self.ctx.nodes + variants[j].index;
+                    if (b->kind.tag == NodeKind::EnumVariant &&
+                        b->kind.payload.EnumVariant.value.name == ea.name)
+                    {
+                        self.dupNamedDiag(ea.name, ea.loc, "duplicate enum case `",
+                                          b->kind.payload.EnumVariant.value.loc);
+                        break;
+                    }
+                    j++;
+                }
+                i++;
+            }
+        }
+        else if (decl->kind.tag == DeclKind::Variant)
+        {
+            self.checkGenericDups(decl->kind.payload.Variant.genericParams,
+                                  decl->kind.payload.Variant.genericParamsLen);
+            VariantVariant* variants = decl->kind.payload.Variant.variants;
+            u32 len = decl->kind.payload.Variant.variantsLen;
+            u32 i = 0;
+            while (i < len)
+            {
+                VariantVariant va = variants[i];
+                u32 j = 0;
+                while (j < i)
+                {
+                    if (variants[j].name == va.name)
+                    {
+                        self.dupNamedDiag(va.name, va.loc, "duplicate variant case `",
+                                          variants[j].loc);
+                        break;
+                    }
+                    j++;
+                }
+                /* duplicate payload field names inside this case */
+                u32 f = 0;
+                while (f < va.fieldsLen)
+                {
+                    u32 g = 0;
+                    while (g < f)
+                    {
+                        if (va.fieldNames[g] == va.fieldNames[f])
+                        {
+                            self.dupNamedDiag(va.fieldNames[f], va.loc,
+                                              "duplicate field `", va.loc);
+                            break;
+                        }
+                        g++;
+                    }
+                    f++;
+                }
+                i++;
+            }
+        }
+        else if (decl->kind.tag == DeclKind::Trait)
+        {
+            self.checkGenericDups(decl->kind.payload.Trait.genericParams,
+                                  decl->kind.payload.Trait.genericParamsLen);
+        }
+    }
+
+    /* methods of one type decl: push a scope holding its generic params
+     * (`T` and friends) and check each method against the self type. when no
+     * explicit list was given (legacy `extend Option<T>`) the param names are
+     * pulled out of the self type's generic args instead. */
+    bool checkMethods(NodeId* methods, u32 methodsLen, Ty selfType, NodeId* genericParams, u32 genericParamsLen)
+    {
+        self.scopes.enter();
+        bool ok = true;
+        u32 genericIndex = 0;
+        while (genericIndex < genericParamsLen)
+        {
+            NodeId genericId = genericParams[genericIndex];
+            Node* genericNode = self.ctx.nodes + genericId.index;
+            if (genericNode->kind.tag == NodeKind::GenericParam)
+            {
+                GenericParam* generic = &genericNode->kind.payload.GenericParam.value;
+                Ty typeNode = self.typeParamType(generic->name, genericIndex);
+                if (!self.scopes.declare(generic->name, 4, typeNode, genericId, 0, 0))
+                {
+                    if (self.scopes.lastDeclFail == 1)
+                        self.dupDeclDiagKind(generic->name, genericId, "duplicate generic parameter `");
+                    ok = false;
+                }
+            }
+            genericIndex++;
+        }
+        /* legacy `extend Option<T>`: parameter names live in the self
+         * type's generic args when no explicit list was given */
+        if (genericParamsLen == 0 && selfType != 0)
+        {
+            TypeEntry* te = self.ctx.types + selfType;
+            if (te->kind.tag == TypeKind::Named)
+            {
+                u32 a = 0;
+                while (a < te->kind.payload.Named.genericArgsLen)
+                {
+                    Ty arg = te->kind.payload.Named.genericArgs[a];
+                    TypeEntry* ae = self.ctx.types + arg;
+                    if (ae->kind.tag == TypeKind::Named)
+                    {
+                        Ty typeNode = self.typeParamType(ae->kind.payload.Named.name, a);
+                        NodeId nid;
+                        nid.index = 0;
+                        self.scopes.declare(ae->kind.payload.Named.name, 4, typeNode, nid, 0, 0);
+                    }
+                    a++;
+                }
+            }
+        }
+        u32 i = 0;
+        while (i < methodsLen)
+        {
+            Node* methodNode = self.ctx.nodes + methods[i].index;
+            if (methodNode->kind.tag == NodeKind::Decl)
+            {
+                Decl* method = &methodNode->kind.payload.Decl.value;
+                if (method->kind.tag == DeclKind::Func)
+                {
+                    if (!self.checkFunction(method, selfType)) ok = false;
+                }
+            }
+            i++;
+        }
+        self.scopes.leave();
+        return ok;
+    }
+
+    /* does the module's `pub mod name = import ...` line re-export `member`?
+     * symbol flags bit 2 = `*`, which means the whole module is public; a
+     * decl that isn't a ModReexport at all (plain path-only module) exports
+     * everything too, and null (unresolved) stays permissive; the import
+     * binder reports that miss. */
+    bool moduleExportsContain(Decl* modDecl, Str member)
+    {
+        if (modDecl == null) return true;
+        if (modDecl->kind.tag != DeclKind::ModReexport) return true;
+        if (modDecl->kind.payload.ModReexport.symbolsLen == 0) return true;
+        ImportSymbol* symbols = modDecl->kind.payload.ModReexport.symbols;
+        u32 i = 0;
+        while (i < modDecl->kind.payload.ModReexport.symbolsLen)
+        {
+            if ((symbols[i].flags & 2) != 0) return true;
+            if (symbols[i].name == member) return true;
+            if (symbols[i].alias != 0 && symbols[i].alias == member) return true;
+            i++;
+        }
+        return false;
+    }
+
+    // "file"/"lib": the compiler's own root segments, compared as bytes.
+    // a path starting with one is the loader's business, not a module symbol
+    // in this file's scope
+    bool isRootSegment(u8* ptr, u32 len)
+    {
+        if (len == 4 && ptr[0] == 102 && ptr[1] == 105 && ptr[2] == 108 && ptr[3] == 101) return true;
+        if (len == 3 && ptr[0] == 108 && ptr[1] == 105 && ptr[2] == 98) return true;
+        return false;
+    }
+
+    /* module path for one import symbol: the import path plus the symbol's
+     * module prefix (`std::text { string::{String} }` → `std::text::string`). */
+    Str importSymbolModulePath(Decl* decl, Str symbolName)
+    {
+        Str base = decl->kind.payload.Import.path;
+        if (base == 0 || symbolName == 0) return base;
+        InternEntry* se = self.ctx.interns + symbolName;
+        usize last = 0;
+        usize q = 0;
+        while (q + 1 < se->len)
+        {
+            if (se->ptr[q] == 58 && se->ptr[q + 1] == 58) last = q;
+            q++;
+        }
+        if (last == 0) return base;
+        InternEntry* pe = self.ctx.interns + base;
+        if (last > pe->len + 1)
+        {
+            bool absolute = true;
+            usize chk = 0;
+            while (chk < pe->len)
+            {
+                if (se->ptr[chk] != pe->ptr[chk]) { absolute = false; break; }
+                chk++;
+            }
+            if (absolute && (se->ptr[pe->len] != 58 || se->ptr[pe->len + 1] != 58)) absolute = false;
+            if (absolute) return self.ctx.intern(str { .ptr = se->ptr, .len = last });
+        }
+        usize n = pe->len + 2 + last;
+        u8* buf = alloc<u8>(n);
+        if (buf == null) return base;
+        usize k = 0;
+        while (k < pe->len) { buf[k] = pe->ptr[k]; k++; }
+        
+        buf[k] = 58; buf[k + 1] = 58;
+        usize m = 0;
+        while (m < last) { buf[k + 2 + m] = se->ptr[m]; m++; }
+        Str joined = self.ctx.intern(str { .ptr = buf, .len = n });
+        dealloc<u8>(buf);
+        return joined;
+    }
+
+    /* `path`'s `::` segments must each appear (in order) as a path component
+     * of `fileId`'s source path; e.g. `std::mman` matches
+     * lib/std/x86_64/linux/mman.crl (platform segments may sit between). */
+    bool importPathInFile(Str path, u32 fileId)
+    {
+        if (path == 0 || self.diag == null) return false;
+        if (fileId >= self.diag.fileCount) return false;
+        str fpath = self.diag.filePaths.at((usize)fileId);
+        u8* fp = (u8*)fpath.ptr;
+        usize fl = fpath.len;
+        if (fp == null || fl == 0) return false;
+        InternEntry* pe = self.ctx.interns + path;
+        usize pi = 0;
+        usize start = 0;
+        while (pi < pe->len)
+        {
+            usize segLen = pe->len - pi;
+            usize q = pi;
+            while (q + 1 < pe->len)
+            {
+                if (pe->ptr[q] == 58 && pe->ptr[q + 1] == 58) { segLen = q - pi; break; }
+                q++;
+            }
+            if (segLen == 0)
+            {
+                pi += 2;
+                continue;
+            }
+            bool found = false;
+            usize j = start;
+            while (j + segLen <= fl)
+            {
+                usize k = 0;
+                while (k < segLen && fp[j + k] == pe->ptr[pi + k]) k++;
+                if (k == segLen)
+                {
+                    // 47 '/' either side; 46 '.' on the right so the final
+                    // segment can end at the ".crl" extension
+                    bool leftOk = (j == 0) || fp[j - 1] == 47;
+                    usize end = j + segLen;
+                    bool rightOk = (end >= fl) || fp[end] == 47 || fp[end] == 46;
+                    if (leftOk && rightOk) { found = true; start = end; break; }
+                }
+                j++;
+            }
+            if (!found) return false;
+            pi += segLen + 2;
+        }
+        return true;
+    }
+
+    /* exact module-table lookup: module path → the file path the builder
+     * resolved it to (Slice::from(null, 0) when absent) */
+    Slice moduleFileForPath(Str modulePath)
+    {
+        if (self.modKeys == null || modulePath == 0) return Slice::from(null, 0);
+        InternEntry* me = self.ctx.interns + modulePath;
+        u32 i = 0;
+        while (i < self.modLen)
+        {
+            Slice k = self.modKeys[i];
+            if (k.ptr != null && k.len == me->len)
+            {
+                bool same = true;
+                usize j = 0;
+                while (j < me->len)
+                {
+                    if (k.ptr[j] != me->ptr[j]) { same = false; break; }
+                    j++;
+                }
+                if (same) return self.modVals[i];
+            }
+            i++;
+        }
+        return Slice::from(null, 0);
+    }
+
+    /* does the diag path of `fileId` end at `suffix` on component
+     * boundaries (also true for full equality)? */
+    bool filePathEndsWith(u32 fileId, Slice suffix)
+    {
+        if (suffix.ptr == null || suffix.len == 0) return false;
+        if (self.diag == null) return false;
+        if ((usize)fileId >= self.diag.filePaths.len) return false;
+        str fp = self.diag.filePaths.at((usize)fileId);
+        if (fp.ptr == null || fp.len < suffix.len) return false;
+        usize off = fp.len - suffix.len;
+        usize i = 0;
+        while (i < suffix.len)
+        {
+            if (fp.ptr[off + i] != suffix.ptr[i]) return false;
+            i++;
+        }
+        if (off > 0 && fp.ptr[off - 1] != 47) return false;
+        usize end = off + suffix.len;
+        if (end < fp.len && fp.ptr[end] != 47 && fp.ptr[end] != 46) return false;
+        return true;
+    }
+
+    /* Bind every named symbol of an import into THIS file's scope, pointing
+     * at the real declaration. Two direct pulls of the same local name in one
+     * file conflict; alias one with `as` or use a qualified path; the same
+     * name in different files stays legal (mangling keeps them apart). */
+    bool bindImportSymbols(NodeId id, Decl* decl, str notFoundMsg)
+    {
+        u32 fileId = self.fileOf(id);
+        u32 i = 0;
+        while (i < decl->kind.payload.Import.symbolsLen)
+        {
+            ImportSymbol* symbol = decl->kind.payload.Import.symbols + i;
+            if ((symbol->flags & 2) == 0 && symbol->name != 0)
+            {
+                // tail segment for nested `mod::{ Sym }` groups
+                Str lookupName = symbol->name;
+                InternEntry* se = self.ctx.interns + lookupName;
+                u8* sp = se->ptr;
+                usize sl = se->len;
+                usize lastCol = 0;
+                usize q = 0;
+                while (q + 1 < sl)
+                {
+                    if (sp[q] == 58 && sp[q + 1] == 58) lastCol = q;
+                    q++;
+                }
+                if (lastCol > 0 && lastCol + 2 < sl)
+                    lookupName = self.ctx.intern(str { .ptr = sp + lastCol + 2, .len = sl - (lastCol + 2) });
+                /* merged files may declare the same name (libc's extern
+                 * realloc vs mman's realloc<T>); prefer the candidate whose
+                 * file path matches this import's module path; plain lookup
+                 * would take whichever was inserted first (libc). */
+                Symbol* real = null;
+                if (symbol->name != 0 && decl->kind.payload.Import.path != 0)
+                {
+                    Str modulePath = self.importSymbolModulePath(decl, symbol->name);
+                    Symbol** cands = alloc<Symbol*>(16);
+                    if (cands != null)
+                    {
+                        u32 n = self.scopes.lookupAll(lookupName, cands, 16);
+                        Slice want = self.moduleFileForPath(modulePath);
+                        u32 m = 0;
+                        while (m < n)
+                        {
+                            if (self.filePathEndsWith(cands[m]->fileId, want)) { real = cands[m]; break; }
+                            m++;
+                        }
+                        m = 0;
+                        while (real == null && m < n)
+                        {
+                            if (self.importPathInFile(modulePath, cands[m]->fileId)) { real = cands[m]; break; }
+                            m++;
+                        }
+                        dealloc<Symbol*>(cands);
+                    }
+                }
+                if (real == null) real = self.scopes.lookup(lookupName);
+                if (real == null)
+                {
+                    self.semaErrorNode(ErrorCode::SemaUndeclaredIdent, id, notFoundMsg);
+                    return false;
+                }
+                Str local = lookupName;
+                if (symbol->alias != 0) local = symbol->alias;
+                if (!self.claimDirectImport(fileId, local))
+                {
+                    self.semaError(ErrorCode::SemaDuplicateDecl, (self.ctx.nodes + id.index)->loc, self.nameMsg("conflicting import: already bound in this file — alias it with `as` or use a qualified path: ", local));
+                    return false;
+                }
+                if (!self.scopes.declare(local, real->kind, real->typeNode, real->declaration, 0, fileId))
+                {
+                    if (self.scopes.lastDeclFail == 1)
+                        self.semaErrorCounted(ErrorCode::SemaDuplicateDecl, id, self.nameMsg("conflicting import: already bound in this file — alias it with `as` or use a qualified path: ", local));
+                    return false;
+                }
+                /* an `as` rename: the backend mangles refs through the alias
+                 * as `path__alias__name` and needs a bridge to the
+                 * canonical `path__name` definition */
+                if (symbol->alias != 0 && symbol->alias != lookupName)
+                    self.addAliasPair(symbol->alias, real->declaration);
+            }
+            i++;
+        }
+        return true;
+    }
+
+    /* one import statement:
+     * - path-only (`import foo::bar;`) binds the last segment as a module
+     *   name so qualified calls (`bar::x`) resolve
+     * - import(lib) merges the target's decls flat (flags bit 0)
+     * - a module import checks the target's re-export list before binding
+     * returns false only when binding failed hard. */
+    bool checkImportDecl(NodeId id, Decl* decl)
+    {
+        Str path = decl->kind.payload.Import.path;
+        if (path == 0)
+        {
+            self.semaErrorNode(ErrorCode::SemaUndeclaredIdent, id, "missing import path");
+            return false;
+        }
+        /* path-only import: bind the last path segment as the module name
+         * so qualified calls (`libc::printf`) resolve */
+        if (decl->kind.payload.Import.symbolsLen == 0)
+        {
+            Str modName = path;
+            InternEntry* pe = self.ctx.interns + path;
+            usize lastCol = 0;
+            usize q = 0;
+            while (q + 1 < pe->len)
+            {
+                if (pe->ptr[q] == 58 && pe->ptr[q + 1] == 58) lastCol = q;
+                q++;
+            }
+            if (lastCol > 0 && lastCol + 2 < pe->len)
+                modName = self.ctx.intern(str { .ptr = pe->ptr + lastCol + 2, .len = pe->len - (lastCol + 2) });
+            u32 impFileId = self.fileOf(id);
+            if (!self.claimDirectImport(impFileId, modName))
+            {
+                self.semaError(ErrorCode::SemaDuplicateDecl, (self.ctx.nodes + id.index)->loc, self.nameMsg("conflicting import: already bound in this file — alias it with `as` or use a qualified path: ", modName));
+                return false;
+            }
+            if (!self.scopes.declare(modName, 5, 0, id, 0, impFileId) && self.scopes.lastDeclFail == 1)
+                self.semaErrorCounted(ErrorCode::SemaDuplicateDecl, id, self.nameMsg("conflicting import: already bound in this file — alias it with `as` or use a qualified path: ", modName));
+        }
+        if ((decl->kind.payload.Import.flags & 1) != 0)
+        {
+            /* import(lib): the loader merges the target's decls flat; bind
+             * each named symbol to its real declaration in this file's scope */
+            return self.bindImportSymbols(id, decl, "symbol not found in imported library");
+        }
+        Decl* modDecl = null;
+        if ((decl->kind.payload.Import.flags & 1) == 0)
+        {
+            InternEntry* entry = self.ctx.interns + path;
+            usize firstLen = 0;
+            while (firstLen < entry->len && entry->ptr[firstLen] != 58) firstLen++;
+            if (firstLen == 0)
+            {
+                self.semaErrorNode(ErrorCode::SemaUndeclaredIdent, id, "invalid import path");
+                return false;
+            }
+            if (!self.isRootSegment(entry->ptr, (u32)firstLen))
+            {
+                Str first = self.ctx.intern(str { .ptr = entry->ptr, .len = firstLen });
+                Symbol* symbol = self.scopes.lookup(first);
+                if (symbol == null)
+                {
+                    /* sibling file import: the loader merged <first>.crl
+                     * flat, so the named symbols are plain declarations in
+                     * scope; bind them into this file */
+                    return self.bindImportSymbols(id, decl, "symbol not found in imported file");
+                }
+                if (symbol->kind == 5 && symbol->declaration.index != 0)
+                {
+                    // first segment resolved to a module; the next one has
+                    // to be in its re-export list before we bind anything
+                    Node* modNode = self.ctx.nodes + symbol->declaration.index;
+                    if (modNode->kind.tag == NodeKind::Decl)
+                    {
+                        Decl* resolved = &modNode->kind.payload.Decl.value;
+                        if (firstLen < entry->len)
+                        {
+                            usize memberStart = firstLen + 2;
+                            usize memberLen = memberStart;
+                            while (memberLen < entry->len && entry->ptr[memberLen] != 58) memberLen++;
+                            if (memberLen <= memberStart)
+                            {
+                                self.semaErrorNode(ErrorCode::SemaUndeclaredIdent, id, "invalid module member in import path");
+                                return false;
+                            }
+                            Str member = self.ctx.intern(str { .ptr = entry->ptr + memberStart, .len = memberLen - memberStart });
+                            if (!self.moduleExportsContain(resolved, member))
+                            {
+                                self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "symbol not exported by module");
+                                return false;
+                            }
+                        }
+                        else modDecl = resolved;
+                    }
+                }
+            }
+        }
+        if (modDecl != null)
+        {
+            u32 i = 0;
+            while (i < decl->kind.payload.Import.symbolsLen)
+            {
+                ImportSymbol* symbol = decl->kind.payload.Import.symbols + i;
+                if ((symbol->flags & 2) == 0 && symbol->name != 0)
+                {
+                    if (!self.moduleExportsContain(modDecl, symbol->name))
+                    {
+                        self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "symbol not exported by module");
+                        return false;
+                    }
+                }
+                i++;
+            }
+        }
+        return self.bindImportSymbols(id, decl, "symbol not found in imported module");
+    }
+
+    /* both passes plus the error sync. analyze.crl drives declareAll and
+     * checkBodies by hand and skips this wrapper (it wants the ScopeStack
+     * to outlive the call for the backend). */
+    bool checkFile(File* file)
+    {
+        if (file == null)
+        {
+            self.semaErrorNode(ErrorCode::SemaInternal, self.ctx.noneNode(), "checkFile called with null file");
+            return false;
+        }
+        if (!self.scopes.enter())
+        {
+            self.semaErrorNode(ErrorCode::SemaInternal, self.ctx.noneNode(), "scopes.enter failed");
+            return false;
+        }
+        self.declareAll(file);
+        self.checkBodies(file);
+        self.errors = self.scopes.errors;
+        return self.errors == 0;
+    }
+
+    // pass 1: names and types only, no bodies. a Symbol conflict here is a
+    // real duplicate (or a prototype/definition pair, handled in checkDecl).
+    void declareAll(File* file)
+    {
+        if (file == null) return;
+        /* builtin `str` namespace symbol: non-module kind so `str::…`
+         * path calls route through findMethod on the str type instead of
+         * the module-file resolution branch */
+        Str strName = self.ctx.intern("str");
+        if (self.scopes.lookup(strName) == null)
+        {
+            NodeId noneId;
+            noneId.index = 0;
+            self.scopes.declare(strName, 3, 0, noneId, 0, 0);
+        }
+        u32 i = 0;
+        while (i < file->declsLen)
+        {
+            self.checkDecl(file->decls[i], false);
+            i++;
+        }
+    }
+
+    // pass 2: bodies, now that every name in the merged unit is bound
+    void checkBodies(File* file)
+    {
+        if (file == null) return;
+        u32 i = 0;
+        while (i < file->declsLen)
+        {
+            self.checkDecl(file->decls[i], true);
+            i++;
+        }
+    }
+}

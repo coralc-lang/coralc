@@ -1,0 +1,292 @@
+#[[no_drop_all]]
+import(lib) wallvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrModule, IrValueKind };
+import(lib) wallvm::irOps { IrOpcode };
+import(lib) std::mman { alloc, dealloc };
+
+// Interprocedural Constant Propagation (IPA-CP)
+//
+// Propagates constants across function call boundaries. When a function
+// is called with constant arguments, those constants can be propagated
+// into the callee's body, enabling further optimizations.
+//
+// Algorithm,
+// 1. Build a call graph of the program
+// 2. For each function, collect all call sites
+// 3. At each call site, record which arguments are constant
+// 4. For each callee, compute the intersection of constant arguments
+//    across all call sites
+// 5. Clone the callee with constants replaced by their values
+// 6. If a function has only one call site with all constant arguments,
+//    it can be fully specialized (inlined)
+//
+// This pass works bottom-up in the call graph (callees before callers).
+
+const u32 MAX_ARGS = 32;
+const u32 MAX_CALL_SITES = 256;
+
+pub struct CallSite
+{
+    IrInst* call;                     // The call instruction
+    IrFunc* callee;                   // The callee function
+    IrValue* constantArgs[MAX_ARGS];  // Constant args (null if not constant)
+    u32 nargs;
+}
+
+pub struct FuncInfo
+{
+    IrFunc* func;
+    CallSite callSites[MAX_CALL_SITES];
+    u32 nCallSites;
+    u32 topoIndex;                    // Topological order index
+    bool visited;                     // For topological sort
+    bool inStack;                     // For cycle detection
+}
+
+pub struct IPAConstPropPass
+{
+    IrContext* ctx;
+    u64 propagations;
+    u64 specializations;
+
+    IPAConstPropPass new(IrContext* ctx)
+    {
+        return IPAConstPropPass {
+            .ctx = ctx,
+            .propagations = 0,
+            .specializations = 0
+        };
+    }
+
+    // I called the module parameter modd, matching the module entry points
+    // elsewhere in the tree, since mod reads as the module keyword here
+    bool run(IrModule* modd)
+    {
+        self.propagations = 0;
+        self.specializations = 0;
+
+        if (modd == null || modd->funcs == null || modd->nfuncs == 0) return false;
+
+        // Build function info for each function
+        FuncInfo* funcInfos = alloc<FuncInfo>(modd->nfuncs);
+        for (u32 i = 0; i < modd->nfuncs; i++)
+        {
+            funcInfos[i].func = modd->funcs[i];
+            funcInfos[i].nCallSites = 0;
+            funcInfos[i].topoIndex = 0;
+            funcInfos[i].visited = false;
+            funcInfos[i].inStack = false;
+        }
+
+        // Collect call sites for each function
+        for (u32 i = 0; i < modd->nfuncs; i++)
+        {
+            self.collectCallSites(funcInfos[i].func, &funcInfos[i]);
+        }
+
+        // Topological sort of functions (callees before callers)
+        u32* order = alloc<u32>(modd->nfuncs);
+        u32 orderIdx = 0;
+
+        for (u32 i = 0; i < modd->nfuncs; i++)
+        {
+            if (!funcInfos[i].visited)
+                self.topologicalSort(i, funcInfos, modd->nfuncs, order, &orderIdx);
+        }
+
+        // Process functions in topological order (bottom-up)
+        bool changed = false;
+        for (u32 i = 0; i < orderIdx; i++)
+        {
+            u32 funcIdx = order[i];
+            FuncInfo* info = &funcInfos[funcIdx];
+
+            if (self.propagateConstants(info))
+                changed = true;
+        }
+
+        dealloc<u32>(order);
+        dealloc<FuncInfo>(funcInfos);
+        return changed;
+    }
+
+    // Collect call sites in a function
+    void collectCallSites(IrFunc* func, FuncInfo* info)
+    {
+        if (func == null || func->blocks == null) return;
+
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst->opcode == IrOpcode::Call && inst->nops >= 1)
+                {
+                    // The first operand is the callee
+                    if (inst->ops[0]->kind == IrValueKind::Func)
+                    {
+                        IrFunc* callee = (IrFunc*)inst->ops[0];
+                        if (info->nCallSites < MAX_CALL_SITES)
+                        {
+                            CallSite* cs = &info->callSites[info->nCallSites++];
+                            cs->call = inst;
+                            cs->callee = callee;
+                            cs->nargs = inst->nops - 1;
+
+                            // Record which arguments are constant
+                            for (u32 ai = 0; ai < cs->nargs && ai < MAX_ARGS; ai++)
+                            {
+                                IrValue* arg = inst->ops[ai + 1];
+                                if (arg != null && (arg->kind == IrValueKind::ConstInt ||
+                                                    arg->kind == IrValueKind::ConstFloat))
+                                    cs->constantArgs[ai] = arg;
+                                else
+                                    cs->constantArgs[ai] = null;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Topological sort of functions (callees before callers)
+    void topologicalSort(u32 funcIdx, FuncInfo* funcInfos, u32 nFuncs, u32* order, u32* orderIdx)
+    {
+        FuncInfo* info = &funcInfos[funcIdx];
+        if (info->visited) return;
+        if (info->inStack) return; // Cycle detected, skip
+
+        info->inStack = true;
+
+        // Visit callees first
+        for (u32 ci = 0; ci < info->nCallSites; ci++)
+        {
+            IrFunc* callee = info->callSites[ci].callee;
+            // Find the callee's index
+            for (u32 fi = 0; fi < nFuncs; fi++)
+            {
+                if (funcInfos[fi].func == callee)
+                {
+                    self.topologicalSort(fi, funcInfos, nFuncs, order, orderIdx);
+                    break;
+                }
+            }
+        }
+
+        info->inStack = false;
+        info->visited = true;
+        order[(*orderIdx)++] = funcIdx;
+    }
+
+    // Propagate constants into a function based on its call sites
+    bool propagateConstants(FuncInfo* info)
+    {
+        if (info->nCallSites == 0) return false;
+
+        IrFunc* func = info->func;
+        if (func == null || func->blocks == null || func->nblocks == 0) return false;
+
+        // Compute the intersection of constant arguments across all call sites
+        // For each argument position, if all call sites pass the same constant,
+        // we can propagate that constant into the callee
+        u32 nargs = info->callSites[0].nargs;
+        IrValue* constantArgs[MAX_ARGS];
+        bool argIsConstant[MAX_ARGS];
+
+        // Initialize arrays
+        for (u32 ai = 0; ai < MAX_ARGS; ai++)
+        {
+            constantArgs[ai] = null;
+            argIsConstant[ai] = false;
+        }
+
+        for (u32 ai = 0; ai < nargs && ai < MAX_ARGS; ai++)
+        {
+            IrValue* firstConst = info->callSites[0].constantArgs[ai];
+            bool allSame = true;
+
+            for (u32 ci = 1; ci < info->nCallSites; ci++)
+            {
+                IrValue* arg = info->callSites[ci].constantArgs[ai];
+                if (arg == null || arg->id != firstConst->id)
+                {
+                    allSame = false;
+                    break;
+                }
+            }
+
+            if (allSame && firstConst != null)
+            {
+                constantArgs[ai] = firstConst;
+                argIsConstant[ai] = true;
+            }
+        }
+
+        // Check if we have any constants to propagate
+        bool hasConstants = false;
+        for (u32 ai = 0; ai < nargs; ai++)
+        {
+            if (argIsConstant[ai])
+            {
+                hasConstants = true;
+                break;
+            }
+        }
+
+        if (!hasConstants) return false;
+
+        // Find the entry block and propagate constants into argument slots
+        IrBlock* entry = func->blocks[0];
+        bool changed = false;
+
+        // Look for stores to argument alloca slots
+        for (u32 ai = 0; ai < nargs && ai < MAX_ARGS; ai++)
+        {
+            if (!argIsConstant[ai]) continue;
+
+            // Find the alloca for this argument
+            for (u32 ii = 0; ii < entry->ninsts; ii++)
+            {
+                IrInst* inst = entry->insts[ii];
+                if (inst->opcode == IrOpcode::Alloca && inst->nops >= 1)
+                {
+                    // This might be the alloca for argument ai
+                    // Replace any loads from this alloca with the constant
+                    for (u32 bi = 0; bi < func->nblocks; bi++)
+                    {
+                        IrBlock* bb = func->blocks[bi];
+                        for (u32 jj = 0; jj < bb->ninsts; jj++)
+                        {
+                            IrInst* loadInst = bb->insts[jj];
+                            if (loadInst->opcode == IrOpcode::Load && loadInst->nops >= 1)
+                            {
+                                if (loadInst->ops[0] == &inst->base)
+                                {
+                                    // Replace this load with the constant
+                                    loadInst->base.replaceAllUses(constantArgs[ai]);
+                                    changed = true;
+                                    self.propagations++;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return changed;
+    }
+}
+
+pub bool irPassIPAConstProp(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (ctx == null || func == null) return false;
+
+    // IPA-CP needs module-level access, but we only have a function.
+    // For now, just return false (this pass needs to be called at module level).
+    // TODO, implement module-level entry point
+    (void)func;
+    return false;
+}

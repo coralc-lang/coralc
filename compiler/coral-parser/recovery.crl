@@ -1,0 +1,245 @@
+#[[no_drop_all]]
+
+/* parser/recovery.crl: panic-mode error reporting and resynchronisation
+ *
+ * panicMode packs two things into one word (see base.crl): the low 30
+ * bits are the error count, 0x40000000 says "recovery is in progress".
+ * counting lives here, the skip-to-safety loops live below. nothing
+ * reads the in-progress bit today; only begin/endRecovery touch it. */
+
+import(lib) std::text::string { String };
+import common::token { Token, TokenKind };
+import diag::code { ErrorCode };
+import diag::engine { DiagnosticEngine };
+import base { Parser };
+
+pub extend Parser
+{
+    /* ── counters and flags ── */
+
+    u32 errorCount() { return self.panicMode & 0x3fffffff; }
+    bool hasParseErrors() { return self.errorCount() != 0; }
+    bool isRecovering() { return (self.panicMode & 0x40000000) != 0; }
+    bool isSpeculating() { return self.specDepth != 0; }
+    void beginSpeculation() { self.specDepth++; }
+    void endSpeculation() { if (self.specDepth != 0) self.specDepth--; }
+    void beginRecovery() { self.panicMode |= 0x40000000; }
+    void endRecovery() { self.panicMode &= 0xbfffffff; }
+    void reportCurrentError(ErrorCode code, str msg) { self.reportError(code, self.current, msg); }
+    void reportAllocFailed() { self.reportError(ErrorCode::DriverOutOfMemory, self.current, "out of memory while parsing"); }
+
+    // saturating; the count shares its word with the recovery flag
+    void addError()
+    {
+        u32 count = self.errorCount();
+        if (count < 0x3fffffff)
+            self.panicMode = (self.panicMode & 0xc0000000) | (count + 1);
+    }
+
+    /* diagnostics from speculative passes (cast/decl/type lookaheads) are
+     * dropped on the floor; if the guess is wrong, its errors are noise.
+     * also tolerates a parser with no lexer/diag wired up (tests) */
+    void reportError(ErrorCode code, Token token, str msg)
+    {
+        if (self.isSpeculating()) return;
+        self.attrNameError = false;
+        self.addError();
+        if (self.lexer == null) return;
+        DiagnosticEngine* diag = self.lexer.diag;
+        if (diag == null) return;
+        diag.emitError(code, self.tokenLoc(token), msg, null);
+    }
+
+    /* like reportError but doesn't count against the error budget */
+    void reportWarning(ErrorCode code, Token token, str msg)
+    {
+        if (self.isSpeculating()) return;
+        if (self.lexer == null) return;
+        DiagnosticEngine* diag = self.lexer.diag;
+        if (diag == null) return;
+        diag.emitWarning(code, self.tokenLoc(token), msg, null);
+    }
+
+    /* error at an already-recorded location (an attribute's own loc is
+     * captured before its args are skipped, so it is not self.current) */
+    void reportErrorAtHelp(ErrorCode code, SourceLoc loc, str msg, str help)
+    {
+        if (self.isSpeculating()) return;
+        if (code == ErrorCode::ParseUnknownAttr) self.attrNameError = true;
+        self.addError();
+        if (self.lexer == null) return;
+        DiagnosticEngine* diag = self.lexer.diag;
+        if (diag == null) return;
+        diag.emitError(code, loc, msg, help);
+    }
+
+    /* warning at an already-recorded location (e.g. an attribute parsed
+     * into the attribute list, far from self.current) */
+    void reportWarningAt(ErrorCode code, SourceLoc loc, str msg)
+    {
+        if (self.isSpeculating()) return;
+        if (self.lexer == null) return;
+        DiagnosticEngine* diag = self.lexer.diag;
+        if (diag == null) return;
+        diag.emitWarning(code, loc, msg, null);
+    }
+
+    str expectedTokenText(TokenKind kind)
+    {
+        switch (kind)
+        {
+            TokenKind::LParen => { return "expected '('"; },
+            TokenKind::RParen => { return "expected ')'"; },
+            TokenKind::LBrace => { return "expected '{'"; },
+            TokenKind::RBrace => { return "expected '}'"; },
+            TokenKind::LBracket => { return "expected '['"; },
+            TokenKind::RBracket => { return "expected ']'"; },
+            TokenKind::Ident => { return "expected identifier"; },
+            TokenKind::Equal => { return "expected '='"; },
+            TokenKind::Semicolon => { return "expected ';'"; },
+            TokenKind::Comma => { return "expected ','"; },
+            TokenKind::Colon => { return "expected ':'"; },
+            TokenKind::FatArrow => { return "expected '=>'"; },
+            TokenKind::Less => { return "expected '<'"; },
+            TokenKind::Greater => { return "expected '>'"; },
+            else => { return "expected token"; },
+        }
+    }
+
+    void reportExpected(TokenKind kind)
+    {
+        if (self.current.kind == TokenKind::Eof)
+        {
+            self.reportError(ErrorCode::ParseUnexpectedEof, self.current, "unexpected end of file");
+            return;
+        }
+        /* "expected ';', found 'x'", built with String; reportError renders
+         * the view synchronously, the buffer dies with the scope */
+        str base = self.expectedTokenText(kind);
+        Token t = self.current;
+        // cap the echoed token at 64 bytes; a huge string literal token
+        // otherwise dumps into the diagnostic
+        usize tl = t.data.len;
+        if (tl > 64) tl = 64;
+        String sb = String::from(base);
+        if (sb.ptr == null)
+        {
+            self.reportError(ErrorCode::ParseExpectedToken, t, base);
+            return;
+        }
+        sb.pushView(", found '");
+        sb.pushView(str { .ptr = t.data.ptr, .len = tl });
+        sb.pushByte(39);                     // \'
+        self.reportError(ErrorCode::ParseExpectedToken, t, sb.asView());
+    }
+
+    // tokens that end a construct on their own and must not be skipped:
+    // swallowing a closer desyncs every enclosing level
+    bool isRecoveryBoundary(TokenKind kind)
+    {
+        return kind == TokenKind::Eof || kind == TokenKind::Semicolon ||
+               kind == TokenKind::RBrace || kind == TokenKind::RParen ||
+               kind == TokenKind::RBracket || kind == TokenKind::LBrace;
+    }
+
+    /* ── resynchronisation ── */
+
+    /* skip to the end of the current declaration. depth counters keep a
+     * `;` inside parens/brackets/braces from ending recovery early; a
+     * closer stops the skip (leave it for the construct that owns it);
+     * a fresh line starting a decl keyword stops it too */
+    void synchronize()
+    {
+        self.beginRecovery();
+        u32 braceDepth = 0;
+        u32 parenDepth = 0;
+        u32 bracketDepth = 0;
+        usize startLine = self.current.line;
+        while (!self.atEnd())
+        {
+            TokenKind kind = self.current.kind;
+            if (braceDepth == 0 && parenDepth == 0 && bracketDepth == 0)
+            {
+                if (kind == TokenKind::Semicolon)
+                {
+                    self.advance();
+                    break;
+                }
+                if (kind == TokenKind::RBrace || kind == TokenKind::RParen ||
+                    kind == TokenKind::RBracket)
+                    break;
+                if (self.current.line > startLine && self.isDeclarationStart()) break;
+            }
+            if (kind == TokenKind::LBrace) braceDepth++;
+            else if (kind == TokenKind::RBrace)
+            {
+                if (braceDepth > 0) braceDepth--;
+            }
+            else if (kind == TokenKind::LParen) parenDepth++;
+            else if (kind == TokenKind::RParen)
+            {
+                if (parenDepth > 0) parenDepth--;
+            }
+            else if (kind == TokenKind::LBracket) bracketDepth++;
+            else if (kind == TokenKind::RBracket)
+            {
+                if (bracketDepth > 0) bracketDepth--;
+            }
+            self.advance();
+        }
+        self.endRecovery();
+    }
+
+    // same idea, statement granularity: consume through the next `;`, or
+    // stop at a closer. no depth tracking; a `;` in a for-header would
+    // end the skip early, which costs one extra diagnostic at worst
+    void synchronizeStatement()
+    {
+        self.beginRecovery();
+        while (!self.atEnd())
+        {
+            TokenKind kind = self.current.kind;
+            if (kind == TokenKind::RBrace || kind == TokenKind::RParen ||
+                kind == TokenKind::RBracket)
+                break;
+            if (kind == TokenKind::Semicolon)
+            {
+                self.advance();
+                break;
+            }
+            self.advance();
+        }
+        self.endRecovery();
+    }
+
+    // stop at anything that can follow an expression; consume nothing
+    void synchronizeExpression()
+    {
+        self.beginRecovery();
+        while (!self.atEnd())
+        {
+            TokenKind kind = self.current.kind;
+            if (kind == TokenKind::Comma || kind == TokenKind::Semicolon ||
+                kind == TokenKind::RParen || kind == TokenKind::RBrace ||
+                kind == TokenKind::RBracket)
+                break;
+            self.advance();
+        }
+        self.endRecovery();
+    }
+
+    // case granularity: `,` / `=>` / `}` all start the next arm
+    void synchronizeCase()
+    {
+        self.beginRecovery();
+        while (!self.atEnd())
+        {
+            TokenKind kind = self.current.kind;
+            if (kind == TokenKind::Comma || kind == TokenKind::FatArrow ||
+                kind == TokenKind::RBrace)
+                break;
+            self.advance();
+        }
+        self.endRecovery();
+    }
+}

@@ -1,0 +1,1104 @@
+#[[no_drop_all]]
+import(lib) wallvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrType, IrValueKind, IrTypeKind };
+import(lib) wallvm::irOps { IrOpcode, IrICmpPred, IrFCmpPred, irOpcodeIsTerminator };
+import(lib) std::mman { alloc, dealloc, memcpy };
+import(lib) core::limits { INT64_MIN };
+
+enum LatticeKind
+{
+    Top,
+    ConstInt,
+    ConstFloat,
+    Bottom
+}
+
+struct LatticeCell
+{
+    LatticeKind kind;
+    u64 valData;
+}
+
+LatticeCell latticeTop()
+{
+    return LatticeCell { .kind = LatticeKind::Top, .valData = 0 };
+}
+
+LatticeCell latticeBottom()
+{
+    return LatticeCell {  .kind = LatticeKind::Bottom, .valData = 0 };
+}
+
+LatticeCell latticeConstInt(u64 v)
+{
+    return LatticeCell {  .kind = LatticeKind::ConstInt, .valData = v };
+}
+
+LatticeCell latticeConstFloat(u64 v)
+{
+    return LatticeCell {  .kind = LatticeKind::ConstFloat, .valData = v };
+}
+
+bool latticeIsConstant(LatticeCell c)
+{
+    return c.kind == LatticeKind::ConstInt || c.kind == LatticeKind::ConstFloat;
+}
+
+bool latticeEqual(LatticeCell a, LatticeCell b)
+{
+    return a.kind == b.kind && a.valData == b.valData;
+}
+
+LatticeCell latticeMeet(LatticeCell a, LatticeCell b)
+{
+    // Bottom (undefined) is the neutral element, nothing known yet.
+    if (a.kind == LatticeKind::Bottom) return b;
+    if (b.kind == LatticeKind::Bottom) return a;
+    // Top (overdefined) is absorbing, a conflicting value makes the
+    // result overdefined, never a constant.
+    if (a.kind == LatticeKind::Top) return a;
+    if (b.kind == LatticeKind::Top) return b;
+    if (a.kind == b.kind && a.valData == b.valData) return a;
+    return latticeTop();
+}
+
+LatticeCell getCell(IrValue* val, LatticeCell* cells)
+{
+    if (val == null) return latticeBottom();
+    if (val->kind == IrValueKind::ConstInt) return latticeConstInt(val->valData);
+    if (val->kind == IrValueKind::ConstFloat) return latticeConstFloat(val->valData);
+    if (val->kind == IrValueKind::Block || val->kind == IrValueKind::Func) return latticeTop();
+    return cells[val->id];
+}
+
+// Sign-extend to 64-bit signed
+i64 signExtU64(u64 val, u32 bits)
+{
+    if (bits >= 64) return (i64)val;
+    u64 mask = (1ULL << bits) - 1;
+    u64 v = val & mask;
+    if ((v & (1ULL << (bits - 1))) != 0)
+        return (i64)(v | ~mask);
+    return (i64)v;
+}
+
+u64 maskWidth(u32 bits)
+{
+    if (bits >= 64) return ~0ULL;
+    return (1ULL << bits) - 1;
+}
+
+u32 findBlockIdx(IrFunc* func, IrBlock* block)
+{
+    for (u32 i = 0; i < func->nblocks; i++)
+        if (func->blocks[i] == block) return i;
+    return 0;
+}
+
+// Evaluate a single instruction given current lattice state
+LatticeCell evalInst(IrInst* inst, LatticeCell* cells, bool* reachable, IrFunc* func)
+{
+    switch (inst->opcode)
+    {
+        IrOpcode::Phi
+        => {
+            LatticeCell result = latticeBottom();
+            IrBlock* bb = inst->parent;
+            if (bb == null) return latticeTop();
+            for (u32 j = 0; j + 1 < inst->nops; j += 2)
+            {
+                IrBlock* pred = (IrBlock*)inst->ops[j + 1];
+                u32 predIdx = findBlockIdx(func, pred);
+                if (predIdx < func->nblocks && reachable[predIdx])
+                {
+                    LatticeCell opCell = getCell(inst->ops[j], cells);
+                    result = latticeMeet(result, opCell);
+                }
+            }
+            return result;
+        },
+
+        IrOpcode::Select
+        => {
+            if (inst->nops < 3) return latticeTop();
+            LatticeCell cond = getCell(inst->ops[0], cells);
+            if (cond.kind == LatticeKind::Bottom) return latticeBottom();
+            if (cond.kind == LatticeKind::Top) return latticeTop();
+            if (cond.kind == LatticeKind::ConstInt)
+                return getCell(cond.valData != 0 ? inst->ops[1] : inst->ops[2], cells);
+            return latticeTop();
+        },
+
+        IrOpcode::ICmp
+        => {
+            if (inst->nops < 2) return latticeTop();
+            LatticeCell ac = getCell(inst->ops[0], cells);
+            LatticeCell bc = getCell(inst->ops[1], cells);
+            if (ac.kind == LatticeKind::Bottom || bc.kind == LatticeKind::Bottom)
+                return latticeBottom();
+            if (ac.kind == LatticeKind::Top || bc.kind == LatticeKind::Top)
+                return latticeTop();
+            if (ac.kind == LatticeKind::ConstInt && bc.kind == LatticeKind::ConstInt)
+            {
+                u32 bits = inst->ops[0]->type != null ? inst->ops[0]->type->width : 64;
+                u64 mask = maskWidth(bits);
+                u64 au = ac.valData & mask;
+                u64 bu = bc.valData & mask;
+                i64 sa = signExtU64(au, bits);
+                i64 sb = signExtU64(bu, bits);
+                bool res;
+                switch (inst->icmpPred)
+                {
+                    IrICmpPred::Eq => { res = (au == bu); },
+                    IrICmpPred::Ne => { res = (au != bu); },
+                    IrICmpPred::Slt => { res = (sa < sb); },
+                    IrICmpPred::Sle => { res = (sa <= sb); },
+                    IrICmpPred::Sgt => { res = (sa > sb); },
+                    IrICmpPred::Sge => { res = (sa >= sb); },
+                    IrICmpPred::Ult => { res = (au < bu); },
+                    IrICmpPred::Ule => { res = (au <= bu); },
+                    IrICmpPred::Ugt => { res = (au > bu); },
+                    IrICmpPred::Uge => { res = (au >= bu); },
+                }
+                return latticeConstInt((u64)(res ? 1 : 0));
+            }
+            if (ac.kind == LatticeKind::ConstFloat && bc.kind == LatticeKind::ConstFloat)
+            {
+                f64 fa, fb;
+                // I take the old bare memcpy from std::mman, I cast to its rawptr parameters.
+                memcpy((rawptr)&fa, (const rawptr)&ac.valData, 8);
+                memcpy((rawptr)&fb, (const rawptr)&bc.valData, 8);
+                bool res;
+                switch (inst->icmpPred)
+                {
+                    // For integer compare predicates on floats, use ordered equality
+                    IrICmpPred::Eq => { res = (fa == fb); },
+                    IrICmpPred::Ne => { res = (fa != fb); },
+                    IrICmpPred::Slt | IrICmpPred::Ult => { res = (fa < fb); },
+                    IrICmpPred::Sle | IrICmpPred::Ule => { res = (fa <= fb); },
+                    IrICmpPred::Sgt | IrICmpPred::Ugt => { res = (fa > fb); },
+                    IrICmpPred::Sge | IrICmpPred::Uge => { res = (fa >= fb); },
+                }
+                return latticeConstInt((u64)(res ? 1 : 0));
+            }
+            return latticeTop();
+        },
+
+        IrOpcode::FCmp 
+        => {
+            if (inst->nops < 2) return latticeTop();
+            LatticeCell ac = getCell(inst->ops[0], cells);
+            LatticeCell bc = getCell(inst->ops[1], cells);
+            if (ac.kind == LatticeKind::Bottom || bc.kind == LatticeKind::Bottom)
+                return latticeBottom();
+            if (ac.kind == LatticeKind::Top || bc.kind == LatticeKind::Top)
+                return latticeTop();
+            if (ac.kind == LatticeKind::ConstFloat && bc.kind == LatticeKind::ConstFloat)
+            {
+                f64 fa, fb;
+                memcpy((rawptr)&fa, (const rawptr)&ac.valData, 8);
+                memcpy((rawptr)&fb, (const rawptr)&bc.valData, 8);
+                bool res;
+                switch (inst->fcmpPred)
+                {
+                    IrFCmpPred::Oeq | IrFCmpPred::Ueq => { res = (fa == fb); },
+                    IrFCmpPred::One | IrFCmpPred::Une => { res = (fa != fb); },
+                    IrFCmpPred::Olt | IrFCmpPred::Ult => { res = (fa < fb); },
+                    IrFCmpPred::Ole | IrFCmpPred::Ule => { res = (fa <= fb); },
+                    IrFCmpPred::Ogt | IrFCmpPred::Ugt => { res = (fa > fb); },
+                    IrFCmpPred::Oge | IrFCmpPred::Uge => { res = (fa >= fb); },
+                }
+                return latticeConstInt((u64)(res ? 1 : 0));
+            }
+            if (ac.kind == LatticeKind::ConstInt && bc.kind == LatticeKind::ConstInt)
+            {
+                u64 au = ac.valData;
+                u64 bu = bc.valData;
+                bool res;
+                switch (inst->fcmpPred)
+                {
+                    IrFCmpPred::Oeq | IrFCmpPred::Ueq => { res = (au == bu); },
+                    IrFCmpPred::One | IrFCmpPred::Une => { res = (au != bu); },
+                    IrFCmpPred::Olt | IrFCmpPred::Ult => { res = (au < bu); },
+                    IrFCmpPred::Ole | IrFCmpPred::Ule => { res = (au <= bu); },
+                    IrFCmpPred::Ogt | IrFCmpPred::Ugt => { res = (au > bu); },
+                    IrFCmpPred::Oge | IrFCmpPred::Uge => { res = (au >= bu); },
+                }
+                return latticeConstInt((u64)(res ? 1 : 0));
+            }
+            return latticeTop();
+        },
+
+        IrOpcode::Neg 
+        => {
+            if (inst->nops < 1) return latticeTop();
+            LatticeCell ac = getCell(inst->ops[0], cells);
+            if (ac.kind == LatticeKind::Bottom) return latticeBottom();
+            if (ac.kind == LatticeKind::Top) return latticeTop();
+            IrType* ty = inst->base.type;
+            u32 bits = ty != null ? ty->width : 64;
+            if (ty != null && ty->kind == IrTypeKind::Float)
+            {
+                if (ac.kind == LatticeKind::ConstFloat)
+                {
+                    f64 f;
+                    memcpy((rawptr)&f, (const rawptr)&ac.valData, 8);
+                    f = -f;
+                    u64 raw;
+                    memcpy((rawptr)&raw, (const rawptr)&f, 8);
+                    return latticeConstFloat(raw);
+                }
+                return latticeTop();
+            }
+            if (ac.kind == LatticeKind::ConstInt)
+            {
+                u64 mask = maskWidth(bits);
+                return latticeConstInt(mask & (~ac.valData + 1));
+            }
+            return latticeTop();
+        },
+
+        IrOpcode::Not 
+        => {
+            LatticeCell ac = getCell(inst->ops[0], cells);
+            if (ac.kind == LatticeKind::Bottom) return latticeBottom();
+            if (ac.kind == LatticeKind::Top) return latticeTop();
+            if (ac.kind == LatticeKind::ConstInt)
+            {
+                u32 bits = inst->base.type != null ? inst->base.type->width : 64;
+                u64 mask = maskWidth(bits);
+                return latticeConstInt(mask & ~ac.valData);
+            }
+            return latticeTop();
+        },
+
+        IrOpcode::Abs 
+        => {
+            LatticeCell ac = getCell(inst->ops[0], cells);
+            if (ac.kind == LatticeKind::Bottom) return latticeBottom();
+            if (ac.kind == LatticeKind::Top) return latticeTop();
+            IrType* ty = inst->base.type;
+            if (ty != null && ty->kind == IrTypeKind::Float)
+            {
+                if (ac.kind == LatticeKind::ConstFloat)
+                {
+                    f64 f;
+                    memcpy((rawptr)&f, (const rawptr)&ac.valData, 8);
+                    if (f < 0) f = -f;
+                    u64 raw;
+                    memcpy((rawptr)&raw, (const rawptr)&f, 8);
+                    return latticeConstFloat(raw);
+                }
+                return latticeTop();
+            }
+            if (ac.kind == LatticeKind::ConstInt)
+            {
+                u32 bits = ty != null ? ty->width : 64;
+                u64 mask = maskWidth(bits);
+                i64 v = signExtU64(ac.valData, bits);
+                if (v < 0) v = -v;
+                return latticeConstInt(mask & (u64)v);
+            }
+            return latticeTop();
+        },
+
+        IrOpcode::FAbs 
+        => {
+            LatticeCell ac = getCell(inst->ops[0], cells);
+            if (ac.kind == LatticeKind::Bottom) return latticeBottom();
+            if (ac.kind == LatticeKind::Top) return latticeTop();
+            if (ac.kind == LatticeKind::ConstFloat)
+            {
+                f64 f;
+                memcpy((rawptr)&f, (const rawptr)&ac.valData, 8);
+                if (f < 0) f = -f;
+                u64 raw;
+                memcpy((rawptr)&raw, (const rawptr)&f, 8);
+                return latticeConstFloat(raw);
+            }
+            return latticeTop();
+        },
+
+        IrOpcode::FSqrt =>
+        {
+            LatticeCell ac = getCell(inst->ops[0], cells);
+            if (ac.kind == LatticeKind::Bottom) return latticeBottom();
+            if (ac.kind == LatticeKind::Top) return latticeTop();
+            if (ac.kind == LatticeKind::ConstFloat)
+            {
+                f64 f;
+                memcpy((rawptr)&f, (const rawptr)&ac.valData, 8);
+                // I keep the old builtin name, it is plain C the backend passes through.
+                f = __builtin_sqrt(f);
+                u64 raw;
+                memcpy((rawptr)&raw, (const rawptr)&f, 8);
+                return latticeConstFloat(raw);
+            }
+            return latticeTop();
+        },
+
+        IrOpcode::Trunc =>
+        {
+            LatticeCell ac = getCell(inst->ops[0], cells);
+            if (ac.kind == LatticeKind::Bottom) return latticeBottom();
+            if (ac.kind == LatticeKind::Top) return latticeTop();
+            if (ac.kind == LatticeKind::ConstInt)
+            {
+                u32 dstBits = inst->base.type != null ? inst->base.type->width : 32;
+                u64 mask = maskWidth(dstBits);
+                return latticeConstInt(ac.valData & mask);
+            }
+            return latticeTop();
+        },
+
+        IrOpcode::Zext =>
+        {
+            LatticeCell ac = getCell(inst->ops[0], cells);
+            if (ac.kind == LatticeKind::Bottom) return latticeBottom();
+            if (ac.kind == LatticeKind::Top) return latticeTop();
+            if (ac.kind == LatticeKind::ConstInt)
+            {
+                u32 srcBits = inst->ops[0]->type != null ? inst->ops[0]->type->width : 32;
+                u64 mask = maskWidth(srcBits);
+                return latticeConstInt(ac.valData & mask);
+            }
+            return latticeTop();
+        },
+
+        IrOpcode::Sext =>
+        {
+            LatticeCell ac = getCell(inst->ops[0], cells);
+            if (ac.kind == LatticeKind::Bottom) return latticeBottom();
+            if (ac.kind == LatticeKind::Top) return latticeTop();
+            if (ac.kind == LatticeKind::ConstInt)
+            {
+                u32 srcBits = inst->ops[0]->type != null ? inst->ops[0]->type->width : 32;
+                u64 result = (u64)signExtU64(ac.valData, srcBits);
+                return latticeConstInt(result);
+            }
+            return latticeTop();
+        },
+
+        IrOpcode::Bitcast =>
+        {
+            LatticeCell ac = getCell(inst->ops[0], cells);
+            if (ac.kind == LatticeKind::Bottom) return latticeBottom();
+            if (ac.kind == LatticeKind::Top) return latticeTop();
+            if (latticeIsConstant(ac)) return ac;
+            return latticeTop();
+        },
+
+        IrOpcode::Bswap =>
+        {
+            LatticeCell ac = getCell(inst->ops[0], cells);
+            if (ac.kind == LatticeKind::Bottom) return latticeBottom();
+            if (ac.kind == LatticeKind::Top) return latticeTop();
+            if (ac.kind == LatticeKind::ConstInt)
+            {
+                u64 v = ac.valData;
+                u32 bits = inst->base.type != null ? inst->base.type->width : 64;
+                u64 result;
+                if (bits == 16)
+                    result = ((v >> 8) & 0xFF) | ((v & 0xFF) << 8);
+                else if (bits == 32)
+                    result = ((v >> 24) & 0xFF) | ((v >> 8) & 0xFF00) |
+                             ((v & 0xFF00) << 8) | ((v & 0xFF) << 24);
+                else
+                    result = ((v >> 56) & 0xFF) | ((v >> 40) & 0xFF00) |
+                             ((v >> 24) & 0xFF0000) | ((v >> 8) & 0xFF000000) |
+                             ((v & 0xFF000000) << 8) | ((v & 0xFF0000) << 24) |
+                             ((v & 0xFF00) << 40) | ((v & 0xFF) << 56);
+                return latticeConstInt(result);
+            }
+            return latticeTop();
+        },
+
+        IrOpcode::CtPop =>
+        {
+            LatticeCell ac = getCell(inst->ops[0], cells);
+            if (ac.kind == LatticeKind::Bottom) return latticeBottom();
+            if (ac.kind == LatticeKind::Top) return latticeTop();
+            if (ac.kind == LatticeKind::ConstInt)
+            {
+                u64 v = ac.valData;
+                u32 cnt = 0;
+                while (v != 0) { cnt += v & 1; v >>= 1; }
+                return latticeConstInt((u64)cnt);
+            }
+            return latticeTop();
+        },
+
+        IrOpcode::CtLz =>
+        {
+            LatticeCell ac = getCell(inst->ops[0], cells);
+            if (ac.kind == LatticeKind::Bottom) return latticeBottom();
+            if (ac.kind == LatticeKind::Top) return latticeTop();
+            if (ac.kind == LatticeKind::ConstInt)
+            {
+                u64 v = ac.valData;
+                u32 bits = inst->base.type != null ? inst->base.type->width : 64;
+                if (v == 0) return latticeConstInt((u64)bits);
+                u32 result = (u32)__builtin_clzll(v) - (64 - bits);
+                return latticeConstInt((u64)result);
+            }
+            return latticeTop();
+        },
+
+        IrOpcode::CtTz =>
+        {
+            LatticeCell ac = getCell(inst->ops[0], cells);
+            if (ac.kind == LatticeKind::Bottom) return latticeBottom();
+            if (ac.kind == LatticeKind::Top) return latticeTop();
+            if (ac.kind == LatticeKind::ConstInt)
+            {
+                u64 v = ac.valData;
+                u32 bits = inst->base.type != null ? inst->base.type->width : 64;
+                if (v == 0) return latticeConstInt((u64)bits);
+                u32 result = (u32)__builtin_ctzll(v);
+                if (result > bits) result = bits;
+                return latticeConstInt((u64)result);
+            }
+            return latticeTop();
+        },
+
+        else =>
+        {
+            // Binary arithmetic
+            if (inst->nops == 2)
+            {
+                LatticeCell ac = getCell(inst->ops[0], cells);
+                LatticeCell bc = getCell(inst->ops[1], cells);
+                if (ac.kind == LatticeKind::Bottom || bc.kind == LatticeKind::Bottom)
+                    return latticeBottom();
+                if (ac.kind == LatticeKind::Top || bc.kind == LatticeKind::Top)
+                    return latticeTop();
+
+                IrType* ty = inst->base.type;
+                bool isFloat = ty != null && ty->kind == IrTypeKind::Float;
+
+                if (isFloat)
+                {
+                    if (ac.kind != LatticeKind::ConstFloat || bc.kind != LatticeKind::ConstFloat)
+                        return latticeTop();
+                    f64 fa, fb;
+                    memcpy((rawptr)&fa, (const rawptr)&ac.valData, 8);
+                    memcpy((rawptr)&fb, (const rawptr)&bc.valData, 8);
+                    f64 fr = 0;
+                    bool ok = true;
+                    switch (inst->opcode)
+                    {
+                        IrOpcode::FAdd => { fr = fa + fb; },
+                        IrOpcode::FSub => { fr = fa - fb; },
+                        IrOpcode::FMul => { fr = fa * fb; },
+                        // I use else here, the old case jumped past the second write with break.
+                        IrOpcode::FDiv =>
+                        {
+                            if (fb == 0.0) ok = false;
+                            else fr = fa / fb;
+                        },
+                        IrOpcode::Add => { fr = fa + fb; },
+                        IrOpcode::Sub => { fr = fa - fb; },
+                        IrOpcode::Mul => { fr = fa * fb; },
+                        // I use else here, the old case jumped past the second write with break.
+                        IrOpcode::SDiv =>
+                        {
+                            if (fb == 0.0) ok = false;
+                            else fr = fa / fb;
+                        },
+                        else => { ok = false; },
+                    }
+                    if (!ok) return latticeTop();
+                    u64 raw;
+                    memcpy((rawptr)&raw, (const rawptr)&fr, 8);
+                    return latticeConstFloat(raw);
+                }
+                else
+                {
+                    if (ac.kind != LatticeKind::ConstInt || bc.kind != LatticeKind::ConstInt)
+                        return latticeTop();
+                    u64 av = ac.valData;
+                    u64 bv = bc.valData;
+                    u32 bits = ty != null ? ty->width : 64;
+                    u64 mask = maskWidth(bits);
+                    u64 result = 0;
+
+                    switch (inst->opcode)
+                    {
+                        IrOpcode::Add =>
+                        {
+                            result = mask & (av + bv);
+                        },
+                        IrOpcode::Sub =>
+                        {
+                            result = mask & (av - bv);
+                        },
+                        IrOpcode::Mul =>
+                        {
+                            result = mask & (av * bv);
+                        },
+                        IrOpcode::And =>
+                        {
+                            result = mask & (av & bv);
+                        },
+                        IrOpcode::Or =>
+                        {
+                            result = mask & (av | bv);
+                        },
+                        IrOpcode::Xor =>
+                        {
+                            result = mask & (av ^ bv);
+                        },
+                        IrOpcode::Shl =>
+                        {
+                            result = mask & (av << (bv & (bits > 0 ? (bits - 1) : 0x3F)));
+                        },
+                        IrOpcode::Lshr =>
+                        {
+                            result = mask & (av >> (bv & (bits > 0 ? (bits - 1) : 0x3F)));
+                        },
+                        IrOpcode::Ashr =>
+                        {
+                            result = (u64)((i64)av >> (bv & (bits > 0 ? (bits - 1) : 0x3F)));
+                        },
+                        IrOpcode::SDiv =>
+                        {
+                            if (bv == 0) return latticeTop();
+                            i64 sa = signExtU64(av, bits);
+                            i64 sb = signExtU64(bv, bits);
+                            if (sa == (i64)INT64_MIN && sb == -1) return latticeTop();
+                            result = (u64)(sa / sb);
+                            result = mask & result;
+                        },
+                        IrOpcode::UDiv =>
+                        {
+                            if (bv == 0) return latticeTop();
+                            result = av / bv;
+                        },
+                        IrOpcode::SRem =>
+                        {
+                            if (bv == 0) return latticeTop();
+                            i64 sa = signExtU64(av, bits);
+                            i64 sb = signExtU64(bv, bits);
+                            // I use else here, the old case jumped past the second write with break.
+                            if (sa == (i64)INT64_MIN && sb == -1) result = 0;
+                            else
+                            {
+                                result = (u64)(sa % sb);
+                                result = mask & result;
+                            }
+                        },
+                        IrOpcode::URem =>
+                        {
+                            if (bv == 0) return latticeTop();
+                            result = av % bv;
+                        },
+                        IrOpcode::Rotl =>
+                        {
+                            u32 shift = (u32)(bv & (bits > 0 ? (bits - 1) : 0x3F));
+                            if (bits > 0 && bits < 64)
+                            {
+                                u64 low = (av << shift) & mask;
+                                u64 high = (av >> (bits - shift)) & mask;
+                                result = low | high;
+                            }
+                            else
+                            {
+                                if (shift == 0) result = av;
+                                else result = (av << shift) | (av >> (64 - shift));
+                            }
+                        },
+                        IrOpcode::Rotr =>
+                        {
+                            u32 shift = (u32)(bv & (bits > 0 ? (bits - 1) : 0x3F));
+                            if (bits > 0 && bits < 64)
+                            {
+                                u64 low = (av >> shift) & mask;
+                                u64 high = (av << (bits - shift)) & mask;
+                                result = low | high;
+                            }
+                            else
+                            {
+                                if (shift == 0) result = av;
+                                else result = (av >> shift) | (av << (64 - shift));
+                            }
+                        },
+                        IrOpcode::SMin =>
+                        {
+                            result = signExtU64(av, bits) < signExtU64(bv, bits) ? av : bv;
+                        },
+                        IrOpcode::SMax =>
+                        {
+                            result = signExtU64(av, bits) > signExtU64(bv, bits) ? av : bv;
+                        },
+                        IrOpcode::UMin =>
+                        {
+                            result = av < bv ? av : bv;
+                        },
+                        IrOpcode::UMax =>
+                        {
+                            result = av > bv ? av : bv;
+                        },
+                        else => { return latticeTop(); },
+                    }
+                    return latticeConstInt(mask & result);
+                }
+            }
+
+            if (inst->nops == 1)
+            {
+                LatticeCell ac = getCell(inst->ops[0], cells);
+                if (ac.kind == LatticeKind::Bottom) return latticeBottom();
+                if (ac.kind == LatticeKind::Top) return latticeTop();
+
+                IrType* ty = inst->base.type;
+                bool isFloat = ty != null && ty->kind == IrTypeKind::Float;
+
+                if (isFloat)
+                {
+                    if (ac.kind != LatticeKind::ConstFloat) return latticeTop();
+                    f64 f;
+                    memcpy((rawptr)&f, (const rawptr)&ac.valData, 8);
+                    f64 fr = 0;
+                    bool ok = true;
+                    switch (inst->opcode)
+                    {
+                        IrOpcode::Fma =>
+                        {
+                            // Fma is a 3-operand op; with only 1 known operand cannot fold
+                            return latticeTop();
+                        },
+                        else => { ok = false; },
+                    }
+                    if (!ok) return latticeTop();
+                    u64 raw;
+                    memcpy((rawptr)&raw, (const rawptr)&fr, 8);
+                    return latticeConstFloat(raw);
+                }
+                else
+                {
+                    if (ac.kind != LatticeKind::ConstInt) return latticeTop();
+                    u64 av = ac.valData;
+                    u32 bits = ty != null ? ty->width : 64;
+                    u64 mask = maskWidth(bits);
+                    u64 result = 0;
+
+                    switch (inst->opcode)
+                    {
+                        IrOpcode::Neg =>
+                        {
+                            result = mask & (~av + 1);
+                        },
+                        IrOpcode::Not =>
+                        {
+                            result = mask & ~av;
+                        },
+                        IrOpcode::Abs =>
+                        {
+                            i64 sv = signExtU64(av, bits);
+                            if (sv < 0) result = mask & (u64)(-sv);
+                            else result = av & mask;
+                        },
+                        IrOpcode::Bswap =>
+                        {
+                            u64 v = av;
+                            if (bits == 16)
+                                result = ((v >> 8) & 0xFF) | ((v & 0xFF) << 8);
+                            else if (bits == 32)
+                                result = ((v >> 24) & 0xFF) | ((v >> 8) & 0xFF00) |
+                                         ((v & 0xFF00) << 8) | ((v & 0xFF) << 24);
+                            else
+                                result = ((v >> 56) & 0xFF) | ((v >> 40) & 0xFF00) |
+                                         ((v >> 24) & 0xFF0000) | ((v >> 8) & 0xFF000000) |
+                                         ((v & 0xFF000000) << 8) | ((v & 0xFF0000) << 24) |
+                                         ((v & 0xFF00) << 40) | ((v & 0xFF) << 56);
+                        },
+                        IrOpcode::CtPop =>
+                        {
+                            u64 v = av;
+                            result = 0;
+                            while (v != 0) { result += v & 1; v >>= 1; }
+                        },
+                        // I use else here, the old case jumped past the count with break.
+                        IrOpcode::CtLz =>
+                        {
+                            if (av == 0) { result = bits; }
+                            else result = __builtin_clzll(av) - (64 - bits);
+                        },
+                        // I use else here, the old case jumped past the count with break.
+                        IrOpcode::CtTz =>
+                        {
+                            if (av == 0) { result = bits; }
+                            else
+                            {
+                                result = __builtin_ctzll(av);
+                                if (result > bits) result = bits;
+                            }
+                        },
+                        else => { return latticeTop(); },
+                    }
+                    return latticeConstInt(mask & result);
+                }
+            }
+
+            if (inst->opcode == IrOpcode::Fma && inst->nops == 3)
+            {
+                LatticeCell ac = getCell(inst->ops[0], cells);
+                LatticeCell bc = getCell(inst->ops[1], cells);
+                LatticeCell cc = getCell(inst->ops[2], cells);
+                if (ac.kind == LatticeKind::Bottom || bc.kind == LatticeKind::Bottom || cc.kind == LatticeKind::Bottom)
+                    return latticeBottom();
+                if (ac.kind == LatticeKind::Top || bc.kind == LatticeKind::Top || cc.kind == LatticeKind::Top)
+                    return latticeTop();
+                if (ac.kind == LatticeKind::ConstFloat && bc.kind == LatticeKind::ConstFloat && cc.kind == LatticeKind::ConstFloat)
+                {
+                    f64 fa, fb, fc;
+                    memcpy((rawptr)&fa, (const rawptr)&ac.valData, 8);
+                    memcpy((rawptr)&fb, (const rawptr)&bc.valData, 8);
+                    memcpy((rawptr)&fc, (const rawptr)&cc.valData, 8);
+                    f64 fr = fa * fb + fc;
+                    u64 raw;
+                    memcpy((rawptr)&raw, (const rawptr)&fr, 8);
+                    return latticeConstFloat(raw);
+                }
+                return latticeTop();
+            }
+
+            // Terminators, Store, Call, Alloca, Load, Gep, etc.
+            return latticeTop();
+        },
+    }
+}
+
+// Propagate control flow from a terminator
+void handleTerminator(IrInst* inst, LatticeCell* cells, bool* reachable,
+    IrInst** worklist, u32* wlSize, u32 wlCap, IrFunc* func)
+{
+    switch (inst->opcode)
+    {
+        IrOpcode::Br =>
+        {
+            // I return where the old code broke out of the case, the switch is the whole body.
+            if (inst->nops < 1) return;
+            IrBlock* target = (IrBlock*)inst->ops[0];
+            u32 tgtIdx = findBlockIdx(func, target);
+            if (!reachable[tgtIdx])
+            {
+                reachable[tgtIdx] = true;
+                for (u32 i = 0; i < target->ninsts && *wlSize < wlCap; i++)
+                    worklist[(*wlSize)++] = target->insts[i];
+            }
+            else
+            {
+                for (u32 i = 0; i < target->ninsts && *wlSize < wlCap; i++)
+                {
+                    if (target->insts[i]->opcode == IrOpcode::Phi)
+                        worklist[(*wlSize)++] = target->insts[i];
+                    else
+                        break;
+                }
+            }
+        },
+        IrOpcode::CondBr =>
+        {
+            if (inst->nops < 3) return;
+            LatticeCell cond = getCell(inst->ops[0], cells);
+            IrBlock* trueBlock = (IrBlock*)inst->ops[1];
+            IrBlock* falseBlock = (IrBlock*)inst->ops[2];
+
+            bool trueEdge = true;
+            bool falseEdge = true;
+
+            if (cond.kind == LatticeKind::ConstInt)
+            {
+                if (cond.valData != 0) falseEdge = false;
+                else trueEdge = false;
+            }
+            // Bottom and Top, both edges may be taken so keep them both live.
+            if (trueEdge)
+            {
+                u32 tgtIdx = findBlockIdx(func, trueBlock);
+                if (!reachable[tgtIdx])
+                {
+                    reachable[tgtIdx] = true;
+                    for (u32 i = 0; i < trueBlock->ninsts && *wlSize < wlCap; i++)
+                        worklist[(*wlSize)++] = trueBlock->insts[i];
+                }
+                else
+                {
+                    for (u32 i = 0; i < trueBlock->ninsts && *wlSize < wlCap; i++)
+                    {
+                        if (trueBlock->insts[i]->opcode == IrOpcode::Phi)
+                            worklist[(*wlSize)++] = trueBlock->insts[i];
+                        else
+                            break;
+                    }
+                }
+            }
+
+            if (falseEdge)
+            {
+                u32 tgtIdx = findBlockIdx(func, falseBlock);
+                if (!reachable[tgtIdx])
+                {
+                    reachable[tgtIdx] = true;
+                    for (u32 i = 0; i < falseBlock->ninsts && *wlSize < wlCap; i++)
+                        worklist[(*wlSize)++] = falseBlock->insts[i];
+                }
+                else
+                {
+                    for (u32 i = 0; i < falseBlock->ninsts && *wlSize < wlCap; i++)
+                    {
+                        if (falseBlock->insts[i]->opcode == IrOpcode::Phi)
+                            worklist[(*wlSize)++] = falseBlock->insts[i];
+                        else
+                            break;
+                    }
+                }
+            }
+        },
+        else => { },
+    }
+}
+
+// Add users of a value to the worklist
+void addUsers(IrValue* val, IrInst** worklist, u32* wlSize, u32 wlCap)
+{
+    if (val == null) return;
+    for (u32 i = 0; i < val->nusers && *wlSize < wlCap; i++)
+        worklist[(*wlSize)++] = val->users[i];
+}
+
+pub bool irPassSccp(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (ctx == null || func == null) return false;
+
+    u32 maxId = 0;
+    u32 totalInsts = 0;
+    for (u32 bi = 0; bi < func->nblocks; bi++)
+    {
+        IrBlock* bb = func->blocks[bi];
+        if (bb->base.id > maxId) maxId = bb->base.id;
+        totalInsts += bb->ninsts;
+        for (u32 ii = 0; ii < bb->ninsts; ii++)
+        {
+            IrInst* inst = bb->insts[ii];
+            if (inst->base.id > maxId) maxId = inst->base.id;
+            for (u32 oi = 0; oi < inst->nops; oi++)
+            {
+                IrValue* op = inst->ops[oi];
+                if (op != null && op->id > maxId) maxId = op->id;
+            }
+        }
+    }
+
+    if (maxId == 0 && totalInsts == 0) return false;
+
+    LatticeCell* cells = alloc<LatticeCell>(maxId + 1);
+    for (u32 i = 0; i <= maxId; i++)
+        cells[i] = latticeBottom();
+
+    u32 nblocks = func->nblocks;
+    bool* reachable = alloc<bool>(nblocks);
+    for (u32 i = 0; i < nblocks; i++)
+        reachable[i] = false;
+    if (nblocks > 0)
+        reachable[0] = true;
+
+    // Worklist capacity, each value refines at most twice and each refinement
+    // re-enqueues its users, so the generous headroom never truncates.
+    u32 wlCap = totalInsts * 8 + 64;
+    IrInst** worklist = alloc<IrInst*>(wlCap);
+    u32 wlSize = 0;
+
+    if (nblocks > 0)
+    {
+        IrBlock* entry = func->blocks[0];
+        for (u32 i = 0; i < entry->ninsts && wlSize < wlCap; i++)
+            worklist[wlSize++] = entry->insts[i];
+    }
+
+    // Main worklist loop
+    u32 wlHead = 0;
+    while (wlHead < wlSize)
+    {
+        IrInst* inst = worklist[wlHead++];
+        LatticeCell oldCell = cells[inst->base.id];
+
+        if (oldCell.kind == LatticeKind::Top) continue;
+
+        LatticeCell newCell = evalInst(inst, cells, reachable, func);
+
+        if (latticeEqual(newCell, oldCell)) continue;
+
+        cells[inst->base.id] = newCell;
+
+        addUsers(&inst->base, worklist, &wlSize, wlCap);
+
+        if (irOpcodeIsTerminator(inst->opcode))
+            handleTerminator(inst, cells, reachable, worklist, &wlSize, wlCap, func);
+    }
+
+    // Phase 2, Replace constant instructions and remove unreachable block instructions
+    bool changed = false;
+
+    // First, fix up CFG edges from reachable blocks that target unreachable ones
+    for (u32 bi = 0; bi < nblocks; bi++)
+    {
+        IrBlock* bb = func->blocks[bi];
+        if (!reachable[bi]) continue;
+
+        IrInst* term = bb->ninsts > 0 ? bb->insts[bb->ninsts - 1] : null;
+        if (term == null) continue;
+
+        if (term->opcode == IrOpcode::Br && term->nops >= 1)
+        {
+            IrBlock* target = (IrBlock*)term->ops[0];
+            u32 tgtIdx = findBlockIdx(func, target);
+            if (tgtIdx < nblocks && !reachable[tgtIdx])
+            {
+                // Redirect to the nearest reachable dominator or keep
+                // as-is; the backend will handle unreachable paths.
+            }
+        }
+        else if (term->opcode == IrOpcode::CondBr && term->nops >= 3)
+        {
+            IrBlock* trueTgt = (IrBlock*)term->ops[1];
+            IrBlock* falseTgt = (IrBlock*)term->ops[2];
+            u32 trueIdx = findBlockIdx(func, trueTgt);
+            u32 falseIdx = findBlockIdx(func, falseTgt);
+
+            // If the condition is a known constant, fold to unconditional
+            LatticeCell condCell = cells[term->ops[0]->id];
+            if (condCell.kind == LatticeKind::ConstInt)
+            {
+                if (condCell.valData != 0)
+                {
+                    // Always true, replace cond_br with br trueTgt
+                    term->ops[0]->removeUser(term);
+                    term->ops[2]->removeUser(term);
+                    IrInst* brInst =
+                        ctx->createInst(IrOpcode::Br, ctx->tyVoid(), &term->ops[1], 1, 0, 0);
+                    term->ops[1]->addUser(brInst);
+                    brInst->parent = bb;
+                    for (u32 ii = 0; ii < bb->ninsts; ii++)
+                    {
+                        if (bb->insts[ii] == term)
+                        {
+                            for (u32 oi = 0; oi < term->nops; oi++)
+                                if (term->ops[oi] != null) term->ops[oi]->removeUser(term);
+                            if (term->capOps > 0) dealloc<IrValue*>(term->ops);
+                            if (term->base.capUsers > 0) dealloc<IrInst*>(term->base.users);
+                            dealloc<IrInst>(term);
+                            bb->insts[ii] = brInst;
+                            break;
+                        }
+                    }
+                    bb->nsuccs = 1;
+                    if (bb->succs[0] != trueTgt)
+                    {
+                        bb->succs[0]->removePred(bb);
+                        bb->succs[0] = trueTgt;
+                        trueTgt->addPred(bb);
+                    }
+                    if (falseTgt != null) falseTgt->removePred(bb);
+                    changed = true;
+                }
+                else
+                {
+                    // Always false, replace cond_br with br falseTgt
+                    term->ops[0]->removeUser(term);
+                    term->ops[1]->removeUser(term);
+                    IrInst* brInst =
+                        ctx->createInst(IrOpcode::Br, ctx->tyVoid(), &term->ops[2], 1, 0, 0);
+                    term->ops[2]->addUser(brInst);
+                    brInst->parent = bb;
+                    for (u32 ii = 0; ii < bb->ninsts; ii++)
+                    {
+                        if (bb->insts[ii] == term)
+                        {
+                            for (u32 oi = 0; oi < term->nops; oi++)
+                                if (term->ops[oi] != null) term->ops[oi]->removeUser(term);
+                            if (term->capOps > 0) dealloc<IrValue*>(term->ops);
+                            if (term->base.capUsers > 0)
+                                dealloc<IrInst*>(term->base.users);
+                            dealloc<IrInst>(term);
+                            bb->insts[ii] = brInst;
+                            break;
+                        }
+                    }
+                    bb->nsuccs = 1;
+                    if (bb->succs[0] != falseTgt)
+                    {
+                        bb->succs[0]->removePred(bb);
+                        bb->succs[0] = falseTgt;
+                        falseTgt->addPred(bb);
+                    }
+                    if (trueTgt != null) trueTgt->removePred(bb);
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    for (u32 bi = 0; bi < nblocks; bi++)
+    {
+        IrBlock* bb = func->blocks[bi];
+
+        if (!reachable[bi])
+        {
+            for (u32 i = 0; i < bb->ninsts; i++)
+            {
+                IrInst* inst = bb->insts[i];
+                for (u32 j = 0; j < inst->nops; j++)
+                    if (inst->ops[j] != null)
+                        inst->ops[j]->removeUser(inst);
+                if (inst->capOps > 0) dealloc<IrValue*>(inst->ops);
+                if (inst->base.capUsers > 0) dealloc<IrInst*>(inst->base.users);
+                dealloc<IrInst>(inst);
+            }
+            bb->ninsts = 0;
+            changed = true;
+            continue;
+        }
+
+        u32 ii = 0;
+        while (ii < bb->ninsts)
+        {
+            IrInst* inst = bb->insts[ii];
+            LatticeCell cell = cells[inst->base.id];
+
+            if (latticeIsConstant(cell))
+            {
+                IrValue* cval = null;
+                if (cell.kind == LatticeKind::ConstInt)
+                {
+                    cval = ctx->constInt(inst->base.type, cell.valData);
+                }
+                else
+                {
+                    f64 fval;
+                    memcpy((rawptr)&fval, (const rawptr)&cell.valData, 8);
+                    cval = ctx->constFloat(inst->base.type, fval);
+                }
+
+                // Don't replace the terminator, control flow is not a constant.
+                if (!irOpcodeIsTerminator(inst->opcode))
+                {
+                    inst->base.replaceAllUses(cval);
+                    inst->erase();
+                    changed = true;
+                    continue;
+                }
+            }
+
+            ii++;
+        }
+    }
+
+    // Clean up
+    dealloc<LatticeCell>(cells);
+    dealloc<bool>(reachable);
+    dealloc<IrInst*>(worklist);
+
+    return changed;
+}

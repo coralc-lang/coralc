@@ -1,0 +1,413 @@
+#[[no_drop_all]]
+import(lib) wallvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind };
+import(lib) wallvm::irOps { IrOpcode };
+import(lib) wallvm::passes::loop_detect { IrLoop, irLoopDetectNatural };
+import(lib) std::mman { alloc, dealloc };
+
+// Loop Interchange Pass
+//
+// Swaps the order of nested loops to improve data locality and enable
+// vectorization. For example:
+//
+//   for i = 0..n       for j = 0..m
+//     for j = 0..m  →    for i = 0..n
+//       a[i][j] = ...      a[i][j] = ...
+//
+// This improves cache performance when accessing column-major arrays
+// and can enable vectorization of the inner loop.
+//
+// Safety criteria for interchange:
+// 1. Both loops must be counted loops (phi, increment, compare with constant)
+// 2. No data dependencies that would break correctness
+// 3. The inner loop must not contain calls, stores to aliased addresses, or
+//    loop-carried dependencies that span iterations of the outer loop
+// 4. The interchange must not introduce new dependencies
+
+const u32 MAX_LOOPS = 32;
+
+pub struct NestedLoop
+{
+    IrLoop* inner;
+    IrLoop* outer;
+}
+
+pub struct LoopInterchangePass
+{
+    IrContext* ctx;
+    u64 interchanges;
+
+    LoopInterchangePass new(IrContext* ctx)
+    {
+        return LoopInterchangePass {
+            .ctx = ctx,
+            .interchanges = 0
+        };
+    }
+
+    bool run(IrFunc* func)
+    {
+        self.interchanges = 0;
+
+        // Detect all natural loops
+        IrLoop** loops = irLoopDetectNatural(func);
+        if (loops == null) return false;
+
+        // Find nested loop pairs (outer contains inner, immediately nested)
+        NestedLoop nested[MAX_LOOPS];
+        u32 nNested = 0;
+
+        for (u32 i = 0; loops[i] != null && nNested < MAX_LOOPS; i++)
+        {
+            for (u32 j = 0; loops[j] != null && nNested < MAX_LOOPS; j++)
+            {
+                if (i == j) continue;
+                IrLoop* outer = loops[i];
+                IrLoop* inner = loops[j];
+
+                // Check if inner is contained in outer
+                if (self.isLoopContained(inner, outer))
+                {
+                    // Check that inner is immediately nested (no other loop between them)
+                    bool immediatelyNested = true;
+                    for (u32 k = 0; loops[k] != null; k++)
+                    {
+                        if (k == i || k == j) continue;
+                        IrLoop* mid = loops[k];
+                        if (self.isLoopContained(inner, mid) && self.isLoopContained(mid, outer))
+                        {
+                            immediatelyNested = false;
+                            break;
+                        }
+                    }
+
+                    if (immediatelyNested)
+                    {
+                        nested[nNested].inner = inner;
+                        nested[nNested].outer = outer;
+                        nNested++;
+                    }
+                }
+            }
+        }
+
+        bool changed = false;
+
+        // Try to interchange each nested loop pair
+        for (u32 i = 0; i < nNested; i++)
+        {
+            if (self.canInterchange(nested[i].inner, nested[i].outer, func))
+            {
+                if (self.interchangeLoops(nested[i].inner, nested[i].outer, func))
+                {
+                    changed = true;
+                    self.interchanges++;
+                }
+            }
+        }
+
+        dealloc<IrLoop*>(loops);
+        return changed;
+    }
+
+    // Check if loop 'inner' is fully contained within loop 'outer'
+    bool isLoopContained(IrLoop* inner, IrLoop* outer)
+    {
+        // The inner loop's header must be inside the outer loop
+        for (u32 i = 0; i < outer->nblocks; i++)
+        {
+            if (outer->blocks[i] == inner->header)
+                return true;
+        }
+        return false;
+    }
+
+    // Check if two loops can be safely interchanged
+    bool canInterchange(IrLoop* inner, IrLoop* outer, IrFunc* func)
+    {
+        // Both loops must be counted (have phi, increment, compare)
+        if (inner->header == null || outer->header == null) return false;
+
+        // Check inner loop has an induction variable
+        IrInst* innerPhi = self.findInductionVar(inner);
+        if (innerPhi == null) return false;
+
+        // Check outer loop has an induction variable
+        IrInst* outerPhi = self.findInductionVar(outer);
+        if (outerPhi == null) return false;
+
+        // Check that the inner loop doesn't contain any calls (may alias with anything)
+        for (u32 bi = 0; bi < inner->nblocks; bi++)
+        {
+            IrBlock* bb = inner->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst->opcode == IrOpcode::Call ||
+                    inst->opcode == IrOpcode::InlineAsm ||
+                    inst->opcode == IrOpcode::AtomicStore ||
+                    inst->opcode == IrOpcode::AtomicLoad ||
+                    inst->opcode == IrOpcode::AtomicRmw ||
+                    inst->opcode == IrOpcode::Fence)
+                    return false;
+            }
+        }
+
+        // Check that the outer loop's body (excluding the inner loop) doesn't
+        // contain stores that may alias with loads in the inner loop
+        for (u32 bi = 0; bi < outer->nblocks; bi++)
+        {
+            IrBlock* bb = outer->blocks[bi];
+            // Skip blocks that are part of the inner loop
+            bool isInnerBlock = false;
+            for (u32 ii = 0; ii < inner->nblocks; ii++)
+            {
+                if (inner->blocks[ii] == bb) { isInnerBlock = true; break; }
+            }
+            if (isInnerBlock) continue;
+
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                // Stores in the outer loop body (outside inner loop) may alias
+                // with loads in the inner loop, preventing interchange
+                if (inst->opcode == IrOpcode::Store ||
+                    inst->opcode == IrOpcode::AtomicStore)
+                    return false;
+            }
+        }
+
+        // Check that the inner loop's induction variable doesn't depend on the outer loop's IV
+        // (i.e., the inner trip count must not depend on the outer loop)
+        IrInst* innerCompare = self.findLoopCompare(inner);
+        if (innerCompare != null && innerCompare->nops >= 2)
+        {
+            for (u32 i = 0; i < innerCompare->nops; i++)
+            {
+                if (innerCompare->ops[i]->kind == IrValueKind::Inst)
+                {
+                    IrInst* opInst = (IrInst*)innerCompare->ops[i];
+                    // Check if this operand is defined inside the outer loop
+                    if (self.isInstInLoop(opInst, outer) && opInst != outerPhi)
+                        return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    // Find the induction variable (phi) of a loop
+    IrInst* findInductionVar(IrLoop* lp)
+    {
+        IrBlock* header = lp->header;
+        if (header == null) return null;
+
+        for (u32 i = 0; i < header->ninsts; i++)
+        {
+            IrInst* inst = header->insts[i];
+            if (inst->opcode == IrOpcode::Phi)
+                return inst;
+        }
+        return null;
+    }
+
+    // Find the loop exit compare instruction
+    IrInst* findLoopCompare(IrLoop* lp)
+    {
+        for (u32 bi = 0; bi < lp->nblocks; bi++)
+        {
+            IrBlock* bb = lp->blocks[bi];
+            IrInst* term = bb->insts[bb->ninsts - 1];
+            if (term != null && term->opcode == IrOpcode::CondBr && term->nops >= 3)
+            {
+                // The condition is usually the last instruction before the terminator
+                // or it's embedded in the terminator
+                for (u32 i = 0; i < bb->ninsts; i++)
+                {
+                    if (bb->insts[i]->opcode == IrOpcode::ICmp ||
+                        bb->insts[i]->opcode == IrOpcode::FCmp)
+                        return bb->insts[i];
+                }
+            }
+        }
+        return null;
+    }
+
+    // Check if an instruction is defined within a loop
+    bool isInstInLoop(IrInst* inst, IrLoop* lp)
+    {
+        if (inst->parent == null) return false;
+        for (u32 i = 0; i < lp->nblocks; i++)
+        {
+            if (lp->blocks[i] == inst->parent)
+                return true;
+        }
+        return false;
+    }
+
+    // Interchange two nested loops by swapping their headers and adjusting PHI nodes
+    bool interchangeLoops(IrLoop* inner, IrLoop* outer, IrFunc* func)
+    {
+        // Find the inner loop's preheader (the block that jumps to the inner header)
+        // and the outer loop's header
+        IrBlock* innerHeader = inner->header;
+        IrBlock* outerHeader = outer->header;
+
+        if (innerHeader == null || outerHeader == null) return false;
+
+        // Find the inner loop's phi and increment
+        IrInst* innerPhi = self.findInductionVar(inner);
+        IrInst* outerPhi = self.findInductionVar(outer);
+
+        if (innerPhi == null || outerPhi == null) return false;
+
+        // Find the inner loop's increment instruction
+        IrInst* innerInc = self.findIncrement(inner, innerPhi);
+        if (innerInc == null) return false;
+
+        // Find the outer loop's increment instruction
+        IrInst* outerInc = self.findIncrement(outer, outerPhi);
+        if (outerInc == null) return false;
+
+        // Swap the phi initial values
+        // The inner phi's initial value should be the outer phi's initial value
+        // and vice versa
+        // In this IR a phi's operands are (value, predecessor-block) pairs,
+        // so exchange the even (value) slots, not the odd (block) ones
+        if (innerPhi->nops >= 2 && outerPhi->nops >= 2)
+        {
+            u32 innerSlot = 0xFFFFFFFF;
+            u32 outerSlot = 0xFFFFFFFF;
+            for (u32 j = 1; j < innerPhi->nops; j += 2)
+                if ((IrBlock*)innerPhi->ops[j] == inner->preheader)
+                    innerSlot = j - 1;
+            for (u32 j = 1; j < outerPhi->nops; j += 2)
+                if ((IrBlock*)outerPhi->ops[j] == outer->preheader)
+                    outerSlot = j - 1;
+
+            if (innerSlot != 0xFFFFFFFF && outerSlot != 0xFFFFFFFF)
+            {
+                IrValue* innerInit = innerPhi->ops[innerSlot];
+                IrValue* outerInit = outerPhi->ops[outerSlot];
+                innerInit->removeUser(innerPhi);
+                outerInit->removeUser(outerPhi);
+                innerPhi->ops[innerSlot] = outerInit;
+                outerPhi->ops[outerSlot] = innerInit;
+                outerInit->addUser(innerPhi);
+                innerInit->addUser(outerPhi);
+            }
+        }
+
+        // Swap the increment operations' operands
+        // innerInc should use outerPhi, outerInc should use innerPhi
+        if (innerInc->nops >= 2 && outerInc->nops >= 2)
+        {
+            // Find which operand is the phi
+            for (u32 i = 0; i < innerInc->nops; i++)
+            {
+                if (innerInc->ops[i] == &innerPhi->base)
+                {
+                    innerInc->ops[i]->removeUser(innerInc);
+                    innerInc->ops[i] = &outerPhi->base;
+                    innerInc->ops[i]->addUser(innerInc);
+                }
+            }
+            for (u32 i = 0; i < outerInc->nops; i++)
+            {
+                if (outerInc->ops[i] == &outerPhi->base)
+                {
+                    outerInc->ops[i]->removeUser(outerInc);
+                    outerInc->ops[i] = &innerPhi->base;
+                    outerInc->ops[i]->addUser(outerInc);
+                }
+            }
+        }
+
+        // Swap the loop headers in the loop structures
+        IrBlock* tempHeader = inner->header;
+        inner->header = outer->header;
+        outer->header = tempHeader;
+
+        // The header swap leaves each phi's incoming-block operands to be
+        // re-derived; rebuild them from the containing blocks' preds so the
+        // CFG stays consistent
+        self.repairPhiIncoming(innerPhi);
+        self.repairPhiIncoming(outerPhi);
+
+        return true;
+    }
+
+    // Rebuild a phi's operand list so the (value, block) pairs match the
+    // containing block's actual predecessor list, keeping the value that
+    // was previously paired with each predecessor
+    void repairPhiIncoming(IrInst* phi)
+    {
+        IrBlock* block = phi->parent;
+        if (block == null) return;
+
+        IrValue** newOps = alloc<IrValue*>(block->npreds * 2);
+        u32 n = 0;
+        for (u32 pi = 0; pi < block->npreds; pi++)
+        {
+            IrBlock* pred = block->preds[pi];
+            IrValue* val = null;
+            for (u32 j = 0; j + 1 < phi->nops; j += 2)
+            {
+                if ((IrBlock*)phi->ops[j + 1] == pred)
+                {
+                    val = phi->ops[j];
+                    break;
+                }
+            }
+            if (val == null)
+                val = phi->ops[0];
+            newOps[n++] = val;
+            newOps[n++] = &pred->base;
+        }
+
+        for (u32 i = 0; i < phi->nops; i++)
+            if (phi->ops[i] != null)
+                phi->ops[i]->removeUser(phi);
+
+        if (phi->capOps > 0)
+            dealloc<IrValue*>(phi->ops);
+
+        phi->ops = newOps;
+        phi->nops = n;
+        phi->capOps = block->npreds * 2;
+
+        for (u32 i = 0; i < n; i++)
+            phi->ops[i]->addUser(phi);
+    }
+
+    // Find the increment instruction for an induction variable
+    IrInst* findIncrement(IrLoop* lp, IrInst* phi)
+    {
+        for (u32 bi = 0; bi < lp->nblocks; bi++)
+        {
+            IrBlock* bb = lp->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if ((inst->opcode == IrOpcode::Add || inst->opcode == IrOpcode::Sub) && inst->nops == 2)
+                {
+                    // Check if one operand is the phi
+                    for (u32 i = 0; i < inst->nops; i++)
+                    {
+                        if (inst->ops[i] == &phi->base)
+                            return inst;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+}
+
+pub bool irPassLoopInterchange(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (ctx == null || func == null) return false;
+    LoopInterchangePass pass = LoopInterchangePass::new(ctx);
+    return pass.run(func);
+}

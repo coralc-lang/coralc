@@ -1,0 +1,643 @@
+#[[no_drop_all]]
+import(lib) wallvm::irtypes { IrBlock, IrContext, IrFunc, IrInst, IrType, IrTypeKind, IrValue, IrValueKind };
+import(lib) wallvm::irOps { IrOpcode };
+import(lib) std::mman { alloc, dealloc };
+
+// Key-value map for value/block remapping during cloning
+struct ValMap
+{
+    IrValue** keys;
+    IrValue** vals;
+    u32 count;
+    u32 cap;
+
+    void init()
+    {
+        self = ValMap {
+            .keys = null,
+            .vals = null,
+            .count = 0,
+            .cap = 0
+        };
+    }
+
+    void put(IrValue* k, IrValue* v)
+    {
+        if (self.count >= self.cap)
+        {
+            u32 nc = self.cap ? self.cap * 2 : 32;
+            IrValue** nk = alloc<IrValue*>(nc);
+            IrValue** nv = alloc<IrValue*>(nc);
+            for (u32 i = 0; i < self.count; i++)
+            {
+                nk[i] = self.keys[i];
+                nv[i] = self.vals[i];
+            }
+            if (self.keys != null) dealloc<IrValue*>(self.keys);
+            if (self.vals != null) dealloc<IrValue*>(self.vals);
+            self.keys = nk;
+            self.vals = nv;
+            self.cap = nc;
+        }
+        self.keys[self.count] = k;
+        self.vals[self.count] = v;
+        self.count++;
+    }
+
+    IrValue* get(IrValue* k)
+    {
+        for (u32 i = 0; i < self.count; i++)
+            if (self.keys[i] == k)
+                return self.vals[i];
+        return null;
+    }
+
+    void free()
+    {
+        if (self.keys != null) dealloc<IrValue*>(self.keys);
+        if (self.vals != null) dealloc<IrValue*>(self.vals);
+        self.keys = null;
+        self.vals = null;
+        self.count = 0;
+        self.cap = 0;
+    }
+}
+
+// Cost model constants
+const u32 COST_LOAD = 2;
+const u32 COST_STORE = 3;
+const u32 COST_CALL = 5;
+const u32 COST_BRANCH = 2;
+const u32 COST_ARITH = 1;
+const u32 COST_CMP = 1;
+const u32 COST_CAST = 1;
+const u32 COST_PHI = 2;
+const u32 COST_GEP = 1;
+const u32 COST_ALLOCA = 1;
+const u32 COST_RET = 1;
+const u32 COST_SELECT = 1;
+const u32 COST_UNREACHABLE = 0;
+
+// Thresholds per opt level
+const u32 INLINE_THRESHOLD_O1 = 30;
+const u32 INLINE_THRESHOLD_O2 = 60;
+const u32 INLINE_THRESHOLD_O3 = 120;
+const u32 MAX_INLINE_DEPTH = 4;
+const u32 MAX_CALLER_GROWTH = 4;
+
+// Cost estimation
+// I folded the old stacked labels into | arms, one body per cost class and
+// no number in the table moved.
+u32 estimateInstCost(IrInst* inst)
+{
+    switch (inst->opcode)
+    {
+        IrOpcode::Load => { return COST_LOAD; },
+        IrOpcode::Store => { return COST_STORE; },
+        IrOpcode::Call => { return COST_CALL; },
+        IrOpcode::Br | IrOpcode::CondBr => { return COST_BRANCH; },
+        IrOpcode::Ret => { return COST_RET; },
+        IrOpcode::Unreachable | IrOpcode::Noret => { return COST_UNREACHABLE; },
+        IrOpcode::Phi => { return COST_PHI; },
+        IrOpcode::Gep => { return COST_GEP; },
+        IrOpcode::Alloca => { return COST_ALLOCA; },
+        IrOpcode::Select => { return COST_SELECT; },
+        IrOpcode::ICmp | IrOpcode::FCmp => { return COST_CMP; },
+        IrOpcode::Trunc |
+        IrOpcode::Zext |
+        IrOpcode::Sext |
+        IrOpcode::FpTrunc |
+        IrOpcode::FpExt |
+        IrOpcode::FpToSi |
+        IrOpcode::SiToFp |
+        IrOpcode::FpToUi |
+        IrOpcode::UiToFp |
+        IrOpcode::Bitcast => { return COST_CAST; },
+        else => { return COST_ARITH; },
+    }
+}
+
+u32 estimateFuncCost(IrFunc* f)
+{
+    u32 cost = 0;
+    for (u32 bi = 0; bi < f->nblocks; bi++)
+    {
+        IrBlock* bb = f->blocks[bi];
+        u32 start = (bi == 0) ? f->nparams : 0;
+        if (start > bb->ninsts) start = bb->ninsts;
+        for (u32 ii = start; ii < bb->ninsts; ii++)
+            cost += estimateInstCost(bb->insts[ii]);
+    }
+    return cost;
+}
+
+u32 countCallSites(IrFunc* caller, IrFunc* callee)
+{
+    u32 count = 0;
+    for (u32 bi = 0; bi < caller->nblocks; bi++)
+    {
+        IrBlock* bb = caller->blocks[bi];
+        for (u32 ii = 0; ii < bb->ninsts; ii++)
+        {
+            IrInst* inst = bb->insts[ii];
+            if (inst->opcode == IrOpcode::Call && inst->nops >= 1 &&
+                inst->ops[0] == (IrValue*)callee)
+                count++;
+        }
+    }
+    return count;
+}
+
+// Check if the callee contains any calls back to the caller (recursive)
+bool isRecursive(IrFunc* caller, IrFunc* callee)
+{
+    if (callee == caller) return true;
+    for (u32 bi = 0; bi < callee->nblocks; bi++)
+    {
+        IrBlock* bb = callee->blocks[bi];
+        for (u32 ii = 0; ii < bb->ninsts; ii++)
+        {
+            IrInst* inst = bb->insts[ii];
+            if (inst->opcode == IrOpcode::Call && inst->nops >= 1)
+            {
+                IrValue* cv = inst->ops[0];
+                if (cv != null && cv->kind == IrValueKind::Func &&
+                    (IrFunc*)cv == caller)
+                    return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Count how many instructions reference pointer types (memory operations)
+u32 countMemoryOps(IrFunc* f)
+{
+    u32 n = 0;
+    for (u32 bi = 0; bi < f->nblocks; bi++)
+    {
+        IrBlock* bb = f->blocks[bi];
+        for (u32 ii = 0; ii < bb->ninsts; ii++)
+        {
+            IrInst* inst = bb->insts[ii];
+            if (inst->opcode == IrOpcode::Load ||
+                inst->opcode == IrOpcode::Store ||
+                inst->opcode == IrOpcode::Alloca ||
+                inst->opcode == IrOpcode::Gep)
+                n++;
+        }
+    }
+    return n;
+}
+
+// Does the function have any side effects (stores, calls, volatile loads)?
+bool hasSideEffects(IrFunc* f)
+{
+    for (u32 bi = 0; bi < f->nblocks; bi++)
+    {
+        IrBlock* bb = f->blocks[bi];
+        for (u32 ii = 0; ii < bb->ninsts; ii++)
+        {
+            IrInst* inst = bb->insts[ii];
+            if (inst->opcode == IrOpcode::Store) return true;
+            if (inst->opcode == IrOpcode::Call) return true;
+        }
+    }
+    return false;
+}
+
+// Check if the callee only has one call site and is small enough to always inline
+bool alwaysInlineCandidate(IrFunc* caller, IrFunc* callee, u32 threshold)
+{
+    u32 cost = estimateFuncCost(callee);
+    u32 callSites = countCallSites(caller, callee);
+    // Single-use small function, always inline
+    if (callSites == 1 && cost <= threshold / 2) return true;
+    // Very tiny function, inline regardless
+    if (cost <= 5) return true;
+    return false;
+}
+
+// Clone infrastructure
+u32 countBodyInsts(IrFunc* f)
+{
+    u32 n = 0;
+    u32 skip = f->nparams;
+    for (u32 bi = 0; bi < f->nblocks; bi++)
+    {
+        IrBlock* bb = f->blocks[bi];
+        u32 start = (bi == 0) ? skip : 0;
+        if (start > bb->ninsts) start = bb->ninsts;
+        n += bb->ninsts - start;
+    }
+    return n;
+}
+
+IrInst* cloneInst(IrInst* old,
+                         IrBlock* newBlock,
+                         ValMap* valMap, ValMap* blkMap,
+                         IrContext* ctx)
+{
+    IrValue** newOps = alloc<IrValue*>(old->nops > 0 ? old->nops : 1);
+
+    for (u32 i = 0; i < old->nops; i++)
+    {
+        IrValue* op = old->ops[i];
+        if (op == null) { newOps[i] = null; continue; }
+
+        if (op->kind == IrValueKind::Inst) {
+            IrValue* m = valMap->get(op);
+            if (m != null) { newOps[i] = m; continue; }
+        }
+        else if (op->kind == IrValueKind::Block) {
+            IrValue* m = blkMap->get(op);
+            if (m != null) { newOps[i] = m; continue; }
+        }
+
+        newOps[i] = op;
+    }
+
+    IrInst* ni = ctx->createInst(old->opcode, old->base.type, newOps, old->nops,
+                                 (u64)old->icmpPred, (u64)old->fcmpPred);
+
+    newBlock->addInst(ni);
+    valMap->put(&old->base, &ni->base);
+
+    // Copy debug info
+    if (old->debugLoc.file != null)
+        ni->setDebugLoc(old->debugLoc.file, old->debugLoc.line, old->debugLoc.col);
+
+    // Copy var debug info
+    for (u32 vi = 0; vi < old->nvarDbg; vi++)
+        ni->addVarDebug(old->varDbg[vi].varName, old->varDbg[vi].varType,
+                        old->varDbg[vi].line, old->varDbg[vi].col, old->varDbg[vi].argIndex);
+
+    for (u32 i = 0; i < old->nops; i++)
+        if (newOps[i] != null)
+            newOps[i]->addUser(ni);
+
+    return ni;
+}
+
+void eraseInstAt(IrBlock* bb, u32 ii)
+{
+    for (u32 j = ii; j < bb->ninsts - 1; j++)
+        bb->insts[j] = bb->insts[j + 1];
+    bb->ninsts--;
+}
+
+void transferSuccs(IrBlock* src, IrBlock* dst)
+{
+    for (u32 i = 0; i < src->nsuccs; i++)
+    {
+        IrBlock* succ = src->succs[i];
+        succ->removePred(src);
+        dst->addSucc(succ);
+        for (u32 pi = 0; pi < succ->ninsts; pi++)
+        {
+            IrInst* phi = succ->insts[pi];
+            if (phi->opcode == IrOpcode::Phi)
+            {
+                for (u32 oi = 1; oi < phi->nops; oi += 2)
+                    if (phi->ops[oi] == &src->base)
+                        phi->ops[oi] = &dst->base;
+            }
+        }
+    }
+    src->nsuccs = 0;
+    if (src->succs != null)
+    {
+        dealloc<IrBlock*>(src->succs);
+        src->succs = null;
+    }
+    src->capSuccs = 0;
+}
+
+void moveInstsAfter(IrBlock* src, u32 startIdx, IrBlock* dst)
+{
+    u32 nToMove = src->ninsts - startIdx;
+    for (u32 i = 0; i < nToMove; i++)
+    {
+        IrInst* inst = src->insts[startIdx];
+        eraseInstAt(src, startIdx);
+        inst->parent = dst;
+        dst->addInst(inst);
+    }
+}
+
+// Core inlining logic
+bool inlineCall(IrFunc* caller, IrBlock* callBlock, IrInst* callInst,
+                       u32 instIdx, IrFunc* callee, IrContext* ctx)
+{
+    u32 nCallArgs = (callInst->nops > 0) ? callInst->nops - 1 : 0;
+    IrValue** callArgs = (callInst->nops > 1) ? &callInst->ops[1] : null;
+
+    IrBlock* afterBlock = ctx->createBlock("after_inline");
+    caller->addBlock(afterBlock);
+
+    transferSuccs(callBlock, afterBlock);
+    moveInstsAfter(callBlock, instIdx + 1, afterBlock);
+
+    for (u32 i = 0; i < callInst->nops; i++)
+        if (callInst->ops[i] != null)
+            callInst->ops[i]->removeUser(callInst);
+    eraseInstAt(callBlock, instIdx);
+
+    ValMap blkMap;
+    blkMap.init();
+
+    IrBlock** newBlocks = alloc<IrBlock*>(callee->nblocks);
+    for (u32 bi = 0; bi < callee->nblocks; bi++)
+    {
+        IrBlock* ob = callee->blocks[bi];
+        IrBlock* nb = ctx->createBlock(ob->base.name);
+        caller->addBlock(nb);
+        newBlocks[bi] = nb;
+        blkMap.put(&ob->base, &nb->base);
+    }
+    IrBlock* calleeEntry = newBlocks[0];
+
+    ValMap valMap;
+    valMap.init();
+
+    u32 nparams = callee->nparams;
+    IrBlock* oldEntry = callee->blocks[0];
+    for (u32 i = 0; i < nparams && i < nCallArgs; i++)
+    {
+        if (i < oldEntry->ninsts)
+        {
+            IrInst* paramInst = oldEntry->insts[i];
+            valMap.put(&paramInst->base, callArgs[i]);
+        }
+    }
+
+    for (u32 bi = 0; bi < callee->nblocks; bi++)
+    {
+        IrBlock* ob = callee->blocks[bi];
+        IrBlock* nb = newBlocks[bi];
+        u32 start = (bi == 0) ? nparams : 0;
+
+        for (u32 ii = start; ii < ob->ninsts; ii++)
+            cloneInst(ob->insts[ii], nb, &valMap, &blkMap, ctx);
+    }
+
+    for (u32 bi = 0; bi < callee->nblocks; bi++)
+    {
+        IrBlock* nb = newBlocks[bi];
+        for (u32 ii = 0; ii < nb->ninsts; ii++)
+        {
+            IrInst* ni = nb->insts[ii];
+            for (u32 j = 0; j < ni->nops; j++)
+            {
+                IrValue* op = ni->ops[j];
+                if (op == null || op->kind != IrValueKind::Inst) continue;
+                IrValue* m = valMap.get(op);
+                if (m == null || m == op) continue;
+                op->removeUser(ni);
+                ni->ops[j] = m;
+                m->addUser(ni);
+            }
+        }
+    }
+
+    // Wire up control flow, br from callBlock to callee entry
+    {
+        IrValue** brOps = alloc<IrValue*>(1);
+        brOps[0] = &calleeEntry->base;
+        IrInst* brInst = ctx->createInst(IrOpcode::Br, ctx->tyVoid(), brOps, 1, 0, 0);
+        dealloc<IrValue*>(brOps);
+        callBlock->addInst(brInst);
+        calleeEntry->base.addUser(brInst);
+        callBlock->addSucc(calleeEntry);
+    }
+
+    // Handle return values
+    u32 retCount = 0;
+    IrInst** retInsts = alloc<IrInst*>(callee->nblocks);
+    for (u32 bi = 0; bi < callee->nblocks; bi++)
+    {
+        IrBlock* nb = newBlocks[bi];
+        for (u32 ii = 0; ii < nb->ninsts; ii++)
+        {
+            if (nb->insts[ii]->opcode == IrOpcode::Ret)
+                retInsts[retCount++] = nb->insts[ii];
+        }
+    }
+
+    IrBlock* contBlock = ctx->createBlock("cont_inline");
+    caller->addBlock(contBlock);
+
+    bool hasRetVal = callInst->base.type != null && callInst->base.type->kind != IrTypeKind::Void;
+
+    for (u32 ri = 0; ri < retCount; ri++)
+    {
+        IrInst* ret = retInsts[ri];
+        IrBlock* retBlock = ret->parent;
+
+        for (u32 oi = 0; oi < ret->nops; oi++)
+            if (ret->ops[oi] != null)
+                ret->ops[oi]->removeUser(ret);
+
+        for (u32 ii = 0; ii < retBlock->ninsts; ii++)
+        {
+            if (retBlock->insts[ii] == ret)
+            {
+                eraseInstAt(retBlock, ii);
+                break;
+            }
+        }
+
+        retBlock->addSucc(contBlock);
+
+        IrValue** brOps = alloc<IrValue*>(1);
+        brOps[0] = &contBlock->base;
+        IrInst* brInst =
+            ctx->createInst(IrOpcode::Br, ctx->tyVoid(), brOps, 1, 0, 0);
+        dealloc<IrValue*>(brOps);
+        retBlock->addInst(brInst);
+        contBlock->base.addUser(brInst);
+    }
+
+    IrValue* mergedRetVal = null;
+
+    if (hasRetVal && retCount > 1)
+    {
+        IrType* retTy = callInst->base.type;
+        IrValue** phiVals = alloc<IrValue*>(retCount);
+        IrValue** phiBlks = alloc<IrValue*>(retCount);
+        u32 phiCount = 0;
+
+        for (u32 ri = 0; ri < retCount; ri++)
+        {
+            IrInst* ret = retInsts[ri];
+            if (ret->nops > 0 && ret->ops[0] != null)
+            {
+                IrBlock* retBlock = ret->parent;
+                phiVals[phiCount] = ret->ops[0];
+                phiBlks[phiCount] = &retBlock->base;
+                phiCount++;
+            }
+        }
+
+        if (phiCount > 1)
+        {
+            IrValue** phiOps = alloc<IrValue*>(phiCount * 2);
+            for (u32 i = 0; i < phiCount; i++)
+            {
+                phiOps[i * 2] = phiVals[i];
+                phiOps[i * 2 + 1] = phiBlks[i];
+            }
+            IrInst* phiInst =
+                ctx->createInst(IrOpcode::Phi, retTy, phiOps, phiCount * 2, 0, 0);
+            contBlock->addInst(phiInst);
+            for (u32 i = 0; i < phiCount * 2; i++)
+                if (phiOps[i] != null)
+                    phiOps[i]->addUser(phiInst);
+            dealloc<IrValue*>(phiOps);
+            mergedRetVal = &phiInst->base;
+        }
+        else if (phiCount == 1)
+        {
+            mergedRetVal = phiVals[0];
+        }
+
+        if (phiVals != null) dealloc<IrValue*>(phiVals);
+        if (phiBlks != null) dealloc<IrValue*>(phiBlks);
+    }
+    else if (hasRetVal && retCount == 1)
+    {
+        IrInst* ret = retInsts[0];
+        if (ret->nops > 0 && ret->ops[0] != null)
+            mergedRetVal = ret->ops[0];
+    }
+
+    for (u32 ri = 0; ri < retCount; ri++)
+        retInsts[ri]->erase();
+
+    // br from contBlock to afterBlock
+    {
+        IrValue** brOps = alloc<IrValue*>(1);
+        brOps[0] = &afterBlock->base;
+        IrInst* brInst =
+            ctx->createInst(IrOpcode::Br, ctx->tyVoid(), brOps, 1, 0, 0);
+        dealloc<IrValue*>(brOps);
+        contBlock->addInst(brInst);
+        afterBlock->base.addUser(brInst);
+        contBlock->addSucc(afterBlock);
+    }
+
+    if (hasRetVal && mergedRetVal != null)
+    {
+        IrValue* callVal = &callInst->base;
+        callVal->replaceAllUses(mergedRetVal);
+    }
+
+    callInst->erase();
+
+    dealloc<IrBlock*>(newBlocks);
+    dealloc<IrInst*>(retInsts);
+
+    valMap.free();
+    blkMap.free();
+
+    return true;
+}
+
+// Main inline pass
+pub bool irPassInline(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (ctx == null || func == null) return false;
+    if (func->nblocks == 0) return false;
+
+    // Determine threshold based on function's own size, I kept the two
+    // cut-offs (200 and 80) as bare numbers exactly where the old file left them
+    u32 callerCost = estimateFuncCost(func);
+    u32 threshold = INLINE_THRESHOLD_O1;
+    if (callerCost > 200) threshold = INLINE_THRESHOLD_O3;
+    else if (callerCost > 80) threshold = INLINE_THRESHOLD_O2;
+
+    bool changed = false;
+    u32 totalInlined = 0;
+    const u32 MAX_TOTAL_INLINED = 500;
+
+    bool progress = true;
+    while (progress && totalInlined < MAX_TOTAL_INLINED)
+    {
+        progress = false;
+
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst->opcode != IrOpcode::Call) continue;
+
+                if (inst->nops < 1) continue;
+                IrValue* calleeVal = inst->ops[0];
+                if (calleeVal == null || calleeVal->kind != IrValueKind::Func) continue;
+
+                IrFunc* callee = (IrFunc*)calleeVal;
+
+                // Never inline extern, recursive, or self-recursive callees
+                if (callee->isExtern) continue;
+                if (callee == func || isRecursive(func, callee)) continue;
+
+                // Cost-benefit analysis
+                u32 calleeCost = estimateFuncCost(callee);
+                u32 callSites = countCallSites(func, callee);
+
+                // Benefit, instructions saved = calleeCost * callSites - calleeCost (the callee body)
+                // Cost, calleeCost (one copy inlined)
+                // Net benefit = calleeCost * (callSites - 1) when callSites > 1
+                // For single call site, benefit = constant propagation opportunity
+
+                bool shouldInline = false;
+
+                if (alwaysInlineCandidate(func, callee, threshold))
+                {
+                    shouldInline = true;
+                }
+                else if (callSites == 1)
+                {
+                    // Single call site, inline if callee is small enough
+                    // Account for caller growth
+                    u32 growth = calleeCost;
+                    if (callerCost + growth <= threshold * MAX_CALLER_GROWTH)
+                        shouldInline = (calleeCost <= threshold);
+                }
+                else
+                {
+                    // Multiple call sites, more aggressive - the benefit is multiplied
+                    // But we only inline if callee is very small to avoid code bloat
+                    shouldInline = (calleeCost <= threshold / 3);
+                }
+
+                // Never inline functions with too many memory ops (likely large state)
+                if (countMemoryOps(callee) > calleeCost / 2)
+                    shouldInline = false;
+
+                // Don't inline functions that contain calls (will be handled by recursive inlining)
+                // unless they're very small
+                if (!shouldInline && calleeCost <= 8)
+                    shouldInline = true;
+
+                if (!shouldInline) continue;
+
+                if (inlineCall(func, bb, inst, ii, callee, ctx))
+                {
+                    changed = true;
+                    progress = true;
+                    totalInlined++;
+                    callerCost = estimateFuncCost(func);
+                    break;
+                }
+            }
+
+            if (progress) break;
+        }
+    }
+    return changed;
+}

@@ -1,0 +1,1091 @@
+#[[no_drop_all]]
+import(lib) wallvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind };
+import(lib) wallvm::irOps { IrOpcode, IrICmpPred };
+import(lib) std::mman { alloc, dealloc };
+
+const u32 MAX_LEAVES = 16;
+
+// A single-variable integer range constraint derived from ICmp instructions.
+// A value used by other code may appear in multiple intervals; the ICmp
+// instructions themselves are always reused, never duplicated.
+struct Interval
+{
+    IrInst* loIcmp; // ICmp providing the lower bound (null if unbounded below)
+    IrInst* hiIcmp; // ICmp providing the upper bound (null if unbounded above)
+    u64 loC;
+    u64 hiC;
+    bool loIncl;
+    bool hiIncl;
+    bool hasLo;
+    bool hasHi;
+    bool empty; // no integer satisfies the range
+    bool sign; // signedness of the ordering comparisons
+    bool isEq; // came from an Eq comparison (a sign-agnostic point)
+}
+
+// Effective lower value of a bound (first integer satisfying it).
+// *inf is set when the bound is beyond every representable value.
+u64 effLoVal(u64 c, bool incl, bool sign, bool* inf)
+{
+    if (!incl)
+    {
+        if (sign)
+        {
+            if (c == 0x7FFFFFFFFFFFFFFF) { *inf = true; return 0; }
+        }
+        else
+        {
+            if (c == 0xFFFFFFFFFFFFFFFF) { *inf = true; return 0; }
+        }
+        *inf = false;
+        return c + 1;
+    }
+    *inf = false;
+    return c;
+}
+
+// Effective upper value of a bound (last integer satisfying it).
+// *inf is set when the bound is below every representable value.
+u64 effHiVal(u64 c, bool incl, bool sign, bool* inf)
+{
+    if (!incl)
+    {
+        if (sign)
+        {
+            if (c == 0x8000000000000000) { *inf = true; return 0; }
+        }
+        else
+        {
+            if (c == 0) { *inf = true; return 0; }
+        }
+        *inf = false;
+        return c - 1;
+    }
+    *inf = false;
+    return c;
+}
+
+// Compare two effective bound values. Returns 1 if v1 > v2, -1 if v1 < v2, 0 if equal.
+// +inf sorts above every finite value.
+i32 cmpEff(u64 v1, bool inf1, u64 v2, bool inf2, bool sign)
+{
+    if (inf1 && inf2) return 0;
+    if (inf1) return 1;
+    if (inf2) return -1;
+    if (sign)
+    {
+        u64 bias = 0x8000000000000000;
+        if ((v1 ^ bias) > (v2 ^ bias)) return 1;
+        if ((v1 ^ bias) < (v2 ^ bias)) return -1;
+        return 0;
+    }
+    if (v1 > v2) return 1;
+    if (v1 < v2) return -1;
+    return 0;
+}
+
+// Convert an ICmp leaf into an interval on its (already verified) shared variable.
+// Returns false for comparisons that cannot be merged (Ne, non-constant bound).
+bool leafToInterval(IrInst* icmp, Interval* out)
+{
+    if (icmp->opcode != IrOpcode::ICmp) return false;
+    if (icmp->nops != 2) return false;
+    IrValue* a = icmp->ops[0];
+    IrValue* b = icmp->ops[1];
+    if (a == null || b == null) return false;
+    IrValue* cval = null;
+    if (a->kind == IrValueKind::ConstInt && b->kind == IrValueKind::Inst) cval = a;
+    else if (b->kind == IrValueKind::ConstInt && a->kind == IrValueKind::Inst) cval = b;
+    else return false;
+
+    out->loIcmp = icmp;
+    out->hiIcmp = icmp;
+    out->hasLo = false;
+    out->hasHi = false;
+    out->empty = false;
+    out->isEq = false;
+    out->sign = false;
+
+    switch (icmp->icmpPred)
+    {
+        IrICmpPred::Sge => { out->hasLo = true; out->loC = cval->valData; out->loIncl = true; out->sign = true; },
+        IrICmpPred::Sgt => { out->hasLo = true; out->loC = cval->valData; out->loIncl = false; out->sign = true; },
+        IrICmpPred::Sle => { out->hasHi = true; out->hiC = cval->valData; out->hiIncl = true; out->sign = true; },
+        IrICmpPred::Slt => { out->hasHi = true; out->hiC = cval->valData; out->hiIncl = false; out->sign = true; },
+        IrICmpPred::Uge => { out->hasLo = true; out->loC = cval->valData; out->loIncl = true; },
+        IrICmpPred::Ugt => { out->hasLo = true; out->loC = cval->valData; out->loIncl = false; },
+        IrICmpPred::Ule => { out->hasHi = true; out->hiC = cval->valData; out->hiIncl = true; },
+        IrICmpPred::Ult => { out->hasHi = true; out->hiC = cval->valData; out->hiIncl = false; },
+        IrICmpPred::Eq => { out->hasLo = true; out->hasHi = true; out->loC = cval->valData; out->hiC = cval->valData; out->loIncl = true; out->hiIncl = true; out->isEq = true; },
+        else => { return false; }, // Ne
+    }
+    return true;
+}
+
+// Verify an ICmp constrains a single shared variable (const vs variable).
+bool icmpOnVar(IrInst* icmp, IrValue** varr)
+{
+    if (icmp->nops != 2) return false;
+    IrValue* a = icmp->ops[0];
+    IrValue* b = icmp->ops[1];
+    if (a == null || b == null) return false;
+    IrValue* cand = null;
+    if (a->kind == IrValueKind::Inst && b->kind == IrValueKind::ConstInt) cand = a;
+    else if (b->kind == IrValueKind::Inst && a->kind == IrValueKind::ConstInt) cand = b;
+    else return false;
+    if (*varr == null) *varr = cand;
+    else if (*varr != cand) return false;
+    return true;
+}
+
+// Flatten an And-tree into ICmp leaves. Returns false if any node is not an
+// And or ICmp, or if leaves constrain different variables.
+bool collectAndLeaves(IrValue* v, IrValue** varr, IrInst** leaves, u32* n, u32* instCount)
+{
+    if (v->kind != IrValueKind::Inst) return false;
+    IrInst* inst = (IrInst*)v;
+    if (inst->opcode == IrOpcode::And)
+    {
+        if (inst->nops != 2) return false;
+        (*instCount)++;
+        if (!collectAndLeaves(inst->ops[0], varr, leaves, n, instCount)) return false;
+        return collectAndLeaves(inst->ops[1], varr, leaves, n, instCount);
+    }
+    if (inst->opcode != IrOpcode::ICmp) return false;
+    if (!icmpOnVar(inst, varr)) return false;
+    if (*n >= MAX_LEAVES) return false;
+    leaves[(*n)++] = inst;
+    return true;
+}
+
+// Collect the clauses of an Or-chain. Each clause is either a single ICmp or
+// an And-tree of ICmps (no nested Or). Clauses are stored contiguously in
+// leafStorage, delimited by offsets.
+bool collectOrClauses(IrValue* v, IrValue** varr, IrInst** leafStorage, u32* offsets, u32* nClauses, u32* used, u32* instCount)
+{
+    if (v->kind != IrValueKind::Inst) return false;
+    IrInst* inst = (IrInst*)v;
+    if (inst->opcode == IrOpcode::Or)
+    {
+        if (inst->nops != 2) return false;
+        (*instCount)++;
+        if (!collectOrClauses(inst->ops[0], varr, leafStorage, offsets, nClauses, used, instCount)) return false;
+        return collectOrClauses(inst->ops[1], varr, leafStorage, offsets, nClauses, used, instCount);
+    }
+    offsets[*nClauses] = *used;
+    if (!collectAndLeaves(v, varr, leafStorage, used, instCount)) return false;
+    offsets[*nClauses + 1] = *used;
+    (*nClauses)++;
+    return true;
+}
+
+// Merge two single-variable intervals. isAnd, true = intersection, false = union.
+// Returns 0 on incompatible signedness, 1 on merged, 2 when a union has a gap
+// (cannot be represented exactly as one interval).
+i32 mergeIntervals(Interval* a, Interval* b, bool isAnd, Interval* out)
+{
+    if (isAnd)
+    {
+        if (a->empty || b->empty) { out->empty = true; out->hasLo = false; out->hasHi = false; return 1; }
+    }
+    else
+    {
+        if (a->empty) { *out = *b; return 1; }
+        if (b->empty) { *out = *a; return 1; }
+    }
+
+    bool sign;
+    if (a->isEq && b->isEq) sign = false;
+    else if (a->isEq) sign = b->sign;
+    else sign = a->sign;
+    if (!a->isEq && !b->isEq && a->sign != b->sign) return 0;
+
+    Interval r;
+    r.loIcmp = null;
+    r.hiIcmp = null;
+    r.empty = false;
+    r.sign = sign;
+    r.isEq = false;
+    r.hasLo = false;
+    r.hasHi = false;
+
+    if (isAnd)
+    {
+        if (a->hasLo || b->hasLo)
+        {
+            r.hasLo = true;
+            if (!a->hasLo) { r.loIcmp = b->loIcmp; r.loC = b->loC; r.loIncl = b->loIncl; }
+            else if (!b->hasLo) { r.loIcmp = a->loIcmp; r.loC = a->loC; r.loIncl = a->loIncl; }
+            else
+            {
+                u64 ea; u64 eb; bool ia; bool ib;
+                ea = effLoVal(a->loC, a->loIncl, sign, &ia);
+                eb = effLoVal(b->loC, b->loIncl, sign, &ib);
+                if (cmpEff(ea, ia, eb, ib, sign) >= 0) { r.loIcmp = a->loIcmp; r.loC = a->loC; r.loIncl = a->loIncl; }
+                else { r.loIcmp = b->loIcmp; r.loC = b->loC; r.loIncl = b->loIncl; }
+            }
+        }
+        if (a->hasHi || b->hasHi)
+        {
+            r.hasHi = true;
+            if (!a->hasHi) { r.hiIcmp = b->hiIcmp; r.hiC = b->hiC; r.hiIncl = b->hiIncl; }
+            else if (!b->hasHi) { r.hiIcmp = a->hiIcmp; r.hiC = a->hiC; r.hiIncl = a->hiIncl; }
+            else
+            {
+                u64 ea; u64 eb; bool ia; bool ib;
+                ea = effHiVal(a->hiC, a->hiIncl, sign, &ia);
+                eb = effHiVal(b->hiC, b->hiIncl, sign, &ib);
+                if (cmpEff(ea, ia, eb, ib, sign) <= 0) { r.hiIcmp = a->hiIcmp; r.hiC = a->hiC; r.hiIncl = a->hiIncl; }
+                else { r.hiIcmp = b->hiIcmp; r.hiC = b->hiC; r.hiIncl = b->hiIncl; }
+            }
+        }
+        if (r.hasLo)
+        {
+            u64 eLo;
+            bool hasInf;
+            eLo = effLoVal(r.loC, r.loIncl, sign, &hasInf);
+            if (hasInf) { r.empty = true; *out = r; return 1; }
+        }
+        if (r.hasHi)
+        {
+            u64 eHi;
+            bool hasInf;
+
+            eHi = effHiVal(r.hiC, r.hiIncl, sign, &hasInf);
+            if (hasInf) { r.empty = true; *out = r; return 1; }
+        }
+        if (r.hasLo && r.hasHi)
+        {
+            u64 el; u64 eh; bool il; bool ih;
+            el = effLoVal(r.loC, r.loIncl, sign, &il);
+            eh = effHiVal(r.hiC, r.hiIncl, sign, &ih);
+            if (cmpEff(el, il, eh, ih, sign) > 0) { r.empty = true; *out = r; return 1; }
+        }
+        *out = r;
+        return 1;
+    }
+
+    if (a->hasLo && b->hasLo)
+    {
+        u64 ea; u64 eb; bool ia; bool ib;
+        ea = effLoVal(a->loC, a->loIncl, sign, &ia);
+        eb = effLoVal(b->loC, b->loIncl, sign, &ib);
+        if (cmpEff(ea, ia, eb, ib, sign) <= 0) { r.hasLo = true; r.loIcmp = a->loIcmp; r.loC = a->loC; r.loIncl = a->loIncl; }
+        else { r.hasLo = true; r.loIcmp = b->loIcmp; r.loC = b->loC; r.loIncl = b->loIncl; }
+    }
+    else
+    {
+        r.hasLo = false;
+    }
+    if (a->hasHi && b->hasHi)
+    {
+        u64 ea; u64 eb; bool ia; bool ib;
+        ea = effHiVal(a->hiC, a->hiIncl, sign, &ia);
+        eb = effHiVal(b->hiC, b->hiIncl, sign, &ib);
+        if (cmpEff(ea, ia, eb, ib, sign) >= 0) { r.hasHi = true; r.hiIcmp = a->hiIcmp; r.hiC = a->hiC; r.hiIncl = a->hiIncl; }
+        else { r.hasHi = true; r.hiIcmp = b->hiIcmp; r.hiC = b->hiC; r.hiIncl = b->hiIncl; }
+    }
+    else
+    {
+        r.hasHi = false;
+    }
+
+    if (a->hasLo)
+    {
+        u64 e;
+        bool inf;
+
+        e = effHiVal(b->hiC, b->hiIncl, sign, &inf);
+        if (inf) { *out = *a; return 1; }
+    }
+    if (a->hasHi)
+    {
+        u64 e;
+        bool inf;
+        e = effHiVal(a->hiC, a->hiIncl, sign, &inf);
+        if (inf) { *out = *b; return 1; }
+    }
+    if (b->hasLo)
+    {
+        u64 e;
+        bool inf;
+        e = effLoVal(b->loC, b->loIncl, sign, &inf);
+        if (inf) { *out = *a; return 1; }
+    }
+    if (b->hasHi)
+    {
+        u64 e;
+        bool inf;
+        e = effHiVal(b->hiC, b->hiIncl, sign, &inf);
+        if (inf) { *out = *a; return 1; }
+    }
+
+    // Gap check, a union is exactly representable as one interval only when
+    // the intervals overlap or are adjacent (no hole of unreached integers).
+    // maxLo = larger effective lower bound (an unbounded side counts as -inf),
+    // minHi = smaller effective upper bound (unbounded counts as +inf). A hole
+    // exists only when both are finite and maxLo - minHi >= 2.
+    bool maxLoInf = !a->hasLo || !b->hasLo;
+    bool minHiInf = !a->hasHi || !b->hasHi;
+    u64 maxLo = 0;
+    u64 minHi = 0;
+    if (!maxLoInf)
+    {
+        u64 ea; u64 eb; bool ia; bool ib;
+        ea = effLoVal(a->loC, a->loIncl, sign, &ia);
+        eb = effLoVal(b->loC, b->loIncl, sign, &ib);
+        maxLo = cmpEff(ea, ia, eb, ib, sign) >= 0 ? ea : eb;
+    }
+    if (!minHiInf)
+    {
+        u64 ea; u64 eb; bool ia; bool ib;
+        ea = effHiVal(a->hiC, a->hiIncl, sign, &ia);
+        eb = effHiVal(b->hiC, b->hiIncl, sign, &ib);
+        minHi = cmpEff(ea, ia, eb, ib, sign) <= 0 ? ea : eb;
+    }
+    if (!maxLoInf && !minHiInf && maxLo - minHi >= 2) return 2;
+
+    *out = r;
+    return 1;
+}
+
+// Intersect a list of intervals (And semantics). Returns false on incompatible
+// signedness.
+bool intersectAll(Interval* ivs, u32 n, Interval* out)
+{
+    Interval r = ivs[0];
+    for (u32 i = 1; i < n; i++)
+    {
+        Interval m;
+        i32 rc = mergeIntervals(&r, &ivs[i], true, &m);
+        if (rc != 1) return false;
+        r = m;
+    }
+    *out = r;
+    return true;
+}
+
+// True if interval a's lower bound sorts before interval b's (stable for ties).
+bool loBefore(Interval* a, Interval* b)
+{
+    bool sign = !a->isEq ? a->sign : (!b->isEq ? b->sign : false);
+    if (!a->hasLo && !b->hasLo) return false;
+    if (!a->hasLo) return true;
+    if (!b->hasLo) return false;
+    u64 ea; u64 eb; bool ia; bool ib;
+    ea = effLoVal(a->loC, a->loIncl, sign, &ia);
+    eb = effLoVal(b->loC, b->loIncl, sign, &ib);
+    return cmpEff(ea, ia, eb, ib, sign) < 0;
+}
+
+// Merge intervals of an Or into the fewest exact groups. Returns false on
+// incompatible signedness.
+bool unionMergeAll(Interval* ivs, u32 n, Interval* groups, u32* k)
+{
+    u32 m = 0;
+    Interval buf[16];
+    for (u32 i = 0; i < n; i++)
+        if (!ivs[i].empty) buf[m++] = ivs[i];
+    if (m == 0) { *k = 0; return true; }
+
+    for (u32 i = 1; i < m; i++)
+    {
+        Interval key = buf[i];
+        u32 j = i;
+        while (j > 0 && loBefore(&key, &buf[j - 1]))
+        {
+            buf[j] = buf[j - 1];
+            j--;
+        }
+        buf[j] = key;
+    }
+
+    u32 g = 0;
+    groups[g] = buf[0];
+    for (u32 i = 1; i < m; i++)
+    {
+        Interval merged;
+        i32 rc = mergeIntervals(&groups[g], &buf[i], false, &merged);
+        if (rc == 2)
+        {
+            g++;
+            groups[g] = buf[i];
+        }
+        else if (rc == 1)
+        {
+            groups[g] = merged;
+        }
+        else
+        {
+            return false;
+        }
+    }
+    *k = g + 1;
+    return true;
+}
+
+pub struct RangeMergePass
+{
+    IrContext* ctx;
+    u64 merges;
+
+    RangeMergePass new(IrContext* ctx)
+    {
+        return RangeMergePass {
+            .ctx = ctx,
+            .merges = 0
+        };
+    }
+
+    bool run(IrFunc* func)
+    {
+        self.merges = 0;
+        bool changed = false;
+
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            u32 ii = 0;
+            while (ii < bb->ninsts)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (self.simplify(inst))
+                {
+                    self.merges++;
+                    changed = true;
+                }
+                else
+                {
+                    ii++;
+                }
+            }
+        }
+        return changed;
+    }
+
+    // Build the IR value for a merged interval, reusing the merged ICmp leaves
+    // as-is and counting newly created instructions in *newInsts.
+    IrValue* buildIntervalValue(Interval* r, IrInst* anchor, u32* newInsts)
+    {
+        if (r->empty)
+        {
+            (*newInsts) = 0;
+            return self.ctx->constInt(anchor->base.type, 0);
+        }
+        if (!r->hasLo && !r->hasHi)
+        {
+            (*newInsts) = 0;
+            return self.ctx->constInt(anchor->base.type, 1);
+        }
+        IrValue* loV = r->hasLo ? &r->loIcmp->base : null;
+        IrValue* hiV = r->hasHi ? &r->hiIcmp->base : null;
+        if (loV != null && hiV != null && loV != hiV)
+        {
+            IrValue* ops[2] = { loV, hiV };
+            IrInst* andInst = self.ctx->createInst(IrOpcode::And, anchor->base.type, ops, 2, 0, 0);
+            ops[0]->addUser(andInst);
+            ops[1]->addUser(andInst);
+            anchor->parent->insertBefore(andInst, anchor);
+            (*newInsts)++;
+            return &andInst->base;
+        }
+        if (loV != null) return loV;
+        return hiV;
+    }
+
+    // Simplify one And/Or node whose leaves are all ICmps on a single shared
+    // variable; rebuilds only when strictly smaller.
+    bool simplify(IrInst* inst)
+    {
+        if (inst->nops != 2) return false;
+        if (inst->opcode != IrOpcode::And && inst->opcode != IrOpcode::Or) return false;
+        if (inst->ops[0] == null || inst->ops[1] == null) return false;
+
+        IrValue* varr = null;
+        u32 instCount = 0;
+
+        if (inst->opcode == IrOpcode::And)
+        {
+            IrInst* leaves[16];
+            u32 nLeaves = 0;
+            if (!collectAndLeaves(inst->ops[0], &varr, leaves, &nLeaves, &instCount)) return false;
+            if (!collectAndLeaves(inst->ops[1], &varr, leaves, &nLeaves, &instCount)) return false;
+            if (nLeaves < 2) return false;
+
+            Interval ivs[16];
+            for (u32 i = 0; i < nLeaves; i++)
+                if (!leafToInterval(leaves[i], &ivs[i])) return false;
+
+            Interval r;
+            if (!intersectAll(ivs, nLeaves, &r)) return false;
+
+            u32 newInsts = 0;
+            IrValue* val = self.buildIntervalValue(&r, inst, &newInsts);
+            if (newInsts >= instCount) return false;
+
+            inst->base.replaceAllUses(val);
+            inst->erase();
+            return true;
+        }
+
+        IrInst* leafStorage[16];
+        u32 offsets[17];
+        u32 nClauses = 0;
+        u32 used = 0;
+        if (!collectOrClauses(inst->ops[0], &varr, leafStorage, offsets, &nClauses, &used, &instCount)) return false;
+        if (!collectOrClauses(inst->ops[1], &varr, leafStorage, offsets, &nClauses, &used, &instCount)) return false;
+        if (nClauses < 2) return false;
+
+        Interval clauseIv[16];
+        for (u32 c = 0; c < nClauses; c++)
+        {
+            u32 nl = offsets[c + 1] - offsets[c];
+            if (nl == 1)
+            {
+                if (!leafToInterval(leafStorage[offsets[c]], &clauseIv[c])) return false;
+            }
+            else
+            {
+                Interval tmp[16];
+                if (nl > 16) return false;
+                for (u32 k = 0; k < nl; k++)
+                    if (!leafToInterval(leafStorage[offsets[c] + k], &tmp[k])) return false;
+                if (!intersectAll(tmp, nl, &clauseIv[c])) return false;
+            }
+        }
+
+        Interval groups[16];
+        u32 k = 0;
+        if (!unionMergeAll(clauseIv, nClauses, groups, &k)) return false;
+
+        u32 newInsts = 0;
+        IrValue* val = null;
+        for (u32 g = 0; g < k; g++)
+        {
+            IrValue* gv = self.buildIntervalValue(&groups[g], inst, &newInsts);
+            if (val == null)
+            {
+                val = gv;
+            }
+            else
+            {
+                IrValue* ops[2] = { val, gv };
+                IrInst* orInst = self.ctx->createInst(IrOpcode::Or, inst->base.type, ops, 2, 0, 0);
+                ops[0]->addUser(orInst);
+                ops[1]->addUser(orInst);
+                inst->parent->insertBefore(orInst, inst);
+                newInsts++;
+                val = &orInst->base;
+            }
+        }
+        if (val == null) val = self.ctx->constInt(inst->base.type, 0);
+        if (newInsts >= instCount) return false;
+
+        inst->base.replaceAllUses(val);
+        inst->erase();
+        return true;
+    }
+}
+
+pub bool irPassRange(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (ctx == null || func == null) return false;
+    RangeMergePass pass = RangeMergePass::new(ctx);
+    return pass.run(func);
+}
+
+// Branch elimination using range analysis, if we know the range of a value
+// from dominating ICmp comparisons, we can sometimes fold branches.
+pub bool irPassRangeBranchElim(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (ctx == null || func == null) return false;
+
+    bool changed = false;
+
+    // Phase 1, Build range information from dominating ICmps
+    // For each block, track what we know about value ranges
+    RangeInfo* blockRanges = alloc<RangeInfo>(func->nblocks);
+    for (u32 i = 0; i < func->nblocks; i++)
+        blockRanges[i].init();
+
+    // First pass, collect range info from ICmps in each block
+    for (u32 bi = 0; bi < func->nblocks; bi++)
+    {
+        IrBlock* bb = func->blocks[bi];
+        for (u32 ii = 0; ii < bb->ninsts; ii++)
+        {
+            IrInst* inst = bb->insts[ii];
+            if (inst->opcode != IrOpcode::ICmp) continue;
+            if (inst->nops != 2) continue;
+
+            IrValue* a = inst->ops[0];
+            IrValue* b = inst->ops[1];
+            if (a == null || b == null) continue;
+
+            // Extract constant bound
+            IrValue* cval = null;
+            IrValue* val = null;
+            if (a->kind == IrValueKind::ConstInt && b->kind == IrValueKind::Inst)
+            {
+                cval = a;
+                val = b;
+            }
+            else if (b->kind == IrValueKind::ConstInt && a->kind == IrValueKind::Inst)
+            {
+                cval = b;
+                val = a;
+            }
+            else continue;
+
+            if (cval == null || val == null) continue;
+
+            // Record range info
+            blockRanges[bi].addConstraint(val, inst->icmpPred, cval->valData, a == cval);
+        }
+    }
+
+    // Second pass, propagate ranges through dominators and fold branches
+    for (u32 bi = 1; bi < func->nblocks; bi++)
+    {
+        IrBlock* bb = func->blocks[bi];
+        if (bb->ninsts == 0) continue;
+
+        IrInst* term = bb->terminator();
+        if (term == null || term->opcode != IrOpcode::CondBr) continue;
+
+        IrValue* cond = term->ops[0];
+        if (cond == null || cond->kind != IrValueKind::Inst) continue;
+
+        IrInst* condInst = (IrInst*)cond;
+        if (condInst->opcode != IrOpcode::ICmp) continue;
+        if (condInst->nops != 2) continue;
+
+        IrValue* a = condInst->ops[0];
+        IrValue* b = condInst->ops[1];
+        if (a == null || b == null) continue;
+
+        // Try to fold based on range info from dominating blocks
+        IrValue* result = tryFoldByRange(ctx, condInst, &blockRanges[bi], func, bi);
+        if (result != null)
+        {
+            term->ops[0] = result;
+            result->addUser(term);
+            cond->removeUser(term);
+            changed = true;
+        }
+    }
+
+    // Clean up
+    for (u32 i = 0; i < func->nblocks; i++)
+        blockRanges[i].free();
+    dealloc<RangeInfo>(blockRanges);
+
+    return changed;
+}
+
+// Range information for a single value
+struct ValueRange
+{
+    IrValue* value;
+    i64 loBound;
+    i64 hiBound;
+    bool hasLo;
+    bool hasHi;
+    bool loInclusive;
+    bool hiInclusive;
+
+    void init(IrValue* val)
+    {
+        self.value = val;
+        self.loBound = 0;
+        self.hiBound = 0;
+        self.hasLo = false;
+        self.hasHi = false;
+        self.loInclusive = false;
+        self.hiInclusive = false;
+    }
+
+    void updateFromICmp(IrICmpPred pred, i64 bound, bool constOnLeft)
+    {
+        switch (pred)
+        {
+            IrICmpPred::Slt |
+            IrICmpPred::Ult => {
+                if (constOnLeft)
+                {
+                    // bound < val  =>  val > bound  =>  loBound = bound+1
+                    self.loBound = bound + 1;
+                    self.hasLo = true;
+                    self.loInclusive = false;
+                }
+                else
+                {
+                    // val < bound  =>  hiBound = bound-1
+                    self.hiBound = bound - 1;
+                    self.hasHi = true;
+                    self.hiInclusive = false;
+                }
+            },
+            IrICmpPred::Sle |
+            IrICmpPred::Ule => {
+                if (constOnLeft)
+                {
+                    // bound <= val  =>  val >= bound
+                    self.loBound = bound;
+                    self.hasLo = true;
+                    self.loInclusive = true;
+                }
+                else
+                {
+                    // val <= bound
+                    self.hiBound = bound;
+                    self.hasHi = true;
+                    self.hiInclusive = true;
+                }
+            },
+            IrICmpPred::Sgt |
+            IrICmpPred::Ugt => {
+                if (constOnLeft)
+                {
+                    // bound > val  =>  val < bound  =>  hiBound = bound-1
+                    self.hiBound = bound - 1;
+                    self.hasHi = true;
+                    self.hiInclusive = false;
+                }
+                else
+                {
+                    // val > bound  =>  loBound = bound+1
+                    self.loBound = bound + 1;
+                    self.hasLo = true;
+                    self.loInclusive = false;
+                }
+            },
+            IrICmpPred::Sge |
+            IrICmpPred::Uge => {
+                if (constOnLeft)
+                {
+                    // bound >= val  =>  val <= bound
+                    self.hiBound = bound;
+                    self.hasHi = true;
+                    self.hiInclusive = true;
+                }
+                else
+                {
+                    // val >= bound
+                    self.loBound = bound;
+                    self.hasLo = true;
+                    self.loInclusive = true;
+                }
+            },
+            IrICmpPred::Eq => {
+                self.loBound = bound;
+                self.hiBound = bound;
+                self.hasLo = true;
+                self.hasHi = true;
+                self.loInclusive = true;
+                self.hiInclusive = true;
+            },
+            IrICmpPred::Ne => {
+                // Can't express neq as a range, skip
+            },
+            else => { },
+        }
+    }
+
+    bool isEmpty()
+    {
+        if (!self.hasLo || !self.hasHi) return false;
+        if (self.loBound > self.hiBound) return true;
+        if (self.loBound == self.hiBound && (!self.loInclusive || !self.hiInclusive))
+            return true;
+        return false;
+    }
+
+    bool isSingleValue(i64* outVal)
+    {
+        if (!self.hasLo || !self.hasHi) return false;
+        if (self.loBound == self.hiBound && self.loInclusive && self.hiInclusive)
+        {
+            *outVal = self.loBound;
+            return true;
+        }
+        return false;
+    }
+}
+
+// Range info for a block
+struct RangeInfo
+{
+    ValueRange* ranges;
+    u32 numRanges;
+    u32 capRanges;
+
+    void init()
+    {
+        self.ranges = null;
+        self.numRanges = 0;
+        self.capRanges = 0;
+    }
+
+    void free()
+    {
+        if (self.ranges != null) dealloc<ValueRange>(self.ranges);
+        self.ranges = null;
+        self.numRanges = 0;
+        self.capRanges = 0;
+    }
+
+    void addConstraint(IrValue* val, IrICmpPred pred, i64 bound, bool constOnLeft)
+    {
+        // Find or create range for this variable
+        for (u32 i = 0; i < self.numRanges; i++)
+        {
+            if (self.ranges[i].value == val)
+            {
+                self.ranges[i].updateFromICmp(pred, bound, constOnLeft);
+                return;
+            }
+        }
+
+        // Create new range
+        if (self.numRanges >= self.capRanges)
+        {
+            u32 newCap = self.capRanges ? self.capRanges * 2 : 8;
+            ValueRange* newRanges = alloc<ValueRange>(newCap);
+            for (u32 i = 0; i < self.numRanges; i++)
+                newRanges[i] = self.ranges[i];
+            if (self.ranges != null) dealloc<ValueRange>(self.ranges);
+            self.ranges = newRanges;
+            self.capRanges = newCap;
+        }
+
+        self.ranges[self.numRanges].init(val);
+        self.ranges[self.numRanges].updateFromICmp(pred, bound, constOnLeft);
+        self.numRanges++;
+    }
+
+    ValueRange* findRange(IrValue* val)
+    {
+        for (u32 i = 0; i < self.numRanges; i++)
+            if (self.ranges[i].value == val)
+                return &self.ranges[i];
+        return null;
+    }
+}
+
+IrValue* tryFoldByRange(IrContext* ctx, IrInst* icmp, RangeInfo* info, IrFunc* func, u32 blockIdx)
+{
+    if (icmp == null || info == null) return null;
+    if (icmp->opcode != IrOpcode::ICmp) return null;
+    if (icmp->nops != 2) return null;
+
+    IrValue* a = icmp->ops[0];
+    IrValue* b = icmp->ops[1];
+    if (a == null || b == null) return null;
+
+    // Case 1, Comparing a variable with a known constant range
+    IrValue* val = null;
+    IrValue* cval = null;
+    bool constOnLeft = false;
+
+    if (a->kind == IrValueKind::ConstInt && b->kind == IrValueKind::Inst)
+    {
+        cval = a;
+        val = b;
+        constOnLeft = true;
+    }
+    else if (b->kind == IrValueKind::ConstInt && a->kind == IrValueKind::Inst)
+    {
+        cval = b;
+        val = a;
+        constOnLeft = false;
+    }
+    else return null;
+
+    if (val == null || cval == null) return null;
+
+    // Look up range for the variable
+    ValueRange* range = info.findRange(val);
+    if (range == null) return null;
+
+    i64 cvalData = cval->valData;
+
+    // Try to fold based on the comparison predicate and known range
+    bool result = false;
+    bool determined = false;
+
+    switch (icmp->icmpPred)
+    {
+        IrICmpPred::Slt |
+        IrICmpPred::Ult => {
+            if (constOnLeft)
+            {
+                // cval < val
+                if (range->hasLo && range->loBound > cvalData)
+                {
+                    // val > range.loBound > cval, so cval < val is always true
+                    result = true;
+                    determined = true;
+                }
+                else if (range->hasHi && range->hiBound <= cvalData)
+                {
+                    // val <= range.hiBound <= cval, so cval < val is always false
+                    result = false;
+                    determined = true;
+                }
+            }
+            else
+            {
+                // val < cval
+                if (range->hasHi && range->hiBound < cvalData)
+                {
+                    // val <= range.hiBound < cval, so val < cval is always true
+                    result = true;
+                    determined = true;
+                }
+                else if (range->hasLo && range->loBound >= cvalData)
+                {
+                    // val >= range.loBound >= cval, so val < cval is always false
+                    result = false;
+                    determined = true;
+                }
+            }
+        },
+        IrICmpPred::Sle |
+        IrICmpPred::Ule => {
+            if (constOnLeft)
+            {
+                // cval <= val
+                if (range->hasLo && range->loBound > cvalData)
+                {
+                    result = true;
+                    determined = true;
+                }
+                else if (range->hasHi && range->hiBound < cvalData)
+                {
+                    result = false;
+                    determined = true;
+                }
+            }
+            else
+            {
+                // val <= cval
+                if (range->hasHi && range->hiBound <= cvalData)
+                {
+                    result = true;
+                    determined = true;
+                }
+                else if (range->hasLo && range->loBound > cvalData)
+                {
+                    result = false;
+                    determined = true;
+                }
+            }
+        },
+        IrICmpPred::Sgt |
+        IrICmpPred::Ugt => {
+            if (constOnLeft)
+            {
+                // cval > val
+                if (range->hasHi && range->hiBound < cvalData)
+                {
+                    result = true;
+                    determined = true;
+                }
+                else if (range->hasLo && range->loBound >= cvalData)
+                {
+                    result = false;
+                    determined = true;
+                }
+            }
+            else
+            {
+                // val > cval
+                if (range->hasLo && range->loBound > cvalData)
+                {
+                    result = true;
+                    determined = true;
+                }
+                else if (range->hasHi && range->hiBound <= cvalData)
+                {
+                    result = false;
+                    determined = true;
+                }
+            }
+        },
+        IrICmpPred::Sge |
+        IrICmpPred::Uge => {
+            if (constOnLeft)
+            {
+                // cval >= val
+                if (range->hasHi && range->hiBound <= cvalData)
+                {
+                    result = true;
+                    determined = true;
+                }
+                else if (range->hasLo && range->loBound > cvalData)
+                {
+                    result = false;
+                    determined = true;
+                }
+            }
+            else
+            {
+                // val >= cval
+                if (range->hasLo && range->loBound >= cvalData)
+                {
+                    result = true;
+                    determined = true;
+                }
+                else if (range->hasHi && range->hiBound < cvalData)
+                {
+                    result = false;
+                    determined = true;
+                }
+            }
+        },
+        IrICmpPred::Eq => {
+            i64 singleVal;
+            if (range->isSingleValue(&singleVal))
+            {
+                if (constOnLeft)
+                {
+                    result = (cvalData == singleVal);
+                    determined = true;
+                }
+                else
+                {
+                    result = (singleVal == cvalData);
+                    determined = true;
+                }
+            }
+        },
+        IrICmpPred::Ne =>
+        {
+            i64 singleVal;
+            if (range->isSingleValue(&singleVal))
+            {
+                if (constOnLeft)
+                {
+                    result = (cvalData != singleVal);
+                    determined = true;
+                }
+                else
+                {
+                    result = (singleVal != cvalData);
+                    determined = true;
+                }
+            }
+        },
+        else => { },
+    }
+
+    if (determined)
+    {
+        return ctx->constInt(icmp->base.type, result ? 1 : 0);
+    }
+
+    return null;
+}

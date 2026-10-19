@@ -1,0 +1,834 @@
+#[[no_drop_all]]
+/* mono/mono.crl: monomorphization state and type substitution.
+ *
+ * MonoContext owns the three tables this pass builds: declarations that
+ * mention generics, pending work items (collect enqueues, instantiate
+ * drains), and the concrete instances themselves. Substitution walks
+ * types recursively and interns a FRESH node for every composite it
+ * touches: see typeDigest for why hashes must never compare those Ty
+ * indices across phases. */
+
+import ast::id { Str, NodeId, SourceLoc };
+import ast::types { Ty, TypeEntry, TypeKind };
+import ast::node { Node, NodeKind };
+import ast::decl { File, Decl, DeclKind, GenericParam, Param, Field, Attribute, VariantVariant };
+import ast::expr { Expr, ExprKind };
+import ast::stmt { Stmt, StmtKind, SwitchCase };
+import ast::pat { Pat, PatKind };
+import context::context { AstContext };
+import sem::sema { Sema };
+import sem::typecheck;
+
+import(lib) std::mman { alloc, dealloc, realloc };
+
+pub enum MonoDeclKind
+{
+    TypeDecl,
+    FunctionDecl
+}
+
+pub enum MonoInstanceKind
+{
+    TypeInstance,
+    FunctionInstance
+}
+
+pub struct MonoDecl
+{
+    MonoDeclKind kind;
+    Str name;
+    NodeId declaration;
+}
+
+/* one generic param → concrete type. `index` is the slot for bare `T`
+ * params, `parameter` the name for explicit `<T>` lists: lookups match
+ * whichever the type site can provide. */
+pub struct MonoSubstitution
+{
+    Str parameter;
+    u32 index;
+    NodeId declaration;
+    Ty typeNode;
+}
+
+pub struct MonoInstance
+{
+    MonoInstanceKind kind;
+    Str name;
+    NodeId declaration;
+    Ty typeNode;
+    Ty returnType;
+    Ty* paramTypes;
+    u32 paramTypesLen;
+    Ty* arguments;
+    u32 argumentsLen;
+    MonoSubstitution* substitutions;
+    u32 substitutionsLen;
+    NodeId body;
+    Attribute* attributes;
+    u32 attributesLen;
+    u8 validationAttempted;
+    u8 validated;
+    /* Zig-style value specialization: instances of the same declaration
+     * with the same type arguments but different comptime-visible call
+     * values (literal formats, argument arity) are distinct instances */
+    u64 valueKey;
+    u32 packArity;
+    Str* literalNames;
+    NodeId* literalNodes;
+    u32 literalsLen;
+    /* trailing variadic call args: their concrete types + original arg
+     * nodes (literal tails fold during evalComptimeBody, runtime tails
+     * become named C parameters `_varg0`, `_varg1`, … whose names are
+     * synthesized during eval and stored in tailArgNames) */
+    Ty* tailTypes;
+    NodeId* tailNodes;
+    Str* tailArgNames;
+    u32 tailLen;
+}
+
+/* a queued instantiation. Its argument/substitution/literal/tail
+ * arrays are alloc'd copies made by the enqueuer; clear() frees them
+ * per item. */
+pub struct MonoWorkItem
+{
+    MonoDeclKind kind;
+    NodeId declaration;
+    Ty* arguments;
+    u32 argumentsLen;
+    MonoSubstitution* inherited;
+    u32 inheritedLen;
+    u64 valueKey;
+    u32 packArity;
+    Str* literalNames;
+    NodeId* literalNodes;
+    u32 literalsLen;
+    Ty* tailTypes;
+    NodeId* tailNodes;
+    u32 tailLen;
+}
+
+pub struct MonoContext
+{
+    AstContext* ast;
+    Sema* sema;
+    File* file;
+    MonoDecl* declarations;
+    u32 declarationsLen;
+    u32 declarationsCap;
+    MonoWorkItem* work;
+    u32 workLen;
+    u32 workCap;
+    MonoInstance* instances;
+    u32 instancesLen;
+    u32 instancesCap;
+    u32 errors;
+    /* substitutions of the instance whose body is currently being
+     * re-collected; generic calls inside instance bodies enqueue with
+     * these applied so `alloc<T>` inside Vec<str> yields alloc<str> */
+    MonoSubstitution* activeSubs;
+    u32 activeSubsLen;
+}
+
+pub extend MonoContext
+{
+    void init(AstContext* ast, Sema* sema)
+    {
+        self.ast = ast;
+        self.sema = sema;
+        self.file = null;
+        self.declarations = null;
+        self.declarationsLen = 0;
+        self.declarationsCap = 0;
+        self.work = null;
+        self.workLen = 0;
+        self.workCap = 0;
+        self.instances = null;
+        self.instancesLen = 0;
+        self.instancesCap = 0;
+        self.errors = 0;
+        self.activeSubs = null;
+        self.activeSubsLen = 0;
+        /* no ast = nothing to mono; surface it as an error so callers bail */
+        if (ast == null) self.errors = 1;
+    }
+
+    /* drops every alloc<T> array this context owns. None of it is
+     * arena-backed, so each array goes back through the matching
+     * dealloc<T> below. */
+    void clear()
+    {
+        u32 i = 0;
+        while (i < self.workLen)
+        {
+            if (self.work[i].arguments != null) dealloc<Ty>(self.work[i].arguments);
+            if (self.work[i].inherited != null) dealloc<MonoSubstitution>(self.work[i].inherited);
+            if (self.work[i].literalNames != null) dealloc<Str>(self.work[i].literalNames);
+            if (self.work[i].literalNodes != null) dealloc<NodeId>(self.work[i].literalNodes);
+            if (self.work[i].tailTypes != null) dealloc<Ty>(self.work[i].tailTypes);
+            if (self.work[i].tailNodes != null) dealloc<NodeId>(self.work[i].tailNodes);
+            i++;
+        }
+        if (self.work != null) dealloc<MonoWorkItem>(self.work);
+        i = 0;
+        while (i < self.instancesLen)
+        {
+            if (self.instances[i].arguments != null) dealloc<Ty>(self.instances[i].arguments);
+             if (self.instances[i].paramTypes != null) dealloc<Ty>(self.instances[i].paramTypes);
+             if (self.instances[i].substitutions != null) dealloc<MonoSubstitution>(self.instances[i].substitutions);
+            if (self.instances[i].literalNames != null) dealloc<Str>(self.instances[i].literalNames);
+            if (self.instances[i].literalNodes != null) dealloc<NodeId>(self.instances[i].literalNodes);
+            if (self.instances[i].tailTypes != null) dealloc<Ty>(self.instances[i].tailTypes);
+            if (self.instances[i].tailNodes != null) dealloc<NodeId>(self.instances[i].tailNodes);
+            if (self.instances[i].tailArgNames != null) dealloc<Str>(self.instances[i].tailArgNames);
+            i++;
+        }
+        if (self.instances != null) dealloc<MonoInstance>(self.instances);
+        if (self.declarations != null) dealloc<MonoDecl>(self.declarations);
+        self.file = null;
+        self.work = null;
+        self.workLen = 0;
+        self.workCap = 0;
+        self.instances = null;
+        self.instancesLen = 0;
+        self.instancesCap = 0;
+        self.declarations = null;
+        self.declarationsLen = 0;
+        self.declarationsCap = 0;
+        self.errors = 0;
+        self.activeSubs = null;
+        self.activeSubsLen = 0;
+    }
+
+    void deinit()
+    {
+        self.clear();
+        self.ast = null;
+        self.sema = null;
+    }
+
+    Ty findSubstitution(Ty typeNode, MonoSubstitution* substitutions, u32 substitutionsLen)
+    {
+        TypeEntry* entry = self.typeEntryAt(typeNode);
+        if (entry == null || entry->kind.tag != TypeKind::TypeParam) return 0;
+        u32 i = 0;
+        while (i < substitutionsLen)
+        {
+            if (substitutions[i].index == entry->kind.payload.TypeParam.index ||
+                substitutions[i].parameter == entry->kind.payload.TypeParam.name)
+                return substitutions[i].typeNode;
+            i++;
+        }
+        return 0;
+    }
+
+    /* rebuilds `typeNode` with `substitutions` applied. Every composite
+     * node comes back freshly interned: two calls that produce the
+     * same shape hand out different Ty indices, which is exactly why
+     * typeDigest hashes names instead of indices. */
+    Ty substituteType(Ty typeNode, MonoSubstitution* substitutions, u32 substitutionsLen)
+    {
+        if (typeNode == 0) return 0;
+        TypeEntry* entry = self.typeEntryAt(typeNode);
+        if (entry == null) return 0;
+        switch (entry->kind.tag)
+        {
+            TypeKind::TypeParam => { return self.findSubstitution(typeNode, substitutions, substitutionsLen); },
+            /* a comptime value arg is already concrete */
+            TypeKind::ValueInt => { return typeNode; },
+            TypeKind::Named => {
+                u32 i = 0;
+                while (i < substitutionsLen)
+                {
+                    if (substitutions[i].parameter == entry->kind.payload.Named.name && entry->kind.payload.Named.genericArgsLen == 0)
+                        return substitutions[i].typeNode;
+                    i++;
+                }
+                Ty* args = self.copyTypes(entry->kind.payload.Named.genericArgs, entry->kind.payload.Named.genericArgsLen);
+                self.ast.track((rawptr)args);
+                u32 j = 0;
+                while (j < entry->kind.payload.Named.genericArgsLen)
+                {
+                    args[j] = self.substituteType(args[j], substitutions, substitutionsLen);
+                    j++;
+                }
+                TypeKind kind = TypeKind::Named{ .name = entry->kind.payload.Named.name, .genericArgs = args, .genericArgsLen = entry->kind.payload.Named.genericArgsLen };
+                Ty nt = self.sema.allocType(kind);
+                TypeEntry* ne = self.ast.types + nt;
+                ne->loc = entry->loc;
+                return nt;
+            },
+            
+            TypeKind::Pointer => {
+                TypeKind kind = TypeKind::Pointer{ .base = self.substituteType(entry->kind.payload.Pointer.base, substitutions, substitutionsLen) };
+                return self.sema.allocType(kind);
+            },
+
+            TypeKind::Const => {
+                TypeKind kind = TypeKind::Const{ .base = self.substituteType(entry->kind.payload.Const.base, substitutions, substitutionsLen) };
+                return self.sema.allocType(kind);
+            },
+
+            TypeKind::Comptime => {
+                TypeKind kind = TypeKind::Comptime{ .base = self.substituteType(entry->kind.payload.Comptime.base, substitutions, substitutionsLen) };
+                return self.sema.allocType(kind);
+            },
+
+            TypeKind::Slice => {
+                TypeKind kind = TypeKind::Slice{ .base = self.substituteType(entry->kind.payload.Slice.base, substitutions, substitutionsLen) };
+                return self.sema.allocType(kind);
+            },
+
+            TypeKind::Array => {
+                /* symbolic size `T data[N]`: resolve N through the instance's
+                 * substitutions; a ValueInt argument pins the length and
+                 * clears the symbolic reference */
+                u32 len = entry->kind.payload.Array.len;
+                u32 sizeParam = entry->kind.payload.Array.sizeParam;
+                Str sizeName = entry->kind.payload.Array.sizeName;
+                u32 si = 0;
+                while (si < substitutionsLen)
+                {
+                    /* fields keep the written name (no parser rebind), so
+                     * match by param index or by name; funcs get index'd */
+                    bool match = (sizeParam != 4294967295 && substitutions[si].index == sizeParam) ||
+                                 (sizeParam == 4294967295 && sizeName != 0 && substitutions[si].parameter == sizeName);
+                    if (match)
+                    {
+                        TypeEntry* se = self.typeEntryAt(substitutions[si].typeNode);
+                        if (se != null && se->kind.tag == TypeKind::ValueInt)
+                        {
+                            len = (u32)se->kind.payload.ValueInt.value;
+                            sizeParam = 4294967295;
+                            sizeName = 0;
+                        }
+                        break;
+                    }
+                    si++;
+                }
+                TypeKind kind = TypeKind::Array{ .base = self.substituteType(entry->kind.payload.Array.base, substitutions, substitutionsLen), .len = len,
+                                                 .sizeParam = sizeParam, .sizeName = sizeName };
+                return self.sema.allocType(kind);
+            },
+
+            /* fn-pointer params carry the generic params too:
+             * `bool(T,T) less` must become `bool(i32,i32)` per instance,
+             * not stay the first instantiation's spelling */
+            TypeKind::FnPtr => {
+                Ty* params = self.copyTypes(entry->kind.payload.FnPtr.params, entry->kind.payload.FnPtr.paramsLen);
+                self.ast.track((rawptr)params);
+                u32 k = 0;
+                while (k < entry->kind.payload.FnPtr.paramsLen)
+                {
+                    params[k] = self.substituteType(params[k], substitutions, substitutionsLen);
+                    k++;
+                }
+                TypeKind kind = TypeKind::FnPtr{ .returnType = self.substituteType(entry->kind.payload.FnPtr.returnType, substitutions, substitutionsLen), .params = params, .paramsLen = entry->kind.payload.FnPtr.paramsLen, .name = entry->kind.payload.FnPtr.name };
+                return self.sema.allocType(kind);
+            },
+            else => { return typeNode; },
+        }
+    }
+
+    /* cap-doubling growth; callers check the bool and bail on OOM.
+     * The work set is tiny (one entry per generic call site), so
+     * doubling is plenty. */
+    bool reserveDeclarations()
+    {
+        if (self.declarationsLen < self.declarationsCap) return true;
+        u32 newCap = self.declarationsCap * 2;
+        if (newCap == 0) newCap = 16;
+        MonoDecl* raw = realloc<MonoDecl>(self.declarations, (usize)newCap);
+        if (raw == null)
+        {
+            self.errors++;
+            return false;
+        }
+        self.declarations = raw;
+        self.declarationsCap = newCap;
+        return true;
+    }
+
+    bool reserveWork()
+    {
+        if (self.workLen < self.workCap) return true;
+        u32 newCap = self.workCap * 2;
+        if (newCap == 0) newCap = 16;
+        MonoWorkItem* raw = realloc<MonoWorkItem>(self.work, (usize)newCap);
+        if (raw == null)
+        {
+            self.errors++;
+            return false;
+        }
+        self.work = raw;
+        self.workCap = newCap;
+        return true;
+    }
+
+    bool reserveInstances()
+    {
+        if (self.instancesLen < self.instancesCap) return true;
+        u32 newCap = self.instancesCap * 2;
+        if (newCap == 0) newCap = 16;
+        MonoInstance* raw = realloc<MonoInstance>(self.instances, (usize)newCap);
+        if (raw == null)
+        {
+            self.errors++;
+            return false;
+        }
+        self.instances = raw;
+        self.instancesCap = newCap;
+        return true;
+    }
+
+    /* heap copies owned by the caller; the source is usually an arena
+     * slice or an interned type table that a later pass rewrites. */
+    Ty* copyTypes(Ty* values, u32 len)
+    {
+        if (len == 0) return null;
+        Ty* result = alloc<Ty>((usize)len);
+        if (result == null)
+        {
+            self.errors++;
+            return null;
+        }
+        u32 i = 0;
+        while (i < len)
+        {
+            result[i] = values[i];
+            i++;
+        }
+        return result;
+    }
+
+    MonoSubstitution* copySubstitutions(MonoSubstitution* values, u32 len)
+    {
+        if (len == 0) return null;
+        MonoSubstitution* result = alloc<MonoSubstitution>((usize)len);
+        if (result == null)
+        {
+            self.errors++;
+            return null;
+        }
+        u32 i = 0;
+        while (i < len)
+        {
+            result[i] = values[i];
+            i++;
+        }
+        return result;
+    }
+
+    Node* nodeAt(NodeId id)
+    {
+        if (self.ast == null || id.index == 0 || id.index >= self.ast.nodesLen) return null;
+        return self.ast.nodes + id.index;
+    }
+
+    Decl* declAt(NodeId id)
+    {
+        Node* node = self.nodeAt(id);
+        if (node == null || node->kind.tag != NodeKind::Decl) return null;
+        return &node->kind.payload.Decl.value;
+    }
+
+    /* FNV-1a over the call's per-argument comptime-visible identity:
+     * a literal token (string bytes / int / char / bool value) or 'R'
+     * for runtime args. Two call sites to the same generic function
+     * produce the same valueKey iff their literal args are equal (and
+     * the arity matches): this is the value half of instance identity
+     * (Zig-style: `println("a")` and `println("b")` are distinct
+     * instances, `println(fmt)` with a runtime fmt shares the runtime
+     * instance). Computed identically at collect time (collectCall) and
+     * at codegen time (cgCallFromDecl), both over the call's arg nodes. */
+    u64 callValueKey(NodeId* args, u32 argsLen)
+    {
+        u64 h = 1469598103934665603;
+        h = (h ^ (u64)argsLen) * 1099511628211;
+        u32 i = 0;
+        while (i < argsLen)
+        {
+            u64 tag = 82; // 'R': runtime value
+            u64 val = 0;
+            u8* sp = null;
+            usize sl = 0;
+            Node* an = self.nodeAt(args[i]);
+            if (an != null && an->kind.tag == NodeKind::Expr)
+            {
+                Expr* e = &an->kind.payload.Expr.value;
+                if (e->kind.tag == ExprKind::StringLit)
+                {
+                    tag = 83; // 'S'
+                    Str s = e->kind.payload.StringLit.value;
+                    if (s != 0 && s < self.ast.internsLen)
+                    {
+                        sp = self.ast.interns[s].ptr;
+                        sl = self.ast.interns[s].len;
+                    }
+                }
+                else if (e->kind.tag == ExprKind::IntLit) { tag = 73; val = e->kind.payload.IntLit.value; } // 'I'
+                else if (e->kind.tag == ExprKind::CharLit) { tag = 67; val = (u64)e->kind.payload.CharLit.value; } // 'C'
+                else if (e->kind.tag == ExprKind::BoolLit) { tag = 66; val = (u64)(e->kind.payload.BoolLit.flags & 1); } // 'B'
+                else if (e->kind.tag == ExprKind::Spread && e->kind.payload.Spread.expr.index == 0) tag = 80; // 'P' bare spread
+            }
+            h = (h ^ tag) * 1099511628211;
+            h = (h ^ val) * 1099511628211;
+            usize b = 0;
+            while (b < sl)
+            {
+                h = (h ^ (u64)sp[b]) * 1099511628211;
+                b++;
+            }
+            i++;
+        }
+        return h;
+    }
+
+    /* structural, allocation-free hash of a type as seen through a
+     * substitution list. Must be stable between collect time and codegen
+     * time: `substituteType` interns a FRESH copy for every Named /
+     * Pointer / Slice / … it walks, so hashing its result would compare
+     * two different indices (a struct-typed runtime arg then never finds
+     * its instance). Names / primitive indices are the same in both
+     * phases, so hash those. */
+    u64 typeDigest(Ty t, MonoSubstitution* subs, u32 subsLen)
+    {
+        if (t == 0) return 0;
+        TypeEntry* te = self.typeEntryAt(t);
+        if (te == null) return 0;
+        switch (te->kind.tag)
+        {
+            TypeKind::TypeParam => {
+                Ty st = self.findSubstitution(t, subs, subsLen);
+                if (st != 0 && st != t) return self.typeDigest(st, null, 0);
+                /* still unsubstituted: tag the raw index so it can't be
+                 * mistaken for a primitive's canonical index */
+                return ((u64)t << 1) | 1;
+            },
+            /* comptime value args hash by value: `Arr<i32,4>` != `Arr<i32,9>` */
+            TypeKind::ValueInt => {
+                return (te->kind.payload.ValueInt.value * 1099511628211) ^ 97;
+            },
+            TypeKind::Named => {
+                u64 h = 1469598103934665603 ^ (u64)te->kind.payload.Named.name;
+                u32 i = 0;
+                while (i < te->kind.payload.Named.genericArgsLen)
+                {
+                    h *= 1099511628211;
+                    h = h ^ self.typeDigest(te->kind.payload.Named.genericArgs[i], subs, subsLen);
+                    i++;
+                }
+                return h;
+            },
+            TypeKind::Pointer => {
+                u64 hp = self.typeDigest(te->kind.payload.Pointer.base, subs, subsLen) * 1099511628211;
+                return hp ^ 81;
+            },
+            TypeKind::Const => {
+                u64 hc = self.typeDigest(te->kind.payload.Const.base, subs, subsLen) * 1099511628211;
+                return hc ^ 82;
+            },
+            TypeKind::Comptime => {
+                u64 hk = self.typeDigest(te->kind.payload.Comptime.base, subs, subsLen) * 1099511628211;
+                return hk ^ 83;
+            },
+            TypeKind::Slice => {
+                u64 hs = self.typeDigest(te->kind.payload.Slice.base, subs, subsLen) * 1099511628211;
+                return hs ^ 84;
+            },
+            TypeKind::Array => {
+                u64 ha = self.typeDigest(te->kind.payload.Array.base, subs, subsLen) * 1099511628211;
+                ha = ha ^ 85;
+                ha = ha ^ ((u64)te->kind.payload.Array.len << 32);
+                return ha;
+            },
+            TypeKind::FnPtr => {
+                u64 h = self.typeDigest(te->kind.payload.FnPtr.returnType, subs, subsLen) * 1099511628211;
+                h = h ^ 86;
+                u32 k = 0;
+                while (k < te->kind.payload.FnPtr.paramsLen)
+                {
+                    h *= 1099511628211;
+                    h = h ^ self.typeDigest(te->kind.payload.FnPtr.params[k], subs, subsLen);
+                    k++;
+                }
+                return h;
+            },
+            // primitives: the interned index is canonical and stable
+            else => { return (u64)t; },
+        }
+    }
+
+    /* valueKey + the substituted resolved type of every call arg: two
+     * call sites with equal value tokens but different runtime argument
+     * types (`println("{}", x)` with x:i32 vs y:f64) must not share an
+     * instance, and the instance's named tail parameters are typed from
+     * these. Computed identically at collect time (activeSubs) and at
+     * codegen time (cg.subs) over the same arg nodes. */
+    u64 callValueKeyTyped(NodeId* args, u32 argsLen, MonoSubstitution* subs, u32 subsLen)
+    {
+        u64 h = self.callValueKey(args, argsLen);
+        u32 i = 0;
+        while (i < argsLen)
+        {
+            Ty t = 0;
+            Node* an = self.nodeAt(args[i]);
+            if (an != null && an->kind.tag == NodeKind::Expr) t = an->kind.payload.Expr.value.resolvedType;
+            h = (h ^ self.typeDigest(t, subs, subsLen)) * 1099511628211;
+            i++;
+        }
+        return h;
+    }
+
+    /* fill out[genericCount] with the call-arg type bound to each generic
+     * slot: mirrors collectCall's inference (a bare type-param param, or
+     * a param whose type is that type param) so codegen can test whether a
+     * call site matches a collected instance. Unfilled slots stay 0. */
+    void inferCallArgs(NodeId declaration, NodeId* args, u32 argsLen,
+                       MonoSubstitution* subs, u32 subsLen, Ty* out)
+    {
+        Decl* decl = self.declAt(declaration);
+        if (decl == null || decl->kind.tag != DeclKind::Func) return;
+        u32 gcount = self.genericCount(declaration);
+        u32 next = 0;
+        u32 p = 0;
+        while (p < decl->kind.payload.Func.paramsLen && next < gcount)
+        {
+            NodeId paramId = decl->kind.payload.Func.params[p];
+            if (self.isTypeParameter(paramId))
+            {
+                if (p < argsLen)
+                {
+                    Ty at = 0;
+                    Node* an = self.nodeAt(args[p]);
+                    if (an != null && an->kind.tag == NodeKind::Expr) at = an->kind.payload.Expr.value.resolvedType;
+                    out[next] = self.substituteType(at, subs, subsLen);
+                }
+                next++;
+            }
+            else
+            {
+                Node* pn = self.nodeAt(paramId);
+                if (pn != null && pn->kind.tag == NodeKind::Param)
+                {
+                    Ty pt = pn->kind.payload.Param.value.typeNode;
+                    while (pt != 0)
+                    {
+                        TypeEntry* te2 = self.ast.types + pt;
+                        if (te2->kind.tag == TypeKind::Comptime) pt = te2->kind.payload.Comptime.base;
+                        else if (te2->kind.tag == TypeKind::Const) pt = te2->kind.payload.Const.base;
+                        else break;
+                    }
+                    if (pt != 0)
+                    {
+                        TypeEntry* te3 = self.ast.types + pt;
+                        u32 slot = 0;
+                        bool haveSlot = false;
+                        if (te3->kind.tag == TypeKind::TypeParam)
+                        {
+                            slot = te3->kind.payload.TypeParam.index;
+                            haveSlot = true;
+                        }
+                        else if (te3->kind.tag == TypeKind::Named)
+                        {
+                            /* explicit `<T>` param: resolve its slot by name */
+                            Str tn = te3->kind.payload.Named.name;
+                            u32 gi = 0;
+                            while (gi < decl->kind.payload.Func.genericParamsLen)
+                            {
+                                Node* gpn = self.nodeAt(decl->kind.payload.Func.genericParams[gi]);
+                                if (gpn != null && gpn->kind.tag == NodeKind::GenericParam &&
+                                    gpn->kind.payload.GenericParam.value.name == tn)
+                                {
+                                    slot = gi;
+                                    haveSlot = true;
+                                    break;
+                                }
+                                gi++;
+                            }
+                        }
+                        if (haveSlot && slot < gcount && out[slot] == 0 && p < argsLen)
+                        {
+                            Ty at = 0;
+                            Node* an = self.nodeAt(args[p]);
+                            if (an != null && an->kind.tag == NodeKind::Expr) at = an->kind.payload.Expr.value.resolvedType;
+                            out[slot] = self.substituteType(at, subs, subsLen);
+                        }
+                    }
+                }
+            }
+            p++;
+        }
+    }
+
+    TypeEntry* typeEntryAt(Ty typeNode)
+    {
+        if (self.ast == null || typeNode == 0 || typeNode >= self.ast.typesLen) return null;
+        return self.ast.types + typeNode;
+    }
+
+    u32 nodeCount()
+    {
+        if (self.ast == null) return 0;
+        return self.ast.nodesLen;
+    }
+
+    /* 1 = type-ish decl, 2 = func, 0 = anything else. Currently no
+     * callers; the pipeline discriminates decls by tag directly. */
+    u8 declarationKind(NodeId id)
+    {
+        Decl* decl = self.declAt(id);
+        if (decl == null) return 0;
+        switch (decl->kind.tag)
+        {
+            DeclKind::Struct => { return 1; },
+            DeclKind::Enum => { return 1; },
+            DeclKind::Variant => { return 1; },
+            DeclKind::Union => { return 1; },
+            DeclKind::Trait => { return 1; },
+            DeclKind::Func => { return 2; },
+            else => { return 0; },
+        }
+    }
+
+    Str declarationName(NodeId id)
+    {
+        Decl* decl = self.declAt(id);
+        if (decl == null) return 0;
+        switch (decl->kind.tag)
+        {
+            DeclKind::Struct => { return decl->kind.payload.Struct.name; },
+            DeclKind::Enum => { return decl->kind.payload.Enum.name; },
+            DeclKind::Variant => { return decl->kind.payload.Variant.name; },
+            DeclKind::Union => { return decl->kind.payload.Union.name; },
+            DeclKind::Trait => { return decl->kind.payload.Trait.name; },
+            DeclKind::Func => { return decl->kind.payload.Func.name; },
+            else => { return 0; },
+        }
+    }
+
+    /* the param's spelling: its name, or, for a bare `T` param, which
+     * has no name: the type name it stands for. Call-arg binding and
+     * slot naming both key off this. */
+    Str parameterName(NodeId id)
+    {
+        Node* node = self.nodeAt(id);
+        if (node == null || node->kind.tag != NodeKind::Param) return 0;
+        Param* param = &node->kind.payload.Param.value;
+        if (param->name != 0) return param->name;
+        TypeEntry* entry = self.typeEntryAt(param->typeNode);
+        if (entry != null && entry->kind.tag == TypeKind::Comptime)
+        {
+            TypeEntry* base = self.typeEntryAt(entry->kind.payload.Comptime.base);
+            if (base != null && base->kind.tag == TypeKind::Named)
+                return base->kind.payload.Named.name;
+        }
+        return 0;
+    }
+
+    /* a parameter that occupies a generic slot: the parser tags bare
+     * type params (`T`, `comptime T`) with flags & 8, and the resolved
+     * typeNode must still be Named/TypeParam for the slot to count. */
+    bool isTypeParameter(NodeId id)
+    {
+        Node* node = self.nodeAt(id);
+        if (node == null || node->kind.tag != NodeKind::Param) return false;
+        Param* param = &node->kind.payload.Param.value;
+        if ((param->flags & 8) == 0) return false;
+        Ty base = param->typeNode;
+        if (base == 0) return false;
+        TypeEntry* entry = self.typeEntryAt(base);
+        while (entry != null && entry->kind.tag == TypeKind::Const)
+        {
+            base = entry->kind.payload.Const.base;
+            if (base == 0) return false;
+            entry = self.typeEntryAt(base);
+        }
+        if (entry == null) return false;
+        return entry->kind.tag == TypeKind::Named || entry->kind.tag == TypeKind::TypeParam;
+    }
+
+    /* written `<T, U>` slots only; genericCount adds the implied ones */
+    u32 explicitGenericCount(NodeId id)
+    {
+        Decl* decl = self.declAt(id);
+        if (decl == null) return 0;
+        switch (decl->kind.tag)
+        {
+            DeclKind::Struct => { return decl->kind.payload.Struct.genericParamsLen; },
+            DeclKind::Variant => { return decl->kind.payload.Variant.genericParamsLen; },
+            DeclKind::Union => { return decl->kind.payload.Union.genericParamsLen; },
+            DeclKind::Trait => { return decl->kind.payload.Trait.genericParamsLen; },
+            DeclKind::Func => { return decl->kind.payload.Func.genericParamsLen; },
+            else => { return 0; },
+        }
+    }
+
+    bool nameInGenericParams(NodeId id, Str name)
+    {
+        Decl* decl = self.declAt(id);
+        if (decl == null) return false;
+        NodeId* params = null;
+        u32 len = 0;
+        switch (decl->kind.tag)
+        {
+            DeclKind::Struct => {
+                params = decl->kind.payload.Struct.genericParams;
+                len = decl->kind.payload.Struct.genericParamsLen;
+            },
+            DeclKind::Variant => {
+                params = decl->kind.payload.Variant.genericParams;
+                len = decl->kind.payload.Variant.genericParamsLen;
+            },
+            DeclKind::Union => {
+                params = decl->kind.payload.Union.genericParams;
+                len = decl->kind.payload.Union.genericParamsLen;
+            },
+            DeclKind::Trait => {
+                params = decl->kind.payload.Trait.genericParams;
+                len = decl->kind.payload.Trait.genericParamsLen;
+            },
+            DeclKind::Func => {
+                params = decl->kind.payload.Func.genericParams;
+                len = decl->kind.payload.Func.genericParamsLen;
+            },
+            else => { return false; },
+        }
+        u32 i = 0;
+        while (i < len)
+        {
+            Node* node = self.nodeAt(params[i]);
+            if (node != null && node->kind.tag == NodeKind::GenericParam)
+            {
+                GenericParam* param = &node->kind.payload.GenericParam.value;
+                if (param->name == name) return true;
+            }
+            i++;
+        }
+        return false;
+    }
+
+    /* full generic arity: explicit `<...>` entries plus bare-T params
+     * that weren't named there (`T fmt` style); those count as slots
+     * too, keyed by the parameter's name. */
+    u32 genericCount(NodeId id)
+    {
+        u32 count = self.explicitGenericCount(id);
+        Decl* decl = self.declAt(id);
+        if (decl == null || decl->kind.tag != DeclKind::Func) return count;
+        u32 i = 0;
+        while (i < decl->kind.payload.Func.paramsLen)
+        {
+            NodeId paramId = decl->kind.payload.Func.params[i];
+            if (self.isTypeParameter(paramId))
+            {
+                Str name = self.parameterName(paramId);
+                if (!self.nameInGenericParams(id, name)) count++;
+            }
+            i++;
+        }
+        return count;
+    }
+
+    bool isGenericDeclaration(NodeId id) { return self.genericCount(id) != 0; }
+}

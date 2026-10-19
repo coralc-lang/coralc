@@ -1,0 +1,2396 @@
+#[[no_drop_all]]
+
+/* expr.crl: expression checking. every expression gets a type written back
+ * into the node (resolvedType); the big switch in checkExpr is the entry
+ * point. the helpers above it are where the literal-adoption and assignment
+ * leniency rules live. */
+import ast {
+    id { Str, NodeId },
+    types { Ty, TypeEntry, TypeKind },
+    node { Node, NodeKind },
+    expr { Expr, ExprKind },
+    decl { Decl, DeclKind, Param, VariantVariant },
+    stmt { SwitchCase }
+};
+import scope { Symbol };
+import member { MemberInfo };
+import sema { Sema };
+import diag::code { ErrorCode };
+import(lib) std::mman { alloc, dealloc };
+
+pub extend Sema
+{
+    /* intern id -> text view; empty when out of range */
+    str nameTextView(Str id)
+    {
+        if (id == 0 || id >= self.ctx.internsLen) return str::empty();
+        return str { .ptr = self.ctx.interns[id].ptr, .len = self.ctx.interns[id].len };
+    }
+
+    /* type spelling as a view over the caller's scratch buffer */
+    str typeTextView(Ty ty, u8* buf, usize cap)
+    {
+        if (ty == 0) return String::from("?").asView();
+        u8* ts = self.tySpelling(ty, buf, cap);
+        usize n = 0;
+        while (ts[n] != 0) n++;
+        return str { .ptr = ts, .len = n };
+    }
+
+    /* diagnostics name their operand: `'x'`, `field 'data'`, `this expression` */
+    void appendExprDesc(String* s, NodeId id)
+    {
+        if (id.index == 0 || id.index >= self.ctx.nodesLen)
+        {
+            s.pushView("this expression");
+            return;
+        }
+        Node* n = self.ctx.nodes + id.index;
+        if (n->kind.tag != NodeKind::Expr)
+        {
+            s.pushView("this expression");
+            return;
+        }
+        Expr e = n->kind.payload.Expr.value;
+        if (e.kind.tag == ExprKind::Ident)
+        {
+            s.pushView("'");
+            s.pushView(self.nameTextView(e.kind.payload.Ident.name));
+            s.pushView("'");
+            return;
+        }
+        if (e.kind.tag == ExprKind::Field)
+        {
+            s.pushView("field '");
+            s.pushView(self.nameTextView(e.kind.payload.Field.field));
+            s.pushView("'");
+            return;
+        }
+        if (e.kind.tag == ExprKind::DerefField)
+        {
+            s.pushView("field '");
+            s.pushView(self.nameTextView(e.kind.payload.DerefField.field));
+            s.pushView("'");
+            return;
+        }
+        s.pushView("this expression");
+    }
+
+    /* decimal u64 into a String; arity messages need it */
+    void pushDec(String* s, u64 v)
+    {
+        if (v == 0) { s.pushView("0"); return; }
+        u8 tmp[24];
+        u32 n = 0;
+        while (v > 0) { tmp[n] = (u8)(48 + (v % 10)); v = v / 10; n++; }
+        while (n > 0) { n--; s.pushChar(tmp[n]); }
+    }
+
+    bool checkIdent(NodeId id, Str name)
+    {
+        self.markLocalUsed(name);
+        Symbol* symbol = self.lookupAt(name, id);
+        if (symbol == null)
+        {
+            String msg = String::new();
+            msg.pushView("undeclared identifier '");
+            msg.pushView(self.nameTextView(name));
+            msg.pushView("'");
+            self.semaErrorNode(ErrorCode::SemaUndeclaredIdent, id, msg.asView());
+            return false;
+        }
+        // record the symbol's type on the ident expression: consumers
+        // (comptime, codegen, hover) read it off the node
+        self.setExprType(id, symbol->typeNode);
+        return true;
+    }
+
+    /* An untyped brace literal `{ v1, v2 }` has no type of its own; when
+     * it lands where a struct type is expected, record that type so
+     * codegen emits a cast compound literal, recursing through nested
+     * braces (`T { { ... }, ... }`). */
+    void coerceArrayLit(NodeId arrId, Ty ty)
+    {
+        if (ty == 0 || arrId.index == 0) return;
+        Node* n = self.ctx.nodes + arrId.index;
+        if (n.kind.tag != NodeKind::Expr) return;
+        Expr* e = &n.kind.payload.Expr.value;
+        if (e.kind.tag != ExprKind::ArrayLiteral) return;
+        if (e.resolvedType != 0) return;
+        self.setExprType(arrId, ty);
+        u32 i = 0;
+        while (i < e.kind.payload.ArrayLiteral.elemsLen)
+        {
+            NodeId ev = e.kind.payload.ArrayLiteral.elems[i];
+            MemberInfo m = self.findMemberByIndex(ty, i);
+            if (m.typeNode != 0) self.coerceArrayLit(ev, self.substituteFieldTy(m.typeNode, ty));
+            i++;
+        }
+    }
+
+    /* ── lvalues ─────────────────────────────────────────────────────── */
+
+    /* assign-target check: ident, field, index and deref are assignable.
+     * sets the target's type but does not check the value against it; the
+     * caller owns compatibility. constants are rejected here (TC-0008). */
+    bool assignExpr(NodeId id)
+    {
+        if (id.index == 0) return false;
+        Node* node = self.ctx.nodes + id.index;
+        if (node->kind.tag != NodeKind::Expr) return false;
+        Expr* expr = &node->kind.payload.Expr.value;
+        if (expr->kind.tag == ExprKind::Ident)
+        {
+            Str targetName = expr->kind.payload.Ident.name;
+            Symbol* symbol = self.lookupAt(targetName, id);
+            if (symbol == null)
+            {
+                self.semaErrorNode(ErrorCode::SemaUndeclaredIdent, id, "cannot assign: undeclared identifier");
+                return false;
+            }
+            self.setExprType(id, symbol->typeNode);
+            if (symbol->kind != 1)
+            {
+                self.semaErrorNode(ErrorCode::SemaInvalidAssignTarget, id, "cannot assign: this name is not a variable");
+                return false;
+            }
+            if ((symbol->flags & 1) != 0)
+            {
+                self.semaErrorNode(ErrorCode::SemaInvalidAssignTarget, id, "cannot assign to a constant");
+                return false;
+            }
+            self.scopes.assign(targetName, id);
+            return true;
+        }
+        if (expr->kind.tag == ExprKind::Field)
+        {
+            if (!self.checkExpr(expr->kind.payload.Field.obj)) return false;
+            NodeId fieldObj = expr->kind.payload.Field.obj;
+            if (self.isPayloadAccessNode(fieldObj))
+            {
+                Ty baseTy = self.exprType(self.fieldAccessObj(fieldObj));
+                if (self.isVariantNamedTy(baseTy))
+                {
+                    if (!self.variantHasCase(baseTy, expr->kind.payload.Field.field)) return false;
+                    self.setExprType(id, self.stripType(baseTy));
+                    return true;
+                }
+            }
+            else if (self.isVariantCaseAccess(fieldObj))
+            {
+                NodeId payloadId = self.fieldAccessObj(fieldObj);
+                Ty baseTy = self.exprType(self.fieldAccessObj(payloadId));
+                if (self.isVariantNamedTy(baseTy))
+                {
+                    Ty ft = self.findVariantCaseFieldTy(baseTy, self.fieldAccessName(fieldObj), expr->kind.payload.Field.field);
+                    if (ft == 0) return false;
+                    self.setExprType(id, self.substituteFieldTy(ft, baseTy));
+                    return true;
+                }
+            }
+            MemberInfo member = self.findMember(self.exprType(expr->kind.payload.Field.obj), expr->kind.payload.Field.field);
+            if (member.typeNode == 0) return false;
+            self.setExprType(id, self.substituteFieldTy(member.typeNode, self.exprType(expr->kind.payload.Field.obj)));
+            return true;
+        }
+        if (expr->kind.tag == ExprKind::Index)
+        {
+            if (!self.checkExpr(expr->kind.payload.Index.obj)) return false;
+            Ty objectType = self.exprType(expr->kind.payload.Index.obj);
+            if (objectType == 0) return false;
+            TypeEntry* objectEntry = self.ctx.types + objectType;
+            if (objectEntry->kind.tag == TypeKind::Array) self.setExprType(id, objectEntry->kind.payload.Array.base);
+            else if (objectEntry->kind.tag == TypeKind::Slice) self.setExprType(id, objectEntry->kind.payload.Slice.base);
+            else if (objectEntry->kind.tag == TypeKind::Pointer) self.setExprType(id, objectEntry->kind.payload.Pointer.base);
+            else return false;
+            return self.checkExpr(expr->kind.payload.Index.index);
+        }
+        if (expr->kind.tag == ExprKind::Deref)
+        {
+            if (!self.checkExpr(expr->kind.payload.Deref.expr)) return false;
+            Ty pointerType = self.exprType(expr->kind.payload.Deref.expr);
+            if (pointerType == 0) return false;
+            TypeEntry* pointerEntry = self.ctx.types + pointerType;
+            if (pointerEntry->kind.tag != TypeKind::Pointer) return false;
+            self.setExprType(id, pointerEntry->kind.payload.Pointer.base);
+            return true;
+        }
+        return false;
+    }
+
+    /* a call through a function-pointer value (parameter, local, field):
+     * arity + argument types + result type all come from the FnPtr type */
+    bool checkFnPtrCall(NodeId callId, Ty calleeTy, NodeId* args, u32 argsLen)
+    {
+        if (calleeTy == 0) return true;
+        TypeEntry* te = self.ctx.types + calleeTy;
+        while (te->kind.tag == TypeKind::Const || te->kind.tag == TypeKind::Comptime)
+        {
+            if (te->kind.tag == TypeKind::Const) te = self.ctx.types + te->kind.payload.Const.base;
+            else te = self.ctx.types + te->kind.payload.Comptime.base;
+        }
+        if (te->kind.tag != TypeKind::FnPtr) return true;
+        if (argsLen != te->kind.payload.FnPtr.paramsLen)
+        {
+            String msg = String::new();
+            msg.pushView("wrong number of arguments in function-pointer call: expected ");
+            self.pushDec(&msg, (u64)te->kind.payload.FnPtr.paramsLen);
+            msg.pushView(", got ");
+            self.pushDec(&msg, (u64)argsLen);
+            self.semaErrorNode(ErrorCode::SemaArityMismatch, callId, msg.asView());
+            return false;
+        }
+        u32 i = 0;
+        while (i < argsLen)
+        {
+            if (!self.checkAssign(args[i], self.exprType(args[i]), te->kind.payload.FnPtr.params[i]))
+                self.semaErrorNode(ErrorCode::SemaTypeMismatch, args[i],
+                    self.typeMismatchMsg("argument type", self.exprType(args[i]), te->kind.payload.FnPtr.params[i]));
+            i++;
+        }
+        self.setExprType(callId, te->kind.payload.FnPtr.returnType);
+        return true;
+    }
+
+    bool checkCall(NodeId callId, Str name, NodeId* args, u32 argsLen, Ty calleeTy)
+    {
+        Symbol* symbol = self.lookupAt(name, callId);
+        if (symbol == null)
+        {
+            self.semaErrorNode(ErrorCode::SemaUndeclaredIdent, callId, "call to undeclared function");
+            return false;
+        }
+        return self.checkCallResolved(callId, symbol, args, argsLen, calleeTy);
+    }
+
+    /* checkCall with the callee already resolved: qualified calls
+     * (`fios::fileOpen`) resolve the symbol in the module's file first,
+     * which bare name lookup cannot do when this file declares the same
+     * name (`fs.crl` has its own `fileOpen`) */
+    bool checkCallResolved(NodeId callId, Symbol* symbol, NodeId* args, u32 argsLen, Ty calleeTy)
+    {
+        Node* declNode = self.ctx.nodes + symbol->declaration.index;
+        if (declNode->kind.tag != NodeKind::Decl) return self.checkFnPtrCall(callId, calleeTy, args, argsLen);
+        Decl* decl = &declNode->kind.payload.Decl.value;
+        if (decl->kind.tag != DeclKind::Func) return self.checkFnPtrCall(callId, calleeTy, args, argsLen);
+        u32 paramsLen = decl->kind.payload.Func.paramsLen;
+        bool variadic = false;
+        if (paramsLen > 0)
+        {
+            NodeId lastParamId = decl->kind.payload.Func.params[paramsLen - 1];
+            Node* lastParamNode = self.ctx.nodes + lastParamId.index;
+            if (lastParamNode->kind.tag == NodeKind::Param)
+            {
+                Param* lastParam = &lastParamNode->kind.payload.Param.value;
+                if ((lastParam->flags & 16) != 0)
+                {
+                    variadic = true;
+                    paramsLen--;
+                }
+            }
+        }
+        if (argsLen < paramsLen || (!variadic && argsLen != paramsLen))
+        {
+            String msg = String::new();
+            msg.pushView("wrong number of arguments in call to '");
+            msg.pushView(self.nameTextView(decl->kind.payload.Func.name));
+            msg.pushView("': expected ");
+            self.pushDec(&msg, (u64)paramsLen);
+            if (variadic) msg.pushView(" or more");
+            msg.pushView(", got ");
+            self.pushDec(&msg, (u64)argsLen);
+            self.semaErrorNode(ErrorCode::SemaArityMismatch, callId, msg.asView());
+            return false;
+        }
+        /* C++/clang template rule: explicit typeargs on the callee
+         * (`zero<E<i32, i32>>(p, n)`) bind the generic params once, then
+         * arguments are checked against the SUBSTITUTED parameter types;
+         * concrete sameType compares, no dependent-vs-dependent shape
+         * walking. Bound once here and reused for the args and retTy. */
+        u32 sflag = 0;
+        if (decl->kind.payload.Func.genericParamsLen > 0 && calleeTy != 0)
+        {
+            TypeEntry* ce = self.ctx.types + calleeTy;
+            if (ce->kind.tag == TypeKind::Named && ce->kind.payload.Named.genericArgsLen == decl->kind.payload.Func.genericParamsLen)
+            {
+                sflag = 1;
+            }
+        }
+        u32 i = 0;
+        while (i < argsLen)
+        {
+            /* a `...pack` spread consumes the variadic tail; no per-slot
+             * check against a fixed param */
+            Node* argNode = self.ctx.nodes + args[i].index;
+            bool isSpread = argNode != null && argNode->kind.tag == NodeKind::Expr &&
+                            argNode->kind.payload.Expr.value.kind.tag == ExprKind::Spread;
+            if (isSpread)
+            {
+                if (!self.checkExpr(args[i])) return false;
+                i++;
+                continue;
+            }
+            if (i < paramsLen)
+            {
+                NodeId paramId = decl->kind.payload.Func.params[i];
+                Node* paramNode = self.ctx.nodes + paramId.index;
+                if (paramNode->kind.tag == NodeKind::Param)
+                {
+                    Param* param = &paramNode->kind.payload.Param.value;
+                    if (!self.genericArgParam(decl, param))
+                    {
+                        Ty want = param->typeNode;
+                        if (sflag == 1) want = self.substituteFieldTy(want, calleeTy);
+                        if (!self.checkAssign(args[i], self.exprType(args[i]), want))
+                        {
+                            if (param->name != 0)
+                                self.semaErrorNode(ErrorCode::SemaTypeMismatch, args[i],
+                                    self.paramMismatchMsg(param->name, self.exprType(args[i]), want));
+                            else
+                                self.semaErrorNode(ErrorCode::SemaTypeMismatch, args[i],
+                                    self.typeMismatchMsg("argument type", self.exprType(args[i]), want));
+                        }
+                    }
+                }
+            }
+            i++;
+        }
+        /* explicit typeargs on the callee (`realloc<cchar>(p, n)`); substitute
+         * the generic params in the return type so downstream sees the
+         * concrete pointer type instead of an unresolved `T*` */
+        Ty retTy = decl->kind.payload.Func.returnType;
+        if (sflag == 1)
+            retTy = self.substituteFieldTy(retTy, calleeTy);
+        self.setExprType(callId, retTy);
+        return true;
+    }
+
+    /* `a::b::c` path minus the last segment, joined back with `::`;
+     * the module path an import-path match is tested against */
+    Str modulePathPrefix(NodeId* segs, u32 segCount)
+    {
+        if (segs == null || segCount < 2) return 0;
+        u32 keep = segCount - 1;
+        usize totalLen = 0;
+        u32 i = 0;
+        while (i < keep)
+        {
+            Node* n = self.ctx.nodes + segs[i].index;
+            if (n->kind.tag != NodeKind::Expr || n->kind.payload.Expr.value.kind.tag != ExprKind::Ident) return 0;
+            InternEntry* e = self.ctx.interns + n->kind.payload.Expr.value.kind.payload.Ident.name;
+            if (i > 0) totalLen += 2;
+            totalLen += e->len;
+            i++;
+        }
+        u8* buf = alloc<u8>(totalLen);
+        if (buf == null) return 0;
+        usize w = 0;
+        i = 0;
+        
+        while (i < keep)
+        {
+            Node* n = self.ctx.nodes + segs[i].index;
+            InternEntry* e = self.ctx.interns + n->kind.payload.Expr.value.kind.payload.Ident.name;
+            if (i > 0) { buf[w] = 58; buf[w + 1] = 58; w += 2; }
+            usize k = 0;
+            while (k < e->len) { buf[w] = e->ptr[k]; w++; k++; }
+            i++;
+        }
+        Str out = self.ctx.intern(str { .ptr = buf, .len = w });
+        dealloc<u8>(buf);
+        return out;
+    }
+
+    bool checkPath(NodeId id)
+    {
+        if (id.index == 0) return true;
+        Node* node = self.ctx.nodes + id.index;
+        if (node->kind.tag != NodeKind::Expr) return true;
+        Expr* expr = &node->kind.payload.Expr.value;
+        if (expr->kind.tag != ExprKind::Path) return true;
+        NodeId* segments = expr->kind.payload.Path.segments;
+        u32 segmentsLen = expr->kind.payload.Path.segmentsLen;
+        if (segmentsLen < 2) return true;
+        Node* leftNode = self.ctx.nodes + segments[0].index;
+        if (leftNode->kind.tag != NodeKind::Expr) return true;
+        Expr* leftExpr = &leftNode->kind.payload.Expr.value;
+        if (leftExpr->kind.tag == ExprKind::Path) return self.checkPath(segments[0]);
+        if (leftExpr->kind.tag == ExprKind::TypeRef)
+        {
+            // `Option<f64>::None`: type of the path is the head type
+            self.setExprType(id, leftExpr->kind.payload.TypeRef.typeNode);
+            return true;
+        }
+        if (leftExpr->kind.tag != ExprKind::Ident) return true;
+        Node* rightNode = self.ctx.nodes + segments[1].index;
+        if (rightNode->kind.tag != NodeKind::Expr) return true;
+        Expr* rightExpr = &rightNode->kind.payload.Expr.value;
+        if (rightExpr->kind.tag != ExprKind::Ident) return true;
+        Str root = leftExpr->kind.payload.Ident.name;
+        Str member = rightExpr->kind.payload.Ident.name;
+        Symbol* symbol = self.lookupAt(root, id);
+        if (symbol == null)
+        {
+            self.semaErrorNode(ErrorCode::SemaUndeclaredIdent, id, "undeclared module in path");
+            return false;
+        }
+        // enum value: Color::Red; type is the enum itself
+        if (symbol->declaration.index != 0)
+        {
+            Node* edeclNode = self.ctx.nodes + symbol->declaration.index;
+            if (edeclNode->kind.tag == NodeKind::Decl && edeclNode->kind.payload.Decl.value.kind.tag == DeclKind::Enum)
+            {
+                Decl* edecl = &edeclNode->kind.payload.Decl.value;
+                self.setExprType(id, self.namedType(edecl->kind.payload.Enum.name));
+                return true;
+            }
+            // bare variant: Option::None; type is the variant decl
+            if (edeclNode->kind.tag == NodeKind::Decl && edeclNode->kind.payload.Decl.value.kind.tag == DeclKind::Variant)
+            {
+                Decl* edecl = &edeclNode->kind.payload.Decl.value;
+                self.setExprType(id, self.namedType(edecl->kind.payload.Variant.name));
+                return true;
+            }
+        }
+        if (symbol->kind == 5 && symbol->declaration.index != 0)
+        {
+            Node* declNode = self.ctx.nodes + symbol->declaration.index;
+            if (declNode->kind.tag == NodeKind::Decl)
+            {
+                Decl* decl = &declNode->kind.payload.Decl.value;
+                if (!self.moduleExportsContain(decl, member))
+                {
+                    self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "symbol not exported by module");
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    /* TC-0009: an integer (literal or typed) is never a pointer. Always
+     * reported; --allow-int-ptr keeps it non-fatal, -w silences it. */
+    void intToPtrDiag(NodeId value)
+    {
+        if (self.diag == null) return;
+        SourceLoc loc;
+        loc.data = 0;
+        if (value.index != 0)
+        {
+            Node* node = self.ctx.nodes + value.index;
+            loc = node->loc;
+        }
+        if (self.allowIntPtr) self.diag.emitAllowed(ErrorCode::SemaIntToPtr, loc, "cannot assign an integer to a pointer", "use `null` for a null pointer, or cast the integer explicitly");
+        else self.semaError(ErrorCode::SemaIntToPtr, loc, "cannot assign an integer to a pointer");
+    }
+
+    bool assignCompatible(NodeId value, Ty fromTy, Ty targetTy)
+    {
+        if (self.compatible(fromTy, targetTy)) return true;
+        /* compile-time constant int expressions (`16 + 1`, `'a' - 1`) are
+         * generic; they adopt the expected integer target type at the use
+         * site, same as a bare literal. Without this, `alloc(16 + 1)` types
+         * the literal-sum as i32 and rejects a usize param. */
+        if (value.index != 0 && self.integerType(targetTy) && self.isConstIntExpr(value))
+        {
+            /* a `u`-suffixed literal stays unsigned-only even inside a
+             * compound const-int expr (`5u + 1`), matching the bare-literal
+             * rule further down; the fast path must not launder it into a
+             * signed target during ternary branch unification either */
+            if (self.hasUnsignedSuffix(value)) return !self.intSigned(targetTy);
+            self.setExprType(value, targetTy);
+            return true;
+        }
+        /* tuple literals adopt the expected element types: `((u32)b0, 1)`
+         * in a `(u32, u32)` return can't be seen by compatible() alone */
+        if (fromTy != 0 && targetTy != 0 && value.index != 0)
+        {
+            TypeEntry* fte = self.ctx.types + fromTy;
+            TypeEntry* tte = self.ctx.types + targetTy;
+            if (fte->kind.tag == TypeKind::Tuple && tte->kind.tag == TypeKind::Tuple &&
+                fte->kind.payload.Tuple.elemsLen == tte->kind.payload.Tuple.elemsLen)
+            {
+                Node* vn = self.ctx.nodes + value.index;
+                if (vn->kind.tag == NodeKind::Expr && vn->kind.payload.Expr.value.kind.tag == ExprKind::TupleExpr)
+                {
+                    bool ok = true;
+                    u32 ti = 0;
+                    while (ti < tte->kind.payload.Tuple.elemsLen)
+                    {
+                        NodeId elemId = vn->kind.payload.Expr.value.kind.payload.TupleExpr.elems[ti];
+                        Ty want = tte->kind.payload.Tuple.elems[ti];
+                        if (!self.assignCompatible(elemId, self.exprType(elemId), want)) { ok = false; break; }
+                        self.setExprType(elemId, want);
+                        ti++;
+                    }
+                    if (ok)
+                    {
+                        self.setExprType(value, targetTy);
+                        return true;
+                    }
+                }
+            }
+        }
+        // integer/float literal initializers convert when the value fits
+        if (value.index != 0)
+        {
+            Node* vn = self.ctx.nodes + value.index;
+            if (vn->kind.tag == NodeKind::Expr)
+            {
+                Expr* ev = &vn->kind.payload.Expr.value;
+                /* `-1` parses as Neg{ IntLit }; unwrap the sign so
+                 * negated literals get the same literal leniency, with
+                 * signed range limits (magnitude, sign-aware) */
+                bool negated = false;
+                if (ev->kind.tag == ExprKind::Neg)
+                {
+                    NodeId negIn = ev->kind.payload.Neg.expr;
+                    if (negIn.index != 0)
+                    {
+                        Node* nin = self.ctx.nodes + negIn.index;
+                        if (nin->kind.tag == NodeKind::Expr)
+                        {
+                            ev = &nin->kind.payload.Expr.value;
+                            negated = true;
+                        }
+                    }
+                }
+                if (ev->kind.tag == ExprKind::IntLit)
+                {
+                    u64 v = ev->kind.payload.IntLit.value;
+                    bool unsignedSuffix = (ev->kind.payload.IntLit.flags & 1) != 0;
+                    TypeEntry* te = targetTy != 0 ? self.ctx.types + targetTy : null;
+                    if (te != null)
+                    {
+                        /* `T* p = 0`: an integer literal is not a pointer;
+                         * pure rejection here, checkAssign reports TC-0009 */
+                        if (self.pointerLike(targetTy)) return false;
+                        /* `u`-suffixed literal: unsigned-only. Rejects any
+                         * signed target type regardless of value; `1u` is
+                         * generic among unsigned types (u8..u64, usize). */
+                        if (unsignedSuffix) return !self.intSigned(targetTy);
+                        switch (te->kind.tag)
+                        {
+                            TypeKind::U8 => { return !negated && v <= 255; },
+                            TypeKind::I8 => { return negated ? (v <= 128) : (v <= 127); },
+                            TypeKind::Char => { return !negated; },
+                            TypeKind::U16 => { return !negated && v <= 65535; },
+                            TypeKind::I16 => { return negated ? (v <= 32768) : (v <= 32767); },
+                            TypeKind::U32 => { return !negated && v <= 4294967295; },
+                            TypeKind::I32 => { return negated ? (v <= 2147483648) : (v <= 2147483647); },
+                            else => { return true; },
+                        }
+                    }
+                }
+                /* char literals are untyped: they adopt any integer target
+                 * type (`i32 c = '\n'`, `u8 b = '0'`). The `char` type
+                 * itself (UTF-32) does NOT implicitly convert to ints. */
+                if (ev->kind.tag == ExprKind::CharLit)
+                {
+                    if (self.integerType(targetTy)) return true;
+                }
+                if (ev->kind.tag == ExprKind::FloatLit)
+                {
+                    TypeEntry* te = targetTy != 0 ? self.ctx.types + targetTy : null;
+                    if (te != null && (te->kind.tag == TypeKind::F32 || te->kind.tag == TypeKind::F64)) return true;
+                }
+            }
+        }
+        /* function name → fn-pointer field/param (`T { .alloc = _foo }`,
+         * fn-pointer arguments): fn symbols carry their return type, so
+         * compatible() alone can never match a FnPtr target */
+        if (value.index != 0 && targetTy != 0)
+        {
+            TypeEntry* tte = self.ctx.types + targetTy;
+            if (tte->kind.tag == TypeKind::FnPtr)
+            {
+                Node* vn2 = self.ctx.nodes + value.index;
+                if (vn2->kind.tag == NodeKind::Expr && vn2->kind.payload.Expr.value.kind.tag == ExprKind::Ident)
+                {
+                    Symbol* vs = self.lookupAt(vn2->kind.payload.Expr.value.kind.payload.Ident.name, value);
+                    if (vs != null && vs->kind == 2) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /* is the value an integer (literal or typed) that a pointer target
+     * must reject; the shape checkAssign turns into TC-0009 */
+    bool intToPtrAssign(NodeId value, Ty fromTy, Ty targetTy)
+    {
+        if (fromTy == 0 || targetTy == 0 || value.index == 0) return false;
+        if (!self.pointerLike(targetTy)) return false;
+        if (self.integerType(fromTy)) return true;
+        Node* vn = self.ctx.nodes + value.index;
+        if (vn->kind.tag != NodeKind::Expr) return false;
+        Expr* ev = &vn->kind.payload.Expr.value;
+        if (ev->kind.tag == ExprKind::IntLit) return true;
+        if (ev->kind.tag == ExprKind::Neg)
+        {
+            NodeId inner = ev->kind.payload.Neg.expr;
+            if (inner.index == 0) return false;
+            Node* nin = self.ctx.nodes + inner.index;
+            return nin->kind.tag == NodeKind::Expr && nin->kind.payload.Expr.value.kind.tag == ExprKind::IntLit;
+        }
+        return false;
+    }
+
+    // `x.payload` access node (inside a field chain)
+    bool isPayloadAccessNode(NodeId objId)
+    {
+        if (objId.index == 0) return false;
+        Node* n = self.ctx.nodes + objId.index;
+        if (n->kind.tag != NodeKind::Expr) return false;
+        Expr* e = &n->kind.payload.Expr.value;
+        if (e->kind.tag == ExprKind::Field)
+            return e->kind.payload.Field.field == self.ctx.intern("payload");
+        if (e->kind.tag == ExprKind::DerefField)
+            return e->kind.payload.DerefField.field == self.ctx.intern("payload");
+        return false;
+    }
+
+    Str fieldAccessName(NodeId id)
+    {
+        Node* n = self.ctx.nodes + id.index;
+        Expr* e = &n->kind.payload.Expr.value;
+        if (e->kind.tag == ExprKind::Field) return e->kind.payload.Field.field;
+        return e->kind.payload.DerefField.field;
+    }
+
+    NodeId fieldAccessObj(NodeId id)
+    {
+        Node* n = self.ctx.nodes + id.index;
+        Expr* e = &n->kind.payload.Expr.value;
+        if (e->kind.tag == ExprKind::Field) return e->kind.payload.Field.obj;
+        return e->kind.payload.DerefField.obj;
+    }
+
+    // `x.payload.Case.field` leaf: the object access is `x.payload.Case`
+    bool isVariantCaseAccess(NodeId objId)
+    {
+        if (objId.index == 0) return false;
+        Node* n = self.ctx.nodes + objId.index;
+        if (n->kind.tag != NodeKind::Expr) return false;
+        Expr* e = &n->kind.payload.Expr.value;
+        if (e->kind.tag != ExprKind::Field && e->kind.tag != ExprKind::DerefField) return false;
+        return self.isPayloadAccessNode(self.fieldAccessObj(objId));
+    }
+
+    /* assignCompatible + the one diagnostic it cannot phrase itself:
+     * int→pointer is TC-0009 (always reported; --allow-int-ptr makes it
+     * non-fatal). Returns false only for ordinary mismatches; the
+     * caller then emits its generic message on the same node. */
+    bool checkAssign(NodeId value, Ty fromTy, Ty targetTy)
+    {
+        if (self.assignCompatible(value, fromTy, targetTy)) return true;
+        /* `kind.tag = V::Case`: a bare variant case into the tag int; the
+         * backend writes the ordinal */
+        if (self.integerType(self.stripType(targetTy)) && self.isVariantNamedTy(fromTy)) return true;
+        if (self.intToPtrAssign(value, fromTy, targetTy))
+        {
+            self.intToPtrDiag(value);
+            return true;
+        }
+        return false;
+    }
+
+    Ty assignTargetType(NodeId target)
+    {
+        Ty t = self.exprType(target);
+        if (t != 0 && target.index != 0)
+        {
+            Node* n = self.ctx.nodes + target.index;
+            TypeEntry* te = self.ctx.types + t;
+            if (te->kind.tag == TypeKind::Pointer &&
+                n->kind.tag == NodeKind::Expr &&
+                n->kind.payload.Expr.value.kind.tag == ExprKind::Ident &&
+                n->kind.payload.Expr.value.kind.payload.Ident.name == self.ctx.intern("self"))
+            {
+                // `self = x` writes through the implicit self pointer in the C backend
+                return te->kind.payload.Pointer.base;
+            }
+        }
+        return t;
+    }
+
+    /* binary result typing, roughly in order: variant-vs-tag comparisons,
+     * pointer arithmetic (`+`, `-`, and pointer-minus-pointer below), then
+     * scalar rules. isSub only matters for `-` (byte distance between
+     * pointers). nothing here is checked "forward"; each operand is typed,
+     * then the pair decides the result */
+    bool checkBinary(NodeId id, NodeId left, NodeId right, bool isSub)
+    {
+        if (!self.checkExpr(left)) return false;
+        if (!self.checkExpr(right)) return false;
+        Ty leftType = self.exprType(left);
+        Ty rightType = self.exprType(right);
+        // an untyped side (null) borrows the other side's type
+        if (leftType == 0) leftType = rightType;
+        if (rightType == 0) rightType = leftType;
+        /* `v.tag == V::Case`: a variant value compared against its tag
+         * int; the backend lowers the case side to the ordinal.
+         * isVariantNamedTy strips pointers, so guard against pointer
+         * operands: `variantPtr + i` is pointer arithmetic, not a tag
+         * comparison, and must not become i32 */
+        if (self.integerType(leftType) && !self.pointerLike(rightType) && self.isVariantNamedTy(rightType))
+        {
+            self.setExprType(id, self.i32Type());
+            return true;
+        }
+        if (self.integerType(rightType) && !self.pointerLike(leftType) && self.isVariantNamedTy(leftType))
+        {
+            self.setExprType(id, self.i32Type());
+            return true;
+        }
+        /* `p - q` with both sides pointers; byte distance (usize); the
+         * pointer-preserving rule below only covers `p - i` */
+        if (isSub && self.pointerLike(leftType) && self.pointerLike(rightType))
+        {
+            self.setExprType(id, self.usizeType());
+            return true;
+        }
+        /* no implicit scalar conversion in operators either: same type,
+         * or a literal adopting the typed side (`i < 10`, `8 + (u32)x`);
+         * mixed typed operands need an explicit cast on one side */
+        if (self.integerType(leftType) && self.integerType(rightType))
+        {
+            bool lLit = left.index != 0 && self.isIntLitNode(left);
+            bool rLit = right.index != 0 && self.isIntLitNode(right);
+            if (self.sameType(leftType, rightType)) { self.setExprType(id, leftType); return true; }
+            /* two operands with only provisional types (literals and
+             * literal-only arithmetic like `0x7FFF... - 1`): the wider
+             * side wins so nothing has to be typed by hand */
+            bool lGen = lLit || (left.index != 0 && self.isConstIntExpr(left));
+            bool rGen = rLit || (right.index != 0 && self.isConstIntExpr(right));
+            if (lGen && rGen)
+            {
+                u32 lw = self.intWidth(leftType);
+                u32 rw = self.intWidth(rightType);
+                if (lw > rw) self.setExprType(id, leftType);
+                else if (rw > lw) self.setExprType(id, rightType);
+                else if (!self.intSigned(leftType) && self.intSigned(rightType)) self.setExprType(id, leftType);
+                else self.setExprType(id, rightType);
+                return true;
+            }
+            /* a generic side (literal or literal-only arithmetic) adopts
+             * the typed side's integer type */
+            if (lGen && !rGen && (!lLit || self.intLitAdoptsTo(left, rightType))) { self.setExprType(id, rightType); return true; }
+            if (rGen && !lGen && (!rLit || self.intLitAdoptsTo(right, leftType))) { self.setExprType(id, leftType); return true; }
+            /* usize/isize are the platform word types; compatible() already
+             * treats them as mutually assignable with u64/i64 (C size_t vs
+             * uint64_t). Use that same rule here so `i < v.count` where i
+             * is usize and v.count is u64 works without a cast. */
+            if (self.compatible(leftType, rightType)) { self.setExprType(id, rightType); return true; }
+            if (self.compatible(rightType, leftType)) { self.setExprType(id, leftType); return true; }
+            /* char-family scalar mixing: `char`/`u8`/`i8`/`cchar` are the C
+             * byte types; like C's integer promotion they mix in scalar
+             * position the same way compatible()'s charFamily rule already
+             * lets them mix in assignment/argument position. The wider
+             * side wins the result type. */
+            if (self.charFamily(leftType) && self.charFamily(rightType))
+            {
+                if (self.intWidth(leftType) >= self.intWidth(rightType)) self.setExprType(id, leftType);
+                else self.setExprType(id, rightType);
+                return true;
+            }
+            /* char literals are untyped: they adopt the other operand's
+             * integer type (`c == '\n'` where c is i32: the literal '\n'
+             * becomes i32, the `char` type itself does not convert). */
+            bool lCLit = left.index != 0 && self.isCharLitNode(left);
+            bool rCLit = right.index != 0 && self.isCharLitNode(right);
+            if (lCLit && !rLit && self.integerType(rightType)) { self.setExprType(id, rightType); return true; }
+            if (rCLit && !lLit && self.integerType(leftType)) { self.setExprType(id, leftType); return true; }
+            self.semaErrorNode(ErrorCode::SemaTypeMismatch, id,
+                self.typeMismatchMsg("binary operand types", leftType, rightType));
+            self.setExprType(id, leftType);
+            return true;
+        }
+        if (self.floatType(leftType) && self.floatType(rightType))
+        {
+            if (self.sameType(leftType, rightType)) { self.setExprType(id, leftType); return true; }
+            bool lFLit = left.index != 0 && self.isFloatLitNode(left);
+            bool rFLit = right.index != 0 && self.isFloatLitNode(right);
+            if (lFLit && !rFLit) { self.setExprType(id, rightType); return true; }
+            if (rFLit && !lFLit) { self.setExprType(id, leftType); return true; }
+            self.semaErrorNode(ErrorCode::SemaTypeMismatch, id,
+                self.typeMismatchMsg("binary operand types", leftType, rightType));
+            self.setExprType(id, leftType);
+            return true;
+        }
+        /* pointer arithmetic: `p + i`, `i + p`, `p - i`, `arr + n`; result
+         * keeps the pointer side (C semantics; the backend lowers it natively) */
+        Ty lpTy = self.ptrArithType(leftType);
+        if (lpTy != 0 && (self.integerType(rightType) || (right.index != 0 && self.isIntLitNode(right))))
+        {
+            self.setExprType(id, lpTy);
+            return true;
+        }
+        Ty rpTy = self.ptrArithType(rightType);
+        if (rpTy != 0 && (self.integerType(leftType) || (left.index != 0 && self.isIntLitNode(left))))
+        {
+            self.setExprType(id, rpTy);
+            return true;
+        }
+        /* literal on the left, typed integer on the right: the literal
+         * takes the other side's type (`8 + (u32)x` → u32, not i32) */
+        if (left.index != 0 && self.isIntLitNode(left) && self.integerType(rightType))
+        {
+            self.setExprType(id, rightType);
+            return true;
+        }
+        if (!self.compatible(leftType, rightType) && !self.compatible(rightType, leftType))
+        {
+            /* int literal vs float gets the same leniency as initializers
+             * (assignCompatible's IntLit arm): `x > 0`, `0.5 * n`; the
+             * literal behaves as the float operand; result = the float side */
+            if (left.index != 0 && self.isIntLitNode(left) && self.floatType(rightType))
+            { self.setExprType(id, rightType); return true; }
+            if (right.index != 0 && self.isIntLitNode(right) && self.floatType(leftType))
+            { self.setExprType(id, leftType); return true; }
+            self.semaErrorNode(ErrorCode::SemaTypeMismatch, id,
+                self.typeMismatchMsg("binary operand types", leftType, rightType));
+        }
+        self.setExprType(id, leftType);
+        return true;
+    }
+
+    /* True when the node is an integer literal (looking through unary
+     * negation). Does not inspect the unsigned suffix. */
+    bool isIntLitNode(NodeId id)
+    {
+        if (id.index == 0) return false;
+        Node* n = self.ctx.nodes + id.index;
+        if (n.kind.tag != NodeKind::Expr) return false;
+        Expr* ev = &n.kind.payload.Expr.value;
+        if (ev->kind.tag == ExprKind::Neg) return self.isIntLitNode(ev->kind.payload.Neg.expr);
+        return ev->kind.tag == ExprKind::IntLit;
+    }
+
+    /* True when the node is a compile-time constant integer expression:
+     * an integer literal, a char literal, or a binary op whose both
+     * operands are themselves const-int expressions (`16 + 1`, `'a' - 1`).
+     * These are generic; they adopt the expected type at the use site. */
+    bool isConstIntExpr(NodeId id) { return self.isConstIntExprD(id, 0); }
+
+    bool isConstIntExprD(NodeId id, u32 depth)
+    {
+        if (id.index == 0 || depth > 24) return false;
+        Node* n = self.ctx.nodes + id.index;
+        if (n.kind.tag != NodeKind::Expr) return false;
+        Expr* ev = &n.kind.payload.Expr.value;
+        if (ev->kind.tag == ExprKind::IntLit) return true;
+        if (ev->kind.tag == ExprKind::CharLit) return true;
+        if (ev->kind.tag == ExprKind::Neg) return self.isConstIntExprD(ev->kind.payload.Neg.expr, depth + 1);
+        if (ev->kind.tag == ExprKind::Add) return self.isConstIntExprD(ev->kind.payload.Add.left, depth + 1) && self.isConstIntExprD(ev->kind.payload.Add.right, depth + 1);
+        if (ev->kind.tag == ExprKind::Sub) return self.isConstIntExprD(ev->kind.payload.Sub.left, depth + 1) && self.isConstIntExprD(ev->kind.payload.Sub.right, depth + 1);
+        if (ev->kind.tag == ExprKind::Mul) return self.isConstIntExprD(ev->kind.payload.Mul.left, depth + 1) && self.isConstIntExprD(ev->kind.payload.Mul.right, depth + 1);
+        if (ev->kind.tag == ExprKind::Div) return self.isConstIntExprD(ev->kind.payload.Div.left, depth + 1) && self.isConstIntExprD(ev->kind.payload.Div.right, depth + 1);
+        if (ev->kind.tag == ExprKind::Mod) return self.isConstIntExprD(ev->kind.payload.Mod.left, depth + 1) && self.isConstIntExprD(ev->kind.payload.Mod.right, depth + 1);
+        if (ev->kind.tag == ExprKind::BitAnd) return self.isConstIntExprD(ev->kind.payload.BitAnd.left, depth + 1) && self.isConstIntExprD(ev->kind.payload.BitAnd.right, depth + 1);
+        if (ev->kind.tag == ExprKind::BitOr) return self.isConstIntExprD(ev->kind.payload.BitOr.left, depth + 1) && self.isConstIntExprD(ev->kind.payload.BitOr.right, depth + 1);
+        if (ev->kind.tag == ExprKind::BitXor) return self.isConstIntExprD(ev->kind.payload.BitXor.left, depth + 1) && self.isConstIntExprD(ev->kind.payload.BitXor.right, depth + 1);
+        if (ev->kind.tag == ExprKind::Shl) return self.isConstIntExprD(ev->kind.payload.Shl.left, depth + 1) && self.isConstIntExprD(ev->kind.payload.Shl.right, depth + 1);
+        if (ev->kind.tag == ExprKind::Shr) return self.isConstIntExprD(ev->kind.payload.Shr.left, depth + 1) && self.isConstIntExprD(ev->kind.payload.Shr.right, depth + 1);
+        // a reference to an int constant counts: `u64 x = r ? y : INT64_MAX`
+        if (ev->kind.tag == ExprKind::Ident)
+        {
+            Symbol* sym = self.lookupAt(ev->kind.payload.Ident.name, id);
+            if (sym != null && sym->declaration.index != 0)
+            {
+                Node* dn = self.ctx.nodes + sym->declaration.index;
+                if (dn.kind.tag == NodeKind::Decl)
+                {
+                    Decl* dd = &dn.kind.payload.Decl.value;
+                    if (dd->kind.tag == DeclKind::Constant) return self.isConstIntExprD(dd->kind.payload.Constant.value, depth + 1);
+                }
+            }
+            return false;
+        }
+        /* a ternary over const-int branches is int-generic too; the
+         * condition does not affect the result's type */
+        if (ev->kind.tag == ExprKind::Ternary)
+        {
+            return self.isConstIntExprD(ev->kind.payload.Ternary.thenExpr, depth + 1) &&
+                   self.isConstIntExprD(ev->kind.payload.Ternary.elseExpr, depth + 1);
+        }
+        return false;
+    }
+
+    /* True when a const-int expr contains a `u`-suffixed literal anywhere
+     * (or references an unsigned-typed int constant): such an expr is
+     * generic for unsigned targets only, matching the bare-literal rule. */
+    bool hasUnsignedSuffix(NodeId id) { return self.hasUnsignedSuffixD(id, 0); }
+
+    bool hasUnsignedSuffixD(NodeId id, u32 depth)
+    {
+        if (id.index == 0 || depth > 24) return false;
+        Node* n = self.ctx.nodes + id.index;
+        if (n.kind.tag != NodeKind::Expr) return false;
+        Expr* ev = &n.kind.payload.Expr.value;
+        if (ev->kind.tag == ExprKind::IntLit) return (ev->kind.payload.IntLit.flags & 1) != 0;
+        if (ev->kind.tag == ExprKind::CharLit) return false;
+        if (ev->kind.tag == ExprKind::Neg) return self.hasUnsignedSuffixD(ev->kind.payload.Neg.expr, depth + 1);
+        if (ev->kind.tag == ExprKind::Add) return self.hasUnsignedSuffixD(ev->kind.payload.Add.left, depth + 1) || self.hasUnsignedSuffixD(ev->kind.payload.Add.right, depth + 1);
+        if (ev->kind.tag == ExprKind::Sub) return self.hasUnsignedSuffixD(ev->kind.payload.Sub.left, depth + 1) || self.hasUnsignedSuffixD(ev->kind.payload.Sub.right, depth + 1);
+        if (ev->kind.tag == ExprKind::Mul) return self.hasUnsignedSuffixD(ev->kind.payload.Mul.left, depth + 1) || self.hasUnsignedSuffixD(ev->kind.payload.Mul.right, depth + 1);
+        if (ev->kind.tag == ExprKind::Div) return self.hasUnsignedSuffixD(ev->kind.payload.Div.left, depth + 1) || self.hasUnsignedSuffixD(ev->kind.payload.Div.right, depth + 1);
+        if (ev->kind.tag == ExprKind::Mod) return self.hasUnsignedSuffixD(ev->kind.payload.Mod.left, depth + 1) || self.hasUnsignedSuffixD(ev->kind.payload.Mod.right, depth + 1);
+        if (ev->kind.tag == ExprKind::BitAnd) return self.hasUnsignedSuffixD(ev->kind.payload.BitAnd.left, depth + 1) || self.hasUnsignedSuffixD(ev->kind.payload.BitAnd.right, depth + 1);
+        if (ev->kind.tag == ExprKind::BitOr) return self.hasUnsignedSuffixD(ev->kind.payload.BitOr.left, depth + 1) || self.hasUnsignedSuffixD(ev->kind.payload.BitOr.right, depth + 1);
+        if (ev->kind.tag == ExprKind::BitXor) return self.hasUnsignedSuffixD(ev->kind.payload.BitXor.left, depth + 1) || self.hasUnsignedSuffixD(ev->kind.payload.BitXor.right, depth + 1);
+        if (ev->kind.tag == ExprKind::Shl) return self.hasUnsignedSuffixD(ev->kind.payload.Shl.left, depth + 1) || self.hasUnsignedSuffixD(ev->kind.payload.Shl.right, depth + 1);
+        if (ev->kind.tag == ExprKind::Shr) return self.hasUnsignedSuffixD(ev->kind.payload.Shr.left, depth + 1) || self.hasUnsignedSuffixD(ev->kind.payload.Shr.right, depth + 1);
+        if (ev->kind.tag == ExprKind::Ident)
+        {
+            Symbol* sym = self.lookupAt(ev->kind.payload.Ident.name, id);
+            if (sym != null)
+            {
+                if (sym->typeNode != 0 && self.integerType(sym->typeNode) && !self.intSigned(sym->typeNode)) return true;
+                if (sym->declaration.index != 0)
+                {
+                    Node* dn = self.ctx.nodes + sym->declaration.index;
+                    if (dn.kind.tag == NodeKind::Decl)
+                    {
+                        Decl* dd = &dn.kind.payload.Decl.value;
+                        if (dd->kind.tag == DeclKind::Constant) return self.hasUnsignedSuffixD(dd->kind.payload.Constant.value, depth + 1);
+                    }
+                }
+            }
+            return false;
+        }
+        if (ev->kind.tag == ExprKind::Ternary)
+        {
+            return self.hasUnsignedSuffixD(ev->kind.payload.Ternary.thenExpr, depth + 1) ||
+                   self.hasUnsignedSuffixD(ev->kind.payload.Ternary.elseExpr, depth + 1);
+        }
+        return false;
+    }
+
+    /* True when the node is a character literal. Char literals are untyped:
+     * they carry a u32 codepoint value but adopt the other operand's
+     * integer type in comparisons/assignments (`c == '\n'` where c is i32).
+     * The `char` type itself (UTF-32 codepoint) does NOT implicitly convert
+     * to/from integer types; only the literal does. */
+    bool isCharLitNode(NodeId id)
+    {
+        if (id.index == 0) return false;
+        Node* n = self.ctx.nodes + id.index;
+        if (n.kind.tag != NodeKind::Expr) return false;
+        Expr* ev = &n.kind.payload.Expr.value;
+        return ev->kind.tag == ExprKind::CharLit;
+    }
+
+    // True when the literal node carries the unsigned suffix (flags & 1).
+    bool isUnsignedIntLit(NodeId id)
+    {
+        if (id.index == 0) return false;
+        Node* n = self.ctx.nodes + id.index;
+        if (n.kind.tag != NodeKind::Expr) return false;
+        Expr* ev = &n.kind.payload.Expr.value;
+        if (ev->kind.tag == ExprKind::Neg) return self.isUnsignedIntLit(ev->kind.payload.Neg.expr);
+        if (ev->kind.tag != ExprKind::IntLit) return false;
+        return (ev->kind.payload.IntLit.flags & 1) != 0;
+    }
+
+    /* A literal adopts the other operand's type, but an unsigned-suffixed
+     * literal only adopts unsigned types (it is generic for unsigned only). */
+    bool intLitAdoptsTo(NodeId id, Ty targetType)
+    {
+        if (!self.isIntLitNode(id)) return false;
+        if (self.isUnsignedIntLit(id)) return !self.intSigned(targetType);
+        return true;
+    }
+
+    /* A bare (unsuffixed) integer literal is generic: it adopts the other
+     * operand's type in operators, initializers, and comparisons. `-4095`
+     * parses as Neg(IntLit), so we look through the unary negation. A literal
+     * carrying the unsigned suffix is generic for unsigned types only. */
+
+    bool isFloatLitNode(NodeId id)
+    {
+        if (id.index == 0) return false;
+        Node* n = self.ctx.nodes + id.index;
+        if (n.kind.tag != NodeKind::Expr) return false;
+        return n.kind.payload.Expr.value.kind.tag == ExprKind::FloatLit;
+    }
+
+    /* Pointer or rawptr, looking through Const/Comptime wrappers; the
+     * pointer side of `p + i` keeps its own (possibly const) type */
+    bool pointerLike(Ty typeNode)
+    {
+        while (typeNode != 0)
+        {
+            TypeEntry* te = self.ctx.types + typeNode;
+            if (te->kind.tag == TypeKind::Pointer || te->kind.tag == TypeKind::Rawptr) return true;
+            if (te->kind.tag == TypeKind::Const) typeNode = te->kind.payload.Const.base;
+            else if (te->kind.tag == TypeKind::Comptime) typeNode = te->kind.payload.Comptime.base;
+            else return false;
+        }
+        return false;
+    }
+
+    /* result type of pointer arithmetic: the pointer side itself, or the
+     * decayed Pointer(T) for arrays (`stackBuf + n`); 0 when not pointer-like */
+    Ty ptrArithType(Ty typeNode)
+    {
+        Ty orig = typeNode;
+        while (typeNode != 0)
+        {
+            TypeEntry* te = self.ctx.types + typeNode;
+            if (te->kind.tag == TypeKind::Pointer || te->kind.tag == TypeKind::Rawptr) return orig;
+            if (te->kind.tag == TypeKind::Array)
+            {
+                TypeKind pk;
+                pk = TypeKind::Pointer{ .base = te->kind.payload.Array.base };
+                return self.allocType(pk);
+            }
+            if (te->kind.tag == TypeKind::Const) typeNode = te->kind.payload.Const.base;
+            else if (te->kind.tag == TypeKind::Comptime) typeNode = te->kind.payload.Comptime.base;
+            else return 0;
+        }
+        return 0;
+    }
+
+    bool checkBinaryBool(NodeId id, NodeId left, NodeId right)
+    {
+        if (!self.checkBinary(id, left, right, false)) return false;
+        self.setExprType(id, self.boolType());
+        return true;
+    }
+
+    /* `&&` / `||`; C truthiness: bool, any integer, or a pointer on
+     * either side (`!inStack && alloc->fallback`), result always bool.
+     * checkBinary's strict operand compatibility does not apply here. */
+    bool checkCondBinary(NodeId id, NodeId left, NodeId right)
+    {
+        if (!self.checkExpr(left)) return false;
+        if (!self.checkExpr(right)) return false;
+        Ty lt = self.exprType(left);
+        Ty rt = self.exprType(right);
+        if (lt != 0 && lt != self.boolType() && !self.integerType(lt) && !self.pointerLike(lt))
+            self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "left operand of &&/|| must be bool");
+        if (rt != 0 && rt != self.boolType() && !self.integerType(rt) && !self.pointerLike(rt))
+            self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "right operand of &&/|| must be bool");
+        self.setExprType(id, self.boolType());
+        return true;
+    }
+
+    /* ── the walk ────────────────────────────────────────────────────── */
+
+    /* entry point: type every subexpression depth-first, write the result
+     * back via setExprType. id 0 and non-expr nodes pass through silently;
+     * the parser leaves holes (e.g. an omitted then-branch). */
+    bool checkExpr(NodeId id)
+    {
+        if (id.index == 0) return true;
+        Node* node = self.ctx.nodes + id.index;
+        if (node->kind.tag != NodeKind::Expr) return true;
+        Expr* expr = &node->kind.payload.Expr.value;
+        switch (expr->kind.tag)
+        {
+            ExprKind::IntLit => {
+                u64 v = expr->kind.payload.IntLit.value;
+                Ty t;
+                // no suffix: first type it fits wins, i32 → i64 → u64.
+                // `u` (bit 0): straight to u32/u64
+                if ((expr->kind.payload.IntLit.flags & 1) != 0)
+                {
+                    /* `u` suffix: unsigned literal. Typed as the widest
+                     * unsigned type it fits in (u64 for anything that fits
+                     * in 64 bits); the literal-adoption rule widens it
+                     * further to usize when the other operand is usize,
+                     * and rejects it when the target is a signed type. */
+                    if (v <= 4294967295) t = self.u32Type();
+                    else t = self.u64Type();
+                }
+                else
+                {
+                    if (v <= 2147483647) t = self.i32Type();
+                    else if (v <= 9223372036854775807) t = self.i64Type();
+                    else t = self.u64Type();
+                }
+                self.setExprType(id, t);
+                return true;
+            },
+            // flag bit 2 = `f` suffix: f32, everything else f64
+            ExprKind::FloatLit => { if ((expr->kind.payload.FloatLit.flags & 2) != 0) self.setExprType(id, self.f32Type()); else self.setExprType(id, self.f64Type()); return true; },
+            ExprKind::StringLit => {
+                /* C"..." → NUL-terminated `const cchar*` (no len), the
+                 * C-ABI byte string for libc params; every other string
+                 * literal is a len-carrying `str`. */
+                if ((expr->kind.payload.StringLit.flags & 1) != 0) self.setExprType(id, self.ccharPtrType());
+                else self.setExprType(id, self.strType());
+                return true;
+            },
+            ExprKind::CharLit => { self.setExprType(id, self.charType()); return true; },
+            ExprKind::BoolLit => { self.setExprType(id, self.boolType()); return true; },
+            // null stays UNTYPED (Ty 0); compatible() treats from == 0 as
+            // fitting anything, so there's nothing to decide here
+            ExprKind::NullLit => { return true; },
+            ExprKind::Ident => {
+                if (!self.checkIdent(id, expr->kind.payload.Ident.name)) return false;
+                Symbol* symbol = self.lookupAt(expr->kind.payload.Ident.name, id);
+                if (symbol != null) self.setExprType(id, symbol->typeNode);
+                return true;
+            },
+            ExprKind::TypeRef => {
+                if (!self.checkIdent(id, expr->kind.payload.TypeRef.name)) return false;
+                if (!self.checkType(expr->kind.payload.TypeRef.typeNode)) return false;
+                self.setExprType(id, expr->kind.payload.TypeRef.typeNode);
+                return true;
+            },
+            ExprKind::Path => { return self.checkPath(id); },
+            ExprKind::Call => {
+                if (!self.checkExpr(expr->kind.payload.Call.callee)) return false;
+                u32 i = 0;
+                while (i < expr->kind.payload.Call.argsLen)
+                {
+                    if (!self.checkExpr(expr->kind.payload.Call.args[i])) return false;
+                    i++;
+                }
+                Node* calleeNode = self.ctx.nodes + expr->kind.payload.Call.callee.index;
+                if (calleeNode->kind.tag == NodeKind::Expr &&
+                    calleeNode->kind.payload.Expr.value.kind.tag == ExprKind::Path &&
+                    calleeNode->kind.payload.Expr.value.kind.payload.Path.segmentsLen >= 2)
+                {
+                    NodeId* segs = calleeNode->kind.payload.Expr.value.kind.payload.Path.segments;
+                    Node* s0n = self.ctx.nodes + segs[0].index;
+                    Node* s1n = self.ctx.nodes + segs[1].index;
+                    if (s0n->kind.tag == NodeKind::Expr &&
+                        s0n->kind.payload.Expr.value.kind.tag == ExprKind::TypeRef &&
+                        s1n->kind.tag == NodeKind::Expr &&
+                        s1n->kind.payload.Expr.value.kind.tag == ExprKind::Ident)
+                    {
+                        /* static method on an instantiated generic type:
+                         * `Foo<i32>::new(3)`: the head segment is a TypeRef,
+                         * not an Ident, so the ident/module branch below never
+                         * matches. Resolve the static member on that type and
+                         * substitute the method's generic params through it. */
+                        Str mn = s1n->kind.payload.Expr.value.kind.payload.Ident.name;
+                        Ty ownerTy = s0n->kind.payload.Expr.value.kind.payload.TypeRef.typeNode;
+                        MemberInfo m = self.findMethod(ownerTy, mn);
+                        if (m.declaration.index == 0)
+                        {
+                            u8* mbuf = alloc<u8>(128);
+                            String msg = String::new();
+                            msg.pushView("static method '");
+                            msg.pushView(self.nameTextView(mn));
+                            msg.pushView("' not found on type '");
+                            if (mbuf != null) msg.pushView(self.typeTextView(ownerTy, mbuf, 128)); else msg.pushView("?");
+                            msg.pushView("'");
+                            self.semaErrorNode(ErrorCode::SemaUnknownMember, id, msg.asView());
+                            dealloc<u8>(mbuf);
+                            return false;
+                        }
+                        Node* methodNode = self.ctx.nodes + m.declaration.index;
+                        Decl* md = &methodNode->kind.payload.Decl.value;
+                        if ((md->kind.payload.Func.flags & 4) == 0)
+                        {
+                            u8* mbuf = alloc<u8>(128);
+                            String msg = String::new();
+                            msg.pushView("method '");
+                            msg.pushView(self.nameTextView(mn));
+                            msg.pushView("' on type '");
+                            if (mbuf != null) msg.pushView(self.typeTextView(ownerTy, mbuf, 128)); else msg.pushView("?");
+                            msg.pushView("' is not static; it needs a receiver");
+                            self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, msg.asView());
+                            dealloc<u8>(mbuf);
+                            return false;
+                        }
+                        u32 pLen = md->kind.payload.Func.paramsLen;
+                        if (pLen != expr->kind.payload.Call.argsLen)
+                        {
+                            String msg = String::new();
+                            msg.pushView("wrong number of arguments to static method '");
+                            msg.pushView(self.nameTextView(md->kind.payload.Func.name));
+                            msg.pushView("': expected ");
+                            self.pushDec(&msg, (u64)pLen);
+                            msg.pushView(", got ");
+                            self.pushDec(&msg, (u64)expr->kind.payload.Call.argsLen);
+                            self.semaErrorNode(ErrorCode::SemaArityMismatch, id, msg.asView());
+                            return false;
+                        }
+                        u32 kk = 0;
+                        while (kk < pLen)
+                        {
+                            NodeId ppid = md->kind.payload.Func.params[kk];
+                            Node* pn = self.ctx.nodes + ppid.index;
+                            if (pn->kind.tag == NodeKind::Param)
+                            {
+                                Param* pp = &pn->kind.payload.Param.value;
+                                Ty want = self.substituteFieldTy(pp->typeNode, ownerTy);
+                                if (!self.assignCompatible(expr->kind.payload.Call.args[kk], self.exprType(expr->kind.payload.Call.args[kk]), want))
+                                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "static arg type mismatch");
+                            }
+                            kk++;
+                        }
+                        self.setExprType(id, self.substituteFieldTy(md->kind.payload.Func.returnType, ownerTy));
+                        return true;
+                    }
+                    if (s0n->kind.tag == NodeKind::Expr && s0n->kind.payload.Expr.value.kind.tag == ExprKind::Ident &&
+                        s1n->kind.tag == NodeKind::Expr && s1n->kind.payload.Expr.value.kind.tag == ExprKind::Ident)
+                    {
+                        Str tn = s0n->kind.payload.Expr.value.kind.payload.Ident.name;
+                        Str mn = s1n->kind.payload.Expr.value.kind.payload.Ident.name;
+                        /* module root: math::sqrt(a), a free function in the
+                         * module's namespace, not a static method on a type */
+                        Symbol* rootSym = self.lookupAt(tn, id);
+                        if (rootSym != null && rootSym->kind == 5)
+                        {
+                            if (rootSym->declaration.index != 0)
+                            {
+                                Node* modNode = self.ctx.nodes + rootSym->declaration.index;
+                                if (modNode->kind.tag == NodeKind::Decl)
+                                {
+                                    if (!self.moduleExportsContain(&modNode->kind.payload.Decl.value, mn))
+                                    {
+                                        self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "symbol not exported by module");
+                                        return false;
+                                    }
+                                }
+                            }
+                            /* nested module path `platform::libc::malloc`: the
+                             * function is the LAST segment, not s1 (a module) */
+                            Str fname = mn;
+                            u32 segCount = calleeNode->kind.payload.Expr.value.kind.payload.Path.segmentsLen;
+                            if (segCount >= 3)
+                            {
+                                Symbol* s1Sym = self.lookupAt(mn, id);
+                                Node* s2n = self.ctx.nodes + segs[2].index;
+                                if (s1Sym != null && s1Sym->kind == 5 &&
+                                    s2n->kind.tag == NodeKind::Expr &&
+                                    s2n->kind.payload.Expr.value.kind.tag == ExprKind::Ident)
+                                {
+                                    fname = s2n->kind.payload.Expr.value.kind.payload.Ident.name;
+                                }
+                            }
+                            /* resolve the callee in the MODULE's file, not
+                             * the local scope; `fios::fileOpen` must not
+                             * pick up this file's own `fileOpen` */
+                            Symbol* fsym = null;
+                            Str modPath = self.modulePathPrefix(segs, segCount);
+                            if (modPath != 0)
+                            {
+                                Symbol** cands = alloc<Symbol*>(16);
+                                if (cands != null)
+                                {
+                                    u32 n = self.scopes.lookupAll(fname, cands, 16);
+                                    u32 m = 0;
+                                    while (m < n)
+                                    {
+                                        if (self.importPathInFile(modPath, cands[m]->fileId)) { fsym = cands[m]; break; }
+                                        m++;
+                                    }
+                                    dealloc<Symbol*>(cands);
+                                }
+                            }
+                            if (fsym == null) fsym = self.lookupAt(fname, id);
+                            if (fsym == null) return self.checkCall(id, fname, expr->kind.payload.Call.args, expr->kind.payload.Call.argsLen, 0);
+                            return self.checkCallResolved(id, fsym, expr->kind.payload.Call.args, expr->kind.payload.Call.argsLen, 0);
+                        }
+                        Ty ownerTy = self.namedType(tn);
+                        MemberInfo m = self.findMethod(ownerTy, mn);
+                        if (m.declaration.index == 0)
+                        {
+                            u8* mbuf = alloc<u8>(128);
+                            String msg = String::new();
+                            msg.pushView("static method '");
+                            msg.pushView(self.nameTextView(mn));
+                            msg.pushView("' not found on type '");
+                            if (mbuf != null) msg.pushView(self.typeTextView(ownerTy, mbuf, 128)); else msg.pushView("?");
+                            msg.pushView("'");
+                            self.semaErrorNode(ErrorCode::SemaUnknownMember, id, msg.asView());
+                            dealloc<u8>(mbuf);
+                            return false;
+                        }
+                        Node* methodNode = self.ctx.nodes + m.declaration.index;
+                        Decl* md = &methodNode->kind.payload.Decl.value;
+                        if ((md->kind.payload.Func.flags & 4) == 0)
+                        {
+                            u8* mbuf = alloc<u8>(128);
+                            String msg = String::new();
+                            msg.pushView("method '");
+                            msg.pushView(self.nameTextView(mn));
+                            msg.pushView("' on type '");
+                            if (mbuf != null) msg.pushView(self.typeTextView(ownerTy, mbuf, 128)); else msg.pushView("?");
+                            msg.pushView("' is not static; it needs a receiver");
+                            self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, msg.asView());
+                            dealloc<u8>(mbuf);
+                            return false;
+                        }
+                        u32 pLen = md->kind.payload.Func.paramsLen;
+                        if (pLen != expr->kind.payload.Call.argsLen)
+                        {
+                            String msg = String::new();
+                            msg.pushView("wrong number of arguments to static method '");
+                            msg.pushView(self.nameTextView(md->kind.payload.Func.name));
+                            msg.pushView("': expected ");
+                            self.pushDec(&msg, (u64)pLen);
+                            msg.pushView(", got ");
+                            self.pushDec(&msg, (u64)expr->kind.payload.Call.argsLen);
+                            self.semaErrorNode(ErrorCode::SemaArityMismatch, id, msg.asView());
+                            return false;
+                        }
+                        u32 jj = 0;
+                        while (jj < pLen)
+                        {
+                            NodeId ppid = md->kind.payload.Func.params[jj];
+                            Node* pn = self.ctx.nodes + ppid.index;
+                            if (pn->kind.tag == NodeKind::Param)
+                            {
+                                Param* pp = &pn->kind.payload.Param.value;
+                                if (!self.assignCompatible(expr->kind.payload.Call.args[jj], self.exprType(expr->kind.payload.Call.args[jj]), pp->typeNode))
+                                {
+                                    u8* mbuf = alloc<u8>(128);
+                                    String msg = String::new();
+                                    msg.pushView("type mismatch in argument ");
+                                    self.pushDec(&msg, (u64)(jj + 1));
+                                    msg.pushView(" of static call to '");
+                                    msg.pushView(self.nameTextView(md->kind.payload.Func.name));
+                                    msg.pushView("': expected '");
+                                    if (mbuf != null) msg.pushView(self.typeTextView(pp->typeNode, mbuf, 128)); else msg.pushView("?");
+                                    msg.pushView("'");
+                                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, msg.asView());
+                                    dealloc<u8>(mbuf);
+                                }
+                            }
+                            jj++;
+                        }
+                        self.setExprType(id, md->kind.payload.Func.returnType);
+                        return true;
+                    }
+                }
+                if (calleeNode->kind.tag == NodeKind::Expr)
+                {
+                    Expr* callee = &calleeNode->kind.payload.Expr.value;
+                    if (callee->kind.tag == ExprKind::Ident)
+                        return self.checkCall(id, callee->kind.payload.Ident.name, expr->kind.payload.Call.args, expr->kind.payload.Call.argsLen, callee->resolvedType);
+                    /* explicit generic call `realloc<i32>(p, n)`: validate
+                     * the call against the named function, not as a fn-ptr */
+                    if (callee->kind.tag == ExprKind::TypeRef)
+                        return self.checkCall(id, callee->kind.payload.TypeRef.name, expr->kind.payload.Call.args, expr->kind.payload.Call.argsLen, callee->resolvedType);
+                    return self.checkFnPtrCall(id, callee->resolvedType, expr->kind.payload.Call.args, expr->kind.payload.Call.argsLen);
+                }
+                return true;
+            },
+            ExprKind::MethodCall => {
+                if (!self.checkExpr(expr->kind.payload.MethodCall.receiver)) return false;
+                MemberInfo methodInfo = self.findMethod(self.exprType(expr->kind.payload.MethodCall.receiver), expr->kind.payload.MethodCall.method);
+                if (methodInfo.declaration.index == 0)
+                {
+                    /* fn-pointer field (vtable style): `alloc->alloc(ctx, n)`,
+                     * a struct field of FnPtr type called directly */
+                    MemberInfo fnField = self.findMember(self.exprType(expr->kind.payload.MethodCall.receiver), expr->kind.payload.MethodCall.method);
+                    if (fnField.typeNode != 0)
+                    {
+                        Ty ffTy = self.stripType(fnField.typeNode);
+                        TypeEntry* ffEntry = self.ctx.types + ffTy;
+                        if (ffEntry->kind.tag == TypeKind::FnPtr)
+                        {
+                            u32 ai = 0;
+                            while (ai < expr->kind.payload.MethodCall.argsLen)
+                            {
+                                if (!self.checkExpr(expr->kind.payload.MethodCall.args[ai])) return false;
+                                ai++;
+                            }
+                            return self.checkFnPtrCall(id, fnField.typeNode, expr->kind.payload.MethodCall.args, expr->kind.payload.MethodCall.argsLen);
+                        }
+                    }
+                    u8* tb = alloc<u8>(256);
+                    String msg = String::new();
+                    msg.pushView("method '");
+                    msg.pushView(self.nameTextView(expr->kind.payload.MethodCall.method));
+                    msg.pushView("' not found on type '");
+                    if (tb != null) { msg.pushView(self.typeTextView(self.stripType(self.exprType(expr->kind.payload.MethodCall.receiver)), tb, 256)); dealloc<u8>(tb); }
+                    else msg.pushView("?");
+                    msg.pushView("'");
+                    self.semaErrorNode(ErrorCode::SemaUnknownMember, id, msg.asView());
+                    return false;
+                }
+                Node* methodNode = self.ctx.nodes + methodInfo.declaration.index;
+                Decl* methodDecl = &methodNode->kind.payload.Decl.value;
+                if (methodDecl->kind.payload.Func.name == self.ctx.intern("drop"))
+                {
+                    self.semaErrorNode(ErrorCode::SemaExplicitDrop, id,
+                        "explicit call to drop is not allowed; drop runs automatically at scope exit");
+                    return false;
+                }
+                u32 paramsLen = methodDecl->kind.payload.Func.paramsLen;
+                // `self` sits at param 0 (flag bit 1) but never appears in
+                // method-call args, so arity and substitution start past it
+                u32 selfOffset = 0;
+                if (paramsLen > 0)
+                {
+                    NodeId firstParamId = methodDecl->kind.payload.Func.params[0];
+                    Node* firstParamNode = self.ctx.nodes + firstParamId.index;
+                    if (firstParamNode->kind.tag == NodeKind::Param)
+                    {
+                        Param* firstParam = &firstParamNode->kind.payload.Param.value;
+                        if ((firstParam->flags & 1) != 0) selfOffset = 1;
+                    }
+                }
+                if (paramsLen - selfOffset != expr->kind.payload.MethodCall.argsLen)
+                {
+                    String msg = String::new();
+                    msg.pushView("wrong number of arguments to method '");
+                    msg.pushView(self.nameTextView(methodDecl->kind.payload.Func.name));
+                    msg.pushView("': expected ");
+                    self.pushDec(&msg, (u64)(paramsLen - selfOffset));
+                    msg.pushView(", got ");
+                    self.pushDec(&msg, (u64)expr->kind.payload.MethodCall.argsLen);
+                    self.semaErrorNode(ErrorCode::SemaArityMismatch, id, msg.asView());
+                    return false;
+                }
+                /* the receiver carries the generic binding (`Vec<K>` binds
+                 * push's T := K); substitute params through it just like
+                 * the return type below, then compare bound types */
+                Ty recvTy = self.exprType(expr->kind.payload.MethodCall.receiver);
+                u32 i = 0;
+                while (i < expr->kind.payload.MethodCall.argsLen)
+                {
+                    if (!self.checkExpr(expr->kind.payload.MethodCall.args[i])) return false;
+                    NodeId paramId = methodDecl->kind.payload.Func.params[i + selfOffset];
+                    Node* paramNode = self.ctx.nodes + paramId.index;
+                    if (paramNode->kind.tag == NodeKind::Param)
+                    {
+                        Param* param = &paramNode->kind.payload.Param.value;
+                        Ty want = self.substituteFieldTy(param->typeNode, recvTy);
+                        NodeId argId = expr->kind.payload.MethodCall.args[i];
+                        if (!self.checkAssign(argId, self.exprType(argId), want))
+                        {
+                            if (param->name != 0)
+                                self.semaErrorNode(ErrorCode::SemaTypeMismatch, argId,
+                                    self.paramMismatchMsg(param->name, self.exprType(argId), want));
+                            else
+                                self.semaErrorNode(ErrorCode::SemaTypeMismatch, argId,
+                                    self.typeMismatchMsg("method argument type", self.exprType(argId), want));
+                        }
+                    }
+                    i++;
+                }
+                self.setExprType(id, self.substituteFieldTy(methodDecl->kind.payload.Func.returnType, recvTy));
+                return true;
+            },
+            ExprKind::Field => {
+                if (!self.checkExpr(expr->kind.payload.Field.obj)) return false;
+                NodeId fieldObj = expr->kind.payload.Field.obj;
+                if (self.isPayloadAccessNode(fieldObj))
+                {
+                    Ty baseTy = self.exprType(self.fieldAccessObj(fieldObj));
+                    if (self.isVariantNamedTy(baseTy))
+                    {
+                        if (!self.variantHasCase(baseTy, expr->kind.payload.Field.field))
+                        {
+                            self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "unknown variant case in payload");
+                            return false;
+                        }
+                        self.setExprType(id, self.stripType(baseTy));
+                        return true;
+                    }
+                }
+                else if (self.isVariantCaseAccess(fieldObj))
+                {
+                    NodeId payloadId = self.fieldAccessObj(fieldObj);
+                    Ty baseTy = self.exprType(self.fieldAccessObj(payloadId));
+                    if (self.isVariantNamedTy(baseTy))
+                    {
+                        Ty ft = self.findVariantCaseFieldTy(baseTy, self.fieldAccessName(fieldObj), expr->kind.payload.Field.field);
+                        if (ft == 0)
+                        {
+                            self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "field not found on variant case");
+                            return false;
+                        }
+                        self.setExprType(id, self.substituteFieldTy(ft, baseTy));
+                        return true;
+                    }
+                }
+                MemberInfo member = self.findMember(self.exprType(expr->kind.payload.Field.obj), expr->kind.payload.Field.field);
+                if (member.typeNode == 0)
+                {
+                    u8* tb = alloc<u8>(256);
+                    String msg = String::new();
+                    msg.pushView("field '");
+                    msg.pushView(self.nameTextView(expr->kind.payload.Field.field));
+                    msg.pushView("' not found on type '");
+                    Ty recvTy = self.stripType(self.exprType(expr->kind.payload.Field.obj));
+                    if (tb != null) { msg.pushView(self.typeTextView(recvTy, tb, 256)); dealloc<u8>(tb); }
+                    else msg.pushView("?");
+                    msg.pushView("'");
+                    /* rustc-style follow-ups: a likely spelling first, then
+                     * the full field list so the fix is a copy away */
+                    Str close = self.closestField(recvTy, expr->kind.payload.Field.field);
+                    if (close != 0)
+                    {
+                        msg.pushView("\n\ndid you mean '");
+                        msg.pushView(self.nameTextView(close));
+                        msg.pushView("'?");
+                    }
+                    self.pushAvailableFields(&msg, recvTy);
+                    self.semaErrorNode(ErrorCode::SemaUnknownMember, id, msg.asView());
+                    return false;
+                }
+                self.setExprType(id, self.substituteFieldTy(member.typeNode, self.exprType(expr->kind.payload.Field.obj)));
+                return true;
+            },
+            ExprKind::DerefField => {
+                if (!self.checkExpr(expr->kind.payload.DerefField.obj)) return false;
+                NodeId fieldObj = expr->kind.payload.DerefField.obj;
+                if (self.isPayloadAccessNode(fieldObj))
+                {
+                    Ty baseTy = self.exprType(self.fieldAccessObj(fieldObj));
+                    if (self.isVariantNamedTy(baseTy))
+                    {
+                        if (!self.variantHasCase(baseTy, expr->kind.payload.DerefField.field))
+                        {
+                            self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "unknown variant case in payload");
+                            return false;
+                        }
+                        self.setExprType(id, self.stripType(baseTy));
+                        return true;
+                    }
+                }
+                else if (self.isVariantCaseAccess(fieldObj))
+                {
+                    NodeId payloadId = self.fieldAccessObj(fieldObj);
+                    Ty baseTy = self.exprType(self.fieldAccessObj(payloadId));
+                    if (self.isVariantNamedTy(baseTy))
+                    {
+                        Ty ft = self.findVariantCaseFieldTy(baseTy, self.fieldAccessName(fieldObj), expr->kind.payload.DerefField.field);
+                        if (ft == 0)
+                        {
+                            self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "field not found on variant case");
+                            return false;
+                        }
+                        self.setExprType(id, self.substituteFieldTy(ft, baseTy));
+                        return true;
+                    }
+                }
+                MemberInfo member = self.findMember(self.exprType(expr->kind.payload.DerefField.obj), expr->kind.payload.DerefField.field);
+                if (member.typeNode == 0)
+                {
+                    u8* tb = alloc<u8>(256);
+                    String msg = String::new();
+                    msg.pushView("field '");
+                    msg.pushView(self.nameTextView(expr->kind.payload.DerefField.field));
+                    msg.pushView("' not found through pointer of type '");
+                    if (tb != null) { msg.pushView(self.typeTextView(self.exprType(expr->kind.payload.DerefField.obj), tb, 256)); dealloc<u8>(tb); }
+                    else msg.pushView("?");
+                    msg.pushView("'");
+                    self.semaErrorNode(ErrorCode::SemaUnknownMember, id, msg.asView());
+                    return false;
+                }
+                self.setExprType(id, self.substituteFieldTy(member.typeNode, self.exprType(expr->kind.payload.DerefField.obj)));
+                return true;
+            },
+            ExprKind::Index => {
+                if (!self.checkExpr(expr->kind.payload.Index.obj)) return false;
+                Ty objectType = self.exprType(expr->kind.payload.Index.obj);
+                if (objectType == 0) return false;
+                /* `const u8* buf` wraps as Const{Pointer}; look through
+                 * Const/Comptime first, like the Deref arm does */
+                while (objectType != 0)
+                {
+                    TypeEntry* oe = self.ctx.types + objectType;
+                    if (oe->kind.tag == TypeKind::Const) objectType = oe->kind.payload.Const.base;
+                    else if (oe->kind.tag == TypeKind::Comptime) objectType = oe->kind.payload.Comptime.base;
+                    else break;
+                }
+                if (objectType == 0) return false;
+                TypeEntry* objectEntry = self.ctx.types + objectType;
+                if (objectEntry->kind.tag == TypeKind::Array) self.setExprType(id, objectEntry->kind.payload.Array.base);
+                else if (objectEntry->kind.tag == TypeKind::Slice) self.setExprType(id, objectEntry->kind.payload.Slice.base);
+                else if (objectEntry->kind.tag == TypeKind::Pointer) self.setExprType(id, objectEntry->kind.payload.Pointer.base);
+                else if (objectEntry->kind.tag == TypeKind::Str) self.setExprType(id, self.charType()); // str[i] → char (the byte type)
+                else
+                {
+                    u8* tb = alloc<u8>(256);
+                    String msg = String::new();
+                    msg.pushView("cannot index ");
+                    self.appendExprDesc(&msg, expr->kind.payload.Index.obj);
+                    msg.pushView(": value of type '");
+                    if (tb != null) { msg.pushView(self.typeTextView(objectType, tb, 256)); dealloc<u8>(tb); }
+                    else msg.pushView("?");
+                    msg.pushView("' is not indexable (expected array, slice, pointer, or str)");
+                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, msg.asView());
+                    return false;
+                }
+                if (!self.checkExpr(expr->kind.payload.Index.index)) return false;
+                Ty indexTy = self.exprType(expr->kind.payload.Index.index);
+                if (indexTy != 0 && !self.integerType(indexTy))
+                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "array index must be an integer type");
+                /* T0013: a literal index against a fixed array length */
+                if (objectEntry->kind.tag == TypeKind::Array &&
+                    objectEntry->kind.payload.Array.sizeName == 0 &&
+                    objectEntry->kind.payload.Array.len > 0)
+                {
+                    NodeId idxId = expr->kind.payload.Index.index;
+                    if (idxId.index != 0)
+                    {
+                        Node* idxNode = self.ctx.nodes + idxId.index;
+                        if (idxNode->kind.tag == NodeKind::Expr)
+                        {
+                            Expr* ie = &idxNode->kind.payload.Expr.value;
+                            bool bad = false;
+                            if (ie->kind.tag == ExprKind::IntLit)
+                                bad = ie->kind.payload.IntLit.value >= (u64)objectEntry->kind.payload.Array.len;
+                            else if (ie->kind.tag == ExprKind::Neg) bad = true;
+                            if (bad)
+                            {
+                                String msg = String::new();
+                                msg.pushView("constant array index is out of bounds (array length ");
+                                self.pushDec(&msg, (u64)objectEntry->kind.payload.Array.len);
+                                msg.pushView(")");
+                                self.semaErrorNode(ErrorCode::SemaIndexOutOfBounds, idxId, msg.asView());
+                            }
+                        }
+                    }
+                }
+                return true;
+            },
+            ExprKind::Cast => {
+                if (!self.checkExpr(expr->kind.payload.Cast.expr)) return false;
+                if (expr->kind.payload.Cast.targetType != 0)
+                    self.setExprType(id, expr->kind.payload.Cast.targetType);
+                return true;
+            },
+            ExprKind::Sizeof => { self.setExprType(id, self.usizeType()); return true; },
+            ExprKind::Alignof => { self.setExprType(id, self.usizeType()); return true; },
+            ExprKind::Typeof => { return self.checkExpr(expr->kind.payload.Typeof.expr); },
+            ExprKind::AddressOf => {
+                if (!self.checkExpr(expr->kind.payload.AddressOf.expr)) return false;
+                Ty inner = self.exprType(expr->kind.payload.AddressOf.expr);
+                if (inner != 0)
+                {
+                    TypeKind k = TypeKind::Pointer{ .base = inner };
+                    self.setExprType(id, self.allocType(k));
+                }
+                return true;
+            },
+            ExprKind::Deref => {
+                if (!self.checkExpr(expr->kind.payload.Deref.expr)) return false;
+                Ty inner = self.exprType(expr->kind.payload.Deref.expr);
+                /* `*(const T*)p`: type-position const wraps the whole
+                 * type (Const{Pointer}), so look through Const/Comptime
+                 * before deciding the operand is not a pointer */
+                while (inner != 0)
+                {
+                    TypeEntry* te = self.ctx.types + inner;
+                    if (te->kind.tag == TypeKind::Const) inner = te->kind.payload.Const.base;
+                    else if (te->kind.tag == TypeKind::Comptime) inner = te->kind.payload.Comptime.base;
+                    else break;
+                }
+                if (inner != 0)
+                {
+                    TypeEntry* te = self.ctx.types + inner;
+                    if (te->kind.tag == TypeKind::Pointer) self.setExprType(id, te->kind.payload.Pointer.base);
+                    else
+                    {
+                        u8* tb = alloc<u8>(256);
+                        String msg = String::new();
+                        msg.pushView("cannot dereference ");
+                        self.appendExprDesc(&msg, expr->kind.payload.Deref.expr);
+                        msg.pushView(": value of type '");
+                        if (tb != null) { msg.pushView(self.typeTextView(inner, tb, 256)); dealloc<u8>(tb); }
+                        else msg.pushView("?");
+                        msg.pushView("' is not a pointer");
+                        self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, msg.asView());
+                    }
+                }
+                return true;
+            },
+            ExprKind::Neg => {
+                if (!self.checkExpr(expr->kind.payload.Neg.expr)) return false;
+                Ty t = self.exprType(expr->kind.payload.Neg.expr);
+                /* `-` applied to a bare literal narrows to the smallest
+                 * signed type that can hold the negative value
+                 * (-2147483648 → i32, -9223372036854775808 → i64) */
+                NodeId negInner = expr->kind.payload.Neg.expr;
+                if (negInner.index != 0)
+                {
+                    Node* inner = self.ctx.nodes + negInner.index;
+                    if (inner->kind.tag == NodeKind::Expr && inner->kind.payload.Expr.value.kind.tag == ExprKind::IntLit)
+                    {
+                        u64 v = inner->kind.payload.Expr.value.kind.payload.IntLit.value;
+                        if (v <= 2147483648) t = self.i32Type();
+                        else if (v <= 9223372036854775808) t = self.i64Type();
+                        else
+                        {
+                            self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "negative literal out of range");
+                            t = self.i64Type();
+                        }
+                    }
+                }
+                if (t != 0) self.setExprType(id, t);
+                return true;
+            },
+            ExprKind::BitNot => {
+                if (!self.checkExpr(expr->kind.payload.BitNot.expr)) return false;
+                Ty t = self.exprType(expr->kind.payload.BitNot.expr);
+                if (t != 0) self.setExprType(id, t);
+                return true;
+            },
+            ExprKind::Not => {
+                if (!self.checkExpr(expr->kind.payload.Not.expr)) return false;
+                self.setExprType(id, self.boolType());
+                return true;
+            },
+            ExprKind::Add => { return self.checkBinary(id, expr->kind.payload.Add.left, expr->kind.payload.Add.right, false); },
+            ExprKind::Sub => { return self.checkBinary(id, expr->kind.payload.Sub.left, expr->kind.payload.Sub.right, true); },
+            ExprKind::Mul => { return self.checkBinary(id, expr->kind.payload.Mul.left, expr->kind.payload.Mul.right, false); },
+            ExprKind::Div => { return self.checkBinary(id, expr->kind.payload.Div.left, expr->kind.payload.Div.right, false); },
+            ExprKind::Mod => { return self.checkBinary(id, expr->kind.payload.Mod.left, expr->kind.payload.Mod.right, false); },
+            ExprKind::Eq => { return self.checkBinaryBool(id, expr->kind.payload.Eq.left, expr->kind.payload.Eq.right); },
+            ExprKind::Ne => { return self.checkBinaryBool(id, expr->kind.payload.Ne.left, expr->kind.payload.Ne.right); },
+            ExprKind::Lt => { return self.checkBinaryBool(id, expr->kind.payload.Lt.left, expr->kind.payload.Lt.right); },
+            ExprKind::Le => { return self.checkBinaryBool(id, expr->kind.payload.Le.left, expr->kind.payload.Le.right); },
+            ExprKind::Gt => { return self.checkBinaryBool(id, expr->kind.payload.Gt.left, expr->kind.payload.Gt.right); },
+            ExprKind::Ge => { return self.checkBinaryBool(id, expr->kind.payload.Ge.left, expr->kind.payload.Ge.right); },
+            ExprKind::And => { return self.checkCondBinary(id, expr->kind.payload.And.left, expr->kind.payload.And.right); },
+            ExprKind::Or => { return self.checkCondBinary(id, expr->kind.payload.Or.left, expr->kind.payload.Or.right); },
+            ExprKind::BitAnd => { return self.checkBinary(id, expr->kind.payload.BitAnd.left, expr->kind.payload.BitAnd.right, false); },
+            ExprKind::BitOr => { return self.checkBinary(id, expr->kind.payload.BitOr.left, expr->kind.payload.BitOr.right, false); },
+            ExprKind::BitXor => { return self.checkBinary(id, expr->kind.payload.BitXor.left, expr->kind.payload.BitXor.right, false); },
+            ExprKind::Shl => { return self.checkBinary(id, expr->kind.payload.Shl.left, expr->kind.payload.Shl.right, false); },
+            ExprKind::Shr => { return self.checkBinary(id, expr->kind.payload.Shr.left, expr->kind.payload.Shr.right, false); },
+            ExprKind::Assign => {
+                if (!self.assignExpr(expr->kind.payload.Assign.target)) return false;
+                if (!self.checkExpr(expr->kind.payload.Assign.value)) return false;
+                NodeId av = expr->kind.payload.Assign.value;
+                Ty atgt = self.assignTargetType(expr->kind.payload.Assign.target);
+                if (!self.checkAssign(av, self.exprType(av), atgt))
+                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, av,
+                        self.typeMismatchMsg("assignment", self.exprType(av), atgt));
+                return true;
+            },
+            ExprKind::AssignAdd => {
+                if (!self.assignExpr(expr->kind.payload.AssignAdd.target)) return false;
+                if (!self.checkExpr(expr->kind.payload.AssignAdd.value)) return false;
+                NodeId av = expr->kind.payload.AssignAdd.value;
+                Ty atgt = self.assignTargetType(expr->kind.payload.AssignAdd.target);
+                // `p += 1` is pointer arithmetic, not an int→pointer bind
+                if (!self.intToPtrAssign(av, self.exprType(av), atgt) &&
+                    !self.checkAssign(av, self.exprType(av), atgt))
+                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, av,
+                        self.typeMismatchMsg("compound assignment", self.exprType(av), atgt));
+                return true;
+            },
+            ExprKind::AssignSub => {
+                if (!self.assignExpr(expr->kind.payload.AssignSub.target)) return false;
+                if (!self.checkExpr(expr->kind.payload.AssignSub.value)) return false;
+                NodeId av = expr->kind.payload.AssignSub.value;
+                Ty atgt = self.assignTargetType(expr->kind.payload.AssignSub.target);
+                if (!self.intToPtrAssign(av, self.exprType(av), atgt) &&
+                    !self.checkAssign(av, self.exprType(av), atgt))
+                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, av,
+                        self.typeMismatchMsg("compound assignment", self.exprType(av), atgt));
+                return true;
+            },
+            /* only += and -= get the int→pointer treatment (pointer
+             * arithmetic); *= /= %= &= |= ^= <<= >>= just walk target and
+             * value; NO type check. `x *= "hi"` type-checks today. */
+            ExprKind::AssignMul => {
+                if (!self.assignExpr(expr->kind.payload.AssignMul.target)) return false;
+                if (!self.checkExpr(expr->kind.payload.AssignMul.value)) return false;
+                return true;
+            },
+            ExprKind::AssignDiv => {
+                if (!self.assignExpr(expr->kind.payload.AssignDiv.target)) return false;
+                if (!self.checkExpr(expr->kind.payload.AssignDiv.value)) return false;
+                return true;
+            },
+            ExprKind::AssignMod => {
+                if (!self.assignExpr(expr->kind.payload.AssignMod.target)) return false;
+                if (!self.checkExpr(expr->kind.payload.AssignMod.value)) return false;
+                return true;
+            },
+            ExprKind::AssignBitAnd => {
+                if (!self.assignExpr(expr->kind.payload.AssignBitAnd.target)) return false;
+                if (!self.checkExpr(expr->kind.payload.AssignBitAnd.value)) return false;
+                return true;
+            },
+            ExprKind::AssignBitOr => {
+                if (!self.assignExpr(expr->kind.payload.AssignBitOr.target)) return false;
+                if (!self.checkExpr(expr->kind.payload.AssignBitOr.value)) return false;
+                return true;
+            },
+            ExprKind::AssignBitXor => {
+                if (!self.assignExpr(expr->kind.payload.AssignBitXor.target)) return false;
+                if (!self.checkExpr(expr->kind.payload.AssignBitXor.value)) return false;
+                return true;
+            },
+            ExprKind::AssignShl => {
+                if (!self.assignExpr(expr->kind.payload.AssignShl.target)) return false;
+                if (!self.checkExpr(expr->kind.payload.AssignShl.value)) return false;
+                return true;
+            },
+            ExprKind::AssignShr => {
+                if (!self.assignExpr(expr->kind.payload.AssignShr.target)) return false;
+                if (!self.checkExpr(expr->kind.payload.AssignShr.value)) return false;
+                return true;
+            },
+            ExprKind::TupleField => {
+                if (!self.checkExpr(expr->kind.payload.TupleField.obj)) return false;
+                Ty objTy = self.stripType(self.exprType(expr->kind.payload.TupleField.obj));
+                if (objTy == 0) return false;
+                TypeEntry* te = self.ctx.types + objTy;
+                if (te->kind.tag != TypeKind::Tuple) return false;
+                // `n.1`: source indices are 1-based (codegen emits ._1)
+                u32 tIdx = expr->kind.payload.TupleField.index;
+                if (tIdx == 0 || tIdx > te->kind.payload.Tuple.elemsLen)
+                {
+                    self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "tuple index out of range");
+                    return false;
+                }
+                self.setExprType(id, te->kind.payload.Tuple.elems[tIdx - 1]);
+                return true;
+            },
+            ExprKind::StructLiteral => {
+                if (!self.checkType(expr->kind.payload.StructLiteral.typeNode)) return false;
+                Str variantName = expr->kind.payload.StructLiteral.variantName;
+                if (variantName != 0)
+                {
+                    /* variant construction: fields must belong to the
+                     * named variant of the variant decl behind typeNode */
+                    Ty base = self.stripType(expr->kind.payload.StructLiteral.typeNode);
+                    if (base == 0) return false;
+                    TypeEntry* te = self.ctx.types + base;
+                    if (te->kind.tag != TypeKind::Named)
+                    {
+                        self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "variant construction needs a variant type");
+                        return false;
+                    }
+                    Symbol* symbol = self.lookupType(te->kind.payload.Named.name, te->loc);
+                    if (symbol == null || symbol->declaration.index == 0)
+                    {
+                        self.semaErrorNode(ErrorCode::SemaUndeclaredIdent, id, self.nameMsg("unknown type name: ", te->kind.payload.Named.name));
+                        return false;
+                    }
+                    Node* dn = self.ctx.nodes + symbol->declaration.index;
+                    if (dn->kind.tag != NodeKind::Decl)
+                    {
+                        self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "variant construction needs a variant type");
+                        return false;
+                    }
+                    Decl* decl = &dn->kind.payload.Decl.value;
+                    if (decl->kind.tag != DeclKind::Variant)
+                    {
+                        self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "not a variant type");
+                        return false;
+                    }
+                    VariantVariant* vv = null;
+                    u32 v = 0;
+                    while (v < decl->kind.payload.Variant.variantsLen)
+                    {
+                        if (decl->kind.payload.Variant.variants[v].name == variantName)
+                        {
+                            vv = decl->kind.payload.Variant.variants + v;
+                            break;
+                        }
+                        v++;
+                    }
+                    if (vv == null)
+                    {
+                        self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "unknown variant");
+                        return false;
+                    }
+                    u32 i = 0;
+                    Str* litNames = expr->kind.payload.StructLiteral.fieldNames;
+                    while (i < expr->kind.payload.StructLiteral.fieldValuesLen)
+                    {
+                        Str fieldName;
+                        if (litNames != 0) fieldName = litNames[i];
+                        else
+                        {
+                            if (i >= vv->fieldsLen)
+                            {
+                                self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "too many positional fields in variant construction");
+                                return false;
+                            }
+                            fieldName = vv->fieldNames[i];
+                        }
+                        Ty ft = 0;
+                        u32 k = 0;
+                        while (k < vv->fieldsLen)
+                        {
+                            if (vv->fieldNames[k] == fieldName)
+                            {
+                                ft = vv->fieldTypes[k];
+                                break;
+                            }
+                            k++;
+                        }
+                        if (ft == 0)
+                        {
+                            self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "unknown field in variant construction");
+                            return false;
+                        }
+                    NodeId valueId = expr->kind.payload.StructLiteral.fieldValues[i];
+                    if (!self.checkExpr(valueId)) return false;
+                    Ty expected = self.substituteFieldTy(ft, expr->kind.payload.StructLiteral.typeNode);
+                    Ty actual = self.exprType(valueId);
+                    if (!self.checkAssign(valueId, actual, expected))
+                    {
+                        if (fieldName != 0)
+                            self.semaErrorNode(ErrorCode::SemaTypeMismatch, valueId,
+                                self.paramMismatchMsg(fieldName, actual, expected));
+                        else
+                            self.semaErrorNode(ErrorCode::SemaTypeMismatch, valueId,
+                                self.typeMismatchMsg("field type", actual, expected));
+                    }
+                    if (actual == 0) self.coerceArrayLit(valueId, expected);
+                        i++;
+                    }
+                    self.setExprType(id, expr->kind.payload.StructLiteral.typeNode);
+                    return true;
+                }
+                u32 i = 0;
+                Str* litNames = expr->kind.payload.StructLiteral.fieldNames;
+                while (i < expr->kind.payload.StructLiteral.fieldValuesLen)
+                {
+                    // named fields resolve by name; the arg-list form
+                    // (`Pair { 1, 2 }`) falls back to positional lookup
+                    MemberInfo member;
+                    if (litNames != 0) member = self.findMember(expr->kind.payload.StructLiteral.typeNode, litNames[i]);
+                    else member = self.findMemberByIndex(expr->kind.payload.StructLiteral.typeNode, i);
+                    if (member.typeNode == 0)
+                    {
+                        u8* tb = alloc<u8>(256);
+                        String msg = String::new();
+                        Ty litTy = self.stripType(expr->kind.payload.StructLiteral.typeNode);
+                        if (litNames != 0)
+                        {
+                            msg.pushView("unknown field '");
+                            msg.pushView(self.nameTextView(litNames[i]));
+                            msg.pushView("' in struct literal of type '");
+                            if (tb != null) { msg.pushView(self.typeTextView(litTy, tb, 256)); dealloc<u8>(tb); }
+                            else msg.pushView("?");
+                            msg.pushView("'");
+                            Str close = self.closestField(litTy, litNames[i]);
+                            if (close != 0)
+                            {
+                                msg.pushView("\n\ndid you mean '");
+                                msg.pushView(self.nameTextView(close));
+                                msg.pushView("'?");
+                            }
+                        }
+                        else
+                        {
+                            msg.pushView("too many positional fields in struct literal of type '");
+                            if (tb != null) { msg.pushView(self.typeTextView(litTy, tb, 256)); dealloc<u8>(tb); }
+                            else msg.pushView("?");
+                            msg.pushView("'");
+                        }
+                        self.pushAvailableFields(&msg, litTy);
+                        self.semaErrorNode(ErrorCode::SemaUnknownMember, id, msg.asView());
+                        return false;
+                    }
+                    NodeId valueId = expr->kind.payload.StructLiteral.fieldValues[i];
+                    if (!self.checkExpr(valueId)) return false;
+                    Ty expected = self.substituteFieldTy(member.typeNode, expr->kind.payload.StructLiteral.typeNode);
+                    Ty actual = self.exprType(valueId);
+                    if (!self.checkAssign(valueId, actual, expected))
+                    {
+                        if (litNames != 0)
+                            self.semaErrorNode(ErrorCode::SemaTypeMismatch, valueId,
+                                self.paramMismatchMsg(litNames[i], actual, expected));
+                        else
+                            self.semaErrorNode(ErrorCode::SemaTypeMismatch, valueId,
+                                self.typeMismatchMsg("struct field type", actual, expected));
+                    }
+                    if (actual == 0) self.coerceArrayLit(valueId, expected);
+                    i++;
+                }
+                self.setExprType(id, expr->kind.payload.StructLiteral.typeNode);
+                return true;
+            },
+            ExprKind::ArrayLiteral => {
+                u32 i = 0;
+                while (i < expr->kind.payload.ArrayLiteral.elemsLen)
+                {
+                    if (!self.checkExpr(expr->kind.payload.ArrayLiteral.elems[i])) return false;
+                    i++;
+                }
+                return true;
+            },
+            ExprKind::StaticCall => {
+                u32 i = 0;
+                while (i < expr->kind.payload.StaticCall.argsLen)
+                {
+                    if (!self.checkExpr(expr->kind.payload.StaticCall.args[i])) return false;
+                    i++;
+                }
+                Ty ownerTy = self.namedType(expr->kind.payload.StaticCall.typeName);
+                MemberInfo methodInfo = self.findMethod(ownerTy, expr->kind.payload.StaticCall.method);
+                if (methodInfo.declaration.index == 0)
+                {
+                    u8* mbuf = alloc<u8>(128);
+                    String msg = String::new();
+                    msg.pushView("static method '");
+                    msg.pushView(self.nameTextView(expr->kind.payload.StaticCall.method));
+                    msg.pushView("' not found on type '");
+                    if (mbuf != null) msg.pushView(self.typeTextView(ownerTy, mbuf, 128)); else msg.pushView("?");
+                    msg.pushView("'");
+                    self.semaErrorNode(ErrorCode::SemaUnknownMember, id, msg.asView());
+                    dealloc<u8>(mbuf);
+                    return false;
+                }
+                Node* methodNode = self.ctx.nodes + methodInfo.declaration.index;
+                Decl* methodDecl = &methodNode->kind.payload.Decl.value;
+                if ((methodDecl->kind.payload.Func.flags & 4) == 0)
+                {
+                    u8* mbuf = alloc<u8>(128);
+                    String msg = String::new();
+                    msg.pushView("method '");
+                    msg.pushView(self.nameTextView(expr->kind.payload.StaticCall.method));
+                    msg.pushView("' on type '");
+                    if (mbuf != null) msg.pushView(self.typeTextView(ownerTy, mbuf, 128)); else msg.pushView("?");
+                    msg.pushView("' is not static; it needs a receiver");
+                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, msg.asView());
+                    dealloc<u8>(mbuf);
+                    return false;
+                }
+                u32 paramsLen = methodDecl->kind.payload.Func.paramsLen;
+                if (paramsLen != expr->kind.payload.StaticCall.argsLen)
+                {
+                    String msg = String::new();
+                    msg.pushView("wrong number of arguments to static method '");
+                    msg.pushView(self.nameTextView(methodDecl->kind.payload.Func.name));
+                    msg.pushView("': expected ");
+                    self.pushDec(&msg, (u64)paramsLen);
+                    msg.pushView(", got ");
+                    self.pushDec(&msg, (u64)expr->kind.payload.StaticCall.argsLen);
+                    self.semaErrorNode(ErrorCode::SemaArityMismatch, id, msg.asView());
+                    return false;
+                }
+                i = 0;
+                while (i < expr->kind.payload.StaticCall.argsLen)
+                {
+                    NodeId paramId = methodDecl->kind.payload.Func.params[i];
+                    Node* paramNode = self.ctx.nodes + paramId.index;
+                    if (paramNode->kind.tag == NodeKind::Param)
+                    {
+                        Param* param = &paramNode->kind.payload.Param.value;
+                        NodeId sarg = expr->kind.payload.StaticCall.args[i];
+                        if (!self.checkAssign(sarg, self.exprType(sarg), param->typeNode))
+                        {
+                            if (param->name != 0)
+                                self.semaErrorNode(ErrorCode::SemaTypeMismatch, sarg,
+                                    self.paramMismatchMsg(param->name, self.exprType(sarg), param->typeNode));
+                            else
+                                self.semaErrorNode(ErrorCode::SemaTypeMismatch, sarg,
+                                    self.typeMismatchMsg("static method argument type", self.exprType(sarg), param->typeNode));
+                        }
+                    }
+                    i++;
+                }
+                self.setExprType(id, methodDecl->kind.payload.Func.returnType);
+                return true;
+            },
+            ExprKind::BuiltinCall => {
+                u32 i = 0;
+                while (i < expr->kind.payload.BuiltinCall.argsLen)
+                {
+                    if (!self.checkExpr(expr->kind.payload.BuiltinCall.args[i])) return false;
+                    i++;
+                }
+                Str bname = expr->kind.payload.BuiltinCall.name;
+                /* @compileError("msg"): a hard compile-time error carrying
+                 * the user message. Inside a comptime block the evaluator
+                 * handles it (only the matching switch arm reaches it);
+                 * sema must NOT flag it during the blanket walk of all
+                 * arms; otherwise `else => { @compileError(...) }` fires
+                 * even when a prior arm matched. */
+                if (bname == self.ctx.intern("compileError"))
+                {
+                    if (self.comptimeDepth > 0)
+                    {
+                        // inside comptime: the evaluator decides reachability
+                        self.setExprType(id, self.boolType());
+                        return true;
+                    }
+                    str msgPtr = "@compileError tripped";
+                    usize msgLen = 21;
+                    NodeId msgNodeId;
+                    msgNodeId.index = 0;
+                    if (expr->kind.payload.BuiltinCall.argsLen > 0)
+                        msgNodeId = expr->kind.payload.BuiltinCall.args[0];
+                    if (msgNodeId.index != 0)
+                    {
+                        Node* mn = self.ctx.nodes + msgNodeId.index;
+                        if (mn->kind.tag == NodeKind::Expr &&
+                            mn->kind.payload.Expr.value.kind.tag == ExprKind::StringLit)
+                        {
+                            Str litStr = mn->kind.payload.Expr.value.kind.payload.StringLit.value;
+                            if (litStr != 0 && litStr < self.ctx.internsLen)
+                            {
+                                msgPtr = str { .ptr = self.ctx.interns[litStr].ptr, .len = self.ctx.interns[litStr].len };
+                                msgLen = self.ctx.interns[litStr].len;
+                            }
+                        }
+                    }
+                    u8* msgBuf = alloc<u8>(msgLen + 1);
+                    usize cpI = 0;
+                    while (cpI < msgLen) { msgBuf[cpI] = msgPtr.ptr[cpI]; cpI++; }
+                    msgBuf[msgLen] = 0;
+                    // (usize) on a void call: does nothing, the value is dropped.
+                    // leftover artifact, kept exactly as-is
+                    (usize)self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, str { .ptr = msgBuf, .len = (usize)msgLen });
+                    return false;
+                }
+                /* @isFormatLiteral(expr): true only when the given
+                 * argument is a string literal (comptime path gate). */
+                if (bname == self.ctx.intern("isFormatLiteral"))
+                {
+                    bool lit = false;
+                    if (expr->kind.payload.BuiltinCall.argsLen == 1)
+                    {
+                        NodeId nid = expr->kind.payload.BuiltinCall.args[0];
+                        if (nid.index != 0)
+                        {
+                            Node* nn = self.ctx.nodes + nid.index;
+                            if (nn->kind.tag == NodeKind::Expr &&
+                                nn->kind.payload.Expr.value.kind.tag == ExprKind::StringLit)
+                                lit = true;
+                        }
+                    }
+                    // sic: both ternary arms are boolType(). lit doesn't pick a
+                    // type; @isFormatLiteral always yields bool
+                    self.setExprType(id, lit ? self.boolType() : self.boolType());
+                    return true;
+                }
+                /* @typeof(x): the type of x, only inside comptime blocks,
+                 * and only on a type name, a variable, or a literal
+                 * (int/float/bool/null/str). not on arbitrary expressions. */
+                if (bname == self.ctx.intern("typeof"))
+                {
+                    if (self.comptimeDepth == 0)
+                    {
+                        self.semaErrorNode(ErrorCode::SemaTypeMismatch, id,
+                            "@typeof is only allowed inside a comptime block");
+                        return false;
+                    }
+                    if (expr->kind.payload.BuiltinCall.argsLen != 1)
+                    {
+                        self.semaErrorNode(ErrorCode::SemaTypeMismatch, id,
+                            "@typeof takes exactly one argument");
+                        return false;
+                    }
+                    NodeId aid = expr->kind.payload.BuiltinCall.args[0];
+                    Node* an = self.ctx.nodes + aid.index;
+                    if (an == null || an->kind.tag != NodeKind::Expr)
+                    {
+                        self.semaErrorNode(ErrorCode::SemaTypeMismatch, id,
+                            "@typeof argument must be a type, variable, or literal");
+                        return false;
+                    }
+                    Expr* ae = &an->kind.payload.Expr.value;
+                    u8 akind = 0;
+                    // 1=literal 2=ident/var 3=type
+                    if (ae->kind.tag == ExprKind::IntLit ||
+                        ae->kind.tag == ExprKind::FloatLit ||
+                        ae->kind.tag == ExprKind::BoolLit ||
+                        ae->kind.tag == ExprKind::NullLit ||
+                        ae->kind.tag == ExprKind::StringLit ||
+                        ae->kind.tag == ExprKind::CharLit)
+                        akind = 1;
+                    else if (ae->kind.tag == ExprKind::Ident)
+                        akind = 2;
+                    else if (ae->kind.tag == ExprKind::TypeRef)
+                        akind = 3;
+                    else
+                    {
+                        self.semaErrorNode(ErrorCode::SemaTypeMismatch, id,
+                            "@typeof argument must be a type, variable, or literal");
+                        return false;
+                    }
+                    // resolve the type of the argument
+                    Ty argTy = 0;
+                    if (akind == 3)
+                        argTy = ae->kind.payload.TypeRef.typeNode;
+                    else
+                    {
+                        if (!self.checkExpr(aid)) return false;
+                        argTy = self.exprType(aid);
+                    }
+                    /* @typeof returns a type as a comptime value; the
+                     * expression is typed as the type-of-types placeholder
+                     * (u64) so it can flow into comptime switch arms */
+                    self.setExprType(id, self.u64Type());
+                    return true;
+                }
+                return true;
+            },
+            ExprKind::TupleExpr => {
+                u32 i = 0;
+                while (i < expr->kind.payload.TupleExpr.elemsLen)
+                {
+                    if (!self.checkExpr(expr->kind.payload.TupleExpr.elems[i])) return false;
+                    i++;
+                }
+                // type the literal as a tuple of the element types
+                u32 n = expr->kind.payload.TupleExpr.elemsLen;
+                if (n > 0)
+                {
+                    Ty* elems = alloc<Ty>((usize)n);
+                    if (elems != null)
+                    {
+                        u32 j = 0;
+                        bool allTyped = true;
+                        while (j < n)
+                        {
+                            Ty et = self.exprType(expr->kind.payload.TupleExpr.elems[j]);
+                            if (et == 0) allTyped = false;
+                            elems[j] = et;
+                            j++;
+                        }
+                        if (allTyped)
+                        {
+                            TypeKind k;
+                            k = TypeKind::Tuple{ .elems = elems, .elemsLen = n };
+                            self.setExprType(id, self.allocType(k));
+                        }
+                    }
+                }
+                return true;
+            },
+            ExprKind::BlockExpr => {
+                u32 i = 0;
+                while (i < expr->kind.payload.BlockExpr.stmtsLen)
+                {
+                    if (!self.checkStmt(expr->kind.payload.BlockExpr.stmts[i])) return false;
+                    i++;
+                }
+                if (!self.checkExpr(expr->kind.payload.BlockExpr.result)) return false;
+                Ty bty = self.exprType(expr->kind.payload.BlockExpr.result);
+                if (bty != 0) self.setExprType(id, bty);
+                return true;
+            },
+            ExprKind::Ternary => {
+                if (!self.checkExpr(expr->kind.payload.Ternary.cond)) return false;
+                Ty ternCondTy = self.exprType(expr->kind.payload.Ternary.cond);
+                if (ternCondTy != 0 && ternCondTy != self.boolType() && !self.integerType(ternCondTy) && !self.pointerLike(ternCondTy))
+                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "ternary condition must be bool");
+                if (!self.checkExpr(expr->kind.payload.Ternary.thenExpr)) return false;
+                if (!self.checkExpr(expr->kind.payload.Ternary.elseExpr)) return false;
+                Ty thenTy = self.exprType(expr->kind.payload.Ternary.thenExpr);
+                Ty elseTy = self.exprType(expr->kind.payload.Ternary.elseExpr);
+                if (thenTy == 0) thenTy = elseTy;
+                if (elseTy == 0) elseTy = thenTy;
+                Ty ternTy = thenTy;
+                if (!self.compatible(thenTy, elseTy))
+                {
+                    /* literal branches (`cond ? x : 0`) convert the way
+                     * initializers do; bool branch vs integer branch unifies
+                     * to the integer side (generated C promotes the bool) */
+                    if (self.assignCompatible(expr->kind.payload.Ternary.thenExpr, thenTy, elseTy)) ternTy = elseTy;
+                    else if (self.assignCompatible(expr->kind.payload.Ternary.elseExpr, elseTy, thenTy)) ternTy = thenTy;
+                    else if (thenTy == self.boolType() && self.integerType(elseTy)) ternTy = elseTy;
+                    else if (elseTy == self.boolType() && self.integerType(thenTy)) ternTy = thenTy;
+                    else self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "ternary branch types do not match");
+                }
+                self.setExprType(id, ternTy);
+                return true;
+            },
+            ExprKind::PostInc => { if (!self.assignExpr(expr->kind.payload.PostInc.expr)) return false; self.setExprType(id, self.exprType(expr->kind.payload.PostInc.expr)); return true; },
+            ExprKind::PostDec => { if (!self.assignExpr(expr->kind.payload.PostDec.expr)) return false; self.setExprType(id, self.exprType(expr->kind.payload.PostDec.expr)); return true; },
+            ExprKind::PreInc => { if (!self.assignExpr(expr->kind.payload.PreInc.expr)) return false; self.setExprType(id, self.exprType(expr->kind.payload.PreInc.expr)); return true; },
+            ExprKind::PreDec => { if (!self.assignExpr(expr->kind.payload.PreDec.expr)) return false; self.setExprType(id, self.exprType(expr->kind.payload.PreDec.expr)); return true; },
+            ExprKind::Spread => {
+                /* `...pack` in a call arg list: the pack itself; arity and
+                 * per-arg checks for the spread tail are the call checker's
+                 * job. bare `...` (expr=none) forwards the enclosing
+                 * variadic pack and has no inner expr to type. */
+                NodeId spreadInner = expr->kind.payload.Spread.expr;
+                if (spreadInner.index != 0)
+                {
+                    if (!self.checkExpr(spreadInner)) return false;
+                    self.setExprType(id, self.exprType(spreadInner));
+                }
+                return true;
+            },
+            ExprKind::IfExpr => {
+                if (!self.checkExpr(expr->kind.payload.IfExpr.cond)) return false;
+                Ty ifExprCondTy = self.exprType(expr->kind.payload.IfExpr.cond);
+                // unlike statement `if`, the expression form is strict bool
+                // (no C truthiness, no null)
+                if (ifExprCondTy != 0 && ifExprCondTy != self.boolType())
+                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "if-expression condition must be bool");
+                if (!self.checkExpr(expr->kind.payload.IfExpr.thenBody)) return false;
+                if (!self.checkExpr(expr->kind.payload.IfExpr.elseBody)) return false;
+                Ty thenTy = self.exprType(expr->kind.payload.IfExpr.thenBody);
+                Ty elseTy = self.exprType(expr->kind.payload.IfExpr.elseBody);
+                if (thenTy == 0) thenTy = elseTy;
+                if (elseTy == 0) elseTy = thenTy;
+                // one branch's type becomes the result; an untyped branch
+                // (null literal) adopted the other's before we got here
+                if (!self.compatible(thenTy, elseTy)) self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "if-expression branch types do not match");
+                self.setExprType(id, thenTy);
+                return true;
+            },
+            ExprKind::SwitchExpr => {
+                if (!self.checkExpr(expr->kind.payload.SwitchExpr.expr)) return false;
+                Ty resultTy = 0;
+                bool ok = true;
+                u32 i = 0;
+                while (i < expr->kind.payload.SwitchExpr.casesLen)
+                {
+                    SwitchCase* switchCase = expr->kind.payload.SwitchExpr.cases + i;
+                    u32 p = 0;
+                    while (p < switchCase->patternsLen)
+                    {
+                        if (!self.checkExpr(switchCase->patterns[p])) ok = false;
+                        p++;
+                    }
+                    if (switchCase->guard.index != 0)
+                    {
+                        if (!self.checkExpr(switchCase->guard)) ok = false;
+                    }
+                    if (!self.checkExpr(switchCase->body)) ok = false;
+                    Ty bodyTy = self.exprType(switchCase->body);
+                    /* a case body that is a block value yields the type of
+                       its trailing expression statement */
+                    if (bodyTy == 0 && switchCase->body.index != 0)
+                    {
+                        Node* bn = self.ctx.nodes + switchCase->body.index;
+                        if (bn->kind.tag == NodeKind::Stmt &&
+                            bn->kind.payload.Stmt.value.kind.tag == StmtKind::Block)
+                        {
+                            Stmt* blk = &bn->kind.payload.Stmt.value;
+                            u32 si = blk->kind.payload.Block.stmtsLen;
+                            while (si > 0)
+                            {
+                                si--;
+                                Node* inn = self.ctx.nodes + blk->kind.payload.Block.stmts[si].index;
+                                if (inn->kind.tag != NodeKind::Stmt) continue;
+                                if (inn->kind.payload.Stmt.value.kind.tag == StmtKind::ExprStmt)
+                                {
+                                    bodyTy = self.exprType(inn->kind.payload.Stmt.value.kind.payload.ExprStmt.expr);
+                                    break;
+                                }
+                                if (inn->kind.payload.Stmt.value.kind.tag == StmtKind::Return &&
+                                    inn->kind.payload.Stmt.value.kind.payload.Return.value.index != 0)
+                                {
+                                    bodyTy = self.exprType(inn->kind.payload.Stmt.value.kind.payload.Return.value);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if (bodyTy != 0)
+                    {
+                        if (resultTy == 0) resultTy = bodyTy;
+                        else if (!self.compatible(bodyTy, resultTy)) self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "switch arm types do not match");
+                    }
+                    i++;
+                }
+                self.setExprType(id, resultTy);
+                return ok;
+            },
+            else => {
+                self.semaErrorNode(ErrorCode::SemaInternal, id, "unhandled expression kind in checkExpr");
+                return false;
+            }
+        }
+    }
+}

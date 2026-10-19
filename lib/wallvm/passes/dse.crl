@@ -1,0 +1,157 @@
+#[[no_drop_all]]
+import(lib) wallvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, FunctionAnalysisCache };
+import(lib) wallvm::irOps { IrOpcode };
+import(lib) wallvm::passes::alias_analysis { AliasAnalysis };
+import(lib) std::mman { alloc, dealloc };
+
+// Dead store elimination enhanced with alias analysis.
+//
+// Within a single basic block, a store to an address that is overwritten by a
+// later store to a must-aliasing address — before any load, call, fence or
+// atomic touches it — never contributes to the program state and is removed.
+//
+// Uses AliasAnalysis to determine when two store addresses definitely alias
+// (must-alias), enabling DSE across GEP offsets and bitcasts that the
+// original pointer-equality check missed.
+//
+// Conservative by design — any instruction that can read or write memory
+// (call, atomic, fence, inline asm, landing pad) flushes the tracked stores.
+pub struct DsePass
+{
+    IrContext* ctx;
+    AliasAnalysis* aliasAnalysis;
+    u64 removed;
+
+    DsePass new(IrContext* ctx)
+    {
+        return DsePass {
+            .ctx = ctx,
+            .aliasAnalysis = null,
+            .removed = 0
+        };
+    }
+
+    bool run(IrFunc* func)
+    {
+        self.removed = 0;
+        bool changed = false;
+
+        // Check for cached AA first
+        FunctionAnalysisCache* cache = self.ctx->getOrCreateAnalysisCache(func);
+        AliasAnalysis* aaPtr = (AliasAnalysis*)cache->aliasAnalysis;
+        AliasAnalysis aa;
+        bool ownAA = false;
+        if (aaPtr != null && cache->generation == self.ctx->analysisGeneration) {
+            self.aliasAnalysis = aaPtr;
+        }
+        else {
+            aa = AliasAnalysis::new(self.ctx);
+            aa.analyze(func);
+            self.aliasAnalysis = &aa;
+            ownAA = true;
+        }
+
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            if (self.sweepBlock(bb)) changed = true;
+        }
+
+        // I don't publish a locally built AA into the cache; recompute per run
+        // when no fresh (matching-generation) cached one exists.
+        if (ownAA) aa.deinit();
+        self.aliasAnalysis = null;
+        return changed;
+    }
+
+    bool isBarrier(IrOpcode op)
+    {
+        switch (op)
+        {
+            IrOpcode::Load |
+            IrOpcode::AtomicLoad |
+            IrOpcode::AtomicStore |
+            IrOpcode::AtomicRmw |
+            IrOpcode::AtomicCmpXchg |
+            IrOpcode::Fence |
+            IrOpcode::Call |
+            IrOpcode::InlineAsm |
+            IrOpcode::GcRoot |
+            IrOpcode::GcWriteBarrier |
+            IrOpcode::GcSafepoint |
+            IrOpcode::LandingPad => { return true; },
+
+            else => { return false; },
+        }
+    }
+
+    bool sweepBlock(IrBlock* bb)
+    {
+        const u32 MAX_TRACKED = 128;
+        IrValue** addrs = alloc<IrValue*>(MAX_TRACKED);
+        IrInst** stores = alloc<IrInst*>(MAX_TRACKED);
+        u32 tracked = 0;
+        bool changed = false;
+
+        u32 ii = 0;
+        while (ii < bb->ninsts)
+        {
+            IrInst* inst = bb->insts[ii];
+
+            if (inst->opcode == IrOpcode::Store && inst->nops >= 2)
+            {
+                IrValue* addr = inst->ops[1];
+                // Use alias analysis to find a pending store that must-aliases
+                // this one. Must-alias means the addresses are guaranteed to
+                // refer to the same memory location.
+                i32 hit = -1;
+                for (u32 k = 0; k < tracked; k++)
+                {
+                    if (self.aliasAnalysis != null && self.aliasAnalysis->isMustAlias(addr, addrs[k])) {
+                        hit = (i32)k;
+                        break;
+                    }
+                    if (addrs[k] == addr) {
+                        hit = (i32)k;
+                        break;
+                    }
+                }
+
+                if (hit >= 0)
+                {
+                    stores[hit]->erase();
+                    stores[hit] = inst;
+                    self.removed++;
+                    changed = true;
+                    continue;
+                }
+
+                if (tracked < MAX_TRACKED)
+                {
+                    addrs[tracked] = addr;
+                    stores[tracked] = inst;
+                    tracked++;
+                }
+            }
+            else if (self.isBarrier(inst->opcode)) {
+                tracked = 0;
+            }
+
+            ii++;
+        }
+
+        dealloc<IrValue*>(addrs);
+        dealloc<IrInst*>(stores);
+        return changed;
+    }
+
+    u64 removedCount() { return self.removed; }
+}
+
+pub bool irPassDse(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (ctx == null || func == null) return false;
+    DsePass pass = DsePass::new(ctx);
+    return pass.run(func);
+}

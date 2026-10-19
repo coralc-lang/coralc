@@ -1,0 +1,1694 @@
+#[[no_drop_all]]
+import decl;
+import expr;
+import stmt;
+import typecheck;
+import member;
+import io { readFile };
+import parser { Parser };
+import sema { Sema };
+import context::context { AstContext, InternEntry };
+import common { token { TokenKind }, slice { Slice } };
+import common::platform { hostOs, hostArch };
+import lexer {
+    lexer { Lexer },
+    table { IdentifierTable, IdentEntry }
+};
+import ast {
+    decl { File, Decl, DeclKind },
+    node { Node, NodeKind },
+    id { NodeId }
+};
+import mono {
+    mono { MonoContext },
+    collect,
+    instantiate
+};
+import diag::engine { DiagnosticEngine, DiagList };
+import(lib) std::mman { alloc, dealloc, realloc };
+import(lib) platform::libc { write };
+
+// stderr boundary for loader diagnostics: str in, no raw ptr+len at call sites
+void errWrite(str s) { write(2, (const cchar*)s.ptr, s.len); }
+
+pub struct AnalyzeResult
+{
+    u32 parseErrors;
+    u32 semanticErrors;
+    u32 monoErrors;
+    u32 instances;
+    u32 nodes;
+}
+
+/* Like analyze(), but keeps the AST alive for a backend: the context is
+ * heap-allocated and outlives this call. Free with freeUnit().
+ * sema/mono are kept too; the backend reads monomorphisation instances. */
+pub struct CompileUnit
+{
+    AstContext* ctx;
+    File* file;
+    Sema* sema;
+    MonoContext* mono;
+    u8** bufs;
+    u32 bufsLen;
+    DiagnosticEngine* engineObj;
+    u32 parseErrors;
+    u32 semanticErrors;
+    u32 monoErrors;
+}
+
+pub void freeUnit(CompileUnit* unit)
+{
+    if (unit.bufs != null)
+    {
+        u32 bi = 0;
+        while (bi < unit.bufsLen)
+        {
+            dealloc<u8>(unit.bufs[bi]);
+            bi++;
+        }
+        dealloc<u8*>(unit.bufs);
+        unit.bufs = null;
+    }
+    if (unit.engineObj != null) { unit.engineObj.deinit(); dealloc<DiagnosticEngine>(unit.engineObj); unit.engineObj = null; }
+    if (unit.mono != null) {
+        unit.mono.deinit();
+        dealloc<MonoContext>(unit.mono);
+        unit.mono = null;
+    }
+    if (unit.sema != null) {
+        unit.sema.deinit();
+        dealloc<Sema>(unit.sema);
+        unit.sema = null;
+    }
+    if (unit.ctx != null) {
+        unit.ctx.deinit();
+        dealloc<AstContext>(unit.ctx);
+        unit.ctx = null;
+        unit.file = null;
+    }
+}
+
+/*
+ * Resolves `import(lib) a::b::c` against the lib/ roots:
+ *   1. <root>/a/b/c.crl            direct module file
+ *   2. <root>/a/b/c/lib.crl        directory manifest
+ *   3. <root>/a/lib.crl entry `b`  package manifest: entries are
+ *      `pub mod name = import <path>;` and their targets resolve
+ *      relative to the manifest's directory (nesting recurses).
+ * Roots: <dir(input)>/../../lib, then ./lib.  The resolved file is
+ * parsed into the shared context and merged flat, dependencies first,
+ * ahead of the importing file's own decls. 
+ */
+
+struct LibSeg
+{
+    u8* ptr;
+    u32 len;
+}
+
+struct LibLoader
+{
+    AstContext* ctx;
+    IdentifierTable* idents;
+    DiagnosticEngine* diag;
+    u8* inputPath;
+    u8** loaded;
+    u32 loadedLen;
+    u32 loadedCap;
+    File** files;
+    u32 filesLen;
+    u32 filesCap;
+    u8** bufs;
+    u32 bufsLen;
+    u32 bufsCap;
+    LibSeg* platformRootSegs;
+    u32 platformRootSegsLen;
+    /* in-memory module table from the builder (module/alias::name → path).
+     * authoritative over lib-root probing: a hit here is the resolution. */
+    Slice* modKeys;
+    Slice* modVals;
+    u32 modLen;
+    u32 errors;
+}
+
+usize libLen(u8* s)
+{
+    usize n = 0;
+    if (s == null) return 0;
+    while (s[n] != 0) n++;
+    return n;
+}
+
+bool libBytesEq(u8* a, usize al, u8* b, usize bl)
+{
+    if (a == null || b == null) return false;
+    if (al != bl) return false;
+    usize i = 0;
+    while (i < al)
+    {
+        if (a[i] != b[i]) return false;
+        i++;
+    }
+    return true;
+}
+
+u8* libCandidate(u8* dir, usize dirLen, u8* seg, usize segLen, str suffix)
+{
+    u8* p = alloc<u8>(dirLen + 1 + segLen + suffix.len + 1);
+    if (p == null) return null;
+    usize k = 0;
+    usize i = 0;
+    while (i < dirLen) { p[k] = dir[i]; k++; i++; }
+    p[k] = 47; k++;
+    i = 0;
+    while (i < segLen) { p[k] = seg[i]; k++; i++; }
+    i = 0;
+    while (i < suffix.len) { p[k] = suffix.ptr[i]; k++; i++; }
+    p[k] = 0;
+    return p;
+}
+
+u8* libDir(u8* path)
+{
+    usize n = libLen(path);
+    usize i = n;
+    while (i > 0)
+    {
+        i--;
+        if (path[i] == 47)
+        {
+            if (i == 0) return null;
+            u8* d = alloc<u8>(i + 1);
+            if (d == null) return null;
+            usize k = 0;
+            while (k < i) { d[k] = path[k]; k++; }
+            d[i] = 0;
+            return d;
+        }
+    }
+    return null;
+}
+
+/* installed-toolchain lib root: $CORAL_HOME/lib, else $HOME/.coral/lib */
+u8* libGlobalRoot()
+{
+    u8* base = getenv(C"CORAL_HOME");
+    Slice tail = Slice::fromStr("/lib");
+    if (base == null)
+    {
+        base = getenv(C"HOME");
+        tail = Slice::fromStr("/.coral/lib");
+    }
+    if (base == null) return null;
+    usize bl = 0;
+    while (base[bl] != 0) bl++;
+    if (bl == 0) return null;
+    u8* p = alloc<u8>(bl + tail.len + 1);
+    if (p == null) return null;
+    usize k = 0;
+    while (k < bl) { p[k] = base[k]; k++; }
+    usize j = 0;
+    while (j < tail.len) { p[k] = tail.ptr[j]; k++; j++; }
+    p[k] = 0;
+    return p;
+}
+
+u8* libRead(u8* cpath, usize* outLen)
+{
+    *outLen = 0;
+    Slice s = readFile(str { .ptr = cpath, .len = libLen(cpath) }, outLen);
+    if (s.ptr == null || s.len == 0)
+    {
+        if (s.ptr != null) dealloc<u8>(s.ptr);
+        return null;
+    }
+    return (u8*)s.ptr;
+}
+
+u32 libSplit(u8* s, usize n, LibSeg* out, u32 max)
+{
+    u32 count = 0;
+    usize start = 0;
+    usize i = 0;
+    while (i <= n)
+    {
+        bool atEnd = (i == n);
+        bool atSep = false;
+        if (!atEnd && (i + 1) < n && s[i] == 58 && s[i + 1] == 58) atSep = true;
+        if (atEnd || atSep)
+        {
+            if (count < max)
+            {
+                out[count].ptr = s + start;
+                out[count].len = (u32)(i - start);
+                count++;
+            }
+            if (atEnd) break;
+            i += 2;
+            start = i;
+            continue;
+        }
+        i++;
+    }
+    return count;
+}
+
+File* libParse(LibLoader* L, u8* buf, usize len, u8* cpath, DiagnosticEngine* diag, u32 fileId)
+{
+    /* report into the caller's engine; it owns the file table entry for
+     * `buf` (registered via addFile before this call). A throwaway engine
+     * here produced location-less diagnostics: empty file table made
+     * renderAt fall back to the bare one-line form. */
+    DiagnosticEngine localEngine;
+    DiagnosticEngine* eng = diag;
+    if (eng == null)
+    {
+        localEngine.init(buf, buf + len);
+        eng = &localEngine;
+    }
+    Lexer lexer = Lexer {
+        .bufStart = buf,
+        .cur = buf,
+        .bufEnd = buf + len,
+        .line = 1,
+        .lineStart = buf,
+        .diag = eng,
+        .idents = L->idents,
+        .fileId = fileId,
+    };
+    
+    Parser parser = Parser {
+        .lexer = &lexer,
+        .ctx = L->ctx,
+        .panicMode = 0,
+        .pendingGreater = false,
+        .current = lexer.nextToken(),
+        .fileId = fileId,
+    };
+    parser.previous = parser.current;
+    AstContext* c = L->ctx;
+    File* f = parser.parseFile(c.intern(str { .ptr = cpath, .len = libLen(cpath) }));
+    L->errors += parser.errorCount();
+    return f;
+}
+
+u8* libResolveSegs(LibLoader* L, LibSeg* segs, u32 n, u8* dir, usize dirLen, u32 depth)
+{
+    if (L == null || segs == null || dir == null || n == 0) return null;
+    if (depth > 16) return null;
+
+    if (n == 1)
+    {
+        /* existence probe only; the file is re-read by the loader later,
+         * and nothing here interns into this buffer, so it can be freed */
+        usize len = 0;
+        u8* cand = libCandidate(dir, dirLen, segs[0].ptr, (usize)segs[0].len, ".crl");
+        if (cand != null)
+        {
+            u8* buf = libRead(cand, &len);
+            if (buf != null)
+            {
+                dealloc<u8>(buf);
+                return cand;
+            }
+            dealloc<u8>(cand);
+        }
+        cand = libCandidate(dir, dirLen, segs[0].ptr, (usize)segs[0].len, "/lib.crl");
+        if (cand != null)
+        {
+            u8* buf = libRead(cand, &len);
+            if (buf != null)
+            {
+                dealloc<u8>(buf);
+                return cand;
+            }
+            dealloc<u8>(cand);
+        }
+        return null;
+    }
+    u8* sub = libCandidate(dir, dirLen, segs[0].ptr, (usize)segs[0].len, "");
+    if (sub == null) return null;
+    usize subLen = dirLen + 1 + (usize)segs[0].len;
+    u8* mpath = libCandidate(dir, dirLen, segs[0].ptr, (usize)segs[0].len, "/lib.crl");
+    if (mpath != null)
+    {
+        usize mlen = 0;
+        u8* mbuf = libRead(mpath, &mlen);
+        if (mbuf != null)
+        {
+            /* keep the buffer alive until freeUnit: parsed nodes and the
+             * engine's file ranges point into it (leaked ~65KB per file
+             * per analyze otherwise) */
+            if (L->bufsLen >= L->bufsCap)
+            {
+                u32 newCap = L->bufsCap == 0 ? 8 : L->bufsCap * 2;
+                rawptr raw = realloc<u8*>(L->bufs, (usize)newCap);
+                if (raw != null) { L->bufs = (u8**)raw; L->bufsCap = newCap; }
+            }
+            if (L->bufsLen < L->bufsCap) L->bufs[L->bufsLen] = mbuf;
+            L->bufsLen++;
+            u32 mfid = 0;
+            DiagnosticEngine* dg = L->diag;
+            if (dg != null) mfid = dg.addFile(mpath, libLen(mpath), mbuf, mbuf + mlen);
+            File* mf = libParse(L, mbuf, mlen, mpath, dg, mfid);
+            if (mf != null)
+            {
+                u32 d = 0;
+                while (d < mf->declsLen)
+                {
+                    Node* dn = L->ctx->nodes + mf->decls[d].index;
+                    if (dn->kind.tag == NodeKind::Decl)
+                    {
+                        Decl* dd = &dn->kind.payload.Decl.value;
+                        if (dd->kind.tag == DeclKind::ModReexport && dd->kind.payload.ModReexport.path != 0)
+                        {
+                            InternEntry* entry = L->ctx->interns + dd->kind.payload.ModReexport.alias;
+                            if (libBytesEq(entry->ptr, entry->len, segs[1].ptr, (usize)segs[1].len))
+                            {
+                                InternEntry* target = L->ctx->interns + dd->kind.payload.ModReexport.path;
+                                u32 maxT = (u32)(target->len / 2) + 1;
+                                LibSeg* next = alloc<LibSeg>((usize)maxT + (usize)n);
+                                if (next != null)
+                                {
+                                    u32 got = libSplit(target->ptr, target->len, next, maxT);
+                                    u32 j = 2;
+                                    while (j < n)
+                                    {
+                                        next[got] = segs[j];
+                                        got++;
+                                        j++;
+                                    }
+                                    u8* r = libResolveSegs(L, next, got, sub, subLen, depth + 1);
+                                    dealloc<LibSeg>(next);
+                                    if (r != null)
+                                    {
+                                        dealloc<u8>(mpath);
+                                        return r;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    d++;
+                }
+            }
+        }
+        dealloc<u8>(mpath);
+    }
+    // no export entry (or its target failed); descend as a directory
+    return libResolveSegs(L, segs + 1, n - 1, sub, subLen, depth + 1);
+}
+
+u8* libResolve(LibLoader* L, u8* nsPtr, usize nsLen)
+{
+    if (nsPtr == null || nsLen == 0) return null;
+    /* map-first: the builder's table is authoritative for module paths.
+     * keys are byte-compared (no interning); `common::token` hits the
+     * entry the builder registered for that import. Returns a malloc'd
+     * copy because callers free() the result, same as libCandidate. */
+    if (L->modKeys != null && L->modLen > 0)
+    {
+        u32 mi = 0;
+        while (mi < L->modLen)
+        {
+            if (libBytesEq(L->modKeys[mi].ptr, L->modKeys[mi].len, nsPtr, nsLen))
+            {
+                usize vl = L->modVals[mi].len;
+                u8* copy = alloc<u8>(vl + 1);
+                if (copy == null) return null;
+                usize vi = 0;
+                while (vi < vl) { copy[vi] = L->modVals[mi].ptr[vi]; vi++; }
+                copy[vl] = 0;
+                return copy;
+            }
+            mi++;
+        }
+        /* bare file name: `import io` finds the first registered
+         * `folder::io` (the bootstrap searches module dirs in sorted
+         * order; the table lists module files in that same order) */
+        bool bareName = true;
+        usize bq = 0;
+        while (bq + 1 < nsLen)
+        {
+            if (nsPtr[bq] == 58 && nsPtr[bq + 1] == 58) { bareName = false; break; }
+            bq++;
+        }
+        if (bareName && nsLen > 0)
+        {
+            mi = 0;
+            while (mi < L->modLen)
+            {
+                Slice key = L->modKeys[mi];
+                if (key.len > nsLen + 2 &&
+                    key.ptr[key.len - nsLen - 2] == 58 && key.ptr[key.len - nsLen - 1] == 58 &&
+                    libBytesEq(key.ptr + (key.len - nsLen), nsLen, nsPtr, nsLen))
+                {
+                    Slice mv = L->modVals[mi];
+                    u8* copy = alloc<u8>(mv.len + 1);
+                    if (copy == null) return null;
+                    usize vi = 0;
+                    while (vi < mv.len) { copy[vi] = mv.ptr[vi]; vi++; }
+                    copy[mv.len] = 0;
+                    return copy;
+                }
+                mi++;
+            }
+        }
+    }
+    u32 maxSegs = 1;
+    usize i = 0;
+    while (i + 1 < nsLen)
+    {
+        if (nsPtr[i] == 58 && nsPtr[i + 1] == 58) maxSegs++;
+        i++;
+    }
+    LibSeg* segs = alloc<LibSeg>((usize)maxSegs);
+    if (segs == null) return null;
+    u32 n = libSplit(nsPtr, nsLen, segs, maxSegs);
+    u8* result = null;
+    u8* base = libDir(L->inputPath);
+    if (base != null)
+    {
+        usize bl = libLen(base);
+        u8* up = libCandidate(base, bl, "..".ptr, 2, "/..");
+        if (up != null)
+        {
+            u8* root1 = libCandidate(up, libLen(up), "lib".ptr, 3, "");
+            if (root1 != null)
+            {
+                result = libResolveSegs(L, segs, n, root1, libLen(root1), 0);
+                dealloc<u8>(root1);
+            }
+            dealloc<u8>(up);
+        }
+    }
+    /* `base` stays alive until the platform-root fallback below also
+     * probes it (it was freed here first, use-after-free) */
+    u8* gRoot = libGlobalRoot();
+    if (result == null)
+        result = libResolveSegs(L, segs, n, "lib".ptr, 3, 0);
+    if (result == null && gRoot != null)
+        result = libResolveSegs(L, segs, n, gRoot, libLen(gRoot), 0);
+    if (result == null && L->platformRootSegsLen > 0 && n > 1)
+    {
+        /* platform-first: <module>/<platform_root>/<rest>; neutral paths
+         * resolve under the platform root before the base tree
+         * (see coral-docs/builder_incomplete.md) */
+        LibSeg* psegs = alloc<LibSeg>((usize)n + (usize)L->platformRootSegsLen);
+        if (psegs != null)
+        {
+            psegs[0] = segs[0];
+            u32 k = 1;
+            u32 m = 0;
+            while (m < L->platformRootSegsLen)
+            {
+                psegs[k] = L->platformRootSegs[m];
+                k++;
+                m++;
+            }
+            m = 1;
+            while (m < n)
+            {
+                psegs[k] = segs[m];
+                k++;
+                m++;
+            }
+            result = libResolveSegs(L, psegs, k, "lib".ptr, 3, 0);
+            if (result == null && base != null)
+                result = libResolveSegs(L, psegs, k, base, libLen(base), 0);
+            if (result == null && gRoot != null)
+                result = libResolveSegs(L, psegs, k, gRoot, libLen(gRoot), 0);
+            dealloc<LibSeg>(psegs);
+        }
+    }
+    dealloc<LibSeg>(segs);
+    if (base != null) dealloc<u8>(base);
+    if (gRoot != null) dealloc<u8>(gRoot);
+    return result;
+}
+
+bool libHas(LibLoader* L, u8* path)
+{
+    usize plen = libLen(path);
+    u32 i = 0;
+    while (i < L->loadedLen)
+    {
+        if (libBytesEq(L->loaded[i], libLen(L->loaded[i]), path, plen)) return true;
+        i++;
+    }
+    return false;
+}
+
+bool libPush(LibLoader* L, u8* path)
+{
+    if (L->loadedLen >= L->loadedCap)
+    {
+        u32 newCap = L->loadedCap * 2;
+        rawptr raw = realloc<u8*>(L->loaded, (usize)newCap);
+        if (raw == null) return false;
+        L->loaded = (u8**)raw;
+        L->loadedCap = newCap;
+    }
+    L->loaded[L->loadedLen] = path;
+    L->loadedLen++;
+    return true;
+}
+
+bool libPushFile(LibLoader* L, File* f)
+{
+    if (L->filesLen >= L->filesCap)
+    {
+        u32 newCap = L->filesCap * 2;
+        rawptr raw = realloc<File*>(L->files, (usize)newCap);
+        if (raw == null) return false;
+        L->files = (File**)raw;
+        L->filesCap = newCap;
+    }
+    L->files[L->filesLen] = f;
+    L->filesLen++;
+    return true;
+}
+
+/* resolve + load one import(lib)-style module; used for the builtin `str`
+ * prelude that every unit merges */
+void libLoadModulePath(LibLoader* L, str ns)
+{
+    u8* nsPtr = ns.ptr;
+    usize nsLen = ns.len;
+    u8* resolved = libResolve(L, nsPtr, nsLen);
+    if (resolved == null)
+    {
+        errWrite("coralc: cannot resolve import(lib)");
+        errWrite(ns);
+        errWrite("\n");
+        L->errors++;
+        return;
+    }
+    if (libHas(L, resolved))
+    {
+        dealloc<u8>(resolved);
+        return;
+    }
+    if (!libPush(L, resolved))
+    {
+        L->errors++;
+        return;
+    }
+    usize len = 0;
+    u8* buf = libRead(resolved, &len);
+    if (buf == null)
+    {
+        errWrite("coralc: cannot read import(lib) file");
+        errWrite(str { .ptr = resolved, .len = libLen(resolved) });
+        errWrite("\n");
+        L->errors++;
+        return;
+    }
+    u32 fid = 0;
+    DiagnosticEngine* dg = L->diag;
+    if (dg != null) fid = dg.addFile(resolved, libLen(resolved), buf, buf + len);
+    if (L->bufsLen >= L->bufsCap)
+    {
+        u32 newCap = L->bufsCap == 0 ? 8 : L->bufsCap * 2;
+        rawptr raw = realloc<u8*>(L->bufs, (usize)newCap);
+        if (raw != null) { L->bufs = (u8**)raw; L->bufsCap = newCap; }
+    }
+    if (L->bufsLen < L->bufsCap) L->bufs[L->bufsLen] = buf;
+    else dealloc<u8>(buf);
+    L->bufsLen++;
+    File* lf = libParse(L, buf, len, resolved, dg, fid);
+    if (lf == null)
+    {
+        errWrite("coralc: cannot read import(lib) file");
+        errWrite(str { .ptr = resolved, .len = libLen(resolved) });
+        errWrite("\n");
+        L->errors++;
+        return;
+    }
+    libLoadImports(L, lf);   // dependencies first
+    libLoadSiblingImports(L, lf);
+    if (!libPushFile(L, lf)) L->errors++;
+}
+
+ bool libIsRootSeg(u8* p, usize n)
+ {
+     if (n == 4 && p[0] == 102 && p[1] == 105 && p[2] == 108 && p[3] == 101) return true;
+     if (n == 3 && p[0] == 108 && p[1] == 105 && p[2] == 98) return true;
+     return false;
+ }
+
+ /* non-lib `import a { … }`: load the sibling file <dir-of-f>/a.crl and
+  * merge it flat, like import(lib) files. Nested imports recurse;
+  * already-loaded paths are skipped (libHas dedupes). A missing file is
+  * not an error here; sema then falls back to module-symbol lookup. */
+ void libLoadSiblingImports(LibLoader* L, File* f)
+ {
+     if (f == null || f->path == 0) return;
+     InternEntry* pe = L->ctx->interns + f->path;
+     u8* dir = libDir(pe->ptr);
+     if (dir == null) return;
+     usize dirLen = libLen(dir);
+     u32 i = 0;
+     while (i < f->declsLen)
+     {
+         Node* dn = L->ctx->nodes + f->decls[i].index;
+         if (dn->kind.tag == NodeKind::Decl)
+         {
+             Decl* dd = &dn->kind.payload.Decl.value;
+             if (dd->kind.tag == DeclKind::Import && (dd->kind.payload.Import.flags & 1) == 0 && dd->kind.payload.Import.path != 0)
+             {
+                 InternEntry* ie = L->ctx->interns + dd->kind.payload.Import.path;
+                 bool sibling = ie->len > 0;
+                 if (sibling && libIsRootSeg(ie->ptr, ie->len)) sibling = false;
+                 usize q = 0;
+                 while (sibling && q < ie->len)
+                 {
+                     if (ie->ptr[q] == 58) sibling = false;
+                     q++;
+                 }
+                 if (sibling)
+                 {
+                     u8* cand = libCandidate(dir, dirLen, ie->ptr, ie->len, ".crl");
+                     if (cand != null)
+                     {
+                        if (libHas(L, cand))
+                        {
+                            dealloc<u8>(cand);
+                        }
+                        else
+                        {
+                            usize len = 0;
+                            u8* buf = libRead(cand, &len);
+                            if (buf == null)
+                            {
+                                dealloc<u8>(cand);
+                            }
+                            else if (!libPush(L, cand))
+                            {
+                                L->errors++;
+                                dealloc<u8>(cand);
+                                dealloc<u8>(buf);
+                            }
+                            else
+                            {
+                                u32 fid = 0;
+                                DiagnosticEngine* dg = L->diag;
+                                if (dg != null) fid = dg.addFile(cand, libLen(cand), buf, buf + len);
+                                if (L->bufsLen >= L->bufsCap)
+                                {
+                                    u32 newCap = L->bufsCap == 0 ? 8 : L->bufsCap * 2;
+                                    rawptr raw = realloc<u8*>(L->bufs, (usize)newCap);
+                                    if (raw != null) { L->bufs = (u8**)raw; L->bufsCap = newCap; }
+                                }
+                                if (L->bufsLen < L->bufsCap) L->bufs[L->bufsLen] = buf;
+                                else dealloc<u8>(buf);
+                                L->bufsLen++;
+                                File* lf = libParse(L, buf, len, cand, dg, fid);
+                                if (lf == null)
+                                {
+                                    errWrite("coralc: cannot parse sibling impor");
+                                    errWrite(str { .ptr = cand, .len = libLen(cand) });
+                                    errWrite("\n");
+                                    L->errors++;
+                                }
+                                else
+                                {
+                                    libLoadImports(L, lf);
+                                    libLoadSiblingImports(L, lf);
+                                    if (!libPushFile(L, lf)) L->errors++;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i++;
+    }
+}
+
+void libLoadImports(LibLoader* L, File* f)
+{
+    if (f == null) return;
+    u32 i = 0;
+    while (i < f->declsLen)
+    {
+        Node* dn = L->ctx->nodes + f->decls[i].index;
+        if (dn->kind.tag == NodeKind::Decl)
+        {
+            Decl* dd = &dn->kind.payload.Decl.value;
+            if (dd->kind.tag == DeclKind::Import && dd->kind.payload.Import.path != 0)
+            {
+                /* route: import(lib) always; plain `import a::b` too: a
+                 * namespace path is a module import, resolved via the
+                 * module table / lib roots, not a sibling file. Bare
+                 * `import name` stays with libLoadSiblingImports. */
+                bool colonPath = false;
+                {
+                    InternEntry* cp = L->ctx->interns + dd->kind.payload.Import.path;
+                    usize cq = 0;
+                    while (cq < cp->len)
+                    {
+                        if (cp->ptr[cq] == 58) { colonPath = true; break; }
+                        cq++;
+                    }
+                }
+                bool hasGroups = false;
+                {
+                    u32 gi = 0;
+                    while (gi < dd->kind.payload.Import.symbolsLen)
+                    {
+                        Str gn = dd->kind.payload.Import.symbols[gi].name;
+                        if (gn != 0)
+                        {
+                            InternEntry* ge = L->ctx->interns + gn;
+                            usize gq = 0;
+                            while (gq + 1 < ge->len)
+                            {
+                                if (ge->ptr[gq] == 58 && ge->ptr[gq + 1] == 58) { hasGroups = true; break; }
+                                gq++;
+                            }
+                        }
+                        if (hasGroups) break;
+                        gi++;
+                    }
+                }
+                bool bareModule = false;
+                if ((dd->kind.payload.Import.flags & 1) == 0 && !colonPath && !hasGroups && f->path != 0)
+                {
+                    InternEntry* pe0 = L->ctx->interns + dd->kind.payload.Import.path;
+                    InternEntry* fe0 = L->ctx->interns + f->path;
+                    u8* dir0 = libDir(fe0->ptr);
+                    u8* sib0 = null;
+                    if (dir0 != null) sib0 = libCandidate(dir0, libLen(dir0), pe0->ptr, pe0->len, ".crl");
+                    if (sib0 == null)
+                    {
+                        bareModule = true;
+                    }
+                    else
+                    {
+                        usize sl0 = 0;
+                        u8* sbuf0 = libRead(sib0, &sl0);
+                        if (sbuf0 == null) bareModule = true;
+                        else dealloc<u8>(sbuf0);
+                        dealloc<u8>(sib0);
+                    }
+                }
+                if ((dd->kind.payload.Import.flags & 1) == 0 && !colonPath && !hasGroups && !bareModule)
+                {
+                    i++;
+                    continue;
+                }
+                /* copy out before libResolve; parsing manifests grows the
+                 * intern table, invalidating InternEntry pointers */
+                InternEntry* ie = L->ctx->interns + dd->kind.payload.Import.path;
+                u8* nsPtr = ie->ptr;
+                usize nsLen = ie->len;
+                /* targets: the import path itself, plus `path::mod` for
+                 * every nested item group `mod::{ … }`; the submodule file
+                 * must be merged too, not just the directory manifest */
+                u32 symCount = dd->kind.payload.Import.symbolsLen;
+                usize compsSize = 0;
+                u32 groupCount = 0;
+                u32 si = 0;
+                while (si < symCount)
+                {
+                    Str nm = dd->kind.payload.Import.symbols[si].name;
+                    if (nm != 0)
+                    {
+                        InternEntry* se = L->ctx->interns + nm;
+                        usize lastCol = 0;
+                        usize q = 0;
+                        while (q + 1 < se->len)
+                        {
+                            if (se->ptr[q] == 58 && se->ptr[q + 1] == 58) lastCol = q;
+                            q++;
+                        }
+                        if (lastCol > 0 && lastCol + 2 < se->len)
+                        {
+                            groupCount++;
+                            compsSize += nsLen + 2 + lastCol;
+                        }
+                    }
+                    si++;
+                }
+                u8* comps = null;
+                u8** tPtrs = null;
+                usize* tLens = null;
+                u32 targets = 1;
+                if (groupCount > 0)
+                {
+                    comps = alloc<u8>(compsSize);
+                    tPtrs = alloc<u8*>((usize)1 + (usize)groupCount);
+                    tLens = alloc<usize>((usize)1 + (usize)groupCount);
+                    if (comps == null || tPtrs == null || tLens == null)
+                    {
+                        if (comps != null) dealloc<u8>(comps);
+                        if (tPtrs != null) dealloc<u8*>(tPtrs);
+                        if (tLens != null) dealloc<usize>(tLens);
+                        comps = null;
+                        tPtrs = null;
+                        tLens = null;
+                        L->errors++;
+                    }
+                    else
+                    {
+                        usize off = 0;
+                        si = 0;
+                        while (si < symCount)
+                        {
+                            Str nm = dd->kind.payload.Import.symbols[si].name;
+                            if (nm != 0)
+                            {
+                                InternEntry* se = L->ctx->interns + nm;
+                                usize lastCol = 0;
+                                usize q = 0;
+                                while (q + 1 < se->len)
+                                {
+                                    if (se->ptr[q] == 58 && se->ptr[q + 1] == 58) lastCol = q;
+                                    q++;
+                                }
+                                if (lastCol > 0 && lastCol + 2 < se->len)
+                                {
+                                    bool absolute = lastCol > nsLen + 1;
+                                    if (absolute)
+                                    {
+                                        usize c = 0;
+                                        while (c < nsLen)
+                                        {
+                                            if (se->ptr[c] != nsPtr[c]) { absolute = false; break; }
+                                            c++;
+                                        }
+                                        if (absolute && (se->ptr[nsLen] != 58 || se->ptr[nsLen + 1] != 58)) absolute = false;
+                                    }
+                                    u8* dst = comps + off;
+                                    usize d = 0;
+                                    if (absolute)
+                                    {
+                                        while (d < lastCol) { dst[d] = se->ptr[d]; d++; }
+                                        tPtrs[targets] = dst;
+                                        tLens[targets] = lastCol;
+                                        targets++;
+                                        off += lastCol;
+                                    }
+                                    else
+                                    {
+                                        while (d < nsLen) { dst[d] = nsPtr[d]; d++; }
+                                        dst[nsLen] = 58;
+                                        dst[nsLen + 1] = 58;
+                                        d = 0;
+                                        while (d < lastCol) { dst[nsLen + 2 + d] = se->ptr[d]; d++; }
+                                        tPtrs[targets] = dst;
+                                        tLens[targets] = nsLen + 2 + lastCol;
+                                        targets++;
+                                        off += nsLen + 2 + lastCol;
+                                    }
+                                }
+                            }
+                            si++;
+                        }
+                    }
+                }
+                u32 tCap = targets;
+                u8* tHard = null;
+                u8** tOwned = null;
+                if (tPtrs == null)
+                {
+                    tPtrs = alloc<u8*>(1);
+                    tLens = alloc<usize>(1);
+                    tHard = alloc<u8>(1);
+                    tOwned = alloc<u8*>(1);
+                    if (tPtrs == null || tLens == null || tHard == null || tOwned == null)
+                    {
+                        if (tPtrs != null) dealloc<u8*>(tPtrs);
+                        if (tLens != null) dealloc<usize>(tLens);
+                        if (tHard != null) dealloc<u8>(tHard);
+                        if (tOwned != null) dealloc<u8*>(tOwned);
+                        tPtrs = null;
+                        tLens = null;
+                        tHard = null;
+                        tOwned = null;
+                        L->errors++;
+                    }
+                    else tCap = 1;
+                }
+                if (tPtrs == null)
+                {
+                    if (comps != null) dealloc<u8>(comps);
+                     continue;
+                }
+                /* hard = missing file is an error; chased re-export
+                 * targets are soft (a dead re-export may not exist here) */
+                if (tHard == null || tOwned == null)
+                {
+                    u8* nh = alloc<u8>((usize)tCap);
+                    u8** no = alloc<u8*>((usize)tCap);
+                    if (nh != null && no != null)
+                    {
+                        tHard = nh;
+                        tOwned = no;
+                    }
+                    else
+                    {
+                        if (nh != null) dealloc<u8>(nh);
+                        if (no != null) dealloc<u8*>(no);
+                        dealloc<u8*>(tPtrs);
+                        dealloc<usize>(tLens);
+                        if (comps != null) dealloc<u8>(comps);
+                        tPtrs = null;
+                        continue;
+                    }
+                }
+                u32 zi = 0;
+                while (zi < tCap)
+                {
+                    tHard[zi] = 1;
+                    tOwned[zi] = null;
+                    zi++;
+                }
+                if (bareModule) tHard[0] = 0;
+                tPtrs[0] = nsPtr;
+                tLens[0] = nsLen;
+                u32 k = 0;
+                while (k < targets && tPtrs != null)
+                {
+                    u8* target = tPtrs[k];
+                    usize targetLen = tLens[k];
+                    u8* resolved = libResolve(L, target, targetLen);
+                    if (resolved == null)
+                    {
+                        if (tHard[k] != 0)
+                        {
+                            if ((dd->kind.payload.Import.flags & 1) != 0)
+                                errWrite("coralc: cannot resolve import(lib)");
+                            else
+                                errWrite("coralc: cannot resolve impor");
+                            errWrite(str { .ptr = target, .len = targetLen });
+                            errWrite("\n");
+                            /* with a module table present, name the
+                             * likely cause: an unlisted module */
+                            if (L->modKeys != null && L->modLen > 0)
+                                errWrite("  note: not in the module table; check modules/aliases in the build file\n");
+                            L->errors++;
+                        }
+                    }
+                    else
+                    {
+                        if (getenv(C"CORAL_TRACE_LOAD") != null)
+                        {
+                            errWrite("coralc: load");
+                            errWrite(str { .ptr = resolved, .len = libLen(resolved) });
+                            errWrite("\n");
+                        }
+                        if (libHas(L, resolved))
+                        {
+                            dealloc<u8>(resolved);
+                        }
+                        else if (!libPush(L, resolved))
+                        {
+                            L->errors++;
+                        }
+                        else
+                        {
+                            usize len = 0;
+                            u8* buf = libRead(resolved, &len);
+                            File* lf = null;
+                            if (buf != null)
+                            {
+                                u32 fid = 0;
+                                DiagnosticEngine* dg = L->diag;
+                                if (dg != null) fid = dg.addFile(resolved, libLen(resolved), buf, buf + len);
+                                if (L->bufsLen >= L->bufsCap)
+                                {
+                                    u32 newCap = L->bufsCap == 0 ? 8 : L->bufsCap * 2;
+                                    rawptr raw = realloc<u8*>(L->bufs, (usize)newCap);
+                                    if (raw != null) { L->bufs = (u8**)raw; L->bufsCap = newCap; }
+                                }
+                                if (L->bufsLen < L->bufsCap) L->bufs[L->bufsLen] = buf;
+                                else dealloc<u8>(buf);
+                                L->bufsLen++;
+                                lf = libParse(L, buf, len, resolved, dg, fid);
+                            }
+                            if (lf == null)
+                            {
+                                errWrite("coralc: cannot read import(lib) file");
+                                errWrite(str { .ptr = resolved, .len = libLen(resolved) });
+                                errWrite("\n");
+                                L->errors++;
+                            }
+                            else
+                            {
+                                libLoadImports(L, lf);   // dependencies first
+                                libLoadSiblingImports(L, lf);
+                                if (!libPushFile(L, lf)) L->errors++;
+
+                               /* directory-manifest re-exports: a path that
+                                * lands on <dir>/lib.crl must chase its
+                                * `pub mod X = import …` targets so members
+                                * resolve (std::math → math/lib.crl →
+                                * math/math.crl). Chased only for symbols
+                                * this import asked for when any alias
+                                * matches, else all aliases (the path names
+                                * the directory itself). Targets are soft. */
+                                Str* rxAliases = alloc<Str>((usize)lf->declsLen + 1);
+                                u8* rxWant = null;
+                                u32 rxCount = 0;
+                                if (rxAliases != null)
+                                {
+                                    u32 rx = 0;
+                                    while (rx < lf->declsLen)
+                                    {
+                                        Node* rn = L->ctx->nodes + lf->decls[rx].index;
+                                        if (rn->kind.tag == NodeKind::Decl)
+                                        {
+                                            Decl* rd = &rn->kind.payload.Decl.value;
+                                            if (rd->kind.tag == DeclKind::ModReexport)
+                                            {
+                                                rxAliases[rxCount] = rd->kind.payload.ModReexport.alias;
+                                                rxCount++;
+                                            }
+                                        }
+                                        rx++;
+                                    }
+                                }
+                                if (rxAliases != null && rxCount > 0)
+                                {
+                                    rxWant = alloc<u8>((usize)rxCount);
+                                    if (rxWant != null)
+                                    {
+                                        u32 a = 0;
+                                        u32 anyMatch = 0;
+                                        while (a < rxCount)
+                                        {
+                                            rxWant[a] = 0;
+                                            if (symCount > 0)
+                                            {
+                                                u32 s2 = 0;
+                                                while (s2 < symCount)
+                                                {
+                                                    Str nm = dd->kind.payload.Import.symbols[s2].name;
+                                                    if (nm != 0)
+                                                    {
+                                                        if (nm == rxAliases[a]) rxWant[a] = 1;
+                                                        else
+                                                        {
+                                                            InternEntry* se2 = L->ctx->interns + nm;
+                                                            u8* np2 = se2->ptr;
+                                                            usize nl2 = se2->len;
+                                                            usize lc = 0;
+                                                            usize q2 = 0;
+                                                            while (q2 + 1 < nl2)
+                                                            {
+                                                                if (np2[q2] == 58 && np2[q2 + 1] == 58) lc = q2;
+                                                                q2++;
+                                                            }
+                                                            if (lc > 0 && lc + 2 < nl2)
+                                                            {
+                                                                AstContext* ac = L->ctx;
+                                                                Str pref = ac.intern(str { .ptr = np2, .len = lc });
+                                                                Str tail = ac.intern(str { .ptr = np2 + lc + 2, .len = nl2 - (lc + 2) });
+                                                                if (pref == rxAliases[a] || tail == rxAliases[a]) rxWant[a] = 1;
+                                                            }
+                                                        }
+                                                    }
+                                                    s2++;
+                                                }
+                                            }
+                                            if (rxWant[a] != 0) anyMatch = 1;
+                                            a++;
+                                        }
+                                        a = 0;
+                                        while (a < rxCount)
+                                        {
+                                            if (symCount == 0 || anyMatch == 0 || rxWant[a] != 0)
+                                            {
+                                                if (targets >= tCap)
+                                                {
+                                                    u32 nc = 16;
+                                                    if (tCap != 0) nc = tCap * 2;
+                                                    u8** np = realloc<u8*>(tPtrs, (usize)nc);
+                                                    if (np != null) tPtrs = np;
+                                                    usize* nl = realloc<usize>(tLens, (usize)nc);
+                                                    if (nl != null) tLens = nl;
+                                                    u8* nhh = realloc<u8>(tHard, (usize)nc);
+                                                    if (nhh != null) tHard = nhh;
+                                                    u8** noo = realloc<u8*>(tOwned, (usize)nc);
+                                                    if (noo != null) tOwned = noo;
+                                                    if (targets < nc) tCap = nc;
+                                                }
+                                                if (targets < tCap)
+                                                {
+                                                    InternEntry* ae = L->ctx->interns + rxAliases[a];
+                                                    u8* nt = alloc<u8>(targetLen + 2 + ae->len);
+                                                    if (nt != null)
+                                                    {
+                                                        usize w = 0;
+                                                        while (w < targetLen) { nt[w] = target[w]; w++; }
+                                                        nt[targetLen] = 58;
+                                                        nt[targetLen + 1] = 58;
+                                                        w = 0;
+                                                        while (w < ae->len) { nt[targetLen + 2 + w] = ae->ptr[w]; w++; }
+                                                        tPtrs[targets] = nt;
+                                                        tLens[targets] = targetLen + 2 + ae->len;
+                                                        tHard[targets] = 0;
+                                                        tOwned[targets] = nt;
+                                                        targets++;
+                                                    }
+                                                }
+                                            }
+                                            a++;
+                                        }
+                                    }
+                                }
+                                if (rxAliases != null) dealloc<Str>(rxAliases);
+                                if (rxWant != null) dealloc<u8>(rxWant);
+                            }
+                        }
+                    }
+                    k++;
+                }
+                if (comps != null) dealloc<u8>(comps);
+                if (tPtrs != null) dealloc<u8*>(tPtrs);
+                if (tLens != null) dealloc<usize>(tLens);
+                if (tHard != null) dealloc<u8>(tHard);
+                if (tOwned != null)
+                {
+                    u32 fi = 0;
+                    while (fi < targets)
+                    {
+                        if (tOwned[fi] != null) dealloc<u8>(tOwned[fi]);
+                        fi++;
+                    }
+                    dealloc<u8*>(tOwned);
+                }
+            }
+        }
+        i++;
+    }
+}
+
+bool libMerge(LibLoader* L, File* file)
+{
+    if (L->filesLen == 0) return true;
+    u32 total = file->declsLen;
+    u32 i = 0;
+    while (i < L->filesLen)
+    {
+        total += L->files[i]->declsLen;
+        i++;
+    }
+    NodeId* merged = alloc<NodeId>((usize)total);
+    if (merged == null) return false;
+    u32 k = 0;
+    i = 0;
+    while (i < L->filesLen)
+    {
+        u32 j = 0;
+        while (j < L->files[i]->declsLen)
+        {
+            merged[k] = L->files[i]->decls[j];
+            k++;
+            j++;
+        }
+        i++;
+    }
+    i = 0;
+    while (i < file->declsLen)
+    {
+        merged[k] = file->decls[i];
+        k++;
+        i++;
+    }
+    AstContext* c = L->ctx;
+    if (!c.track((rawptr)merged))
+    {
+        dealloc<NodeId>(merged);
+        return false;
+    }
+    file->decls = merged;
+    file->declsLen = total;
+    return true;
+}
+
+/* target-flag override for the platform root: --flag platform=windows
+ * (a bare OS name, or a full '/'-separated x86_64/windows triple) plus
+ * an optional --flag arch=... pick the root that neutral lib paths
+ * resolve under. Precedence: these flags > CORAL_PLATFORM env > the
+ * built-in host default. Returns null when no platform flag is set. */
+LibSeg* segsFromPlatformFlag(AstContext* ctx, u32* outLen)
+{
+    *outLen = 0;
+    if (ctx == null || ctx->flagsLen == 0) return null;
+    Str platName = ctx.intern("platform");
+    Str archName = ctx.intern("arch");
+    Str platVal = 0;
+    Str archVal = 0;
+    u32 fi = 0;
+    while (fi < ctx->flagsLen)
+    {
+        if (ctx->flagNames[fi] == platName) platVal = ctx->flagValues[fi];
+        if (ctx->flagNames[fi] == archName) archVal = ctx->flagValues[fi];
+        fi++;
+    }
+    if (platVal == 0) return null;
+    InternEntry* pe = ctx->interns + platVal;
+    u32 slashes = 0;
+    usize pi = 0;
+    while (pi < pe->len) { if (pe->ptr[pi] == 47) slashes++; pi++; }
+    u32 segCount = slashes + 1;
+    if (slashes == 0) segCount = 2;
+    if (segCount > 4) segCount = 4;
+    LibSeg* segs = alloc<LibSeg>((usize)segCount);
+    if (segs == null) return null;
+    u32 k = 0;
+    if (slashes == 0)
+    {
+        /* bare OS name: prefix the arch. x86_64 is the only tree that
+         * exists in lib/std today; once the builder does manifest
+         * selection the full triple comes from the selected manifest's
+         * platform_root and this shim goes away. An explicit arch flag
+         * wins over the default. */
+        if (archVal != 0)
+        {
+            InternEntry* ae = ctx->interns + archVal;
+            segs[0].ptr = ae->ptr;
+            segs[0].len = (u32)ae->len;
+        }
+        else
+        {
+            str hArch = hostArch();
+            segs[0].ptr = hArch.ptr;
+            segs[0].len = (u32)hArch.len;
+        }
+        segs[1].ptr = pe->ptr;
+        segs[1].len = (u32)pe->len;
+        k = 2;
+    }
+    else
+    {
+        usize start = 0;
+        pi = 0;
+        while (pi <= pe->len && k < segCount)
+        {
+            if (pi == pe->len || pe->ptr[pi] == 47)
+            {
+                if (pi > start && k < segCount)
+                {
+                    segs[k].ptr = pe->ptr + start;
+                    segs[k].len = (u32)(pi - start);
+                    k++;
+                }
+                start = pi++;
+            }
+            pi++;
+        }
+    }
+    if (k == 0) { dealloc<LibSeg>(segs); return null; }
+    *outLen = k;
+    return segs;
+}
+
+CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice* flagsV,
+                             u32 nFlags, usize errorLimit, bool allowIntPtr, bool noPrelude,
+                             bool silenced, Slice* modKeys, Slice* modVals, u32 modLen,
+                             bool keepOnError, DiagList* outDiags)
+{
+    CompileUnit unit = CompileUnit {
+        .ctx = null,
+        .file = null,
+        .sema = null,
+        .mono = null,
+        .bufs = null,
+        .bufsLen = 0,
+        .parseErrors = 0,
+        .semanticErrors = 0,
+        .monoErrors = 0,
+    };
+
+    AstContext* ctx = alloc<AstContext>(1);
+    if (ctx == null) {
+        unit.parseErrors = 1;
+        return unit;
+    }
+    ctx.init(4096, 4096, 4096);
+
+    /* seed flag table from the CLI so `flag (NAME) {...}` evaluates
+     * against build-time flags (see compile.crl / Options) */
+    if (flagsN != null && nFlags > 0)
+    {
+        Str* fns = alloc<Str>((usize)nFlags);
+        Str* fvs = alloc<Str>((usize)nFlags);
+        u32 fi = 0;
+        while (fi < nFlags)
+        {
+            fns[fi] = ctx.intern(flagsN[fi].asStr());
+            fvs[fi] = ctx.intern(flagsV[fi].asStr());
+            fi++;
+        }
+        ctx->flagNames = fns;
+        ctx->flagValues = fvs;
+        ctx->flagsLen = nFlags;
+    }
+
+    IdentEntry* entries = alloc<IdentEntry>(256);
+    if (entries == null) {
+        unit.parseErrors = 1;
+        ctx.deinit();
+        dealloc<AstContext>(ctx);
+        return unit;
+    }
+
+    IdentifierTable idents;
+    idents.init(entries, 256);
+    idents.addKeywords();
+
+    DiagnosticEngine* engine = alloc<DiagnosticEngine>(1);
+    unit.engineObj = engine;
+    DiagnosticEngine __tmpEngine;
+    __tmpEngine.init(src, src + len);
+    __tmpEngine.errorLimit = errorLimit;
+    __tmpEngine.silenced = silenced;
+
+    u8* mainPath = "main".ptr;
+    usize mainPathLen = 4;
+    if (path != null)
+    {
+        usize plen = 0;
+        while (path[plen] != 0) plen++;
+        if (plen > 0) { mainPath = path; mainPathLen = plen; }
+    }
+    __tmpEngine.addFile(mainPath, mainPathLen, src, src + len);
+    __tmpEngine.collect = outDiags != null;
+    *engine = __tmpEngine;
+
+    Lexer lexer = Lexer {
+        .bufStart = src,
+        .cur = src,
+        .bufEnd = src + len,
+        .line = 1,
+        .lineStart = src,
+        .diag = engine,
+        .idents = &idents,
+        .fileId = 0,
+    };
+
+    Parser parser = Parser {
+        .lexer = &lexer,
+        .ctx = ctx,
+        .panicMode = 0,
+        .pendingGreater = false,
+        .current = lexer.nextToken(),
+        .fileId = 0,
+    };
+    parser.previous = parser.current;
+
+    // real file path so the backend can mangle module paths from it
+    Str pathStr = ctx.intern("main");
+    if (path != null) {
+        usize plen = 0;
+        while (path[plen] != 0) plen++;
+        if (plen > 0) pathStr = ctx.intern(str { .ptr = path, .len = plen });
+    }
+    File* file = parser.parseFile(pathStr);
+    unit.parseErrors = parser.errorCount();
+    if (file == null && unit.parseErrors == 0) unit.parseErrors = 1;
+
+    // import(lib): resolve + parse + merge library decls, deps first
+    bool loadOk = true;
+    LibLoader loader = LibLoader {
+        .ctx = null,
+        .idents = null,
+        .diag = null,
+        .inputPath = null,
+        .loaded = null,
+        .loadedLen = 0,
+        .loadedCap = 0,
+        .files = null,
+        .filesLen = 0,
+        .filesCap = 0,
+        .bufs = null,
+        .bufsLen = 0,
+        .bufsCap = 0,
+        .platformRootSegs = null,
+        .platformRootSegsLen = 0,
+        .modKeys = modKeys,
+        .modVals = modVals,
+        .modLen = modLen,
+        .errors = 0
+    };
+    
+    if (file != null)
+    {
+        loader.ctx = ctx;
+        loader.idents = &idents;
+        loader.inputPath = path;
+        loader.diag = engine;
+        /* platform root; neutral lib paths resolve under
+         * <platform_root>/ first, then the base tree (see
+         * coral-docs/builder_incomplete.md). Target flags select the
+         * root first (--flag platform=windows[,arch=...]); then
+         * CORAL_PLATFORM ('/'-separated, e.g. x86_64/windows); then
+         * the built-in host default. */
+        u32 prFlagLen = 0;
+        LibSeg* prFromFlag = segsFromPlatformFlag(ctx, &prFlagLen);
+        if (prFromFlag != null)
+        {
+            loader.platformRootSegs = prFromFlag;
+            loader.platformRootSegsLen = prFlagLen;
+        }
+        if (loader.platformRootSegs == null)
+        {
+        u8* plat = getenv(C"CORAL_PLATFORM");
+        usize plen = 0;
+        while (plat != null && plat[plen] != 0) plen++;
+        if (plat != null && plen > 0)
+        {
+            u32 segCount = 1;
+            usize pi = 0;
+            while (pi < plen) { if (plat[pi] == 47) segCount++; pi++; }
+            LibSeg* prSegs = alloc<LibSeg>((usize)segCount);
+            if (prSegs != null)
+            {
+                u32 k = 0;
+                usize start = 0;
+                pi = 0;
+                while (pi <= plen)
+                {
+                    if (pi == plen || plat[pi] == 47)
+                    {
+                        if (pi > start && k < segCount)
+                        {
+                            prSegs[k].ptr = plat + start;
+                            prSegs[k].len = (u32)(pi - start);
+                            k++;
+                        }
+                        start = pi++;
+                    }
+                    pi++;
+                }
+                loader.platformRootSegs = prSegs;
+                loader.platformRootSegsLen = k;
+            }
+        }
+        else
+        {
+            str hArch = hostArch();
+            str hOs = hostOs();
+            LibSeg* prSegs = alloc<LibSeg>(2);
+            if (prSegs != null)
+            {
+                prSegs[0].ptr = hArch.ptr;
+                prSegs[0].len = (u32)hArch.len;
+                prSegs[1].ptr = hOs.ptr;
+                prSegs[1].len = (u32)hOs.len;
+                loader.platformRootSegs = prSegs;
+                loader.platformRootSegsLen = 2;
+            }
+        }
+        }
+        loader.loaded = alloc<u8*>(8);
+        loader.loadedLen = 0;
+        loader.loadedCap = 8;
+        loader.files = alloc<File*>(8);
+        loader.filesLen = 0;
+        loader.filesCap = 8;
+        loader.errors = 0;
+        if (loader.loaded == null || loader.files == null)
+        {
+            loader.errors++;
+        }
+        else
+        {
+            /* builtin prelude: merged first so every unit sees the
+             * common surface without importing it: core::str for
+             * `pub extend str` (fromCstr, fromParts, …) used by
+             * findMethod, plus the everyday std modules (io, string,
+             * option, result, vec, arr). platform paths (std::io::ios →
+             * std/x86_64/<plat>/io/ios.crl) resolve through the loader.
+             * --no-prelude skips all of it for minimal single-file tests */
+            if (!noPrelude)
+            {
+                libLoadModulePath(&loader, "core::str");
+                libLoadModulePath(&loader, "std::io::ios");
+                libLoadModulePath(&loader, "std::text::string");
+                libLoadModulePath(&loader, "std::option");
+                libLoadModulePath(&loader, "std::result");
+                libLoadModulePath(&loader, "std::vec");
+                /* std::arr resolves to the platform aggregator, which has no
+                 * `arr` alias yet; the explicit path hits collections/lib.crl
+                 * and its `pub mod arr` re-export */
+                libLoadModulePath(&loader, "std::collections::arr");
+            }
+            libLoadImports(&loader, file);
+            libLoadSiblingImports(&loader, file);
+            if (loader.errors == 0 && !libMerge(&loader, file))
+            {
+                errWrite("coralc: failed to merge import(lib) decls");
+                loader.errors++;
+            }
+        }
+        if (loader.loaded != null) dealloc<u8*>(loader.loaded);
+        if (loader.files != null) dealloc<File*>(loader.files);
+        if (loader.errors > 0)
+        {
+            unit.parseErrors += loader.errors;
+            loadOk = false;
+        }
+    }
+
+    if (file != null && loadOk) {
+        Sema* sema = alloc<Sema>(1);
+        MonoContext* mono = alloc<MonoContext>(1);
+        if (sema == null || mono == null) {
+            unit.parseErrors++;
+            if (sema != null) dealloc<Sema>(sema);
+            if (mono != null) dealloc<MonoContext>(mono);
+        } else {
+            sema.init(ctx, engine);
+            sema.allowIntPtr = allowIntPtr;
+            sema.modKeys = modKeys;
+            sema.modVals = modVals;
+            sema.modLen = modLen;
+            sema.scopes.enter();
+            sema.declareAll(file);
+            sema.checkBodies(file);
+            sema.errors = sema.scopes.errors;
+
+            mono.init(ctx, sema);
+            mono.collectFile(file);
+            mono.run();
+
+            unit.semanticErrors = sema.errors;
+            unit.monoErrors = mono.errors;
+            unit.sema = sema;
+            unit.mono = mono;
+        }
+    }
+
+    /* lib file buffers must stay alive until codegen finishes; interned
+     * strings point into them (see freeUnit) */
+    unit.bufs = loader.bufs;
+    unit.bufsLen = loader.bufsLen;
+    if (loader.platformRootSegs != null) dealloc<LibSeg>(loader.platformRootSegs);
+
+    dealloc<IdentEntry>(entries);
+
+    if (unit.parseErrors > 0 || unit.semanticErrors > 0 || unit.monoErrors > 0) {
+        engine.moveRecordsTo(outDiags);
+        if (keepOnError) {
+            /* LSP callers still want symbols/ASTs for hover/definition
+             * on the parts that did analyze */
+            unit.ctx = ctx;
+            unit.file = file;
+            return unit;
+        }
+        freeUnit(&unit);            // sema + mono (unit.ctx not set yet)
+        ctx.deinit();
+        dealloc<AstContext>(ctx);
+        return unit;
+    }
+
+    engine.moveRecordsTo(outDiags);
+    unit.ctx = ctx;
+    unit.file = file;
+    return unit;
+}
+
+AnalyzeResult analyze(u8* src, usize len)
+{
+    AnalyzeResult result = AnalyzeResult{
+        .parseErrors = 0,
+        .semanticErrors = 0,
+        .monoErrors = 0,
+        .instances = 0,
+        .nodes = 0,
+    };
+    
+    AstContext ctx;
+    ctx.init(4096, 4096, 4096);
+    
+    IdentEntry* entries = alloc<IdentEntry>(256);
+    if (entries == null) {
+        result.parseErrors = 1;
+        ctx.deinit();
+        return result;
+    }
+    
+    IdentifierTable idents;
+    idents.init(entries, 256);
+    idents.addKeywords();
+
+    CompileUnit unit;
+    unit.engineObj = null;
+    DiagnosticEngine engine;
+    engine.init(src, src + len);
+
+    Lexer lexer = Lexer {
+        .bufStart = src,
+        .cur = src,
+        .bufEnd = src + len,
+        .line = 1,
+        .lineStart = src,
+        .diag = &engine,
+        .idents = &idents,
+        .fileId = 0,
+    };
+    
+    Parser parser = Parser {
+        .lexer = &lexer,
+        .ctx = &ctx,
+        .panicMode = 0,
+        .pendingGreater = false,
+        .current = lexer.nextToken(),
+        .fileId = 0,
+    };
+    parser.previous = parser.current;
+    
+    File* file = parser.parseFile(ctx.intern("frontend"));
+    Sema sema;
+    sema.init(&ctx, &engine);
+    sema.scopes.enter();
+    sema.declareAll(file);
+    sema.checkBodies(file);
+    sema.errors = sema.scopes.errors;
+    
+    MonoContext mono;
+    mono.init(&ctx, &sema);
+    mono.collectFile(file);
+    mono.run();
+
+    result = AnalyzeResult {
+        .parseErrors = parser.errorCount(),
+        .semanticErrors = sema.errors,
+        .monoErrors = mono.errors,
+        .instances = mono.instancesLen,
+        .nodes = ctx.nodeCount(),
+    };
+
+    mono.deinit();
+    sema.deinit();
+    ctx.deinit();
+    dealloc<IdentEntry>(entries);
+    return result;
+}

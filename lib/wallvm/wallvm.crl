@@ -1,0 +1,559 @@
+#[[no_drop_all]]
+
+import(lib) wallvm::passes {
+    validate::{ irPassValidate },
+    algebraic::{ irPassSimplify },
+    constfold::{ irPassConstfold },
+    sccp::{ irPassSccp },
+    dce::{ irPassDce, irPassAdce },
+    alias_analysis::{ irAliasAnalysis },
+    memory_ssa::{ irMemorySSA },
+    licm::{ irPassLicm },
+    gvn::{ irPassGvn },
+    loopcse::{ irPassLoopCse },
+    jump_thread::{ irPassJumpThread },
+    inline::{ irPassInline },
+    cast_elim::{ irPassCastElimination },
+    idiom::{ irPassIdiom },
+    peephole::{ irPassPeephole },
+    dse::{ irPassDse },
+    lower_phis::{ irLowerPhis },
+    comm_canon::{ irPassCommCanonicalize },
+    involution::{ irPassInvolution },
+    range::{ irPassRange, irPassRangeBranchElim },
+    branchprop::{ irPassBranchProp },
+    branch_inversion::{ irPassBranchInversionFlat },
+    cse::{ irPassCse },
+    borrowcheck::{ irPassBorrowCheck },
+    unroll::{ irPassUnroll },
+    mem2reg::{ irPassMem2Reg },
+    sroa::{ irPassSROA },
+    stack_layout::{ irPassStackLayout },
+    lex_canon::{ irPassLexCanonicalize },
+    branch_factoring::{ irPassBranchFactoring },
+    divmod::{ irPassDivMod },
+    loop_interchange::{ irPassLoopInterchange },
+    loop_distribute::{ irPassLoopDistribute },
+    tail_dup::{ irPassTailDup },
+    tco::{ irPassAccumulate },
+    simd_vec::{ irPassAutoVectorize },
+    idempotent::{ irPassIdempotent },
+    macro_fusion::{ irPassMacroFusion },
+    machine_opt::{ irMachineOpt },
+    select_to_branch::{ irPassSelectToBranch }
+};
+
+import(lib) wallvm::target {
+    x86_64_V::{ irLinux_X86_64, irLinux_X86_64Asm },
+    x86_64_win::{ irWinX86_64, irWinX86_64Asm },
+    x86_V::{ irCodegenX86, irCodegenX86Asm },
+    wasm::{ irCodegenWasm32, irCodegenWasm32Asm },
+    x86_64_generic::{ irCodegenX86_64Bare },
+    x86_64_base::{ X86_64_RESERVED_INT, X86_64_RESERVED_FLOAT },
+    x86_base::{ X86_RESERVED_INT, X86_RESERVED_FLOAT },
+    x86_64::{ linux::{ abi_lower::{ irABILower } } }
+};
+
+// The MS x64 pass stays namespace-qualified: both abi_lower files export
+// `irABILower` and the bare symbol above is the System V one.
+import(lib) wallvm::target::x86_64::windows::abi_lower;
+
+import(lib) wallvm::regalloc {
+    lsra::{ defaultRegAllocConfig, irLinearScanRegAlloc, RegAllocConfig },
+    graph::{ irGraphRegAlloc }
+};
+
+import(lib) wallvm::irtypes { IrContext, IrFunc, IrModule };
+import(lib) wallvm::rules::asm_rules { CallingConvention, ABIRules, abiForCc, formatForCc, AsmFormat };
+import(lib) std::mman { alloc, dealloc };
+import(lib) core::cchar { cchar };
+
+
+pub const u32 WALLVM_VERSION_MAJOR = 0;
+pub const u32 WALLVM_VERSION_MINOR = 1;
+pub const u32 WALLVM_VERSION_PATCH = 0;
+
+// Loop unrolling is opt-in: --funroll. 
+pub bool gUnrollEnabled = false;
+
+pub bool(IrFunc*, rawptr) PassFn;
+
+pub struct PassPipeline
+{
+    PassFn** passes;
+    str* names;
+    u32 count;
+    u32 capacity;
+
+    PassPipeline new()
+    {
+        return PassPipeline {
+            .passes = null,
+            .names = null,
+            .count = 0,
+            .capacity = 0
+        };
+    }
+
+    void add(PassFn* fn, str name)
+    {
+        if (self.count >= self.capacity)
+        {
+            u32 nc = self.capacity ? self.capacity * 2 : 8;
+            PassFn** np = alloc<PassFn*>(nc);
+            str* nn = alloc<str>(nc);
+            for (u32 i = 0; i < self.count; i++)
+            {
+                np[i] = self.passes[i];
+                nn[i] = self.names[i];
+            }
+            if (self.passes != null) dealloc<PassFn*>(self.passes);
+            if (self.names != null) dealloc<str>(self.names);
+            self.passes = np;
+            self.names = nn;
+            self.capacity = nc;
+        }
+        self.passes[self.count] = fn;
+        self.names[self.count] = name;
+        self.count++;
+    }
+
+    void clear()
+    {
+        if (self.passes != null) dealloc<PassFn*>(self.passes);
+        if (self.names != null) dealloc<str>(self.names);
+        self.passes = null;
+        self.names = null;
+        self.count = 0;
+        self.capacity = 0;
+    }
+
+    bool runOnFunc(IrFunc* func, rawptr ctx)
+    {
+        bool changed = false;
+        for (u32 i = 0; i < self.count; i++)
+        {
+            if (self.passes[i](func, ctx))
+            {
+                changed = true;
+                // A pass reported a mutation, so every cached analysis keyed
+                // off this func is now suspect: bump the generation and let
+                // the publishing pass rebuild on its next run.
+                ((IrContext*)ctx)->analysisGeneration++;
+            }
+        }
+        return changed;
+    }
+
+    // Run the pipeline repeatedly until no pass makes changes.
+    // This allows passes that expose new opportunities for each other
+    // to converge (e.g., constfold exposes algebraic, which exposes
+    // constfold again, etc.)
+    bool runOnFuncIterate(IrFunc* func, rawptr ctx, u32 maxIters)
+    {
+        bool anyChanged = false;
+        for (u32 iter = 0; iter < maxIters; iter++)
+        {
+            bool changed = false;
+            for (u32 i = 0; i < self.count; i++)
+            {
+                if (self.passes[i](func, ctx))
+                {
+                    changed = true;
+                    // See runOnFunc: keep the IR-mutation generation in sync
+                    // so cached analyses (AA/MSSA) are rebuilt when stale.
+                    ((IrContext*)ctx)->analysisGeneration++;
+                }
+            }
+            if (!changed) break;
+            anyChanged = true;
+        }
+        return anyChanged;
+    }
+}
+
+pub PassPipeline pipelineLevel0()
+{
+    PassPipeline p = PassPipeline::new();
+    p.add(irPassValidate, "validate");
+    p.add(irPassSimplify, "simplify");
+    p.add(irPassConstfold, "constfold");
+    p.add(irPassSccp, "sccp");
+    p.add(irPassDce, "dce");
+    p.add(irPassValidate, "validate");
+    return p;
+}
+
+// The abi_lower slot at the head of L1-L3 is picked per calling
+// convention — Win64/SyscallWin64 run the Microsoft x64 pass, every
+// other convention runs System V. Both entries take their module from
+// func->parent, so the pipeline keeps passing the context as userdata
+// like it does for every other pass.
+PassFn* abiLowerPassFor(CallingConvention cc)
+{
+    switch (cc)
+    {
+        CallingConvention::Win64 |
+        CallingConvention::SyscallWin64 => { return abi_lower::irABILower; },
+        else => { return irABILower; },
+    }
+}
+
+pub PassPipeline pipelineLevel1(CallingConvention cc)
+{
+    PassPipeline p = PassPipeline::new();
+    p.add(irPassValidate, "validate");
+    p.add(abiLowerPassFor(cc), "abi_lower");
+    p.add(irPassCommCanonicalize, "comm_canon");
+    p.add(irPassSimplify, "simplify");
+    p.add(irPassConstfold, "constfold");
+    p.add(irPassInvolution, "involution");
+    p.add(irPassSccp, "sccp");
+    p.add(irPassRange, "range");
+    p.add(irPassRangeBranchElim, "range_br_elim");
+    p.add(irPassBranchProp, "branchprop");
+    p.add(irPassBranchInversionFlat, "branch_inv_flat");
+    p.add(irPassCse, "cse");
+    p.add(irPassCastElimination, "cast_elim");
+    p.add(irPassDse, "dse");
+    p.add(irPassJumpThread, "jump_thread");
+    p.add(irPassIdiom, "idiom");
+    p.add(irPassPeephole, "peephole");
+    p.add(irPassDce, "dce");
+    p.add(irPassValidate, "validate");
+    return p;
+}
+
+pub PassPipeline pipelineLevel2(CallingConvention cc)
+{
+    PassPipeline p = PassPipeline::new();
+    p.add(irPassValidate, "validate");
+    p.add(abiLowerPassFor(cc), "abi_lower");
+    p.add(irPassMem2Reg, "mem2reg");
+    p.add(irPassSROA, "sroa");
+    p.add(irPassCommCanonicalize, "comm_canon");
+    p.add(irPassSimplify, "simplify");
+    p.add(irPassConstfold, "constfold");
+    p.add(irPassInvolution, "involution");
+    p.add(irPassRange, "range");
+    p.add(irPassRangeBranchElim, "range_br_elim");
+    p.add(irPassBranchProp, "branchprop");
+    p.add(irPassSccp, "sccp");
+    p.add(irPassAdce, "adce");
+    p.add(irAliasAnalysis, "alias");
+    p.add(irMemorySSA, "mssa");
+    p.add(irPassLicm, "licm");
+    p.add(irPassGvn, "gvn");
+    p.add(irPassLoopCse, "loopcse");
+    p.add(irPassJumpThread, "jump_thread");
+    p.add(irPassInline, "inl");
+    p.add(irPassCastElimination, "cast_elim");
+    p.add(irPassIdiom, "idiom");
+    p.add(irPassPeephole, "peephole");
+    p.add(irPassDse, "dse");
+    p.add(irLowerPhis, "lowrphis");
+    p.add(irPassValidate, "validate");
+    return p;
+}
+
+pub PassPipeline pipelineLevel3(CallingConvention cc)
+{
+    PassPipeline p = PassPipeline::new();
+    p.add(irPassValidate, "validate");
+    p.add(abiLowerPassFor(cc), "abi_lower");
+    p.add(irPassMem2Reg, "mem2reg");
+    p.add(irPassSROA, "sroa");
+    p.add(irPassStackLayout, "stack_layout");
+    p.add(irPassCommCanonicalize, "comm_canon");
+    p.add(irPassLexCanonicalize, "lex_canon");
+    p.add(irPassSimplify, "simplify");
+    p.add(irPassConstfold, "constfold");
+    p.add(irPassInvolution, "involution");
+    p.add(irPassRange, "range");
+    p.add(irPassRangeBranchElim, "range_br_elim");
+    p.add(irPassBranchProp, "branchprop");
+    p.add(irPassBranchInversionFlat, "branch_inv_flat");
+    p.add(irPassBranchFactoring, "branch_fact");
+    p.add(irPassDivMod, "divmod");
+    p.add(irPassSccp, "sccp");
+    p.add(irPassAdce, "adce");
+    p.add(irAliasAnalysis, "alias");
+    p.add(irMemorySSA, "mssa");
+    p.add(irPassLicm, "licm");
+    p.add(irPassGvn, "gvn");
+    p.add(irPassLoopCse, "loopcse");
+    p.add(irPassLoopInterchange, "loop_interchange");
+    p.add(irPassLoopDistribute, "loop_distribute");
+    p.add(irPassJumpThread, "jump_thread");
+    p.add(irPassTailDup, "tail_dup");
+    p.add(irPassInline, "inl");
+    p.add(irPassAccumulate, "tco");
+    p.add(irPassAutoVectorize, "simd_vec");
+    p.add(irPassIdiom, "idiom");
+    p.add(irPassIdempotent, "idempotent");
+    p.add(irPassCastElimination, "cast_elim");
+    p.add(irPassMacroFusion, "macro_fusion");
+    p.add(irPassPeephole, "peephole");
+    p.add(irMachineOpt, "machine_opt");
+    p.add(irPassSelectToBranch, "sel2br");
+    p.add(irPassDse, "dse");
+    p.add(irLowerPhis, "lowrphis");
+    p.add(irPassValidate, "validate");
+    return p;
+}
+
+// cc only reaches the pipelines so the abi_lower slot can pick the
+// target's pass (see abiLowerPassFor); no other pass is cc-sensitive.
+pub bool irOptimize(IrFunc* func, IrContext* ctx, CallingConvention cc, u32 optLevel)
+{
+    PassPipeline p;
+    switch (optLevel)
+    {
+        0 => { p = pipelineLevel0(); },
+        1 => { p = pipelineLevel1(cc); },
+        2 => { p = pipelineLevel2(cc); },
+        else => { p = pipelineLevel3(cc); },
+    }
+    // O2 and O3 run the pipeline iteratively so passes that expose new
+    // opportunities for each other can converge (e.g. constfold → algebraic → constfold).
+    u32 maxIters = (optLevel >= 3) ? 8 : (optLevel >= 2) ? 5 : (optLevel >= 1) ? 2 : 1;
+    bool r = p.runOnFuncIterate(func, (rawptr)ctx, maxIters);
+    p.clear();
+    ctx->clearAnalysisCaches();
+    return r;
+}
+
+// Structure lane, passes that reshape or police the CFG/IR rather than
+// tuning it for speed. Kept out of the numbered pipelines so their ordering
+// relative to the optimizer stays fixed regardless of -O level.
+pub bool irStructureLane(IrFunc* func, IrContext* ctx)
+{
+    if (func == null || ctx == null) return false;
+
+    // Borrow checking is semantic, not an optimization, run it before any
+    // pass that could move or remove loads/stores around.
+    if (irPassBorrowCheck(func, (rawptr)ctx)) {
+        // Diagnostic only, do not fail the structure lane
+        // The caller will emit TC-BORROW if --fborrowcheck is enabled
+    }
+
+    PassPipeline p = PassPipeline::new();
+    if (gUnrollEnabled) p.add(irPassUnroll, "unroll");
+    p.add(irPassValidate, "validate");
+    p.runOnFunc(func, (rawptr)ctx);
+    p.clear();
+    // Returns success (a pass's changed-flag is not an error signal); the
+    // borrow check above is the only failure mode.
+    return true;
+}
+
+pub struct CompileResult
+{
+    bool success;
+    str errorMsg;
+    u32 errorLine;
+}
+
+pub CompileResult compileSuccess()
+{
+    CompileResult r;
+    r.success = true;
+    r.errorMsg = str::empty();
+    r.errorLine = 0;
+    return r;
+}
+
+pub CompileResult compileError(str msg, u32 line)
+{
+    CompileResult r;
+    r.success = false;
+    r.errorMsg = msg;
+    r.errorLine = line;
+    return r;
+}
+
+// True when the target's backend decodes lsra's valData assignments
+// (SPILL_BIT/FLOAT_BIT/reg index) directly. Until a backend is upgraded it
+// stays slot-based and lsra keeps rewriting spills in the IR.
+bool targetConsumesRegAlloc(CallingConvention cc)
+{
+    switch (cc)
+    {
+        CallingConvention::SystemV |
+        CallingConvention::Win64 |
+        CallingConvention::SyscallWin64 |
+        CallingConvention::SyscallX86_64 |
+        CallingConvention::SyscallMacOS |
+        CallingConvention::Cdecl |
+        CallingConvention::Stdcall |
+        CallingConvention::Fastcall |
+        CallingConvention::SyscallX86 |
+        CallingConvention::WinX86_32 => { return true; },
+        else => { return false; },
+    }
+}
+
+RegAllocConfig regallocConfigFor(CallingConvention cc)
+{
+    RegAllocConfig cfg = defaultRegAllocConfig();
+    // Caller-save registers only: values live across calls in spill slots,
+    // and no backend needs callee-save prologue/epilogue work. The callee
+    // set of every ABI stays free for the calling convention itself.
+    cfg.useCalleeSave = false;
+    cfg.backendHandlesSpills = targetConsumesRegAlloc(cc);
+    if (!cfg.backendHandlesSpills) return cfg;
+
+    // Reserved registers are the ones the backend's own instruction
+    // sequences need as scratch; lsra never allocates them to values.
+    switch (cc)
+    {
+        CallingConvention::SystemV |
+        CallingConvention::Win64 |
+        CallingConvention::SyscallWin64 |
+        CallingConvention::SyscallX86_64 |
+        CallingConvention::SyscallMacOS => {
+            cfg.reservedIntRegs = X86_64_RESERVED_INT;
+            cfg.numReservedIntRegs = 4;
+            cfg.reservedFloatRegs = X86_64_RESERVED_FLOAT;
+            cfg.numReservedFloatRegs = 3;
+        },
+        CallingConvention::Cdecl |
+        CallingConvention::Stdcall |
+        CallingConvention::SyscallX86 => {
+            cfg.useCalleeSave = true;
+            cfg.reservedIntRegs = X86_RESERVED_INT;
+            cfg.numReservedIntRegs = 2;
+            cfg.reservedFloatRegs = X86_RESERVED_FLOAT;
+            cfg.numReservedFloatRegs = 2;
+        },
+        else => { },
+    }
+    return cfg;
+}
+
+// Syntax for a calling convention's target, from the rules tables.
+bool ccUsesAtt(CallingConvention cc)
+{
+    return formatForCc(cc) == AsmFormat::Att;
+}
+
+pub CompileResult irCompile(IrModule* modd, IrContext* ctx, CallingConvention cc, u32 optLevel)
+{
+    if (modd == null) return compileError("null module", 0);
+    if (ctx == null) return compileError("null context", 0);
+
+    // WASM is a stack machine — no register allocation needed
+    bool isWasm = (cc == CallingConvention::Wasm32 || cc == CallingConvention::Wasm64);
+    ABIRules abi = abiForCc(cc);
+
+    // The register-allocation contract is chosen per target by switch, not
+    // by a global. Each CPU target either consumes lsra's valData
+    // assignments itself (backendHandlesSpills) or keeps IR-level spill
+    // rewriting until its backend is upgraded.
+    RegAllocConfig cfg = regallocConfigFor(cc);
+
+    // Run register allocation on all functions
+    for (u32 fi = 0; fi < modd->nfuncs; fi++)
+    {
+        IrFunc* func = modd->funcs[fi];
+        if (func == null) continue;
+        if (func->isExtern) continue;
+
+        // Optimize
+        irOptimize(func, ctx, cc, optLevel);
+
+        // Structure lane (borrow check + unroll + dse)
+        if (!irStructureLane(func, ctx))
+            return compileError("structure lane failed", 0);
+
+        // Allocate registers (skip for WASM — stack machine)
+        if (!isWasm)
+        {
+            // Use graph coloring for small leaf functions at O3 for tighter allocation
+            bool useGraph = (optLevel >= 3 && func->isLeaf() && func->nblocks <= 8);
+            if (useGraph)
+            {
+                if (!irGraphRegAlloc(func, (rawptr)ctx, &abi, &cfg))
+                    return compileError("graph register allocation failed", 0);
+            }
+            else
+            {
+                if (!irLinearScanRegAlloc(func, (rawptr)ctx, &abi, &cfg))
+                    return compileError("register allocation failed", 0);
+            }
+        }
+    }
+
+    // Generate code
+    if (!irCodegen(modd, (rawptr)ctx, cc))
+        return compileError("codegen failed", 0);
+
+    return compileSuccess();
+}
+
+// Same pipeline as irCompile, but returns the generated assembly text
+// instead of emitting it to a sink. Test-support export; the buffer lives
+// for the program lifetime.
+pub const cchar* irCompileAsm(IrModule* modd, IrContext* ctx, CallingConvention cc, u32 optLevel)
+{
+    if (modd == null || ctx == null) return null;
+    bool isWasm = (cc == CallingConvention::Wasm32 || cc == CallingConvention::Wasm64);
+    ABIRules abi = abiForCc(cc);
+    RegAllocConfig cfg = regallocConfigFor(cc);
+
+    for (u32 fi = 0; fi < modd->nfuncs; fi++)
+    {
+        IrFunc* func = modd->funcs[fi];
+        if (func == null) continue;
+        if (func->isExtern) continue;
+        // Skip second optimize: buildModule already ran the pipeline
+        // irOptimize(func, ctx, cc, optLevel);
+        if (!irStructureLane(func, ctx)) return null;
+        if (!isWasm)
+        {
+            bool useGraph = (optLevel >= 3 && func->isLeaf() && func->nblocks <= 8);
+            if (useGraph)
+            {
+                if (!irGraphRegAlloc(func, (rawptr)ctx, &abi, &cfg)) return null;
+            }
+            else
+            {
+                if (!irLinearScanRegAlloc(func, (rawptr)ctx, &abi, &cfg)) return null;
+            }
+        }
+    }
+
+    switch (cc)
+    {
+        CallingConvention::SystemV |
+        CallingConvention::SyscallX86_64 |
+        CallingConvention::SyscallMacOS => { return irLinux_X86_64Asm(modd, (rawptr)ctx, ccUsesAtt(cc)); },
+        CallingConvention::Win64 |
+        CallingConvention::SyscallWin64 => { return irWinX86_64Asm(modd, (rawptr)ctx, ccUsesAtt(cc)).ptr; },
+        CallingConvention::Cdecl |
+        CallingConvention::Stdcall |
+        CallingConvention::SyscallX86 => { return irCodegenX86Asm(modd, (rawptr)ctx); },
+        CallingConvention::Wasm32 => { return irCodegenWasm32Asm(modd, (rawptr)ctx); },
+        else => { return null; },
+    }
+}
+
+pub bool irCodegen(IrModule* modd, rawptr userdata, CallingConvention cc)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (ctx == null || modd == null) return false;
+    switch (cc)
+    {
+        CallingConvention::SystemV |
+        CallingConvention::SyscallX86_64 |
+        CallingConvention::SyscallMacOS => { return irLinux_X86_64(modd, userdata, ccUsesAtt(cc)); },
+        CallingConvention::Win64 |
+        CallingConvention::SyscallWin64 => { return irWinX86_64(modd, userdata, ccUsesAtt(cc)); },
+        CallingConvention::Cdecl |
+        CallingConvention::Stdcall |
+        CallingConvention::SyscallX86 => { return irCodegenX86(modd, userdata); },
+        CallingConvention::Wasm32 => { return irCodegenWasm32(modd, userdata); },
+        else => { return irCodegenX86_64Bare(modd, userdata, ccUsesAtt(cc)); },
+    }
+    return false;
+}

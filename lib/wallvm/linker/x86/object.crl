@@ -1,0 +1,319 @@
+#[[no_drop_all]]
+/* object.crl for linker
+ * Parses ET_REL input objects (ELF32/ELF64, little-endian) into the
+ * flat ObjFile view: sections, symbols, and per-target relocations.
+ * All names and section bodies are slices into the caller's buffer -
+ * the buffer must outlive the ObjFile (link.crl owns that lifetime).
+ */
+
+import(lib) std::vec { Vec };
+import(lib) std::text::string { String };
+import(lib) std::result { Result };
+import elf { ELFCLASS64, ELFDATA2LSB, ET_REL, SHT_SYMTAB, SHT_RELA, SHT_REL, SHT_NOBITS, SHT_NULL, EHDR32_SIZE, EHDR64_SIZE, SHDR32_SIZE, SHDR64_SIZE, SYM32_SIZE, SYM64_SIZE, RELA32_SIZE, RELA64_SIZE, REL32_SIZE, REL64_SIZE, SHN_UNDEF, fits, leU16, leU32, leU64, leI64, leI32, strFromTable };
+
+pub struct Reloc
+{
+    u64 offset;
+    u32 sym;
+    u32 type;
+    i64 addend;
+    bool rela;
+    u8 fmt; /* 0 = ELF type numbers, 1 = COFF type numbers */
+}
+
+pub struct Section
+{
+    str name;
+    u32 type;
+    u64 flags;
+    u64 addr;
+    u64 offset;
+    u64 size;
+    u32 link;
+    u32 info;
+    u64 addralign;
+    u64 entsize;
+    u32 outIdx;
+
+    static Section empty()
+    {
+        return Section {
+            .name = str::empty(),
+            .type = 0,
+            .flags = 0,
+            .addr = 0,
+            .offset = 0,
+            .size = 0,
+            .link = 0,
+            .info = 0,
+            .addralign = 1,
+            .entsize = 0,
+            .outIdx = 0xffffffff
+        };
+    }
+}
+
+pub struct Sym
+{
+    str name;
+    u64 value;
+    u64 size;
+    u8 bind;
+    u8 type;
+    u16 shndx;
+}
+
+pub struct ObjFile
+{
+    str name;
+    const u8* data;
+    usize len;
+    u8 cls;
+    u16 machine;
+    Vec<Section> secs;
+    Vec<Sym> syms;
+    usize firstGlobal;
+    Vec<Vec<Reloc>> rels;
+    Vec<str> exports;
+
+    static ObjFile empty(str name, const u8* data, usize len)
+    {
+        return ObjFile {
+            .name = name,
+            .data = data,
+            .len = len,
+            .cls = 0,
+            .machine = 0,
+            .secs = Vec<Section>::new(),
+            .syms = Vec<Sym>::new(),
+            .firstGlobal = 0,
+            .rels = Vec<Vec<Reloc>>::new(),
+            .exports = Vec<str>::new()
+        };
+    }
+
+    void dispose()
+    {
+        for (usize i = 0; i < self.rels.count(); i++)
+            self.rels.atPtr(i)->dispose();
+        self.rels.dispose();
+        self.secs.dispose();
+        self.syms.dispose();
+        self.exports.dispose();
+    }
+}
+
+String _objErr(str name, str what)
+{
+    String s = String::new();
+    s.pushView("linker: ");
+    s.pushView(name);
+    s.pushView(": ");
+    s.pushView(what);
+    return s;
+}
+
+Result<ObjFile, String> _fail(ObjFile* f, String msg)
+{
+    f->dispose();
+    return Result<ObjFile, String>::Err { .error = msg };
+}
+
+pub Result<ObjFile, String> parseObject(str name, const u8* data, usize len)
+{
+    ObjFile f = ObjFile::empty(name, data, len);
+    if (len < 16) return _fail(&f, _objErr(name, "truncated ELF header"));
+    if (data[0] != 0x7f || data[1] != 'E' || data[2] != 'L' || data[3] != 'F')
+        return _fail(&f, _objErr(name, "bad ELF magic"));
+    u8 cls = data[4];
+    if (cls != 1 && cls != 2)
+        return _fail(&f, _objErr(name, "bad ELF class"));
+    if (data[5] != ELFDATA2LSB)
+        return _fail(&f, _objErr(name, "not little-endian"));
+    bool is64 = cls == ELFCLASS64;
+    usize ehdrSize = is64 ? EHDR64_SIZE : EHDR32_SIZE;
+    if (len < ehdrSize) return _fail(&f, _objErr(name, "truncated ELF header"));
+    f.cls = cls;
+    if (leU16(data + 16) != ET_REL)
+        return _fail(&f, _objErr(name, "not a relocatable object (ET_REL expected)"));
+    f.machine = leU16(data + 18);
+
+    u64 shoff;
+    u32 shnum;
+    u32 shstrndx;
+    u32 shentsize;
+    if (is64)
+    {
+        shoff = leU64(data + 40);
+        shentsize = leU16(data + 58);
+        shnum = leU16(data + 60);
+        shstrndx = leU16(data + 62);
+    }
+    else
+    {
+        shoff = leU32(data + 32);
+        shentsize = leU16(data + 46);
+        shnum = leU16(data + 48);
+        shstrndx = leU16(data + 50);
+    }
+    if (shnum == 0)
+        return _fail(&f, _objErr(name, "extended section counts not supported"));
+    u32 wantShdr = is64 ? (u32)SHDR64_SIZE : (u32)SHDR32_SIZE;
+    if (shentsize != wantShdr)
+        return _fail(&f, _objErr(name, "bad section header entry size"));
+    if (shstrndx == SHN_UNDEF || shstrndx >= shnum)
+        return _fail(&f, _objErr(name, "bad shstrndx"));
+    if (!fits((usize)shoff, (usize)shnum * (usize)shentsize, len))
+        return _fail(&f, _objErr(name, "section header table out of bounds"));
+
+    const u8* shstrHdr = data + (usize)shoff + (usize)shstrndx * (usize)shentsize;
+    u64 shstrOff = is64 ? leU64(shstrHdr + 24) : leU32(shstrHdr + 16);
+    u64 shstrSize = is64 ? leU64(shstrHdr + 32) : leU32(shstrHdr + 20);
+    if (!fits((usize)shstrOff, (usize)shstrSize, len))
+        return _fail(&f, _objErr(name, "section name table out of bounds"));
+
+    for (u32 i = 0; i < shnum; i++)
+    {
+        const u8* p = data + (usize)shoff + (usize)i * (usize)shentsize;
+        Section s = Section::empty();
+        u32 nameOff = leU32(p);
+        s.type = leU32(p + 4);
+        if (is64)
+        {
+            s.flags = leU64(p + 8);
+            s.addr = leU64(p + 16);
+            s.offset = leU64(p + 24);
+            s.size = leU64(p + 32);
+            s.link = leU32(p + 40);
+            s.info = leU32(p + 44);
+            s.addralign = leU64(p + 48);
+            s.entsize = leU64(p + 56);
+        }
+        else
+        {
+            s.flags = leU32(p + 8);
+            s.addr = leU32(p + 12);
+            s.offset = leU32(p + 16);
+            s.size = leU32(p + 20);
+            s.link = leU32(p + 24);
+            s.info = leU32(p + 28);
+            s.addralign = leU32(p + 32);
+            s.entsize = leU32(p + 36);
+        }
+        if (!strFromTable(data, (usize)shstrOff, (usize)shstrSize, nameOff, &s.name))
+            return _fail(&f, _objErr(name, "bad section name"));
+        if (s.type != SHT_NULL && s.type != SHT_NOBITS)
+        {
+            if (!fits((usize)s.offset, (usize)s.size, len))
+            {
+                String e = _objErr(name, "section ");
+                e.pushView(s.name);
+                e.pushView(" out of bounds");
+                return _fail(&f, e);
+            }
+        }
+        f.secs.push(s);
+        Vec<Reloc> bucket = Vec<Reloc>::new();
+        f.rels.push(bucket);
+    }
+
+    i64 symtabIdx = -1;
+    for (usize i = 0; i < f.secs.count(); i++)
+    {
+        if (f.secs.at(i).type == SHT_SYMTAB)
+        {
+            symtabIdx = (i64)i;
+            break;
+        }
+    }
+    if (symtabIdx < 0)
+        return _fail(&f, _objErr(name, "no symbol table"));
+    Section* symtab = f.secs.atPtr((usize)symtabIdx);
+    u32 wantSym = is64 ? (u32)SYM64_SIZE : (u32)SYM32_SIZE;
+    if (symtab->entsize != (u64)wantSym)
+        return _fail(&f, _objErr(name, "bad symbol table entry size"));
+    if ((usize)symtab->link >= f.secs.count())
+        return _fail(&f, _objErr(name, "bad symbol string table link"));
+    if ((u64)symtab->info > (symtab->size / symtab->entsize))
+        return _fail(&f, _objErr(name, "bad first-global index"));
+    Section* symstr = f.secs.atPtr(symtab->link);
+    f.firstGlobal = symtab->info;
+
+    usize nsyms = (usize)(symtab->size / symtab->entsize);
+    for (usize i = 0; i < nsyms; i++)
+    {
+        const u8* p = data + (usize)symtab->offset + i * (usize)symtab->entsize;
+        Sym sym;
+        sym.name = str::empty();
+        sym.value = 0;
+        sym.size = 0;
+        sym.bind = 0;
+        sym.type = 0;
+        sym.shndx = 0;
+        u32 nameOff = leU32(p);
+        if (is64)
+        {
+            sym.bind = (u8)(p[4] >> 4);
+            sym.type = (u8)(p[4] & 0xf);
+            sym.shndx = leU16(p + 6);
+            sym.value = leU64(p + 8);
+            sym.size = leU64(p + 16);
+        }
+        else
+        {
+            sym.value = leU32(p + 4);
+            sym.size = leU32(p + 8);
+            sym.bind = (u8)(p[12] >> 4);
+            sym.type = (u8)(p[12] & 0xf);
+            sym.shndx = leU16(p + 14);
+        }
+        if (!strFromTable(data, (usize)symstr->offset, (usize)symstr->size, nameOff, &sym.name))
+            return _fail(&f, _objErr(name, "bad symbol name"));
+        f.syms.push(sym);
+    }
+
+    for (usize i = 0; i < f.secs.count(); i++)
+    {
+        Section* s = f.secs.atPtr(i);
+        if (s->type != SHT_RELA && s->type != SHT_REL) continue;
+        bool rela = s->type == SHT_RELA;
+        if ((usize)s->info >= f.secs.count())
+            return _fail(&f, _objErr(name, "relocation section has bad target"));
+        u32 wantRel = is64 ? (rela ? (u32)RELA64_SIZE : (u32)REL64_SIZE)
+                           : (rela ? (u32)RELA32_SIZE : (u32)REL32_SIZE);
+        if (s->entsize != (u64)wantRel)
+            return _fail(&f, _objErr(name, "bad relocation entry size"));
+        usize step = (usize)s->entsize;
+        usize nrel = (usize)(s->size / s->entsize);
+        Vec<Reloc>* bucket = f.rels.atPtr(s->info);
+        for (usize k = 0; k < nrel; k++)
+        {
+            const u8* p = data + (usize)s->offset + k * step;
+            Reloc r;
+            r.addend = 0;
+            r.rela = rela;
+            r.fmt = 0;
+            if (is64)
+            {
+                r.offset = leU64(p);
+                u64 info = leU64(p + 8);
+                r.sym = (u32)(info >> 32);
+                r.type = (u32)(info & 0xffffffffu);
+                if (rela) r.addend = leI64(p + 16);
+            }
+            else
+            {
+                r.offset = leU32(p);
+                u32 info = leU32(p + 4);
+                r.sym = info >> 8;
+                r.type = info & 0xff;
+                if (rela) r.addend = leI32(p + 8);
+            }
+            if ((usize)r.sym >= f.syms.count())
+                return _fail(&f, _objErr(name, "relocation has bad symbol index"));
+            bucket->push(r);
+        }
+    }
+
+    return Result<ObjFile, String>::Ok { .value = f };
+}

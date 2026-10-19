@@ -1,0 +1,983 @@
+#[[no_drop_all]]
+import(lib) wallvm::irtypes { IrModule, IrFunc, IrBlock, IrInst, IrType, IrTypeKind, IrValue, IrValueKind, IrGlobal, IrStringConst, IrStructType, IrArrayConst, IrVarDebugInfo };
+import(lib) wallvm::irOps { IrOpcode, IrICmpPred, IrFCmpPred, IrAtomicOrdering, IrAtomicRmwOp, irOpcodeStr, irICmpStr, irFCmpStr, irAtomicOrderingStr, irAtomicRmwOpStr };
+import(lib) wallvm::irMetadata { MetadataSet, MetadataEntry, MetadataValue, MetadataValueKind };
+import(lib) std::text::string { String };
+import(lib) platform::libc { snprintf, strtod };
+import(lib) std::mman { copy };
+import(lib) core::cchar { cchar };
+
+// the raw bit pattern, because sign, infinity and nan live in the exponent
+// field where a numeric comparison sees nothing useful
+u64 f64Bits(f64 d)
+{
+    u64 b;
+    copy<cchar>((cchar*)&b, (cchar*)&d, 8);
+    return b;
+}
+
+f64 bitsToF64(u64 b)
+{
+    f64 d;
+    copy<cchar>((cchar*)&d, (cchar*)&b, 8);
+    return d;
+}
+
+// IR.md 10 round-trip: whatever this emits has to reparse to the same
+// graph, so every shape mirrors the parser's dispatch exactly — names
+// print as the parser would bind them, and unnamed results print their
+// id, which takeIdent happily accepts as a name
+pub struct IrPrinter
+{
+    String out;
+
+    static IrPrinter new()
+    {
+        return IrPrinter { .out = String::new() };
+    }
+
+    void destroy()
+    {
+        self.out.free();
+    }
+
+    str output()
+    {
+        return self.out.asView();
+    }
+
+    void emitStr(str s)
+    {
+        self.out.appendView(s);
+    }
+
+    void emitChar(cchar c)
+    {
+        self.out.pushChar(c);
+    }
+
+    void emitCstr(const cchar* s)
+    {
+        if (s == null) return;
+        usize i = 0;
+        while (s[i] != 0)
+        {
+            self.out.pushChar(s[i]);
+            i = i + 1;
+        }
+    }
+
+    void emitU64(u64 v)
+    {
+        if (v == 0)
+        {
+            self.out.pushChar('0');
+            return;
+        }
+        u8 buf[32];
+        u32 n = 0;
+        while (v != 0)
+        {
+            u64 digit = v % 10;
+            buf[n] = (u8)('0' + digit);
+            v = v / 10;
+            n = n + 1;
+        }
+        while (n > 0)
+        {
+            n = n - 1;
+            self.out.pushChar((cchar)buf[n]);
+        }
+    }
+
+    void emitI64(i64 v)
+    {
+        if (v < 0)
+        {
+            self.out.pushChar('-');
+            u64 mag = (u64)(-(v + 1)) + 1u;
+            self.emitU64(mag);
+        }
+        else self.emitU64((u64)v);
+    }
+
+    void emitHexU64(u64 v)
+    {
+        self.emitStr("0x");
+        bool started = false;
+        for (i32 shift = 60; shift >= 0; shift = shift - 4)
+        {
+            u64 digit = (v >> (u32)shift) & 0xF;
+            if (!started && digit == 0 && shift != 0) continue;
+            started = true;
+            self.out.pushChar(digit < 10 ? (cchar)('0' + digit) : (cchar)('a' + digit - 10));
+        }
+    }
+
+    // shortest text that strtod gives back as the same double — the parser
+    // lexes floats through strtod too, so the round trip is bit-exact; a
+    // bare integral value gets a forced ".0" or it would reparse as an int
+    void emitFloat(f64 v)
+    {
+        u64 bits = f64Bits(v);
+        u64 sign = bits >> 63;
+        u64 exp = (bits >> 52) & 0x7FF;
+        u64 man = bits & 0xFFFFFFFFFFFFF;
+        if (exp == 0x7FF)
+        {
+            if (sign != 0) self.out.pushChar('-');
+            if (man == 0) self.emitStr("inf");
+            else self.emitStr("nan");
+            return;
+        }
+        cchar buf[64];
+        for (i32 prec = 1; prec <= 17; prec = prec + 1)
+        {
+            i32 n = snprintf(buf, 64, C"%.*g", (i32)prec, v);
+            if (n <= 0 || n > 55) continue;
+            bool plain = true;
+            for (i32 i = 0; i < n; i++)
+            {
+                if (buf[i] == '.' || buf[i] == 'e' || buf[i] == 'E') { plain = false; break; }
+            }
+            if (plain)
+            {
+                buf[n] = '.';
+                buf[n + 1] = '0';
+                buf[n + 2] = 0;
+                n = n + 2;
+            }
+            if (strtod(buf, null) == v)
+            {
+                for (i32 i = 0; i < n; i++) self.out.pushChar(buf[i]);
+                return;
+            }
+        }
+        // 17 digits always round-trips a finite double, but if we ever get
+        // here the raw bits are the exact fallback the parser accepts
+        self.emitHexU64(bits);
+    }
+
+    void emitEscaped(str s)
+    {
+        self.out.pushChar('"');
+        for (usize i = 0; i < s.len; i++)
+        {
+            u8 b = s.ptr[i];
+            if (b == (u8)'\\') self.emitStr("\\\\");
+            else if (b == (u8)'"') self.emitStr("\\\"");
+            else if (b == (u8)'\n') self.emitStr("\\n");
+            else if (b == (u8)'\t') self.emitStr("\\t");
+            else if (b >= 32 && b <= 126) self.out.pushChar((cchar)b);
+            else
+            {
+                self.emitStr("\\x");
+                u64 hi = (u64)b >> 4;
+                u64 lo = (u64)b & 0xF;
+                self.out.pushChar(hi < 10 ? (cchar)('0' + hi) : (cchar)('a' + hi - 10));
+                self.out.pushChar(lo < 10 ? (cchar)('0' + lo) : (cchar)('a' + lo - 10));
+            }
+        }
+        self.out.pushChar('"');
+    }
+
+    void emitType(IrModule* m, IrType* t)
+    {
+        if (t == null)
+        {
+            self.emitStr("void");
+            return;
+        }
+        switch (t.kind)
+        {
+            IrTypeKind::Void => { self.emitStr("void"); },
+            IrTypeKind::Int =>
+            {
+                self.emitChar('i');
+                self.emitU64((u64)t.width);
+            },
+            IrTypeKind::Float =>
+            {
+                if (t.width == 32) self.emitStr("f32");
+                else if (t.width == 64) self.emitStr("f64");
+                else { self.emitChar('f'); self.emitU64((u64)t.width); }
+            },
+            IrTypeKind::Ptr =>
+            {
+                self.emitStr("ptr");
+                if (t.elem != null)
+                {
+                    self.emitChar(' ');
+                    self.emitType(m, t.elem);
+                }
+            },
+            IrTypeKind::Array =>
+            {
+                self.emitStr("array ");
+                self.emitType(m, t.elem);
+                self.emitChar(' ');
+                self.emitU64((u64)t.count);
+            },
+            IrTypeKind::Vector =>
+            {
+                self.emitStr("vector ");
+                self.emitType(m, t.elem);
+                self.emitChar(' ');
+                self.emitU64((u64)t.count);
+            },
+            IrTypeKind::Func =>
+            {
+                self.emitStr("func ");
+                self.emitType(m, t.ret);
+                self.emitStr(" (");
+                for (u32 i = 0; i < t.nparams; i++)
+                {
+                    if (i > 0) self.emitStr(", ");
+                    self.emitType(m, t.params[i]);
+                }
+                if (t.isVararg)
+                {
+                    if (t.nparams > 0) self.emitStr(", ");
+                    self.emitStr("...");
+                }
+                self.emitChar(')');
+            },
+            IrTypeKind::Struct =>
+            {
+                // named structs print the reference the parser looks up in
+                // the module side table; anonymous twins print inline
+                if (m != null)
+                {
+                    for (u32 i = 0; i < m->nstructs; i++)
+                    {
+                        IrStructType* st = m->structs[i];
+                        if (st->irType == t && st->name.len > 0)
+                        {
+                            self.emitStr("struct @");
+                            self.emitStr(st->name);
+                            return;
+                        }
+                    }
+                }
+                self.emitStr("struct { ");
+                for (u32 i = 0; i < t.nparams; i++)
+                {
+                    if (i > 0) self.emitStr(", ");
+                    self.emitType(m, t.params[i]);
+                }
+                self.emitStr(" }");
+            },
+            else => { self.emitStr("void"); }
+        }
+    }
+
+    // %name when the parser bound one, %<id> otherwise — the id form is
+    // what an unnamed result prints on its defining line, so references
+    // and definitions always agree
+    void emitValueRef(IrValue* v)
+    {
+        self.emitChar('%');
+        if (v->name != null && v->name[0] != 0) self.emitCstr(v->name);
+        else self.emitU64((u64)v->id);
+    }
+
+    void emitSymbol(IrValue* v)
+    {
+        self.emitChar('@');
+        if (v->name != null && v->name[0] != 0) self.emitCstr(v->name);
+        else self.emitU64((u64)v->id);
+    }
+
+    void emitBlockLabel(IrValue* v)
+    {
+        if (v->name != null && v->name[0] != 0) self.emitCstr(v->name);
+        else
+        {
+            self.emitChar('b');
+            self.emitU64((u64)v->id);
+        }
+    }
+
+    void emitArrayConst(IrModule* m, IrArrayConst* ac)
+    {
+        self.emitStr("[ ");
+        for (u32 i = 0; i < ac->nelems; i++)
+        {
+            if (i > 0) self.emitStr(", ");
+            self.emitAtom(m, ac->elems[i]);
+        }
+        self.emitStr(" ]");
+    }
+
+    void emitAtom(IrModule* m, IrValue* v)
+    {
+        if (v == null)
+        {
+            self.emitStr("@missing");
+            return;
+        }
+        switch (v->kind)
+        {
+            IrValueKind::ConstInt =>
+            {
+                if (v->type != null && v->type->kind == IrTypeKind::Int && v->type->width == 1)
+                {
+                    if ((v->valData & 1) != 0) self.emitStr("true");
+                    else self.emitStr("false");
+                }
+                else self.emitI64((i64)v->valData);
+            },
+            IrValueKind::ConstFloat => { self.emitFloat(bitsToF64(v->valData)); },
+            IrValueKind::ConstArray => { self.emitArrayConst(m, (IrArrayConst*)v); },
+            IrValueKind::Func => { self.emitSymbol(v); },
+            IrValueKind::Global => { self.emitSymbol(v); },
+            IrValueKind::StringConst => { self.emitSymbol(v); },
+            IrValueKind::Arg => { self.emitValueRef(v); },
+            IrValueKind::Inst => { self.emitValueRef(v); },
+            IrValueKind::Block => { self.emitBlockLabel(v); },
+            else => { self.emitStr("%missing"); }
+        }
+    }
+
+    void emitMetaValue(IrModule* m, MetadataValue* mv)
+    {
+        switch (mv->vkind)
+        {
+            MetadataValueKind::Int => { self.emitI64((i64)mv->intVal); },
+            MetadataValueKind::Float => { self.emitFloat(mv->floatVal); },
+            MetadataValueKind::Bool =>
+            {
+                if (mv->intVal != 0) self.emitStr("true");
+                else self.emitStr("false");
+            },
+            MetadataValueKind::String => { self.emitEscaped(mv->strVal); },
+            MetadataValueKind::IRValue => { self.emitAtom(m, mv->irVal); },
+            MetadataValueKind::Type => { self.emitType(m, mv->typeVal); },
+            else => { self.emitI64((i64)mv->intVal); }
+        }
+    }
+
+    // one entry, one clause; bare !key is the canonical spelling of the
+    // conventional = 1, except alignment which the parser mirrors into the
+    // field only when it sees an explicit =
+    void emitMetaEntry(IrModule* m, str key, MetadataValue* mv)
+    {
+        self.emitChar(' ');
+        self.emitChar('!');
+        self.emitStr(key);
+        bool bare = mv->vkind == MetadataValueKind::Int && mv->intVal == 1 &&
+                    !key.equals("alignment");
+        if (!bare)
+        {
+            self.emitStr(" = ");
+            self.emitMetaValue(m, mv);
+        }
+    }
+
+    void emitMetaSet(IrModule* m, rawptr md)
+    {
+        if (md == null) return;
+        MetadataSet* set = (MetadataSet*)md;
+        for (u32 i = 0; i < set->numEntries; i++)
+        {
+            MetadataEntry* e = &set->entries[i];
+            self.emitMetaEntry(m, e->key, &e->value);
+        }
+    }
+
+    // var debug rides its own clause — the parser routes !var into the
+    // instruction's side array, never into the metadata set
+    void emitVarDebug(IrModule* m, IrInst* inst)
+    {
+        for (u32 i = 0; i < inst->nvarDbg; i++)
+        {
+            IrVarDebugInfo* d = &inst->varDbg[i];
+            self.emitStr(" !var = ");
+            self.emitEscaped(str::fromCstr(d->varName));
+            self.emitStr(", ");
+            self.emitType(m, d->varType);
+            self.emitStr(", ");
+            self.emitU64((u64)d->line);
+            self.emitStr(", ");
+            self.emitU64((u64)d->col);
+            if (d->argIndex != 0xFFFFFFFF)
+            {
+                self.emitStr(", ");
+                self.emitU64((u64)d->argIndex);
+            }
+        }
+    }
+
+    void emitTypedArgs(IrModule* m, IrInst* inst, u32 from)
+    {
+        for (u32 i = from; i < inst->nops; i++)
+        {
+            if (i > from) self.emitStr(", ");
+            self.emitType(m, inst->ops[i]->type);
+            self.emitChar(' ');
+            self.emitAtom(m, inst->ops[i]);
+        }
+    }
+
+    void emitBinary(IrModule* m, IrInst* inst)
+    {
+        self.emitType(m, inst->base.type);
+        self.emitChar(' ');
+        self.emitAtom(m, inst->ops[0]);
+        self.emitStr(", ");
+        self.emitAtom(m, inst->ops[1]);
+    }
+
+    void emitUnary(IrModule* m, IrInst* inst)
+    {
+        self.emitType(m, inst->base.type);
+        self.emitChar(' ');
+        self.emitAtom(m, inst->ops[0]);
+    }
+
+    // the whole instruction, minus its result prefix and metadata tail
+    void emitBody(IrModule* m, IrInst* inst)
+    {
+        IrOpcode op = inst->opcode;
+        switch (op)
+        {
+            IrOpcode::Br =>
+            {
+                self.emitStr("br ");
+                self.emitAtom(m, inst->ops[0]);
+            },
+            IrOpcode::CondBr =>
+            {
+                self.emitStr("cond_br ");
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(", ");
+                self.emitAtom(m, inst->ops[1]);
+                self.emitStr(", ");
+                self.emitAtom(m, inst->ops[2]);
+            },
+            IrOpcode::Ret =>
+            {
+                if (inst->base.type->kind == IrTypeKind::Void) self.emitStr("ret");
+                else
+                {
+                    self.emitStr("ret ");
+                    self.emitType(m, inst->base.type);
+                    self.emitChar(' ');
+                    self.emitAtom(m, inst->ops[0]);
+                }
+            },
+            IrOpcode::Fma =>
+            {
+                self.emitType(m, inst->base.type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(", ");
+                self.emitAtom(m, inst->ops[1]);
+                self.emitStr(", ");
+                self.emitAtom(m, inst->ops[2]);
+            },
+            IrOpcode::ICmp =>
+            {
+                self.emitStr("icmp ");
+                self.emitStr(irICmpStr(inst->icmpPred));
+                self.emitChar(' ');
+                self.emitType(m, inst->ops[0]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(", ");
+                self.emitAtom(m, inst->ops[1]);
+            },
+            IrOpcode::FCmp =>
+            {
+                self.emitStr("fcmp ");
+                self.emitStr(irFCmpStr(inst->fcmpPred));
+                self.emitChar(' ');
+                self.emitType(m, inst->ops[0]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(", ");
+                self.emitAtom(m, inst->ops[1]);
+            },
+            IrOpcode::Alloca =>
+            {
+                self.emitStr("alloca ");
+                self.emitType(m, inst->base.type->elem);
+            },
+            IrOpcode::Load =>
+            {
+                self.emitStr("load ");
+                self.emitType(m, inst->base.type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+            },
+            IrOpcode::Store =>
+            {
+                self.emitStr("store ");
+                self.emitType(m, inst->ops[0]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(", ");
+                self.emitAtom(m, inst->ops[1]);
+            },
+            IrOpcode::Gep =>
+            {
+                self.emitStr("gep ");
+                for (u32 i = 0; i < inst->nops; i++)
+                {
+                    if (i > 0) self.emitStr(", ");
+                    self.emitAtom(m, inst->ops[i]);
+                }
+            },
+            IrOpcode::Call =>
+            {
+                self.emitStr("call ");
+                self.emitType(m, inst->base.type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitChar('(');
+                self.emitTypedArgs(m, inst, 1);
+                self.emitChar(')');
+            },
+            IrOpcode::Phi =>
+            {
+                self.emitStr("phi ");
+                self.emitType(m, inst->base.type);
+                for (u32 i = 0; i + 1 < inst->nops; i = i + 2)
+                {
+                    self.emitStr(" [ ");
+                    self.emitAtom(m, inst->ops[i]);
+                    self.emitStr(", ");
+                    self.emitAtom(m, inst->ops[i + 1]);
+                    self.emitStr(" ]");
+                    if (i + 2 < inst->nops) self.emitChar(',');
+                }
+            },
+            IrOpcode::Select =>
+            {
+                self.emitStr("select ");
+                self.emitType(m, inst->ops[0]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(", ");
+                self.emitType(m, inst->ops[1]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[1]);
+                self.emitStr(", ");
+                self.emitType(m, inst->ops[2]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[2]);
+            },
+            IrOpcode::ExtractValue =>
+            {
+                self.emitStr("extractvalue ");
+                self.emitType(m, inst->ops[0]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(", ");
+                self.emitAtom(m, inst->ops[1]);
+            },
+            IrOpcode::InsertValue =>
+            {
+                self.emitStr("insertvalue ");
+                self.emitType(m, inst->ops[0]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(", ");
+                self.emitType(m, inst->ops[1]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[1]);
+                self.emitStr(", ");
+                self.emitAtom(m, inst->ops[2]);
+            },
+            IrOpcode::ShuffleVector =>
+            {
+                self.emitStr("shufflevector ");
+                self.emitType(m, inst->ops[0]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(", ");
+                self.emitAtom(m, inst->ops[1]);
+                for (u32 i = 2; i < inst->nops; i++)
+                {
+                    self.emitStr(", ");
+                    self.emitAtom(m, inst->ops[i]);
+                }
+            },
+            IrOpcode::ExtractElement =>
+            {
+                self.emitStr("extractelement ");
+                self.emitType(m, inst->ops[0]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(", ");
+                self.emitAtom(m, inst->ops[1]);
+            },
+            IrOpcode::InsertElement =>
+            {
+                self.emitStr("insertelement ");
+                self.emitType(m, inst->ops[0]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(", ");
+                self.emitType(m, inst->ops[1]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[1]);
+                self.emitStr(", ");
+                self.emitAtom(m, inst->ops[2]);
+            },
+            IrOpcode::AtomicLoad =>
+            {
+                self.emitStr("atomic_load ");
+                self.emitType(m, inst->base.type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(", ");
+                self.emitStr(irAtomicOrderingStr((IrAtomicOrdering)inst->icmpPred));
+            },
+            IrOpcode::AtomicStore =>
+            {
+                self.emitStr("atomic_store ");
+                self.emitType(m, inst->ops[0]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(", ");
+                self.emitAtom(m, inst->ops[1]);
+                self.emitStr(", ");
+                self.emitStr(irAtomicOrderingStr((IrAtomicOrdering)inst->icmpPred));
+            },
+            IrOpcode::AtomicRmw =>
+            {
+                self.emitStr("atomic_rmw ");
+                self.emitStr(irAtomicRmwOpStr((IrAtomicRmwOp)inst->icmpPred));
+                self.emitChar(' ');
+                self.emitType(m, inst->base.type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(", ");
+                self.emitAtom(m, inst->ops[1]);
+                self.emitStr(", ");
+                self.emitStr(irAtomicOrderingStr((IrAtomicOrdering)inst->fcmpPred));
+            },
+            IrOpcode::AtomicCmpXchg =>
+            {
+                self.emitStr("atomic_cmpxchg ");
+                self.emitType(m, inst->base.type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(", ");
+                self.emitAtom(m, inst->ops[1]);
+                self.emitStr(", ");
+                self.emitAtom(m, inst->ops[2]);
+                self.emitStr(", ");
+                self.emitStr(irAtomicOrderingStr((IrAtomicOrdering)inst->icmpPred));
+                self.emitStr(", ");
+                self.emitStr(irAtomicOrderingStr((IrAtomicOrdering)inst->fcmpPred));
+            },
+            IrOpcode::Fence =>
+            {
+                self.emitStr("fence ");
+                self.emitStr(irAtomicOrderingStr((IrAtomicOrdering)inst->icmpPred));
+            },
+            IrOpcode::GcRoot =>
+            {
+                self.emitStr("gc_root ");
+                self.emitAtom(m, inst->ops[0]);
+            },
+            IrOpcode::GcWriteBarrier =>
+            {
+                self.emitStr("gc_writebarrier ");
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(", ");
+                self.emitAtom(m, inst->ops[1]);
+            },
+            IrOpcode::InlineAsm =>
+            {
+                self.emitStr("inlineasm ");
+                if (inst->asmNumSideEffects != 0) self.emitStr("volatile ");
+                self.emitType(m, inst->base.type);
+                self.emitChar(' ');
+                self.emitEscaped(inst->asmString);
+                self.emitStr(" : ");
+                self.emitEscaped(inst->asmConstraints);
+                self.emitStr(" : ");
+                self.emitEscaped(inst->asmClobbers);
+                self.emitStr(" (");
+                self.emitTypedArgs(m, inst, 0);
+                self.emitChar(')');
+            },
+            IrOpcode::Neg => { self.emitStr("neg "); self.emitUnary(m, inst); },
+            IrOpcode::Not => { self.emitStr("not "); self.emitUnary(m, inst); },
+            IrOpcode::Abs => { self.emitStr("abs "); self.emitUnary(m, inst); },
+            IrOpcode::CtPop => { self.emitStr("ctpop "); self.emitUnary(m, inst); },
+            IrOpcode::CtLz => { self.emitStr("ctlz "); self.emitUnary(m, inst); },
+            IrOpcode::CtTz => { self.emitStr("cttz "); self.emitUnary(m, inst); },
+            IrOpcode::Bswap => { self.emitStr("bswap "); self.emitUnary(m, inst); },
+            IrOpcode::FAbs => { self.emitStr("fabs "); self.emitUnary(m, inst); },
+            IrOpcode::FSqrt => { self.emitStr("fsqrt "); self.emitUnary(m, inst); },
+            IrOpcode::VecBroadcast => { self.emitStr("vbroadcast "); self.emitUnary(m, inst); },
+            IrOpcode::Add => { self.emitStr("add "); self.emitBinary(m, inst); },
+            IrOpcode::Sub => { self.emitStr("sub "); self.emitBinary(m, inst); },
+            IrOpcode::Mul => { self.emitStr("mul "); self.emitBinary(m, inst); },
+            IrOpcode::SDiv => { self.emitStr("sdiv "); self.emitBinary(m, inst); },
+            IrOpcode::UDiv => { self.emitStr("udiv "); self.emitBinary(m, inst); },
+            IrOpcode::SRem => { self.emitStr("srem "); self.emitBinary(m, inst); },
+            IrOpcode::URem => { self.emitStr("urem "); self.emitBinary(m, inst); },
+            IrOpcode::And => { self.emitStr("and "); self.emitBinary(m, inst); },
+            IrOpcode::Or => { self.emitStr("or "); self.emitBinary(m, inst); },
+            IrOpcode::Xor => { self.emitStr("xor "); self.emitBinary(m, inst); },
+            IrOpcode::Shl => { self.emitStr("shl "); self.emitBinary(m, inst); },
+            IrOpcode::Ashr => { self.emitStr("ashr "); self.emitBinary(m, inst); },
+            IrOpcode::Lshr => { self.emitStr("lshr "); self.emitBinary(m, inst); },
+            IrOpcode::Rotl => { self.emitStr("rotl "); self.emitBinary(m, inst); },
+            IrOpcode::Rotr => { self.emitStr("rotr "); self.emitBinary(m, inst); },
+            IrOpcode::SMin => { self.emitStr("smin "); self.emitBinary(m, inst); },
+            IrOpcode::SMax => { self.emitStr("smax "); self.emitBinary(m, inst); },
+            IrOpcode::UMin => { self.emitStr("umin "); self.emitBinary(m, inst); },
+            IrOpcode::UMax => { self.emitStr("umax "); self.emitBinary(m, inst); },
+            IrOpcode::FAdd => { self.emitStr("fadd "); self.emitBinary(m, inst); },
+            IrOpcode::FSub => { self.emitStr("fsub "); self.emitBinary(m, inst); },
+            IrOpcode::FMul => { self.emitStr("fmul "); self.emitBinary(m, inst); },
+            IrOpcode::FDiv => { self.emitStr("fdiv "); self.emitBinary(m, inst); },
+            IrOpcode::VecAdd => { self.emitStr("vadd "); self.emitBinary(m, inst); },
+            IrOpcode::VecSub => { self.emitStr("vsub "); self.emitBinary(m, inst); },
+            IrOpcode::VecMul => { self.emitStr("vmul "); self.emitBinary(m, inst); },
+            IrOpcode::VecDiv => { self.emitStr("vdiv "); self.emitBinary(m, inst); },
+            IrOpcode::VecFAdd => { self.emitStr("vfadd "); self.emitBinary(m, inst); },
+            IrOpcode::VecFSub => { self.emitStr("vfsub "); self.emitBinary(m, inst); },
+            IrOpcode::VecFMul => { self.emitStr("vfmul "); self.emitBinary(m, inst); },
+            IrOpcode::VecFDiv => { self.emitStr("vfdiv "); self.emitBinary(m, inst); },
+            IrOpcode::VecMin => { self.emitStr("vmin "); self.emitBinary(m, inst); },
+            IrOpcode::VecMax => { self.emitStr("vmax "); self.emitBinary(m, inst); },
+            IrOpcode::Trunc => {
+                self.emitType(m, inst->ops[0]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(" to ");
+                self.emitType(m, inst->base.type);
+            },
+            IrOpcode::Zext => {
+                self.emitType(m, inst->ops[0]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(" to ");
+                self.emitType(m, inst->base.type);
+            },
+            IrOpcode::Sext => {
+                self.emitType(m, inst->ops[0]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(" to ");
+                self.emitType(m, inst->base.type);
+            },
+            IrOpcode::FpTrunc => {
+                self.emitType(m, inst->ops[0]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(" to ");
+                self.emitType(m, inst->base.type);
+            },
+            IrOpcode::FpExt => {
+                self.emitType(m, inst->ops[0]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(" to ");
+                self.emitType(m, inst->base.type);
+            },
+            IrOpcode::FpToSi => {
+                self.emitType(m, inst->ops[0]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(" to ");
+                self.emitType(m, inst->base.type);
+            },
+            IrOpcode::SiToFp => {
+                self.emitType(m, inst->ops[0]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(" to ");
+                self.emitType(m, inst->base.type);
+            },
+            IrOpcode::FpToUi => {
+                self.emitType(m, inst->ops[0]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(" to ");
+                self.emitType(m, inst->base.type);
+            },
+            IrOpcode::UiToFp => {
+                self.emitType(m, inst->ops[0]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(" to ");
+                self.emitType(m, inst->base.type);
+            },
+            IrOpcode::Bitcast => {
+                self.emitType(m, inst->ops[0]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(" to ");
+                self.emitType(m, inst->base.type);
+            },
+            else => {
+                // terminators without operands, safepoint and friends fall
+                // through to the shared name table; landingpad lands here
+                // too and reparses as the reserved word it is
+                self.emitStr(irOpcodeStr(op));
+            }
+        }
+    }
+
+    void printInst(IrModule* m, IrInst* inst)
+    {
+        self.emitStr("    ");
+        if (inst->base.type->kind != IrTypeKind::Void)
+        {
+            self.emitValueRef(&inst->base);
+            self.emitStr(" = ");
+        }
+        self.emitBody(m, inst);
+        self.emitVarDebug(m, inst);
+        self.emitMetaSet(m, inst->metadata);
+    }
+    void printBlock(IrModule* m, IrBlock* bb)
+    {
+        self.emitBlockLabel(&bb->base);
+        self.emitStr(":\n");
+        for (u32 i = 0; i < bb->ninsts; i++)
+        {
+            IrInst* inst = bb->insts[i];
+            if (inst == null) continue;
+            self.printInst(m, inst);
+            self.emitChar('\n');
+        }
+    }
+
+    void printStructDecl(IrModule* m, IrStructType* st)
+    {
+        self.emitStr("type @");
+        self.emitStr(st->name);
+        self.emitStr(" = struct { ");
+        for (u32 i = 0; i < st->nfields; i++)
+        {
+            if (i > 0) self.emitStr(", ");
+            // field names are cosmetic; the type system interned by field
+            // types, so a builder-made struct with no names still has a
+            // valid grammar position to fill
+            bool named = st->fieldNames != null && st->fieldNames[i].len > 0;
+            if (named) { self.emitStr(st->fieldNames[i]); self.emitStr(": "); }
+            else
+            {
+                self.emitChar('f');
+                self.emitU64((u64)i);
+                self.emitStr(": ");
+            }
+            self.emitType(m, st->fieldTypes[i]);
+        }
+        self.emitStr(" };\n");
+    }
+
+    void printGlobal(IrModule* m, IrGlobal* g)
+    {
+        self.emitStr("global");
+        if (g->isConst) self.emitStr(" const");
+        self.emitStr(" @");
+        if (g->base.name != null) self.emitCstr(g->base.name);
+        self.emitStr(": ");
+        self.emitType(m, g->base.type);
+        if (g->initVal != null)
+        {
+            self.emitStr(" = ");
+            self.emitAtom(m, g->initVal);
+        }
+        self.emitMetaSet(m, g->metadata);
+        self.emitStr(";\n");
+    }
+
+    void printStringDecl(IrModule* m, IrStringConst* sc)
+    {
+        self.emitStr("string @");
+        if (sc->base.name != null) self.emitCstr(sc->base.name);
+        self.emitStr(": ");
+        str data;
+        data.ptr = (const u8*)sc->data;
+        data.len = (usize)sc->length;
+        self.emitEscaped(data);
+        self.emitMetaSet(m, sc->metadata);
+        self.emitStr(";\n");
+    }
+
+    void printFunc(IrModule* m, IrFunc* f)
+    {
+        self.emitStr("func @");
+        if (f->base.name != null) self.emitCstr(f->base.name);
+        self.emitChar('(');
+        for (u32 i = 0; i < f->nargs; i++)
+        {
+            if (i > 0) self.emitStr(", ");
+            self.emitValueRef(f->args[i]);
+            self.emitStr(": ");
+            self.emitType(m, f->args[i]->type);
+        }
+        if (f->base.type != null && f->base.type->isVararg)
+        {
+            if (f->nargs > 0) self.emitStr(", ");
+            self.emitStr("...");
+        }
+        self.emitChar(')');
+        if (f->retType != null && f->retType->kind != IrTypeKind::Void)
+        {
+            self.emitChar(' ');
+            self.emitType(m, f->retType);
+        }
+        if (f->isExtern)
+        {
+            self.emitStr(" extern ");
+            self.emitEscaped(f->externLib);
+            self.emitChar(' ');
+            self.emitEscaped(f->externSym);
+            self.emitMetaSet(m, f->metadata);
+            self.emitStr(";\n");
+            return;
+        }
+        self.emitMetaSet(m, f->metadata);
+        self.emitStr(" {\n");
+        for (u32 i = 0; i < f->nblocks; i++)
+        {
+            IrBlock* bb = f->blocks[i];
+            if (bb == null) continue;
+            self.printBlock(m, bb);
+        }
+        self.emitStr("}\n");
+    }
+
+    pub void printModule(IrModule* m)
+    {
+        self.emitStr("module ");
+        self.emitEscaped(m->name);
+        self.emitStr("\n");
+        for (u32 i = 0; i < m->nstructs; i++)
+        {
+            IrStructType* st = m->structs[i];
+            // anonymous twins are type-system citizens with no decl of
+            // their own; the named twin prints the whole shape
+            if (st->name.len == 0) continue;
+            self.emitChar('\n');
+            self.printStructDecl(m, st);
+        }
+        for (u32 i = 0; i < m->nglobals; i++)
+        {
+            self.emitChar('\n');
+            self.printGlobal(m, m->globals[i]);
+        }
+        for (u32 i = 0; i < m->nconstStrings; i++)
+        {
+            self.emitChar('\n');
+            self.printStringDecl(m, m->constStrings[i]);
+        }
+        for (u32 i = 0; i < m->nfuncs; i++)
+        {
+            self.emitChar('\n');
+            self.printFunc(m, m->funcs[i]);
+        }
+    }
+}

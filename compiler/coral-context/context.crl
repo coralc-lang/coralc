@@ -1,0 +1,847 @@
+#[[no_drop_all]]
+/* context/context.crl: AST context, arenas, interning, string ownership
+ *
+ * one place for everything the compiler allocates: interned strings,
+ * uniqued types, AST nodes, plus a general `owned` list of pointers freed
+ * at deinit. arenas grow geometrically (types/nodes via growStable so
+ * cached entry pointers stay valid). index 0 of each arena is a reserved
+ * sentinel (no type, no node, no string). Clang's ASTContext +
+ * BumpPtrAllocator were the starting point; unlike that design this one
+ * can grow.
+ */
+
+import(lib) std::mman { alloc, dealloc, realloc, zero };
+import ast {
+    id { Str, SourceLoc, NodeId },
+    types { Ty, TypeEntry, TypeKind },
+    node { Node, NodeKind },
+    decl { File, VariantVariant },
+    stmt { SwitchCase }
+};
+
+pub struct InternEntry
+{
+    u8* ptr;
+    usize len;
+    u32 id;
+}
+
+/* append-buffers for list-ish fields. append reallocs through ctx.grow;
+ * Finish hands the block to ctx.track, and then the context owns it until
+ * deinit (Finish deallocs it itself only when tracking fails). init just
+ * clears. */
+pub struct NodeListBuilder
+{
+    NodeId* data;
+    u32 len;
+    u32 cap;
+}
+
+pub struct StrListBuilder
+{
+    Str* data;
+    u32 len;
+    u32 cap;
+}
+
+pub struct TyListBuilder
+{
+    Ty* data;
+    u32 len;
+    u32 cap;
+}
+
+pub struct SwitchListBuilder
+{
+    SwitchCase* data;
+    u32 len;
+    u32 cap;
+}
+
+/* one `///` block captured by the parser, keyed to the declaration it
+ * documents: fileId + the 1-based line of the decl's name. text is
+ * interned, so it outlives the source buffer. */
+pub struct DocBlock
+{
+    u32 fileId;
+    u32 declLine;
+    Str text;
+}
+
+pub struct VariantListBuilder
+{
+    VariantVariant* data;
+    u32 len;
+    u32 cap;
+}
+
+pub struct AstContext
+{
+    InternEntry* interns;
+    u32 internsLen;
+    u32 internsCap;
+    TypeEntry* types;
+    u32 typesLen;
+    u32 typesCap;
+    Node* nodes;
+    u32 nodesLen;
+    u32 nodesCap;
+    rawptr* owned;
+    u32 ownedLen;
+    u32 ownedCap;
+    u32 error;
+    str targetArch;
+    Str* flagNames;
+    Str* flagValues;
+    u32 flagsLen;
+    DocBlock* docs;
+    u32 docsLen;
+    u32 docsCap;
+
+    void init(u32 internCap, u32 typeCap, u32 nodeCap)
+    {
+        // caps of 0 mean "don't preallocate; ensureX will grow on demand".
+        // targetArch is resolved at compile time: x86_64 unless the build
+        // was configured for arm64
+        self = AstContext {
+            .interns = null,
+            .internsLen = 0,
+            .internsCap = 0,
+            .types = null,
+            .typesLen = 0,
+            .typesCap = 0,
+            .nodes = null,
+            .nodesLen = 0,
+            .nodesCap = 0,
+            .owned = null,
+            .ownedLen = 0,
+            .ownedCap = 0,
+            .error = 0,
+            .targetArch = flag (arch) { x86_64 => { "x86_64" }, arm64 => { "arm64" }, else => { "x86_64" } },
+            .flagNames = null,
+            .flagValues = null,
+            .flagsLen = 0,
+            .docs = null,
+            .docsLen = 0,
+            .docsCap = 0
+        };
+
+        if (internCap > 0)
+        {
+            usize bytes = 0;
+            if (self.byteCount(internCap, @sizeof(InternEntry), &bytes))
+            {
+                self.interns = (InternEntry*)alloc<u8>(bytes);
+                if (self.interns != null)
+                {
+                    zero<u8>((u8*)self.interns, bytes);
+                    self.internsCap = internCap;
+                    self.internsLen = 1;
+                }
+                else
+                {
+                    self.setError();
+                }
+            }
+        }
+        if (typeCap > 0)
+        {
+            usize bytes = 0;
+            if (self.byteCount(typeCap, @sizeof(TypeEntry), &bytes))
+            {
+                self.types = (TypeEntry*)alloc<u8>(bytes);
+                if (self.types != null) {
+                    zero<u8>((u8*)self.types, bytes);
+                    self.typesCap = typeCap;
+                    self.typesLen = 1;
+                }
+                else {
+                    self.setError();
+                }
+            }
+        }
+        if (nodeCap > 0)
+        {
+            usize bytes = 0;
+            if (self.byteCount(nodeCap, @sizeof(Node), &bytes))
+            {
+                self.nodes = (Node*)alloc<u8>(bytes);
+                if (self.nodes != null) {
+                    zero<u8>((u8*)self.nodes, bytes);
+                    self.nodesCap = nodeCap;
+                    self.nodesLen = 1;
+                }
+                else {
+                    self.setError();
+                }
+            }
+        }
+    }
+
+    void deinit()
+    {
+        // every tracked pointer dies here, then the arenas themselves
+        u32 i = 0;
+        while (i < self.ownedLen)
+        {
+            if (self.owned[i] != null) dealloc<u8>((u8*)self.owned[i]);
+            i++;
+        }
+        if (self.owned != null) dealloc<rawptr>(self.owned);
+        if (self.interns != null) dealloc<InternEntry>(self.interns);
+        if (self.types != null) dealloc<TypeEntry>(self.types);
+        if (self.nodes != null) dealloc<Node>(self.nodes);
+        
+        self.interns = null;
+        self.internsLen = 0;
+        self.internsCap = 0;
+        self.types = null;
+        self.typesLen = 0;
+        self.typesCap = 0;
+        self.nodes = null;
+        self.nodesLen = 0;
+        self.nodesCap = 0;
+        self.owned = null;
+        self.ownedLen = 0;
+        self.ownedCap = 0;
+        self.error = 0;
+    }
+
+    bool streq(str a, str b)
+    {
+        if (a.len != b.len) return false;
+        if (a.len == 0) return true;
+        if (a.ptr == null || b.ptr == null) return false;
+        usize i = 0;
+        while (i < a.len)
+        {
+            if (a.ptr[i] != b.ptr[i]) return false;
+            i++;
+        }
+        return true;
+    }
+
+    // sticky: once set, allocators short-circuit and intern/alloc return 0
+    void setError()
+    {
+        self.error = 1;
+    }
+
+    bool hasError()
+    {
+        return self.error != 0;
+    }
+
+    // overflow guard: multiplication that would wrap instead sets error
+    bool byteCount(u32 count, usize elementSize, usize* bytes)
+    {
+        usize maxSize = (usize)0 - 1;
+        if (elementSize == 0 || (usize)count > maxSize / elementSize)
+        {
+            self.setError();
+            return false;
+        }
+        *bytes = (usize)count * elementSize;
+        return true;
+    }
+
+    /* plain moving (or in-place) realloc, cap doubling. only for buffers
+     * nobody holds interior pointers into: owned, interns, builder arrays.
+     * types/nodes go through growStable instead */
+    rawptr grow(rawptr data, u32 oldCap, u32* newCap, usize elementSize)
+    {
+        if (self.error != 0) return null;
+        u32 nextCap = 4;
+        if (oldCap != 0)
+        {
+            if (oldCap > 2147483647)
+            {
+                self.setError();
+                return null;
+            }
+            nextCap = oldCap * 2;
+            if (nextCap <= oldCap)
+            {
+                self.setError();
+                return null;
+            }
+        }
+        usize bytes = 0;
+        if (!self.byteCount(nextCap, elementSize, &bytes)) return null;
+        rawptr result = realloc<u8>((u8*)data, bytes);
+        if (result == null)
+        {
+            self.setError();
+            return null;
+        }
+        *newCap = nextCap;
+        return result;
+    }
+
+    /* ensureX: bring an arena up if init didn't preallocate it, and plant
+     * the index-0 sentinel. growX: only called when len == cap */
+    bool ensureInterns()
+    {
+        if (self.error != 0) return false;
+        if (self.interns == null || self.internsCap == 0)
+        {
+            u32 newCap = 0;
+            rawptr raw = self.grow((rawptr)self.interns, self.internsCap, &newCap, @sizeof(InternEntry));
+            if (raw == null) return false;
+            self.interns = (InternEntry*)raw;
+            self.internsCap = newCap;
+        }
+        if (self.internsLen == 0)
+        {
+            self.interns[0].ptr = null;
+            self.interns[0].len = 0;
+            self.interns[0].id = 0;
+            self.internsLen = 1;
+        }
+        return true;
+    }
+
+    bool ensureTypes()
+    {
+        if (self.error != 0) return false;
+        if (self.types == null || self.typesCap == 0)
+        {
+            u32 newCap = 0;
+            rawptr raw = self.grow((rawptr)self.types, self.typesCap, &newCap, @sizeof(TypeEntry));
+            if (raw == null) return false;
+            self.types = (TypeEntry*)raw;
+            self.typesCap = newCap;
+        }
+        if (self.typesLen == 0)
+        {
+            self.types[0].kind.tag = TypeKind::Error;
+            self.types[0].loc.data = 0;
+            self.typesLen = 1;
+        }
+        return true;
+    }
+
+    bool ensureNodes()
+    {
+        if (self.error != 0) return false;
+        if (self.nodes == null || self.nodesCap == 0)
+        {
+            u32 newCap = 0;
+            rawptr raw = self.grow((rawptr)self.nodes, self.nodesCap, &newCap, @sizeof(Node));
+            if (raw == null) return false;
+            self.nodes = (Node*)raw;
+            self.nodesCap = newCap;
+        }
+        if (self.nodesLen == 0)
+        {
+            self.nodes[0].kind.tag = NodeKind::Invalid;
+            self.nodes[0].kind.payload.Invalid.flags = 0;
+            self.nodes[0].loc.data = 0;
+            self.nodesLen = 1;
+        }
+        return true;
+    }
+
+    bool ensureOwned()
+    {
+        if (self.error != 0) return false;
+        if (self.owned == null || self.ownedCap == 0)
+        {
+            u32 newCap = 0;
+            rawptr raw = self.grow((rawptr)self.owned, self.ownedCap, &newCap, @sizeof(rawptr));
+            if (raw == null) return false;
+            self.owned = (rawptr*)raw;
+            self.ownedCap = newCap;
+        }
+        return true;
+    }
+
+    bool growInterns()
+    {
+        if (self.internsLen < self.internsCap) return true;
+        u32 newCap = self.internsCap;
+        rawptr raw = self.grow((rawptr)self.interns, self.internsCap, &newCap, @sizeof(InternEntry));
+        if (raw == null) return false;
+        self.interns = (InternEntry*)raw;
+        self.internsCap = newCap;
+        return true;
+    }
+
+    bool growTypes()
+    {
+        if (self.typesLen < self.typesCap) return true;
+        u32 newCap = self.typesCap;
+        rawptr raw = self.growStable((rawptr)self.types, self.typesCap, &newCap, @sizeof(TypeEntry));
+        if (raw == null) return false;
+        self.types = (TypeEntry*)raw;
+        self.typesCap = newCap;
+        return true;
+    }
+
+    bool growNodes()
+    {
+        if (self.nodesLen < self.nodesCap) return true;
+        u32 newCap = self.nodesCap;
+        rawptr raw = self.growStable((rawptr)self.nodes, self.nodesCap, &newCap, @sizeof(Node));
+        if (raw == null) return false;
+        self.nodes = (Node*)raw;
+        self.nodesCap = newCap;
+        return true;
+    }
+
+    /* grow, but into a fresh block with the old one left allocated (not
+     * freed). Node and TypeEntry pointers are cached in locals all over
+     * the evaluator; a moving realloc mid-evaluation leaves those stale
+     * reads dangling the moment a nested instantiation grows the arena.
+     * Keeping the old block alive (geometric growth, so under 2x waste
+     * total) keeps stale pointers valid and content-identical. */
+    rawptr growStable(rawptr data, u32 oldCap, u32* newCap, usize elementSize)
+    {
+        if (self.error != 0) return null;
+        u32 nextCap = 4;
+        if (oldCap != 0)
+        {
+            if (oldCap > 2147483647)
+            {
+                self.setError();
+                return null;
+            }
+            nextCap = oldCap * 2;
+            if (nextCap <= oldCap)
+            {
+                self.setError();
+                return null;
+            }
+        }
+        usize bytes = 0;
+        if (!self.byteCount(nextCap, elementSize, &bytes)) return null;
+        rawptr result = alloc<u8>(bytes);
+        if (result == null)
+        {
+            self.setError();
+            return null;
+        }
+        if (data != null && oldCap != 0)
+        {
+            usize oldBytes = 0;
+            if (self.byteCount(oldCap, elementSize, &oldBytes))
+            {
+                u8* src = (u8*)data;
+                u8* dst = (u8*)result;
+                usize k = 0;
+                while (k < oldBytes)
+                {
+                    dst[k] = src[k];
+                    k++;
+                }
+            }
+        }
+        if (data != null && oldCap != 0)
+        {
+            /* stale-pointer safety keeps the old block alive for the rest
+             * of the compile; deinit frees it through the owned list */
+            self.track(data);
+        }
+        *newCap = nextCap;
+        return result;
+    }
+
+    /* id for a byte string; 0 means empty input or a failed context.
+     * linear scan over distinct strings; O(n) per call, fine until a
+     * profile says otherwise */
+    u32 intern(str s)
+    {
+        if (s.len == 0 || s.ptr == null) return 0;
+        if (self.error != 0) return 0;
+        if (!self.ensureInterns()) return 0;
+
+        u32 i = 1;
+        while (i < self.internsLen)
+        {
+            InternEntry* e = self.interns + i;
+            if (self.streq(str { .ptr = e.ptr, .len = e.len }, s))
+            {
+                return e.id;
+            }
+            i++;
+        }
+        if (!self.growInterns()) return 0;
+        if (self.internsLen == 4294967295) {
+            self.setError();
+            return 0;
+        }
+        /* copy the bytes: callers free their buffers after parsing
+         * (lib loader candidate paths) while entries live as long as
+         * the context, so the table must own its strings */
+        u8* copy = alloc<u8>(s.len + 1);
+        if (copy == null)
+        {
+            self.setError();
+            return 0;
+        }
+        usize ci = 0;
+        while (ci < s.len) { copy[ci] = s.ptr[ci]; ci++; }
+        copy[s.len] = 0;
+        if (!self.track((rawptr)copy))
+        {
+            dealloc<u8>(copy);
+            return 0;
+        }
+        InternEntry* e = self.interns + self.internsLen;
+        e.ptr = copy;
+        e.len = s.len;
+        e.id = self.internsLen;
+        self.internsLen++;
+        return e.id;
+    }
+
+    /* parser hook: remember the `///` block above a declaration whose
+     * name is on `declLine` (1-based, within fileId). text is interned by
+     * the caller. re-parses of the same line overwrite (speculation). */
+    void addDocBlock(u32 fileId, u32 declLine, Str text)
+    {
+        if (text == 0 || self.error != 0) return;
+        u32 i = 0;
+        while (i < self.docsLen)
+        {
+            if (self.docs[i].fileId == fileId && self.docs[i].declLine == declLine)
+            {
+                self.docs[i].text = text;
+                return;
+            }
+            i++;
+        }
+        if (self.docs == null || self.docsLen >= self.docsCap)
+        {
+            u32 newCap = self.docsCap;
+            rawptr raw = self.grow((rawptr)self.docs, self.docsCap, &newCap, @sizeof(DocBlock));
+            if (raw == null) return;
+            self.docs = (DocBlock*)raw;
+            self.docsCap = newCap;
+        }
+        self.docs[self.docsLen].fileId = fileId;
+        self.docs[self.docsLen].declLine = declLine;
+        self.docs[self.docsLen].text = text;
+        self.docsLen++;
+    }
+
+    /* interned text of the `///` block above the decl whose name is on
+     * `declLine`; 0 when the declaration carries no docs */
+    Str docFor(u32 fileId, u32 declLine)
+    {
+        u32 i = 0;
+        while (i < self.docsLen)
+        {
+            if (self.docs[i].fileId == fileId && self.docs[i].declLine == declLine)
+                return self.docs[i].text;
+            i++;
+        }
+        return 0;
+    }
+
+    // remember a pointer for deinit to free; nulls are ignored
+    bool track(rawptr ptr)
+    {
+        if (ptr == null) return true;
+        if (self.error != 0) return false;
+        if (!self.ensureOwned()) return false;
+        if (self.ownedLen >= self.ownedCap)
+        {
+            u32 newCap = self.ownedCap;
+            rawptr raw = self.grow((rawptr)self.owned, self.ownedCap, &newCap, @sizeof(rawptr));
+            if (raw == null) return false;
+            self.owned = (rawptr*)raw;
+            self.ownedCap = newCap;
+        }
+        self.owned[self.ownedLen] = ptr;
+        self.ownedLen++;
+        return true;
+    }
+
+    void nodeListInit(NodeListBuilder* b)
+    {
+        b->data = null;
+        b->len = 0;
+        b->cap = 0;
+    }
+
+    bool nodeListAppend(NodeListBuilder* b, NodeId value)
+    {
+        if (self.error != 0) return false;
+        if (b->len >= b->cap)
+        {
+            u32 newCap = b->cap;
+            rawptr raw = self.grow((rawptr)b->data, b->cap, &newCap, @sizeof(NodeId));
+            if (raw == null) return false;
+            b->data = (NodeId*)raw;
+            b->cap = newCap;
+        }
+        b->data[b->len] = value;
+        b->len++;
+        return true;
+    }
+
+    NodeId* nodeListFinish(NodeListBuilder* b)
+    {
+        NodeId* result = b->data;
+        b->data = null;
+        b->len = 0;
+        b->cap = 0;
+        if (result != null && !self.track((rawptr)result))
+        {
+            dealloc<NodeId>(result);
+            return null;
+        }
+        return result;
+    }
+
+    void strListInit(StrListBuilder* b)
+    {
+        b->data = null;
+        b->len = 0;
+        b->cap = 0;
+    }
+
+    bool strListAppend(StrListBuilder* b, Str value)
+    {
+        if (self.error != 0) return false;
+        if (b->len >= b->cap)
+        {
+            u32 newCap = b->cap;
+            rawptr raw = self.grow((rawptr)b->data, b->cap, &newCap, @sizeof(Str));
+            if (raw == null) return false;
+            b->data = (Str*)raw;
+            b->cap = newCap;
+        }
+        b->data[b->len] = value;
+        b->len++;
+        return true;
+    }
+
+    Str* strListFinish(StrListBuilder* b)
+    {
+        Str* result = b->data;
+        b->data = null;
+        b->len = 0;
+        b->cap = 0;
+        if (result != null && !self.track((rawptr)result))
+        {
+            dealloc<Str>(result);
+            return null;
+        }
+        return result;
+    }
+
+    void tyListInit(TyListBuilder* b)
+    {
+        b->data = null;
+        b->len = 0;
+        b->cap = 0;
+    }
+
+    bool tyListAppend(TyListBuilder* b, Ty value)
+    {
+        if (self.error != 0) return false;
+        if (b->len >= b->cap)
+        {
+            u32 newCap = b->cap;
+            rawptr raw = self.grow((rawptr)b->data, b->cap, &newCap, @sizeof(Ty));
+            if (raw == null) return false;
+            b->data = (Ty*)raw;
+            b->cap = newCap;
+        }
+        b->data[b->len] = value;
+        b->len++;
+        return true;
+    }
+
+    Ty* tyListFinish(TyListBuilder* b)
+    {
+        Ty* result = b->data;
+        b->data = null;
+        b->len = 0;
+        b->cap = 0;
+        if (result != null && !self.track((rawptr)result))
+        {
+            dealloc<Ty>(result);
+            return null;
+        }
+        return result;
+    }
+
+    void switchListInit(SwitchListBuilder* b)
+    {
+        b->data = null;
+        b->len = 0;
+        b->cap = 0;
+    }
+
+    bool switchListAppend(SwitchListBuilder* b, SwitchCase value)
+    {
+        if (self.error != 0) return false;
+        if (b->len >= b->cap)
+        {
+            u32 newCap = b->cap;
+            rawptr raw = self.grow((rawptr)b->data, b->cap, &newCap, @sizeof(SwitchCase));
+            if (raw == null) return false;
+            b->data = (SwitchCase*)raw;
+            b->cap = newCap;
+        }
+        b->data[b->len] = value;
+        b->len++;
+        return true;
+    }
+
+    SwitchCase* switchListFinish(SwitchListBuilder* b)
+    {
+        SwitchCase* result = b->data;
+        b->data = null;
+        b->len = 0;
+        b->cap = 0;
+        if (result != null && !self.track((rawptr)result))
+        {
+            dealloc<SwitchCase>(result);
+            return null;
+        }
+        return result;
+    }
+
+    void variantListInit(VariantListBuilder* b)
+    {
+        b->data = null;
+        b->len = 0;
+        b->cap = 0;
+    }
+
+    bool variantListAppend(VariantListBuilder* b, VariantVariant value)
+    {
+        if (self.error != 0) return false;
+        if (b->len >= b->cap)
+        {
+            u32 newCap = b->cap;
+            rawptr raw = self.grow((rawptr)b->data, b->cap, &newCap, @sizeof(VariantVariant));
+            if (raw == null) return false;
+            b->data = (VariantVariant*)raw;
+            b->cap = newCap;
+        }
+        b->data[b->len] = value;
+        b->len++;
+        return true;
+    }
+
+    VariantVariant* variantListFinish(VariantListBuilder* b)
+    {
+        VariantVariant* result = b->data;
+        b->data = null;
+        b->len = 0;
+        b->cap = 0;
+        if (result != null && !self.track((rawptr)result))
+        {
+            dealloc<VariantVariant>(result);
+            return null;
+        }
+        return result;
+    }
+
+    rawptr allocBytes(usize size)
+    {
+        if (size == 0) return null;
+        if (self.error != 0) return null;
+        rawptr ptr = alloc<u8>(size);
+        if (ptr == null)
+        {
+            self.setError();
+            return null;
+        }
+        if (!self.track(ptr))
+        {
+            dealloc<u8>((u8*)ptr);
+            return null;
+        }
+        return ptr;
+    }
+
+    // typed shims over allocBytes; all null on len 0 or overflow
+    NodeId* allocNodeList(u32 len)
+    {
+        if (len == 0) return null;
+        usize bytes = 0;
+        if (!self.byteCount(len, @sizeof(NodeId), &bytes)) return null;
+        return (NodeId*)self.allocBytes(bytes);
+    }
+
+    Str* allocStrList(u32 len)
+    {
+        if (len == 0) return null;
+        usize bytes = 0;
+        if (!self.byteCount(len, @sizeof(Str), &bytes)) return null;
+        return (Str*)self.allocBytes(bytes);
+    }
+
+    File* allocFile()
+    {
+        return (File*)self.allocBytes(@sizeof(File));
+    }
+
+    Ty* allocTyList(u32 len)
+    {
+        if (len == 0) return null;
+        usize bytes = 0;
+        if (!self.byteCount(len, @sizeof(Ty), &bytes)) return null;
+        return (Ty*)self.allocBytes(bytes);
+    }
+
+    SwitchCase* allocSwitchCaseList(u32 len)
+    {
+        if (len == 0) return null;
+        usize bytes = 0;
+        if (!self.byteCount(len, @sizeof(SwitchCase), &bytes)) return null;
+        return (SwitchCase*)self.allocBytes(bytes);
+    }
+
+    /* reserve the next arena index. 0 means failure; the sentinel sits at
+     * 0, so real types start at 1 */
+    Ty allocTypeSlot()
+    {
+        if (self.error != 0) return 0;
+        if (!self.ensureTypes()) return 0;
+        if (self.typesLen >= self.typesCap && !self.growTypes()) return 0;
+        if (self.typesLen == 4294967295)
+        {
+            self.setError();
+            return 0;
+        }
+        Ty id = self.typesLen;
+        self.typesLen++;
+        return id;
+    }
+
+    // same deal as allocTypeSlot; failure hands back node 0 (Invalid)
+    NodeId allocNodeSlot()
+    {
+        if (self.error != 0) return self.noneNode();
+        if (!self.ensureNodes()) return self.noneNode();
+        if (self.nodesLen >= self.nodesCap && !self.growNodes()) return self.noneNode();
+        if (self.nodesLen == 4294967295)
+        {
+            self.setError();
+            return self.noneNode();
+        }
+        NodeId n;
+        n.index = self.nodesLen;
+        self.nodesLen++;
+        return n;
+    }
+
+    NodeId noneNode()
+    {
+        NodeId n;
+        n.index = 0;
+        return n;
+    }
+
+    u32 nodeCount()
+    {
+        return self.nodesLen;
+    }
+}

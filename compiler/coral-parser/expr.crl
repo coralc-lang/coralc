@@ -1,0 +1,956 @@
+#[[no_drop_all]]
+/* parser/expr.crl: expression parsing
+ *
+ * Clang-style precedence climbing: one function handles all
+ * binary operators, parameterized by minimum precedence.
+ *
+ * the descent chain is parseExpr → parseBinaryExpr → parseUnaryExpr →
+ * parsePostfixExpr → parsePrimaryExpr, one layer per precedence class.
+ * there's no nesting guard anywhere in the parser: a pathological
+ * `((((...` file recurses until the process stack gives out.
+ */
+
+import parser;
+import diag::code { ErrorCode };
+import base { Parser, ParserMark };
+import context::context { AstContext, NodeListBuilder, StrListBuilder, SwitchListBuilder };
+import common::token { Token, TokenKind };
+import lexer {
+    escape { EscapeResult },
+    ident { decodeUtf8 },
+};
+import ast {
+    id { NodeId, Str },
+    types { Ty, TypeEntry },
+    expr { Expr, ExprKind },
+    stmt { SwitchCase },
+    node { Node, NodeKind }
+};
+
+pub extend Parser
+{
+    /* ── operator table ── */
+
+    /* binding powers for parseBinaryExpr. assignment sits at 1 and is
+     * right-assoc (handled by parseExpr itself); higher number = tighter.
+     * left-assoc operators recurse with p+1, right-assoc with p-1, so a
+     * gap of at least 1 between any two levels is load-bearing */
+    i32 prec(TokenKind kind)
+    {
+        switch (kind)
+        {
+            TokenKind::Equal => { return 1; },
+            TokenKind::PlusEqual => { return 1; },
+            TokenKind::MinusEqual => { return 1; },
+            TokenKind::StarEqual => { return 1; },
+            TokenKind::SlashEqual => { return 1; },
+            TokenKind::PercentEqual => { return 1; },
+            TokenKind::AmpEqual => { return 1; },
+            TokenKind::PipeEqual => { return 1; },
+            TokenKind::CaretEqual => { return 1; },
+            TokenKind::ShlEqual => { return 1; },
+            TokenKind::ShrEqual => { return 1; },
+            TokenKind::NegEqual => { return 1; },
+            TokenKind::Or => { return 2; },
+            TokenKind::And => { return 3; },
+            TokenKind::Pipe => { return 4; },
+            TokenKind::Caret => { return 5; },
+            TokenKind::Ampersand => { return 6; },
+            TokenKind::EqualEqual => { return 7; },
+            TokenKind::NotEqual => { return 7; },
+            TokenKind::Less => { return 8; },
+            TokenKind::LessEqual => { return 8; },
+            TokenKind::Greater => { return 8; },
+            TokenKind::GreaterEqual => { return 8; },
+            TokenKind::Shl => { return 9; },
+            TokenKind::Shr => { return 9; },
+            TokenKind::Plus => { return 10; },
+            TokenKind::Minus => { return 10; },
+            TokenKind::Star => { return 11; },
+            TokenKind::Slash => { return 11; },
+            TokenKind::Percent => { return 11; },
+            else => { return 0; }
+        }
+    }
+
+    // must agree with prec() == 1: parseExpr and parseBinaryExpr both lean on it
+    bool isAssignOp(TokenKind kind)
+    {
+        return kind == TokenKind::Equal ||
+               kind == TokenKind::PlusEqual ||
+               kind == TokenKind::MinusEqual ||
+               kind == TokenKind::StarEqual ||
+               kind == TokenKind::SlashEqual ||
+               kind == TokenKind::PercentEqual ||
+               kind == TokenKind::AmpEqual ||
+               kind == TokenKind::PipeEqual ||
+               kind == TokenKind::CaretEqual ||
+               kind == TokenKind::ShlEqual ||
+               kind == TokenKind::ShrEqual ||
+               kind == TokenKind::NegEqual;
+    }
+
+    // fresh expr node stamped with the last consumed token; resolvedType
+    // starts 0 and sema fills it in later (typecheck.crl)
+    NodeId storeExpr(ExprKind kind)
+    {
+        return self.storeNode(NodeKind::Expr{
+            .value = Expr {
+                .kind = kind,
+                .loc = self.tokenLoc(self.previous),
+                .resolvedType = 0 
+            }
+        });
+    }
+
+    /* ── call arguments ── */
+
+    /* parses `a, b, ...` up to (not including) the closing `)`. trailing
+     * comma is legal. the builder belongs to the caller; finish() hands
+     * the array to the ctx, which owns it until deinit */
+    void parseCallArgs(NodeListBuilder* args)
+    {
+        self.ctx.nodeListInit(args);
+        if (self.current.kind == TokenKind::RParen) return;
+        NodeId arg = self.parseCallArg();
+        if (!self.ctx.nodeListAppend(args, arg)) self.reportAllocFailed();
+        while (self.match(TokenKind::Comma))
+        {
+            if (self.current.kind == TokenKind::RParen) break;
+            arg = self.parseCallArg();
+            if (!self.ctx.nodeListAppend(args, arg)) self.reportAllocFailed();
+        }
+    }
+
+    /* one call argument: `...expr` spreads a variadic pack; a bare `...`
+     * forwards all remaining variadic args (empty expr); otherwise a
+     * plain expression */
+    NodeId parseCallArg()
+    {
+        if (self.current.kind == TokenKind::Ellipsis)
+        {
+            self.advance();
+            // bare `...` immediately before `)` or `,` = spread-all
+            if (self.current.kind == TokenKind::RParen || self.current.kind == TokenKind::Comma)
+            {
+                NodeId noneId;
+                noneId.index = 0;
+                return self.storeExpr(ExprKind::Spread{ .expr = noneId });
+            }
+            NodeId inner = self.parseExpr();
+            return self.storeExpr(ExprKind::Spread{ .expr = inner });
+        }
+        return self.parseExpr();
+    }
+
+    /* Initializer lists for array/const-array decls: `= { a, b, ... }`.
+     * In expression position a bare `{` still parses as a block. */
+    NodeId parseInitExpr()
+    {
+        if (self.current.kind == TokenKind::LBrace)
+        {
+            /* `{ .field = … }`: a bare designated struct literal; the type
+             * comes from the declarator (patched in during sema) */
+            {
+                // `{ .` lookahead: designated fields, not a block
+                ParserMark m = self.save();
+                self.advance();
+                bool designated = self.current.kind == TokenKind::Dot;
+                self.restore(m);
+                if (designated) return self.parseLiteralFields(0, 0);
+            }
+            self.advance();
+            NodeListBuilder elems;
+            self.ctx.nodeListInit(&elems);
+            while (self.current.kind != TokenKind::RBrace && !self.atEnd())
+            {
+                NodeId e = self.parseInitExpr();
+                if (!self.ctx.nodeListAppend(&elems, e)) self.reportAllocFailed();
+                if (!self.match(TokenKind::Comma)) break;
+            }
+            self.expect(TokenKind::RBrace);
+            u32 count = elems.len;
+            NodeId* values = self.ctx.nodeListFinish(&elems);
+            return self.storeExpr(ExprKind::ArrayLiteral{ .elems = values, .elemsLen = count });
+        }
+        return self.parseExpr();
+    }
+
+    /* `T name[] = { … }`: an empty `[]` declarator parses as a Slice (type.crl
+     * has no "unsized array" kind), but a brace initializer means C's array
+     * sized from its elements. rewrite the type before sema ever sees it. */
+    Ty inferArrayFromInit(Ty ty, NodeId init)
+    {
+        if (ty == 0 || init.index == 0) return ty;
+        TypeEntry* te = self.ctx.types + ty;
+        if (te->kind.tag != TypeKind::Slice) return ty;
+        Node* n = self.ctx.nodes + init.index;
+        if (n.kind.tag != NodeKind::Expr) return ty;
+        Expr* e = &n.kind.payload.Expr.value;
+        if (e.kind.tag != ExprKind::ArrayLiteral) return ty;
+        return self.makeArray(te->kind.payload.Slice.base, (u32)e.kind.payload.ArrayLiteral.elemsLen);
+    }
+
+    /* ── the entry level: assignment and ternary ── */
+
+    /* everything funnels through here. assignment binds right (`a = b = c`
+     * is `a = (b = c)`) and ternary branches are full parseExpr calls, so
+     * `a = b ? c : d` means `a = (b ? c : d)` like C. binary parsing starts
+     * at 2 because assignment is prec 1 and handled right here; the op's
+     * text pointer is stashed for stmt.crl's #[[condassign]] check */
+    NodeId parseExpr()
+    {
+        NodeId cond = self.parseBinaryExpr(2);
+        if (self.match(TokenKind::Question))
+        {
+            NodeId thenExpr = self.parseExpr();
+            self.expect(TokenKind::Colon);
+            NodeId elseExpr = self.parseExpr();
+            return self.storeExpr(ExprKind::Ternary{ .cond = cond, .thenExpr = thenExpr, .elseExpr = elseExpr });
+        }
+        if (self.isAssignOp(self.current.kind))
+        {
+            Token op = self.advance();
+            self.lastAssignPtr = op.data.ptr;
+            NodeId right = self.parseExpr();
+            return self.makeBinOp(op.kind, cond, right);
+        }
+        return cond;
+    }
+
+    /* precedence climbing proper: consume operators while they bind at
+     * least as tight as minPrec. the p+1/p-1 recursion split (see prec)
+     * is what makes associativity fall out of one loop */
+    NodeId parseBinaryExpr(i32 minPrec)
+    {
+        NodeId left = self.parseUnaryExpr();
+
+        while (true)
+        {
+            i32 p = self.prec(self.current.kind);
+            // 0 = not a binary op, or one that binds looser than this level
+            if (p == 0 || p < minPrec) break;
+
+            Token op = self.advance();
+            // assignment is right-assoc: `a = b = c` means `a = (b = c)`
+            bool rightAssoc = self.isAssignOp(op.kind);
+            if (rightAssoc) self.lastAssignPtr = op.data.ptr;
+            NodeId right;
+            if (rightAssoc) {
+                right = self.parseBinaryExpr(p - 1); }
+            else {
+                right = self.parseBinaryExpr(p + 1); }
+            left = self.makeBinOp(op.kind, left, right);
+        }
+
+        return left;
+    }
+
+    NodeId makeBinOp(TokenKind op, NodeId left, NodeId right)
+    {
+        switch (op)
+        {
+            TokenKind::Plus => { return self.storeExpr(ExprKind::Add{ .left = left, .right = right }); },
+            TokenKind::Minus => { return self.storeExpr(ExprKind::Sub{ .left = left, .right = right }); },
+            TokenKind::Star => { return self.storeExpr(ExprKind::Mul{ .left = left, .right = right }); },
+            TokenKind::Slash => { return self.storeExpr(ExprKind::Div{ .left = left, .right = right }); },
+            TokenKind::Percent => { return self.storeExpr(ExprKind::Mod{ .left = left, .right = right }); },
+            TokenKind::EqualEqual => { return self.storeExpr(ExprKind::Eq{ .left = left, .right = right }); },
+            TokenKind::NotEqual => { return self.storeExpr(ExprKind::Ne{ .left = left, .right = right }); },
+            TokenKind::Less => { return self.storeExpr(ExprKind::Lt{ .left = left, .right = right }); },
+            TokenKind::LessEqual => { return self.storeExpr(ExprKind::Le{ .left = left, .right = right }); },
+            TokenKind::Greater => { return self.storeExpr(ExprKind::Gt{ .left = left, .right = right }); },
+            TokenKind::GreaterEqual => { return self.storeExpr(ExprKind::Ge{ .left = left, .right = right }); },
+            TokenKind::And => { return self.storeExpr(ExprKind::And{ .left = left, .right = right }); },
+            TokenKind::Or => { return self.storeExpr(ExprKind::Or{ .left = left, .right = right }); },
+            TokenKind::Ampersand => { return self.storeExpr(ExprKind::BitAnd{ .left = left, .right = right }); },
+            TokenKind::Pipe => { return self.storeExpr(ExprKind::BitOr{ .left = left, .right = right }); },
+            TokenKind::Caret => { return self.storeExpr(ExprKind::BitXor{ .left = left, .right = right }); },
+            TokenKind::Shl => { return self.storeExpr(ExprKind::Shl{ .left = left, .right = right }); },
+            TokenKind::Shr => { return self.storeExpr(ExprKind::Shr{ .left = left, .right = right }); },
+            TokenKind::Equal => { return self.storeExpr(ExprKind::Assign{ .target = left, .value = right }); },
+            TokenKind::PlusEqual => { return self.storeExpr(ExprKind::AssignAdd{ .target = left, .value = right }); },
+            TokenKind::MinusEqual => { return self.storeExpr(ExprKind::AssignSub{ .target = left, .value = right }); },
+            TokenKind::StarEqual => { return self.storeExpr(ExprKind::AssignMul{ .target = left, .value = right }); },
+            TokenKind::SlashEqual => { return self.storeExpr(ExprKind::AssignDiv{ .target = left, .value = right }); },
+            TokenKind::PercentEqual => { return self.storeExpr(ExprKind::AssignMod{ .target = left, .value = right }); },
+            TokenKind::AmpEqual => { return self.storeExpr(ExprKind::AssignBitAnd{ .target = left, .value = right }); },
+            TokenKind::PipeEqual => { return self.storeExpr(ExprKind::AssignBitOr{ .target = left, .value = right }); },
+            TokenKind::CaretEqual => { return self.storeExpr(ExprKind::AssignBitXor{ .target = left, .value = right }); },
+            TokenKind::ShlEqual => { return self.storeExpr(ExprKind::AssignShl{ .target = left, .value = right }); },
+            TokenKind::ShrEqual => { return self.storeExpr(ExprKind::AssignShr{ .target = left, .value = right }); },
+            /* `~=` is coral's neg-assign; there's no ExprKind for it, so
+             * desugar to Assign(target, BitNot(right)) */
+            TokenKind::NegEqual => { return self.storeExpr(ExprKind::Assign{ .target = left, .value = self.storeExpr(ExprKind::BitNot{ .expr = right }) }); },
+            else => { return self.allocNode(); }
+        }
+    }
+
+    // prefix operators; all recurse into parseUnaryExpr so they stack
+    NodeId parseUnaryExpr()
+    {
+        if (self.current.kind == TokenKind::Not) {
+            self.advance();
+            NodeId expr = self.parseUnaryExpr();
+            return self.storeExpr(ExprKind::Not{ .expr = expr });
+        }
+        if (self.current.kind == TokenKind::Minus) {
+            self.advance();
+            NodeId expr = self.parseUnaryExpr();
+            return self.storeExpr(ExprKind::Neg{ .expr = expr });
+        }
+        if (self.current.kind == TokenKind::Star) {
+            self.advance();
+            NodeId expr = self.parseUnaryExpr();
+            return self.storeExpr(ExprKind::Deref{ .expr = expr });
+        }
+        if (self.current.kind == TokenKind::Ampersand) {
+            self.advance();
+            NodeId expr = self.parseUnaryExpr();
+            return self.storeExpr(ExprKind::AddressOf{ .expr = expr });
+        }
+        // `~` (TokenKind::Neg) is bitwise not; arithmetic negation is Minus
+        if (self.current.kind == TokenKind::Neg) {
+            self.advance();
+            NodeId expr = self.parseUnaryExpr();
+            return self.storeExpr(ExprKind::BitNot{ .expr = expr });
+        }
+        if (self.current.kind == TokenKind::PlusPlus) {
+            self.advance();
+            NodeId expr = self.parseUnaryExpr();
+            return self.storeExpr(ExprKind::PreInc{ .expr = expr });
+        }
+        if (self.current.kind == TokenKind::MinusMinus) {
+            self.advance();
+            NodeId expr = self.parseUnaryExpr();
+            return self.storeExpr(ExprKind::PreDec{ .expr = expr });
+        }
+        return self.parsePostfixExpr();
+    }
+
+    /* ── postfix chains ── */
+
+    /* greedy: call, `.`/`->` field, `.0` tuple index, method call, `::`
+     * path, index, postfix ++/--. call and method nodes get the receiver's
+     * loc via pointAt so a diagnostic points at `foo`, not the `)` */
+    NodeId parsePostfixExpr()
+    {
+        NodeId expr = self.parsePrimaryExpr();
+        while (true)
+        {
+            if (self.current.kind == TokenKind::LParen)
+            {
+                self.advance();
+                NodeListBuilder args;
+                self.parseCallArgs(&args);
+                u32 count = args.len;
+                NodeId* values = self.ctx.nodeListFinish(&args);
+                self.expect(TokenKind::RParen);
+                NodeId callee = expr;
+                expr = self.storeExpr(ExprKind::Call{ .callee = expr, .args = values, .argsLen = count });
+                self.pointAt(expr, callee);
+            } else if (self.current.kind == TokenKind::Dot || self.current.kind == TokenKind::Arrow) {
+                // `->` builds the same Field node as `.`; deref is sema's problem
+                self.advance();
+                // `.0`: tuple index; a name after the dot is a field instead
+                if (self.current.kind == TokenKind::Dec) {
+                    Token index = self.advance();
+                    u32 field = (u32)index.number;
+                    expr = self.storeExpr(ExprKind::TupleField{ .obj = expr, .index = field });
+                }
+                else {
+                    Token field = self.expectName();
+                    Str fieldName = self.ctx.intern(field.data.asStr());
+                    if (self.current.kind == TokenKind::LParen) {
+                        self.advance();
+                        NodeListBuilder args;
+                        self.parseCallArgs(&args);
+                        u32 count = args.len;
+                        NodeId* values = self.ctx.nodeListFinish(&args);
+                        self.expect(TokenKind::RParen);
+                        NodeId recv = expr;
+                        expr = self.storeExpr(ExprKind::MethodCall{ .receiver = expr, .method = fieldName, .args = values, .argsLen = count });
+                        self.pointAt(expr, recv);
+                    }
+                    else { expr = self.storeExpr(ExprKind::Field{ .obj = expr, .field = fieldName }); }
+                }
+            } else if (self.current.kind == TokenKind::ColonColon) {
+                self.advance();
+                Token part = self.expectName();
+                Str partName = self.ctx.intern(part.data.asStr());
+                NodeId segment = self.storeExpr(ExprKind::Ident{ .name = partName });
+                NodeListBuilder segments;
+                self.ctx.nodeListInit(&segments);
+                if (!self.ctx.nodeListAppend(&segments, expr)) self.reportAllocFailed();
+                if (!self.ctx.nodeListAppend(&segments, segment)) self.reportAllocFailed();
+                u32 count = segments.len;
+                NodeId* values = self.ctx.nodeListFinish(&segments);
+                expr = self.storeExpr(ExprKind::Path{ .segments = values, .segmentsLen = count });
+                
+                // `T::V { ... }`: variant literal, type taken from the path head
+                if (self.current.kind == TokenKind::LBrace) {
+                    Ty litTy = self.pathHeadType(expr);
+                    expr = self.parseLiteralFields(litTy, partName);
+                }
+            } else if (self.current.kind == TokenKind::LBracket) {
+                self.advance();
+                NodeId index = self.parseExpr();
+                self.expect(TokenKind::RBracket);
+                expr = self.storeExpr(ExprKind::Index{ .obj = expr, .index = index });
+            } else if (self.current.kind == TokenKind::PlusPlus) {
+                self.advance();
+                expr = self.storeExpr(ExprKind::PostInc{ .expr = expr });
+            } else if (self.current.kind == TokenKind::MinusMinus) {
+                self.advance();
+                expr = self.storeExpr(ExprKind::PostDec{ .expr = expr });
+            }
+            else { break; }
+        }
+        return expr;
+    }
+
+    /* `flag (NAME) { key => expr, ..., else => expr }`: compile-time arm
+     * selection against ctx.flags (`--flag` / manifest). every arm body is
+     * still parsed so its syntax gets checked; only the matching one comes
+     * back. no match and no else arm is an error. */
+    NodeId parseFlagExpr()
+    {
+        self.advance(); // flag
+        self.expect(TokenKind::LParen);
+        Token tknn = self.expect(TokenKind::Ident);
+        Str nameStr = self.ctx.intern(tknn.data.asStr());
+        self.expect(TokenKind::RParen);
+        self.expect(TokenKind::LBrace);
+
+        NodeId chosenNodeId = self.noneNode();
+        NodeId elseNodeId = self.noneNode();
+
+        while (!self.atEnd() && self.current.kind != TokenKind::RBrace)
+        {
+            bool isElse = false;
+            Str keyStr = 0;
+            if (self.match(TokenKind::Else)) isElse = true;
+            else
+            {
+                Token ky = self.expect(TokenKind::Ident);
+                keyStr = self.ctx.intern(ky.data.asStr());
+            }
+            self.expect(TokenKind::FatArrow);
+            NodeId bodyNodeId = self.noneNode();
+            if (self.current.kind == TokenKind::LBrace)
+            {
+                self.advance();
+                bodyNodeId = self.parseExpr();
+                self.expect(TokenKind::RBrace);
+            }
+            else
+            {
+                bodyNodeId = self.parseExpr();
+            }
+            if (isElse) elseNodeId = bodyNodeId;
+            else
+            {
+                Str flagValStr = 0;
+                u32 ii = 0;
+                while (ii < self.ctx->flagsLen)
+                {
+                    if (self.ctx->flagNames[ii] == nameStr) { flagValStr = self.ctx->flagValues[ii]; break; }
+                    ii++;
+                }
+                if (flagValStr != 0 && flagValStr == keyStr) chosenNodeId = bodyNodeId;
+            }
+            if (!self.match(TokenKind::Comma)) break;
+        }
+        self.expect(TokenKind::RBrace);
+        if (chosenNodeId.index != 0) return chosenNodeId;
+        if (elseNodeId.index != 0) return elseNodeId;
+        self.reportCurrentError(ErrorCode::ParseExpectedExpr, "no arm of this flag expression matched; add an `else` arm");
+        return self.noneNode();
+    }
+
+    /* ── primaries: literals, names, parens, blocks, builtins ── */
+
+    NodeId parsePrimaryExpr()
+    {
+        TokenKind k = self.current.kind;
+        switch (k)
+        {
+            TokenKind::Dec => {
+                Token tok = self.advance();
+                return self.storeExpr(ExprKind::IntLit{ .value = tok.number, .flags = tok.numFlags });
+            },
+
+            TokenKind::Hex => {
+                Token tok = self.advance();
+                return self.storeExpr(ExprKind::IntLit{ .value = tok.number, .flags = tok.numFlags });
+            },
+
+            TokenKind::Bin => {
+                Token tok = self.advance();
+                return self.storeExpr(ExprKind::IntLit{ .value = tok.number, .flags = tok.numFlags });
+            },
+
+            TokenKind::Oct => {
+                Token tok = self.advance();
+                return self.storeExpr(ExprKind::IntLit{ .value = tok.number, .flags = tok.numFlags });
+            },
+
+            TokenKind::Float => {
+                Token tok = self.advance();
+                // raw text, interned; the lexer does not parse floats
+                return self.storeExpr(ExprKind::FloatLit{ .value = self.ctx.intern(tok.data.asStr()), .flags = tok.numFlags });
+            },
+
+            TokenKind::String => {
+                Token tok = self.advance();
+                return self.storeExpr(ExprKind::StringLit{ .value = self.ctx.intern(tok.data.asStr()), .flags = 0 });
+            },
+
+            TokenKind::CString => {
+                Token tok = self.advance();
+                // flags 1 = c-string: codegen appends the trailing NUL
+                return self.storeExpr(ExprKind::StringLit{ .value = self.ctx.intern(tok.data.asStr()), .flags = 1 });
+            },
+
+            TokenKind::RawString => {
+                Token tok = self.advance();
+                return self.storeExpr(ExprKind::StringLit{ .value = self.ctx.intern(tok.data.asStr()), .flags = 0 });
+            },
+
+            TokenKind::CharLit => {
+                Token tok = self.advance();
+                u32 value = 0;
+                /* the token span includes both quotes; decode the content
+                 * (`'a'` → 97, `'\n'` → 10; a bare `ptr[0]` would read the
+                 * opening quote and make every literal 39) */
+                if (tok.data.len >= 3)
+                {
+                    u8* p = tok.data.ptr + 1;
+                    u8* end = tok.data.ptr + tok.data.len - 1;
+                    if (p[0] == 92 && end - p >= 2)
+                    {
+                        EscapeResult esc = EscapeResult::decodeEscapeSequence(p, end);
+                        if (esc.isValid && esc.bytesConsumed > 0) value = esc.codepoint;
+                        else value = (u32)p[(u32)1];
+                    }
+                    else
+                    {
+                        usize len = 0;
+                        u32 cp = decodeUtf8(p, end, &len);
+                        if (len > 0) value = cp;
+                        else value = (u32)p[0];
+                    }
+                }
+                return self.storeExpr(ExprKind::CharLit{ .value = value });
+            },
+            
+            TokenKind::True => {
+                self.advance();
+                return self.storeExpr(ExprKind::BoolLit{ .flags = 1 });
+            },
+            
+            TokenKind::False => {
+                self.advance();
+                return self.storeExpr(ExprKind::BoolLit{ .flags = 0 });
+            },
+            
+            TokenKind::Null => {
+                self.advance();
+                return self.storeExpr(ExprKind::NullLit);
+            },
+            
+            TokenKind::Ident => {
+                Token nameTok = self.advance();
+                Str name = self.ctx.intern(nameTok.data.asStr());
+                // `T<A, B>` type ref or a plain name; a following `{` makes
+                // it a struct literal instead
+                Ty* genericArgs = null;
+                u32 genericArgsLen = 0;
+                bool hasGenericArgs = self.parseGenericArguments((rawptr*)&genericArgs, &genericArgsLen);
+                Ty namedType = self.makeNamedArgs(name, genericArgs, genericArgsLen);
+                if (self.current.kind == TokenKind::LBrace)
+                {
+                     return self.parseLiteralFields(namedType, 0);
+                }
+                if (hasGenericArgs)
+                    return self.storeExpr(ExprKind::TypeRef{ .name = name, .typeNode = namedType });
+                return self.storeExpr(ExprKind::Ident{ .name = name });
+            },
+
+            TokenKind::Str => {
+                Token nameTok = self.advance();
+                Str name = self.ctx.intern(nameTok.data.asStr());
+                if (self.current.kind == TokenKind::LBrace)
+                {
+                    // a pure Str tuple value: `str { .ptr = p, .len = n }`
+                    TypeKind k;
+                    k.tag = TypeKind::Str;
+                    Ty ty = self.allocTypeKind(k);
+                    return self.parseLiteralFields(ty, 0);
+                }
+                /* `str::foo(...)`: allow `str` as an identifier in a
+                 * path position (e.g. calls like str::fromParts); the
+                 * postfix loop handles the rest. */
+                if (self.current.kind == TokenKind::ColonColon)
+                {
+                    return self.storeExpr(ExprKind::Ident{ .name = name });
+                }
+                self.reportCurrentError(ErrorCode::ParseExpectedExpr, "expected a path, call or struct literal after `str`");
+                return self.noneNode();
+            },
+
+            TokenKind::Self => {
+                self.advance();
+                return self.storeExpr(ExprKind::Ident{ .name = self.ctx.intern("self") });
+            },
+            
+            TokenKind::LParen => {
+                self.advance();
+                /* cast: (type)operand, keyword types, or Named* pointer
+                 * types (bootstrap parity: an Ident is only a cast type
+                 * when followed by `*`, so `(x)` stays a paren expr) */
+                bool castable = false;
+                if (self.isTypeStart() &&
+                    self.current.kind != TokenKind::Ident &&
+                    self.current.kind != TokenKind::LParen)
+                {
+                    castable = true;
+                }
+                else if (self.current.kind == TokenKind::Ident)
+                {
+                    ParserMark mk0 = self.save();
+                    self.advance();
+                    if (self.current.kind == TokenKind::Star ||
+                        self.current.kind == TokenKind::RParen ||
+                        self.current.kind == TokenKind::Less ||
+                        self.current.kind == TokenKind::ColonColon)
+                    {
+                        castable = true;
+                    }
+                    self.restore(mk0);
+                }
+                if (castable)
+                {
+                    ParserMark cm = self.save();
+                    Ty ctype = self.parseType();
+                    // parseType closed on `)`; this really is a cast. the
+                    // save() above bumped specDepth; close it out here since
+                    // the speculative branch won
+                    if (self.current.kind == TokenKind::RParen)
+                    {
+                        self.advance();
+                        self.endSpeculation();
+                        NodeId cinner = self.parseUnaryExpr();
+                        return self.storeExpr(ExprKind::Cast{ .expr = cinner, .targetType = ctype });
+                    }
+                    // not a cast after all (plain `(expr)`): rewind everything
+                    self.restore(cm);
+                }
+                if (self.current.kind == TokenKind::RParen) {
+                    self.advance();
+                    return self.storeExpr(ExprKind::TupleExpr{ .elems = null, .elemsLen = 0 });
+                }
+                NodeListBuilder elems;
+                self.ctx.nodeListInit(&elems);
+                NodeId elem = self.parseExpr();
+                if (!self.ctx.nodeListAppend(&elems, elem)) self.reportAllocFailed();
+                while (self.match(TokenKind::Comma))
+                {
+                    if (self.current.kind == TokenKind::RParen) break;
+                    elem = self.parseExpr();
+                    if (!self.ctx.nodeListAppend(&elems, elem)) self.reportAllocFailed();
+                }
+                self.expect(TokenKind::RParen);
+                u32 count = elems.len;
+                NodeId* values = self.ctx.nodeListFinish(&elems);
+                // `(x)` is a parenthesized expr, not a one-tuple
+                if (count == 1) return values[0];
+                return self.storeExpr(ExprKind::TupleExpr{ .elems = values, .elemsLen = count });
+            },
+            
+            TokenKind::LBrace => {
+                /* a block in expression position. per item: statement
+                 * keywords go to parseStmt, everything else is an expr, and
+                 * the last item parsed becomes the block's value. bail on
+                 * the first new error so recovery doesn't cascade */
+                self.advance();
+                NodeListBuilder stmts;
+                self.ctx.nodeListInit(&stmts);
+                NodeId result = self.noneNode();
+                while (self.current.kind != TokenKind::RBrace && !self.atEnd())
+                {
+                    u32 errorsBefore = self.errorCount();
+                    bool isStatement = false;
+                    switch (self.current.kind)
+                    {
+                        TokenKind::Return |  TokenKind::If | TokenKind::While | 
+                        TokenKind::For |  TokenKind::Loop | TokenKind::Switch | 
+                        TokenKind::Defer |  TokenKind::Break |  TokenKind::Continue | 
+                        TokenKind::LBrace |  TokenKind::Comptime |  TokenKind::Var | 
+                        TokenKind::Const => { isStatement = true; },
+                        else => {}
+                    }
+                    if (isStatement)
+                    {
+                        result = self.parseStmt();
+                        if (!self.ctx.nodeListAppend(&stmts, result)) self.reportAllocFailed();
+                    }
+                    else {
+                        result = self.parseExpr();
+                        if (!self.ctx.nodeListAppend(&stmts, result)) self.reportAllocFailed();
+                        self.match(TokenKind::Semicolon);
+                    }
+                         if (self.errorCount() > errorsBefore) break;
+                }
+                self.expect(TokenKind::RBrace);
+                u32 count = stmts.len;
+                NodeId* values = self.ctx.nodeListFinish(&stmts);
+                return self.storeExpr(ExprKind::BlockExpr{ .stmts = values, .stmtsLen = count, .result = result });
+            },
+            
+            TokenKind::If => {
+                self.advance();
+                self.expect(TokenKind::LParen);
+                NodeId cond = self.parseExpr();
+                self.expect(TokenKind::RParen);
+                NodeId thenB = self.parseExpr();
+                NodeId elseB = self.noneNode();
+                if (self.match(TokenKind::Else))
+                    elseB = self.parseExpr();
+                return self.storeExpr(ExprKind::IfExpr{ .cond = cond, .thenBody = thenB, .elseBody = elseB });
+            },
+            
+            TokenKind::Switch => {
+                self.advance();
+                self.expect(TokenKind::LParen);
+                NodeId sexpr = self.parseExpr();
+                self.expect(TokenKind::RParen);
+                self.expect(TokenKind::LBrace);
+                SwitchListBuilder cases;
+                self.ctx.switchListInit(&cases);
+                while (self.current.kind != TokenKind::RBrace && !self.atEnd())
+                {
+                    SwitchCase c = self.parseSwitchExprCase();
+                    if (!self.ctx.switchListAppend(&cases, c)) self.reportAllocFailed();
+                }
+                self.expect(TokenKind::RBrace);
+                u32 count = cases.len;
+                SwitchCase* values = self.ctx.switchListFinish(&cases);
+                return self.storeExpr(ExprKind::SwitchExpr{ .expr = sexpr, .cases = values, .casesLen = count });
+            },
+            
+            TokenKind::BuiltinSizeof => {
+                // `sizeof` carries an @ prefix: @sizeof(T)
+                self.reportCurrentError(ErrorCode::ParseExpectedExpr, "sizeof must be written @sizeof(T)");
+                self.advance();
+                if (self.match(TokenKind::LParen)) {
+                    self.parseType();
+                    self.expect(TokenKind::RParen);
+                }
+                return self.noneNode();
+            },
+            
+            TokenKind::BuiltinAlignof => {
+                self.advance();
+                self.expect(TokenKind::LParen);
+                Ty alignofType = self.parseType();
+                self.expect(TokenKind::RParen);
+                return self.storeExpr(ExprKind::Alignof{ .targetType = alignofType });
+            },
+            
+            TokenKind::BuiltinTypeof => {
+                self.advance();
+                self.expect(TokenKind::LParen);
+                NodeId typeofExpr = self.parseExpr();
+                self.expect(TokenKind::RParen);
+                return self.storeExpr(ExprKind::Typeof{ .expr = typeofExpr });
+            },
+            
+            TokenKind::BuiltinAssert => {
+                self.advance();
+                self.expect(TokenKind::LParen);
+                NodeListBuilder bargs;
+                self.ctx.nodeListInit(&bargs);
+                if (self.current.kind != TokenKind::RParen) {
+                    NodeId barg = self.parseExpr();
+                    if (!self.ctx.nodeListAppend(&bargs, barg)) self.reportAllocFailed();
+                    while (self.match(TokenKind::Comma)) {
+                        barg = self.parseExpr();
+                        if (!self.ctx.nodeListAppend(&bargs, barg)) self.reportAllocFailed();
+                    }
+                }
+                self.expect(TokenKind::RParen);
+                u32 bargCount = bargs.len;
+                NodeId* bargValues = self.ctx.nodeListFinish(&bargs);
+                return self.storeExpr(ExprKind::BuiltinCall{ .name = self.ctx.intern("assert"), .args = bargValues, .argsLen = bargCount });
+            },
+            
+            TokenKind::Flag => { return self.parseFlagExpr(); },
+
+            TokenKind::At => {
+                self.advance();
+                if (self.current.kind == TokenKind::BuiltinSizeof)
+                {
+                    self.advance();
+                    self.expect(TokenKind::LParen);
+                    Ty szType = self.parseType();
+                    self.expect(TokenKind::RParen);
+                    return self.storeExpr(ExprKind::Sizeof{ .targetType = szType });
+                }
+                // a couple of builtins lex as keywords, the rest as idents
+                Str bname;
+                if (self.current.kind == TokenKind::BuiltinAssert ||
+                    self.current.kind == TokenKind::BuiltinAssertOut ||
+                    self.current.kind == TokenKind::BuiltinTypeof) {
+                    Token bt = self.advance();
+                    bname = self.ctx.intern(bt.data.asStr());
+                } else {
+                    Token bt = self.expect(TokenKind::Ident);
+                    bname = self.ctx.intern(bt.data.asStr());
+                }
+                self.expect(TokenKind::LParen);
+                NodeListBuilder bargs;
+                self.ctx.nodeListInit(&bargs);
+                if (self.current.kind != TokenKind::RParen) {
+                    NodeId barg = self.parseExpr();
+                    if (!self.ctx.nodeListAppend(&bargs, barg)) self.reportAllocFailed();
+                    while (self.match(TokenKind::Comma)) {
+                        barg = self.parseExpr();
+                        if (!self.ctx.nodeListAppend(&bargs, barg)) self.reportAllocFailed();
+                    }
+                }
+                self.expect(TokenKind::RParen);
+                u32 bargCount = bargs.len;
+                NodeId* bargValues = self.ctx.nodeListFinish(&bargs);
+                return self.storeExpr(ExprKind::BuiltinCall{ .name = bname, .args = bargValues, .argsLen = bargCount });
+            },
+            
+            else => {
+                // consume a token (unless at EOF) so callers can't spin on us
+                self.reportCurrentError(ErrorCode::ParseExpectedExpr, "expected an expression");
+                if (!self.atEnd()) self.advance();
+                return self.noneNode();
+            }
+        }
+    }
+
+    /* `{ .name = expr, ... }` fields of a struct literal, or of a
+     * variant construction (`Type::Variant { ... }`, variant != 0).
+     * When no entry carries `name =` the literal is positional:
+     * values map onto fields in declaration order (same as the
+     * untyped brace form `T x = { v1, v2 }`). */
+    NodeId parseLiteralFields(Ty typeNode, Str variantName)
+    {
+        self.expect(TokenKind::LBrace);
+        // lookahead: `ident =` means named fields, anything else positional
+        bool positional = false;
+        if (self.current.kind != TokenKind::RBrace && self.current.kind != TokenKind::Dot)
+        {
+            if (self.current.kind == TokenKind::Ident)
+            {
+                ParserMark m = self.save();
+                self.advance();
+                positional = self.current.kind != TokenKind::Equal;
+                self.restore(m);
+            }
+            else positional = true;
+        }
+        StrListBuilder fields;
+        NodeListBuilder values;
+        self.ctx.strListInit(&fields);
+        self.ctx.nodeListInit(&values);
+        if (positional)
+        {
+            while (self.current.kind != TokenKind::RBrace && !self.atEnd())
+            {
+                NodeId value = self.parseInitExpr();
+                if (!self.ctx.nodeListAppend(&values, value)) self.reportAllocFailed();
+                if (!self.match(TokenKind::Comma)) break;
+            }
+        }
+        else
+        {
+            while (self.current.kind != TokenKind::RBrace && !self.atEnd())
+            {
+                // leading dot is optional inside the braces
+                self.match(TokenKind::Dot);
+                Token field = self.expectName();
+                Str fieldName = self.ctx.intern(field.data.asStr());
+                self.expect(TokenKind::Equal);
+                NodeId value = self.parseExpr();
+                if (!self.ctx.strListAppend(&fields, fieldName)) self.reportAllocFailed();
+                if (!self.ctx.nodeListAppend(&values, value)) self.reportAllocFailed();
+                if (!self.match(TokenKind::Comma)) break;
+            }
+        }
+        self.expect(TokenKind::RBrace);
+        // positional literals carry values only: fieldNames stays null and
+        // the field count comes from the values array
+        u32 count = positional ? values.len : fields.len;
+        Str* fieldNames = self.ctx.strListFinish(&fields);
+        if (positional) fieldNames = null;
+        NodeId* fieldValues = self.ctx.nodeListFinish(&values);
+        return self.storeExpr(ExprKind::StructLiteral{ .typeNode = typeNode, .variantName = variantName, .fieldNames = fieldNames, .fieldValues = fieldValues, .fieldValuesLen = count });
+    }
+
+    // type carried by the head segment of a path (for `T::V { ... }`)
+    Ty pathHeadType(NodeId e)
+    {
+        Node* n = self.ctx.nodes + e.index;
+        if (n.kind.tag != NodeKind::Expr) return 0;
+        Expr* x = &n.kind.payload.Expr.value;
+        if (x.kind.tag == ExprKind::TypeRef) return x.kind.payload.TypeRef.typeNode;
+        if (x.kind.tag == ExprKind::Ident) return self.makeNamed(x.kind.payload.Ident.name);
+        if (x.kind.tag == ExprKind::Path) {
+            if (x.kind.payload.Path.segmentsLen > 0) return self.pathHeadType(x.kind.payload.Path.segments[0]);
+        }
+        return 0;
+    }
+
+    /* one arm: `pat | pat, pat if guard => body`. flags bit 0 = guard
+     * present (codegen checks it); bit 2 (4) = else arm. the ast header
+     * lists bit 1 as fallthrough, but nothing here sets that; codegen
+     * only ever reads bits 0 and 2 */
+    SwitchCase parseSwitchExprCase()
+    {
+        SwitchCase c;
+        c.patterns = null;
+        c.patternsLen = 0;
+        c.guard = self.noneNode();
+        c.body = self.noneNode();
+        c.flags = 0;
+
+        if (self.match(TokenKind::Else)) {
+            c.flags = 4;
+            self.expect(TokenKind::FatArrow);
+            c.body = self.parseExpr();
+            self.match(TokenKind::Comma);
+            return c;
+        }
+
+        NodeListBuilder patterns;
+        self.ctx.nodeListInit(&patterns);
+        NodeId pattern = self.parseSwitchPattern();
+        if (!self.ctx.nodeListAppend(&patterns, pattern)) self.reportAllocFailed();
+        while (self.match(TokenKind::Pipe)) {
+            pattern = self.parseSwitchPattern();
+            if (!self.ctx.nodeListAppend(&patterns, pattern)) self.reportAllocFailed();
+        }
+        while (self.match(TokenKind::Comma)) {
+            pattern = self.parseSwitchPattern();
+            if (!self.ctx.nodeListAppend(&patterns, pattern)) self.reportAllocFailed();
+        }
+        c.patternsLen = patterns.len;
+        c.patterns = self.ctx.nodeListFinish(&patterns);
+        if (self.match(TokenKind::If)) {
+            c.guard = self.parseExpr();
+            c.flags |= 1;
+        }
+        self.expect(TokenKind::FatArrow);
+        c.body = self.parseExpr();
+        self.match(TokenKind::Comma);
+        return c;
+    }
+
+    NodeId parseSwitchExprPattern() { return self.parseSwitchPattern(); }
+}

@@ -1,0 +1,193 @@
+#[[no_drop_all]]
+import(lib) wallvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrType, IrValueKind };
+import(lib) wallvm::irOps { IrOpcode };
+import(lib) std::mman { alloc, dealloc };
+
+// LowerPhis, eliminate all Phi instructions by inserting Store(src,
+// alloca) on each incoming edge and replacing the phi with Load(alloca).
+// This runs immediately after mem2reg so lsra never sees a Phi opcode.
+// I read the old file's mixed dot and colon spellings of the opcode enum as
+// the same member paths, and ported them all to the colon form.
+pub bool irLowerPhis(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (ctx == null || func == null || func->nblocks == 0) return false;
+
+    // Count phis
+    u32 nphis = 0;
+    for (u32 bi = 0; bi < func->nblocks; bi++)
+    {
+        IrBlock* bb = func->blocks[bi];
+        for (u32 ii = 0; ii < bb->ninsts; ii++)
+        {
+            if (bb->insts[ii]->opcode == IrOpcode::Phi) { nphis++; break; }
+        }
+    }
+    if (nphis == 0) return false;
+
+    // Collect unique phis
+    IrInst** phis = alloc<IrInst*>(nphis);
+    IrInst** phiAllocas = alloc<IrInst*>(nphis);
+    u32 numPhis = 0;
+
+    for (u32 bi = 0; bi < func->nblocks && numPhis < nphis; bi++)
+    {
+        IrBlock* bb = func->blocks[bi];
+        for (u32 ii = 0; ii < bb->ninsts && numPhis < nphis; ii++)
+        {
+            if (bb->insts[ii]->opcode == IrOpcode::Phi)
+            {
+                phis[numPhis] = bb->insts[ii];
+                numPhis++;
+            }
+            else if (numPhis > 0)
+            {
+                break; // stop collecting once we're past the leading phis
+            }
+        }
+    }
+
+    // Step 1 — Create alloca for each phi at top of entry block
+    for (u32 k = 0; k < numPhis; k++)
+    {
+        IrType* elemTy = phis[k]->base.type;
+        if (elemTy == null) elemTy = ctx->tyInt(64);
+        IrType* ptrTy = ctx->tyPtr(elemTy);
+        IrInst* alloca = ctx->createInst(
+            IrOpcode::Alloca, ptrTy, null, 0, 0, 0);
+        phiAllocas[k] = alloca;
+
+        IrBlock* entry = func->blocks[0];
+        u32 insIdx = entry->ninsts;
+        // Insert after existing allocas
+        for (u32 z = 0; z < entry->ninsts; z++)
+        {
+            if (entry->insts[z]->opcode == IrOpcode::Alloca)
+            {
+                insIdx = z + 1;
+            }
+            else
+            {
+                break;
+            }
+        }
+
+        // Grow array if needed
+        if (entry->ninsts + 1 > entry->capInsts)
+        {
+            u32 nc = entry->capInsts ? entry->capInsts * 2 : 16;
+            IrInst** ni = alloc<IrInst*>(nc);
+            for (u32 z = 0; z < entry->ninsts; z++) ni[z] = entry->insts[z];
+            if (entry->insts != null) dealloc<IrInst*>(entry->insts);
+            entry->insts = ni;
+            entry->capInsts = nc;
+        }
+        for (u32 z = entry->ninsts; z > insIdx; z--)
+            entry->insts[z] = entry->insts[z - 1];
+        entry->insts[insIdx] = alloca;
+        alloca->parent = entry;
+        entry->ninsts++;
+    }
+
+    // Step 2 — For each phi operand pair, insert Store(src, alloca) in pred
+    for (u32 k = 0; k < numPhis; k++)
+    {
+        IrInst* phi = phis[k];
+        IrInst* alloca = phiAllocas[k];
+
+        for (u32 j = 0; j + 1 < phi->nops; j += 2)
+        {
+            IrValue* srcVal = phi->ops[j];
+            IrValue* predVal = phi->ops[j + 1];
+            if (predVal == null || predVal->kind != IrValueKind::Block) continue;
+            IrBlock* predBlk = (IrBlock*)predVal;
+            if (srcVal == null) continue;
+
+            // Find terminator index in predecessor
+            u32 termIdx = predBlk->ninsts;
+            for (u32 ti = 0; ti < predBlk->ninsts; ti++)
+            {
+                IrOpcode op = predBlk->insts[ti]->opcode;
+                if (op == IrOpcode::Br || op == IrOpcode::CondBr ||
+                    op == IrOpcode::Ret || op == IrOpcode::Unreachable ||
+                    op == IrOpcode::Noret)
+                { termIdx = ti; break; }
+            }
+
+            // Create Store
+            IrValue** sOps = alloc<IrValue*>(2);
+            sOps[0] = srcVal;
+            sOps[1] = &alloca->base;
+            IrInst* storeInst = ctx->createInst(
+                IrOpcode::Store, ctx->tyVoid(), sOps, 2, 0, 0);
+            srcVal->addUser(storeInst);
+            alloca->base.addUser(storeInst);
+
+            // Insert before terminator
+            if (predBlk->ninsts + 1 > predBlk->capInsts)
+            {
+                u32 nc3 = predBlk->capInsts ? predBlk->capInsts * 2 : 16;
+                IrInst** ni3 = alloc<IrInst*>(nc3);
+                for (u32 z = 0; z < predBlk->ninsts; z++) ni3[z] = predBlk->insts[z];
+                if (predBlk->insts != null) dealloc<IrInst*>(predBlk->insts);
+                predBlk->insts = ni3;
+                predBlk->capInsts = nc3;
+            }
+            for (u32 z = predBlk->ninsts; z > termIdx; z--)
+                predBlk->insts[z] = predBlk->insts[z - 1];
+            predBlk->insts[termIdx] = storeInst;
+            storeInst->parent = predBlk;
+            predBlk->ninsts++;
+        }
+    }
+
+    // Step 3 — Replace each phi with Load(alloca), remove phi.
+    // Process in REVERSE order so position shifts don't break later replacements.
+    u32 idx = numPhis;
+    while (idx > 0)
+    {
+        idx--;
+        IrInst* phi = phis[idx];
+        IrInst* alloca = phiAllocas[idx];
+        IrBlock* parent = phi->parent;
+        if (parent == null) continue;
+
+        IrType* elemTy = phi->base.type;
+        if (elemTy == null) elemTy = ctx->tyInt(64);
+
+        IrValue** lOps = alloc<IrValue*>(1);
+        lOps[0] = &alloca->base;
+        IrInst* loadInst = ctx->createInst(
+            IrOpcode::Load, elemTy, lOps, 1, 0, 0);
+        alloca->base.addUser(loadInst);
+
+        // Replace all uses of phi with load result
+        phi->base.replaceAllUses(&loadInst->base);
+
+        // Remove phi's user links from operands
+        for (u32 oi = 0; oi < phi->nops; oi++)
+        {
+            if (phi->ops[oi] != null)
+                phi->ops[oi]->removeUser(phi);
+        }
+
+        // Find phi position in parent
+        u32 phiPos = 0;
+        for (u32 pi = 0; pi < parent->ninsts; pi++)
+        {
+            if (parent->insts[pi] == phi) { phiPos = pi; break; }
+        }
+
+        // Replace phi slot with load instruction
+        if (phiPos < parent->ninsts)
+        {
+            // Free old ops
+            if (phi->capOps > 0)
+                dealloc<IrValue*>(phi->ops);
+            loadInst->parent = parent;
+            parent->insts[phiPos] = loadInst;
+        }
+    }
+
+    return true;
+}

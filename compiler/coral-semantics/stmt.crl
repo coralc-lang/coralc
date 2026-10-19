@@ -1,0 +1,820 @@
+#[[no_drop_all]]
+/* stmt.crl: statement checking and function-body setup (generic params,
+ * self, params). every StmtKind has an arm; says `ok = false` rather than
+ * bailing so one bad statement doesn't hide the rest. Comptime blocks bump
+ * comptimeDepth so @typeof and type-switch arms know where they are. */
+import ast::expr;
+
+import ast::id { Str, NodeId };
+import ast::types { Ty, TypeEntry, TypeKind };
+import ast::node { Node, NodeKind };
+import ast::decl { Decl, DeclKind, Param, GenericParam, VariantVariant, Attribute };
+import ast::stmt { Stmt, StmtKind, SwitchCase };
+import ast::pat { Pat, PatKind };
+import scope { Symbol };
+import sema { Sema };
+import member { MemberInfo };
+import diag::code { ErrorCode };
+import(lib) std::mman { alloc, dealloc };
+
+pub extend Sema
+{
+    // statements
+
+    bool checkStmt(NodeId id)
+    {
+        if (id.index == 0) return true;
+        Node* node = self.ctx.nodes + id.index;
+        if (node->kind.tag != NodeKind::Stmt) return true;
+        Stmt* stmt = &node->kind.payload.Stmt.value;
+        switch (stmt->kind.tag)
+        {
+            StmtKind::VarDecl => {
+                // `{ .field = … }` initializer, typed from the declarator
+                if (stmt->kind.payload.VarDecl.typeNode != 0 && stmt->kind.payload.VarDecl.init.index != 0)
+                {
+                    Node* inn = self.ctx.nodes + stmt->kind.payload.VarDecl.init.index;
+                    if (inn.kind.tag == NodeKind::Expr &&
+                        inn.kind.payload.Expr.value.kind.tag == ExprKind::StructLiteral &&
+                        inn.kind.payload.Expr.value.kind.payload.StructLiteral.typeNode == 0)
+                        inn.kind.payload.Expr.value.kind.payload.StructLiteral.typeNode = stmt->kind.payload.VarDecl.typeNode;
+                }
+                if (!self.checkExpr(stmt->kind.payload.VarDecl.init)) return false;
+                Ty declaredType = stmt->kind.payload.VarDecl.typeNode;
+                if (!self.checkType(declaredType)) return false;
+                Ty actualType = self.exprType(stmt->kind.payload.VarDecl.init);
+                if (declaredType != 0 && !self.checkAssign(stmt->kind.payload.VarDecl.init, actualType, declaredType))
+                {
+                    if (stmt->kind.payload.VarDecl.name != 0)
+                        self.semaErrorNode(ErrorCode::SemaTypeMismatch, stmt->kind.payload.VarDecl.init,
+                            self.nameMsgS("initializer for `", stmt->kind.payload.VarDecl.name, "` does not match its declared type"));
+                    else
+                        self.semaErrorNode(ErrorCode::SemaTypeMismatch, stmt->kind.payload.VarDecl.init, "initializer type does not match variable type");
+                }
+                if (declaredType != 0 && actualType == 0)
+                    self.coerceArrayLit(stmt->kind.payload.VarDecl.init, declaredType);
+                if (declaredType != 0 && stmt->kind.payload.VarDecl.init.index != 0)
+                    self.checkIntLitFit(stmt->kind.payload.VarDecl.init, declaredType);
+                if (declaredType == 0)
+                {
+                    // `var x = expr;`: infer from the initializer
+                    declaredType = actualType;
+                    if (declaredType == 0 && stmt->kind.payload.VarDecl.init.index != 0)
+                    {
+                        // `var p = null;`: a bare null has no type of its own
+                        Node* inn = self.ctx.nodes + stmt->kind.payload.VarDecl.init.index;
+                        if (inn->kind.tag == NodeKind::Expr && inn->kind.payload.Expr.value.kind.tag == ExprKind::NullLit)
+                            declaredType = self.rawptrType();
+                    }
+                    if (declaredType == 0)
+                    {
+                        self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "cannot infer type: add an explicit type annotation");
+                        return false;
+                    }
+                    stmt->kind.payload.VarDecl.typeNode = declaredType;
+                }
+                if (stmt->kind.payload.VarDecl.name != 0)
+                {
+                    // fileId 0: locals resolve by scope/shadowing, not by the
+                    // cross-file mangling that top-level decls need
+                    if (!self.scopes.declare(stmt->kind.payload.VarDecl.name, 1, declaredType, id, stmt->kind.payload.VarDecl.flags, 0) &&
+                        self.scopes.lastDeclFail == 1)
+                        self.dupDeclDiag(stmt->kind.payload.VarDecl.name, id);
+                }
+                /* RAII: resolve the type's drop method now; the backend
+                 * emits the call at scope exit. static locals, #[[no_drop]]
+                 * and #[[no_drop_all]] opt out */
+                if (declaredType != 0 && (stmt->kind.payload.VarDecl.flags & 4) == 0 &&
+                    !self.fileNoDropAll && self.noDropDepth == 0 &&
+                    !self.stmtHasAttr(stmt, self.ctx.intern("no_drop")))
+                {
+                    MemberInfo dropInfo = self.findMethod(declaredType, self.ctx.intern("drop"));
+                    if (dropInfo.declaration.index != 0 &&
+                        self.dropMethodIsValid(dropInfo.declaration))
+                        stmt->kind.payload.VarDecl.dropMethod = dropInfo.declaration;
+                }
+                if ((stmt->kind.payload.VarDecl.flags & 4) == 0)
+                    self.noteLocal(stmt->kind.payload.VarDecl.name, stmt->kind.payload.VarDecl.nameLoc);
+                return true;
+            },
+            
+            StmtKind::Block => {
+                // every block gets a scope; leave() frees the symbol array
+                bool noDrop = self.stmtHasAttr(stmt, self.ctx.intern("no_drop"));
+                if (noDrop) self.noDropDepth++;
+                self.scopes.enter();
+                bool ok = true;
+                u32 i = 0;
+                while (i < stmt->kind.payload.Block.stmtsLen)
+                {
+                    if (!self.checkStmt(stmt->kind.payload.Block.stmts[i])) ok = false;
+                    i++;
+                }
+                self.scopes.leave();
+                if (noDrop) self.noDropDepth--;
+                return ok;
+            },
+            
+            StmtKind::Return => {
+                NodeId retVal = stmt->kind.payload.Return.value;
+                if (retVal.index == 0)
+                {
+                    /* bare `return;` is only valid where no value is
+                     * expected — otherwise the emitted C is `return;` in a
+                     * value-returning function and gcc rejects it */
+                    Ty rt = self.currentReturnType;
+                    if (rt != 0 && (self.ctx.types + rt)->kind.tag != TypeKind::Void)
+                    {
+                        u8* tb = alloc<u8>(256);
+                        String msg = String::new();
+                        msg.pushView("return with no value in function returning '");
+                        if (tb != null) { msg.pushView(self.typeTextView(self.stripType(rt), tb, 256)); dealloc<u8>(tb); }
+                        else msg.pushView("?");
+                        msg.pushView("'");
+                        self.semaErrorNodeHelp(ErrorCode::SemaTypeMismatch, id, msg.asView(),
+                            "write `return <expr>;` or change the function's return type to void");
+                    }
+                    return true;
+                }
+                if (!self.checkExpr(retVal)) return false;
+                if (!self.checkAssign(retVal, self.exprType(retVal), self.currentReturnType))
+                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, retVal, "return value type does not match function return type");
+                return true;
+            },
+            
+            StmtKind::If => {
+                // statement conditions are C-truthy (bool, int, pointer);
+                // ternary/if-expr conditions are not; they demand bool
+                if (!self.checkExpr(stmt->kind.payload.If.cond)) return false;
+                Ty ifCondTy = self.exprType(stmt->kind.payload.If.cond);
+                if (ifCondTy != 0 && ifCondTy != self.boolType() && !self.integerType(ifCondTy) && !self.pointerLike(ifCondTy))
+                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "if condition must be bool");
+                if (!self.checkStmt(stmt->kind.payload.If.thenBody)) return false;
+                return self.checkStmt(stmt->kind.payload.If.elseBody);
+            },
+            
+            StmtKind::While => {
+                if (!self.checkExpr(stmt->kind.payload.While.cond)) return false;
+                Ty whileCondTy = self.exprType(stmt->kind.payload.While.cond);
+                if (whileCondTy != 0 && whileCondTy != self.boolType() && !self.integerType(whileCondTy) && !self.pointerLike(whileCondTy))
+                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "while condition must be bool");
+                return self.checkStmt(stmt->kind.payload.While.body);
+            },
+            
+            StmtKind::ForIn => {
+                if (!self.checkExpr(stmt->kind.payload.ForIn.iterExpr)) return false;
+                Ty iterTy = self.exprType(stmt->kind.payload.ForIn.iterExpr);
+                if (iterTy != 0)
+                {
+                    TypeEntry* ie = self.ctx.types + iterTy;
+                    bool isIterable = ie->kind.tag == TypeKind::Slice || ie->kind.tag == TypeKind::Array;
+                    /* inside comptime a for-in may iterate a variadic pack
+                     * (`for (var arg : args)`): the pack has no runtime
+                     * type; the evaluator unrolls it. Only reject outside
+                     * comptime where a runtime array/slice is required. */
+                    if (!isIterable && self.comptimeDepth == 0)
+                        self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "for-in iterator must be an array or slice");
+                    else if (isIterable)
+                    {
+                        Ty elemTy = ie->kind.tag == TypeKind::Slice ? ie->kind.payload.Slice.base
+                                                                     : ie->kind.payload.Array.base;
+                        if (stmt->kind.payload.ForIn.bindType != 0)
+                        {
+                            if (!self.compatible(elemTy, stmt->kind.payload.ForIn.bindType))
+                                self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "for-in bind type does not match the iterator's element type");
+                        }
+                        if (stmt->kind.payload.ForIn.bindType == 0) stmt->kind.payload.ForIn.bindType = elemTy;
+                    }
+                }
+                self.scopes.enter();
+                self.scopes.declare(stmt->kind.payload.ForIn.bindName, 1, stmt->kind.payload.ForIn.bindType, id, 2, 0); // flags bit 1 = loop binding
+                bool ok = self.checkStmt(stmt->kind.payload.ForIn.body);
+                self.scopes.leave();
+                return ok;
+            },
+            
+            StmtKind::For => {
+                /* the loop variable lives in the loop's own scope: two
+                 * `for (u32 i = ...)` loops in the same block must not
+                 * collide (C scoping) */
+                self.scopes.enter();
+                bool forOk = self.checkStmt(stmt->kind.payload.For.init);
+                if (!self.checkExpr(stmt->kind.payload.For.cond)) forOk = false;
+                Ty forCondTy = self.exprType(stmt->kind.payload.For.cond);
+                if (forCondTy != 0 && forCondTy != self.boolType() && !self.integerType(forCondTy) && !self.pointerLike(forCondTy))
+                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "for condition must be bool");
+                if (!self.checkExpr(stmt->kind.payload.For.post)) forOk = false;
+                if (!self.checkStmt(stmt->kind.payload.For.body)) forOk = false;
+                self.scopes.leave();
+                return forOk;
+            },
+            
+            StmtKind::Comptime => {
+                // depth must unwind even on the early break; the evaluator
+                // and the @typeof/@compileError arms read it later
+                self.comptimeDepth++;
+                u32 i = 0;
+                bool ok = true;
+                while (i < stmt->kind.payload.Comptime.stmtsLen)
+                {
+                    if (!self.checkStmt(stmt->kind.payload.Comptime.stmts[i])) { ok = false; break; }
+                    i++;
+                }
+                self.comptimeDepth--;
+                return ok;
+            },
+            
+            StmtKind::Asm => {
+                u32 i = 0;
+                while (i < stmt->kind.payload.Asm.templateLen)
+                {
+                    if (!self.checkExpr(stmt->kind.payload.Asm.template[i])) return false;
+                    i++;
+                }
+                i = 0;
+                while (i < stmt->kind.payload.Asm.outputsLen)
+                {
+                    if (!self.checkExpr(stmt->kind.payload.Asm.outputs[i])) return false;
+                    i++;
+                }
+                i = 0;
+                while (i < stmt->kind.payload.Asm.inputsLen)
+                {
+                    if (!self.checkExpr(stmt->kind.payload.Asm.inputs[i])) return false;
+                    i++;
+                }
+                return true;
+            },
+            
+            StmtKind::Defer => { return self.checkStmt(stmt->kind.payload.Defer.stmt); },
+            StmtKind::Break => { return true; },
+            StmtKind::Continue => { return true; },
+            StmtKind::Loop => { return self.checkStmt(stmt->kind.payload.Loop.body); },
+            StmtKind::ExprStmt => { return self.checkExpr(stmt->kind.payload.ExprStmt.expr); },
+
+    
+            StmtKind::Switch => {
+                if (!self.checkExpr(stmt->kind.payload.Switch.expr)) return false;
+                // each case opens its own scope: pattern bindings must not
+                // bleed into sibling cases (or after the switch)
+                /* comptime switches (inside a comptime block) are desugared
+                 * by the evaluator: it selects the matching arm and emits
+                 * only that body. Blanket-checking all arms with generic
+                 * types would falsely reject type-switch arms like
+                 * `str => val.ptr` where val is still typed T. Skip them. */
+                if (self.comptimeDepth > 0) return true;
+                Ty scrutTy = self.exprType(stmt->kind.payload.Switch.expr);
+                bool ok = true;
+                u32 i = 0;
+                while (i < stmt->kind.payload.Switch.casesLen) {
+                    SwitchCase* switchCase = stmt->kind.payload.Switch.cases + i;
+                    self.scopes.enter();
+                    u32 p = 0;
+                    while (p < switchCase->patternsLen) {
+                        if (!self.declarePatternBindings(switchCase->patterns[p], scrutTy)) ok = false;
+                        p++;
+                    }
+                    if (switchCase->guard.index != 0) {
+                        if (!self.checkExpr(switchCase->guard)) ok = false;
+                    }
+                    if (switchCase->body.index != 0) {
+                        Node* bodyNode = self.ctx.nodes + switchCase->body.index;
+                        if (bodyNode->kind.tag == NodeKind::Expr) {
+                            if (!self.checkExpr(switchCase->body)) ok = false;
+                        } else {
+                            if (!self.checkStmt(switchCase->body)) ok = false;
+                        }
+                    }
+                    self.scopes.leave();
+                    i++;
+                }
+                return ok;
+            },
+            else => {
+                self.semaErrorNode(ErrorCode::SemaInternal, id, "unhandled statement kind in checkStmt");
+                return false;
+            }
+        }
+    }
+
+    // replace the `self` placeholder with the actual type; only Named /
+    // Pointer / Const nodes are rebuilt; anything else is shared as-is
+    Ty resolveSelfTy(Ty t, Ty selfType)
+    {
+        if (t == 0) return 0;
+        TypeEntry* e = self.ctx.types + t;
+        switch (e->kind.tag)
+        {
+            TypeKind::Named => {
+                if (e->kind.payload.Named.name == self.ctx.intern("self")) return selfType;
+                return t;
+            },
+            TypeKind::Pointer => {
+                Ty base = self.resolveSelfTy(e->kind.payload.Pointer.base, selfType);
+                if (base == e->kind.payload.Pointer.base) return t;
+                return self.allocType(TypeKind::Pointer{ .base = base });
+            },
+            TypeKind::Const => {
+                Ty base = self.resolveSelfTy(e->kind.payload.Const.base, selfType);
+                if (base == e->kind.payload.Const.base) return t;
+                return self.allocType(TypeKind::Const{ .base = base });
+            },
+            else => { return t; }
+        }
+    }
+
+    /* ── function bodies ─────────────────────────────────────────────── */
+
+    /* a `break` that belongs to the loop being analysed; nested loops own
+     * their own breaks, so their bodies are not scanned */
+    bool stmtHasBreak(NodeId id)
+    {
+        if (id.index == 0) return false;
+        Node* n = self.ctx.nodes + id.index;
+        if (n->kind.tag != NodeKind::Stmt) return false;
+        Stmt* st = &n->kind.payload.Stmt.value;
+        if (st->kind.tag == StmtKind::Break) return true;
+        if (st->kind.tag == StmtKind::Block)
+        {
+            u32 i = 0;
+            while (i < st->kind.payload.Block.stmtsLen)
+            {
+                if (self.stmtHasBreak(st->kind.payload.Block.stmts[i])) return true;
+                i++;
+            }
+        }
+        else if (st->kind.tag == StmtKind::If)
+        {
+            if (self.stmtHasBreak(st->kind.payload.If.thenBody)) return true;
+            if (self.stmtHasBreak(st->kind.payload.If.elseBody)) return true;
+        }
+        else if (st->kind.tag == StmtKind::Switch)
+        {
+            u32 i = 0;
+            while (i < st->kind.payload.Switch.casesLen)
+            {
+                if (self.stmtHasBreak(st->kind.payload.Switch.cases[i].body)) return true;
+                i++;
+            }
+        }
+        return false;
+    }
+
+    /* `true` literal condition: `while (true)` */
+    bool exprIsTrueLiteral(NodeId id)
+    {
+        if (id.index == 0) return false;
+        Node* n = self.ctx.nodes + id.index;
+        if (n->kind.tag != NodeKind::Expr) return false;
+        Expr* e = &n->kind.payload.Expr.value;
+        if (e->kind.tag != ExprKind::BoolLit) return false;
+        return (e->kind.payload.BoolLit.flags & 1) != 0;
+    }
+
+    /* conditions that can never become false: `true` or a nonzero integer
+     * literal (`while (1)`, `for (; 1; )`) */
+    bool exprIsInfiniteCond(NodeId id)
+    {
+        if (self.exprIsTrueLiteral(id)) return true;
+        if (id.index == 0) return false;
+        Node* n = self.ctx.nodes + id.index;
+        if (n->kind.tag != NodeKind::Expr) return false;
+        Expr* e = &n->kind.payload.Expr.value;
+        if (e->kind.tag != ExprKind::IntLit) return false;
+        return e->kind.payload.IntLit.value != 0;
+    }
+
+    /* calls that never fall through: @assert(false), @assertOut(false, …),
+     * @panic(…), @unreachable() */
+    bool exprIsNoReturnCall(NodeId id)
+    {
+        if (id.index == 0) return false;
+        Node* n = self.ctx.nodes + id.index;
+        if (n->kind.tag != NodeKind::Expr) return false;
+        Expr* e = &n->kind.payload.Expr.value;
+        if (e->kind.tag != ExprKind::BuiltinCall) return false;
+        Str nm = e->kind.payload.BuiltinCall.name;
+        if (nm == self.ctx.intern("panic") || nm == self.ctx.intern("unreachable")) return true;
+        if (nm != self.ctx.intern("assert") && nm != self.ctx.intern("assertOut")) return false;
+        if (e->kind.payload.BuiltinCall.argsLen == 0) return false;
+        NodeId a = e->kind.payload.BuiltinCall.args[0];
+        if (a.index == 0) return false;
+        Node* an = self.ctx.nodes + a.index;
+        if (an->kind.tag != NodeKind::Expr) return false;
+        Expr* ae = &an->kind.payload.Expr.value;
+        if (ae->kind.tag != ExprKind::BoolLit) return false;
+        return (ae->kind.payload.BoolLit.flags & 1) == 0;
+    }
+
+    /* T0011 support: only the obvious shapes count as "always returns" —
+     * a `return`, a block whose last statement does, an if/else with both
+     * arms doing so, a switch with a `default` whose cases all do, a
+     * break-less `loop`/`while (true)`, a trailing noreturn builtin, and
+     * a comptime block (its arms either return or fail compilation). */
+    bool stmtAlwaysReturns(NodeId id)
+    {
+        if (id.index == 0) return false;
+        Node* n = self.ctx.nodes + id.index;
+        if (n->kind.tag != NodeKind::Stmt) return false;
+        Stmt* st = &n->kind.payload.Stmt.value;
+        if (st->kind.tag == StmtKind::Return) return true;
+        if (st->kind.tag == StmtKind::ExprStmt)
+            return self.exprIsNoReturnCall(st->kind.payload.ExprStmt.expr);
+        if (st->kind.tag == StmtKind::Comptime) return true;
+        if (st->kind.tag == StmtKind::Loop)
+            return !self.stmtHasBreak(st->kind.payload.Loop.body);
+        if (st->kind.tag == StmtKind::While)
+        {
+            if (!self.exprIsInfiniteCond(st->kind.payload.While.cond)) return false;
+            return !self.stmtHasBreak(st->kind.payload.While.body);
+        }
+        if (st->kind.tag == StmtKind::For)
+        {
+            /* `for (;;)` has no condition at all (flags bit 1) */
+            bool infinite = (st->kind.payload.For.flags & 2) == 0 ||
+                            self.exprIsInfiniteCond(st->kind.payload.For.cond);
+            if (!infinite) return false;
+            return !self.stmtHasBreak(st->kind.payload.For.body);
+        }
+        if (st->kind.tag == StmtKind::Block)
+        {
+            u32 len = st->kind.payload.Block.stmtsLen;
+            if (len == 0) return false;
+            return self.stmtAlwaysReturns(st->kind.payload.Block.stmts[len - 1]);
+        }
+        if (st->kind.tag == StmtKind::If)
+        {
+            if (st->kind.payload.If.elseBody.index == 0) return false;
+            return self.stmtAlwaysReturns(st->kind.payload.If.thenBody) &&
+                   self.stmtAlwaysReturns(st->kind.payload.If.elseBody);
+        }
+        if (st->kind.tag == StmtKind::Switch)
+        {
+            if (st->kind.payload.Switch.casesLen == 0) return false;
+            bool hasDefault = false;
+            u32 i = 0;
+            while (i < st->kind.payload.Switch.casesLen)
+            {
+                SwitchCase c = st->kind.payload.Switch.cases[i];
+                if ((c.flags & 4) != 0) hasDefault = true;
+                if (!self.stmtAlwaysReturns(c.body)) return false;
+                i++;
+            }
+            return hasDefault;
+        }
+        return false;
+    }
+
+    /* T0012 support: locals are recorded when their declaration is
+     * checked and marked used when an Ident resolves to the same interned
+     * name. Shadowing shares a name, so a use of any local with that name
+     * counts (conservative: never warns spuriously). */
+    void noteLocal(Str name, SourceLoc loc)
+    {
+        if (!self.warnUnused || name == 0) return;
+        InternEntry* ie = self.ctx.interns + name;
+        if (ie->len > 0 && ie->ptr[0] == 95) return; /* `_name` opts out */
+        if (self.unusedLen == self.unusedCap)
+        {
+            u32 cap = self.unusedCap == 0 ? (u32)16 : self.unusedCap * 2;
+            Str* nn = alloc<Str>((usize)cap);
+            SourceLoc* nl = alloc<SourceLoc>((usize)cap);
+            u8* nu = alloc<u8>((usize)cap);
+            u32 i = 0;
+            while (i < self.unusedLen)
+            {
+                nn[i] = self.unusedNames[i];
+                nl[i] = self.unusedLocs[i];
+                nu[i] = self.unusedUsed[i];
+                i++;
+            }
+            if (self.unusedNames != null) dealloc<Str>(self.unusedNames);
+            if (self.unusedLocs != null) dealloc<SourceLoc>(self.unusedLocs);
+            if (self.unusedUsed != null) dealloc<u8>(self.unusedUsed);
+            self.unusedNames = nn;
+            self.unusedLocs = nl;
+            self.unusedUsed = nu;
+            self.unusedCap = cap;
+        }
+        self.unusedNames[self.unusedLen] = name;
+        self.unusedLocs[self.unusedLen] = loc;
+        self.unusedUsed[self.unusedLen] = 0;
+        self.unusedLen++;
+    }
+
+    void markLocalUsed(Str name)
+    {
+        u32 i = 0;
+        while (i < self.unusedLen)
+        {
+            if (self.unusedNames[i] == name) self.unusedUsed[i] = 1;
+            i++;
+        }
+    }
+
+    void reportUnusedLocals(u32 base)
+    {
+        u32 i = base;
+        while (i < self.unusedLen)
+        {
+            if (self.unusedUsed[i] == 0)
+            {
+                String msg = String::new();
+                msg.pushView("unused local '");
+                msg.pushView(self.nameTextView(self.unusedNames[i]));
+                msg.pushView("'");
+                self.semaWarn(ErrorCode::SemaUnusedVar, self.unusedLocs[i], msg.asView());
+            }
+            i++;
+        }
+        self.unusedLen = base;
+    }
+
+    /* check one function body. scope layout, in order: generic params, the
+     * implicit self pointer (when checking a method), then real params, then
+     * the body. currentReturnType is parked here for Return statements and
+     * cleared on the way out; checkFunction does not nest. */
+    bool checkFunction(Decl* decl, Ty selfType)
+    {
+        bool prevNoDropAll = self.fileNoDropAll;
+        self.fileNoDropAll = self.declHasAttr(decl, self.ctx.intern("no_drop_all"));
+        self.scopes.enter();
+        bool ok = true;
+        u32 genericIndex = 0;
+        while (genericIndex < decl->kind.payload.Func.genericParamsLen)
+        {
+            NodeId genericId = decl->kind.payload.Func.genericParams[genericIndex];
+            Node* genericNode = self.ctx.nodes + genericId.index;
+            if (genericNode->kind.tag == NodeKind::GenericParam)
+            {
+                GenericParam* generic = &genericNode->kind.payload.GenericParam.value;
+                Ty typeNode = self.typeParamType(generic->name, genericIndex);
+                if (!self.scopes.declare(generic->name, 4, typeNode, genericId, 0, 0))
+                {
+                    if (self.scopes.lastDeclFail == 1)
+                        self.dupDeclDiagKind(generic->name, genericId, "duplicate generic parameter `");
+                    ok = false;
+                }
+            }
+            genericIndex++;
+        }
+        u32 i = 0;
+        bool hasSelfParam = false;
+        while (i < decl->kind.payload.Func.paramsLen)
+        {
+            NodeId paramId = decl->kind.payload.Func.params[i];
+            Node* paramNode = self.ctx.nodes + paramId.index;
+            if (paramNode->kind.tag == NodeKind::Param)
+            {
+                Param* param = &paramNode->kind.payload.Param.value;
+                if ((param->flags & 1) != 0) hasSelfParam = true;
+            }
+            i++;
+        }
+        if (selfType != 0 && !hasSelfParam) {
+            Str selfStr = self.ctx.intern("self");
+            /* self is a pointer in the C implementation: declare it as one
+             * so member access emits `self->field` */
+            Ty selfPtr = self.allocType(TypeKind::Pointer{ .base = selfType });
+            self.scopes.declare(selfStr, 1, selfPtr, decl->kind.payload.Func.body, 0, 0);
+        }
+        i = 0;
+        while (i < decl->kind.payload.Func.paramsLen)
+        {
+            NodeId paramId = decl->kind.payload.Func.params[i];
+            Node* paramNode = self.ctx.nodes + paramId.index;
+            if (paramNode->kind.tag == NodeKind::Param)
+            {
+                Param* param = &paramNode->kind.payload.Param.value;
+                if (param->name != 0) {
+                    if ((param->flags & 8) != 0) {
+                        // bit 8 = unnamed type-only param: acts as a generic
+                        // type parameter (`T`), index = param position
+                        Ty typeNode = self.typeParamType(param->name, i);
+                        if (!self.scopes.declare(param->name, 4, typeNode, paramId, 0, 0))
+                        {
+                            if (self.scopes.lastDeclFail == 1)
+                                self.dupDeclDiagKind(param->name, paramId, "duplicate parameter `");
+                            ok = false;
+                        }
+                    } else if ((param->flags & 1) != 0) {
+                        // bit 1 = the `self` receiver (explicit `self`,
+                        // `self*`, `const self*` all end up here)
+                        Ty selfTy = param->typeNode;
+                        if (selfTy == 0) selfTy = selfType;
+                        else selfTy = self.resolveSelfTy(selfTy, selfType);
+                        /* self binds as a pointer in the C implementation;
+                         * an explicit value-spelled receiver (`self`,
+                         * `const self`) wraps too, so member access emits
+                         * `self->field` against the `T*` parameter */
+                        if (selfTy != 0 && selfType != 0)
+                        {
+                            Ty probe = selfTy;
+                            while (probe != 0 && ((self.ctx.types + probe)->kind.tag == TypeKind::Const ||
+                                                  (self.ctx.types + probe)->kind.tag == TypeKind::Comptime))
+                            {
+                                if ((self.ctx.types + probe)->kind.tag == TypeKind::Const) probe = (self.ctx.types + probe)->kind.payload.Const.base;
+                                else probe = (self.ctx.types + probe)->kind.payload.Comptime.base;
+                            }
+                            if (probe != 0 && (self.ctx.types + probe)->kind.tag != TypeKind::Pointer)
+                                selfTy = self.allocType(TypeKind::Pointer{ .base = selfTy });
+                        }
+                        if (!self.scopes.declare(param->name, 1, selfTy, paramId, 0, 0))
+                        {
+                            if (self.scopes.lastDeclFail == 1)
+                                self.dupDeclDiagKind(param->name, paramId, "duplicate parameter `");
+                            ok = false;
+                        }
+                    } else {
+                        if (!self.scopes.declare(param->name, 1, param->typeNode, paramId, 0, 0))
+                        {
+                            if (self.scopes.lastDeclFail == 1)
+                                self.dupDeclDiagKind(param->name, paramId, "duplicate parameter `");
+                            ok = false;
+                        }
+                    }
+                }
+                if ((param->flags & 1) == 0 && !self.checkType(param->typeNode)) ok = false;
+            }
+            i++;
+        }
+        /* a comptime generic parameter must have a matching comptime
+         * block somewhere in this function's body (the compiler is
+         * expected to auto-deduce the parameter's value from it) */
+        bool needsComptimeBlock = false;
+        u32 ci = 0;
+        while (ci < decl->kind.payload.Func.genericParamsLen)
+        {
+            NodeId gId = decl->kind.payload.Func.genericParams[ci];
+            Node* gNode = self.ctx.nodes + gId.index;
+            if (gNode->kind.tag == NodeKind::GenericParam && (gNode->kind.payload.GenericParam.value.flags & 1) != 0)
+                needsComptimeBlock = true;
+            ci++;
+        }
+        if (needsComptimeBlock && decl->kind.payload.Func.body.index != 0)
+        {
+            Node* bNode = self.ctx.nodes + decl->kind.payload.Func.body.index;
+            bool found = false;
+            if (bNode->kind.tag == NodeKind::Stmt &&
+                bNode->kind.payload.Stmt.value.kind.tag == StmtKind::Block)
+            {
+                Stmt* blk = &bNode->kind.payload.Stmt.value;
+                u32 bi = 0;
+                while (bi < blk->kind.payload.Block.stmtsLen)
+                {
+                    Node* inner = self.ctx.nodes + blk->kind.payload.Block.stmts[bi].index;
+                    if (inner->kind.tag == NodeKind::Stmt &&
+                        inner->kind.payload.Stmt.value.kind.tag == StmtKind::Comptime)
+                        found = true;
+                    bi++;
+                }
+            }
+            else if (bNode->kind.tag == NodeKind::Stmt &&
+                     bNode->kind.payload.Stmt.value.kind.tag == StmtKind::Comptime)
+                found = true;
+            if (!found)
+                self.semaErrorNode(ErrorCode::SemaTypeMismatch, decl->kind.payload.Func.body, "function with a comptime generic parameter needs a comptime {} block in its body");
+        }
+        if (!self.checkType(decl->kind.payload.Func.returnType)) ok = false;
+        self.currentReturnType = decl->kind.payload.Func.returnType;
+        u32 unusedBase = self.unusedLen;
+        if (!self.checkStmt(decl->kind.payload.Func.body)) ok = false;
+        if (decl->kind.payload.Func.body.index != 0) self.reportUnusedLocals(unusedBase);
+        /* T0011: a non-void function must not fall off the closing brace */
+        Ty retTy = decl->kind.payload.Func.returnType;
+        if (decl->kind.payload.Func.body.index != 0 && retTy != 0)
+        {
+            Ty probe = retTy;
+            while (probe != 0 && ((self.ctx.types + probe)->kind.tag == TypeKind::Const ||
+                                  (self.ctx.types + probe)->kind.tag == TypeKind::Comptime))
+            {
+                if ((self.ctx.types + probe)->kind.tag == TypeKind::Const)
+                    probe = (self.ctx.types + probe)->kind.payload.Const.base;
+                else probe = (self.ctx.types + probe)->kind.payload.Comptime.base;
+            }
+            if (probe != 0 && (self.ctx.types + probe)->kind.tag != TypeKind::Void &&
+                !self.stmtAlwaysReturns(decl->kind.payload.Func.body))
+            {
+                SourceLoc loc = decl->loc;
+                if (loc.data == 0) loc = decl->nameLoc;
+                self.semaError(ErrorCode::SemaMissingReturn, loc,
+                    "non-void function can reach the end without returning a value");
+            }
+        }
+        self.currentReturnType = 0; // no nesting; nothing to restore to
+        self.scopes.leave();
+        self.fileNoDropAll = prevNoDropAll;
+        return ok;
+    }
+
+    /* ── attributes ──────────────────────────────────────────────────── */
+
+    bool attrListHas(Attribute* attrs, u32 attrsLen, Str name)
+    {
+        if (attrs == null || name == 0) return false;
+        u32 i = 0;
+        while (i < attrsLen)
+        {
+            if (attrs[i].name == name) return true;
+            i++;
+        }
+        return false;
+    }
+
+    bool declHasAttr(Decl* decl, Str name)
+    {
+        if (decl == null) return false;
+        return self.attrListHas(decl->attrs, decl->attrsLen, name);
+    }
+
+    bool stmtHasAttr(Stmt* stmt, Str name)
+    {
+        if (stmt == null) return false;
+        return self.attrListHas(stmt->attrs, stmt->attrsLen, name);
+    }
+
+    /* a `drop` method is only an RAII hook when it is `void drop()`: the
+     * self receiver and nothing else. extend methods omit self from the
+     * param list (paramsLen 0); struct-body methods may spell it */
+    bool dropMethodIsValid(NodeId declId)
+    {
+        if (declId.index == 0) return false;
+        Node* n = self.ctx.nodes + declId.index;
+        if (n->kind.tag != NodeKind::Decl) return false;
+        Decl* d = &n->kind.payload.Decl.value;
+        if (d->kind.tag != DeclKind::Func) return false;
+        if (d->kind.payload.Func.paramsLen == 0) return true;
+        if (d->kind.payload.Func.paramsLen != 1) return false;
+        Node* pn = self.ctx.nodes + d->kind.payload.Func.params[0].index;
+        if (pn->kind.tag != NodeKind::Param) return false;
+        return (pn->kind.payload.Param.value.flags & 1) != 0;
+    }
+
+    /* declares the fields bound by a variant pattern (`Some { value }`)
+     * in the case scope, typed against the scrutinee's variant decl.
+     * the caller owns the scope (Switch enters it per case); unknown fields
+     * are reported but the remaining fields still bind. */
+    bool declarePatternBindings(NodeId patId, Ty scrutTy)
+    {
+        if (patId.index == 0) return true;
+        Node* n = self.ctx.nodes + patId.index;
+        if (n.kind.tag != NodeKind::Pat) return true;
+        Pat* p = &n.kind.payload.Pat.value;
+        if (p->kind.tag != PatKind::Variant) return true;
+        Ty base = self.stripType(scrutTy);
+        if (base == 0) return true;
+        TypeEntry* te = self.ctx.types + base;
+        if (te->kind.tag != TypeKind::Named) return true;
+        Symbol* symbol = self.lookupType(te->kind.payload.Named.name, te->loc);
+        if (symbol == null || symbol->declaration.index == 0) return true;
+        Node* dn = self.ctx.nodes + symbol->declaration.index;
+        if (dn->kind.tag != NodeKind::Decl) return true;
+        Decl* decl = &dn->kind.payload.Decl.value;
+        if (decl->kind.tag != DeclKind::Variant) return true;
+        VariantVariant* vv = null;
+        u32 v = 0;
+        while (v < decl->kind.payload.Variant.variantsLen)
+        {
+            if (decl->kind.payload.Variant.variants[v].name == p->kind.payload.Variant.variantName)
+            {
+                vv = decl->kind.payload.Variant.variants + v;
+                break;
+            }
+            v++;
+        }
+        if (vv == null)
+        {
+            self.semaErrorNode(ErrorCode::SemaUnknownMember, patId, "unknown variant in pattern");
+            return false;
+        }
+        bool ok = true;
+        u32 f = 0;
+        while (f < p->kind.payload.Variant.fieldNamesLen)
+        {
+            Str fieldName = p->kind.payload.Variant.fieldNames[f];
+            Ty ft = 0;
+            u32 k = 0;
+            while (k < vv->fieldsLen)
+            {
+                if (vv->fieldNames[k] == fieldName)
+                {
+                    ft = vv->fieldTypes[k];
+                    break;
+                }
+                k++;
+            }
+            if (ft == 0)
+            {
+                self.semaErrorNode(ErrorCode::SemaUnknownMember, patId, "unknown field in pattern");
+                ok = false;
+            }
+            else
+            {
+                Ty boundTy = self.substituteFieldTy(ft, scrutTy);
+                if (!self.scopes.declare(fieldName, 1, boundTy, patId, 0, 0)) ok = false;
+            }
+            f++;
+        }
+        return ok;
+    }
+}

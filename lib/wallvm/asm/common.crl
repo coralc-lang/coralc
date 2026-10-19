@@ -1,0 +1,853 @@
+#[[no_drop_all]]
+// Shared assembler front end: AT&T text lexer/parser to a target-neutral
+// operand model, plus the inline-asm constraint parser. One line in, one
+// AsmLine out; per-target encoders consume AsmLine. Structure follows the
+// standard scanner/parser split every assembler uses (NASM stdscan+
+// parse_line, LLVM lexer+AsmParser): this file knows AT&T syntax tokens
+// and operand shapes, nothing about opcodes.
+import(lib) core::char_util { isDigit, isAlpha, isAlnum, isSpace, isHexDigit, digitValue, toLower };
+import(lib) core::cchar { cchar };
+import(lib) platform::libc { malloc, free };
+
+pub enum AsmOpKind
+{
+    Reg,      // %rax — name holds "rax"
+    Imm,      // $5, $0x10 — imm holds the value
+    Mem,      // disp(%base,%index,scale), rip-relative, bare (,%rax,4)
+    Rel       // branch displacement: .+N / .-N / absolute number
+}
+
+pub struct AsmOperand
+{
+    AsmOpKind kind;
+    str text;      // register name without %, or label for future use
+    i64 imm;       // immediate or relative displacement value
+    str base;      // mem: base register without %
+    str index;     // mem: index register without %
+    u32 scale;     // mem: 1, 2, 4, 8
+    i64 disp;      // mem: displacement
+    bool hasDisp;
+    bool rip;      // mem: rip-relative
+    str sym;       // symbolic displacement/immediate: "sym" or "sym@PLT"
+    bool hasSym;
+    str mask;      // AVX-512 opmask register name without % ("k1"), empty = none
+    bool maskZero; // {%k1}{z} zeroing mask
+    bool indirect; // '*' marker: call *%rax / call *foo — memory-indirect
+    u8 seg;        // %fs: override prefix byte: 0 none, else 26/2E/36/3E/64/65
+}
+
+pub struct AsmLine
+{
+    str mnem;            // full mnemonic text, suffix included ("movl")
+    AsmOperand ops[4];
+    u32 nops;
+    u32 lineNo;
+    bool isDirective;    // .globl and friends, no encoding work
+    bool isEmpty;
+    str label;           // label defined on this line, empty if none
+    bool hasLabel;
+    str dargs;           // directive: raw argument text after the name
+    // instruction prefixes captured instead of discarded: lock F0,
+    // rep/repz F3, repne F2, data16 66, data32/addr32 67
+    bool pfxLock;
+    bool pfxRep;
+    bool pfxRepne;
+    bool pfxData16;
+    bool pfxData32;
+    bool pfxAddr32;
+}
+
+pub struct AsmParseError
+{
+    str msg;
+    u32 lineNo;
+}
+
+pub AsmOperand asmOperandEmpty()
+{
+    return AsmOperand {
+        .kind = AsmOpKind::Imm,
+        .text = str::empty(),
+        .imm = 0,
+        .base = str::empty(),
+        .index = str::empty(),
+        .scale = 1,
+        .disp = 0,
+        .hasDisp = false,
+        .rip = false,
+        .sym = str::empty(),
+        .hasSym = false,
+        .mask = str::empty(),
+        .maskZero = false,
+        .indirect = false,
+        .seg = 0
+    };
+}
+
+// Cursor over one source line. AT&T: %reg, $imm, disp(base,index,scale),
+// comments run from # or // to end of line, labels end with ':'.
+pub struct AsmLexer
+{
+    str src;
+    usize pos;
+    u32 lineNo;
+
+    AsmLexer new(str src, u32 lineNo)
+    {
+        return AsmLexer { .src = src, .pos = 0, .lineNo = lineNo };
+    }
+
+    bool done() { return self.pos >= self.src.len; }
+
+    u8 peek()
+    {
+        if (self.pos >= self.src.len) return 0;
+        return self.src.ptr[self.pos];
+    }
+
+    u8 peekAt(usize off)
+    {
+        if (self.pos + off >= self.src.len) return 0;
+        return self.src.ptr[self.pos + off];
+    }
+
+    void skipSpace()
+    {
+        while (self.pos < self.src.len && isSpace(self.src.ptr[self.pos])) self.pos++;
+        // comment to end of line
+        if (self.pos < self.src.len && self.src.ptr[self.pos] == (u8)'#') self.pos = self.src.len;
+        else if (self.pos + 1 < self.src.len && self.src.ptr[self.pos] == (u8)'/' &&
+                 self.src.ptr[self.pos + 1] == (u8)'/') self.pos = self.src.len;
+    }
+
+    bool eat(u8 c)
+    {
+        self.skipSpace();
+        if (self.pos < self.src.len && self.src.ptr[self.pos] == c) { self.pos++; return true; }
+        return false;
+    }
+
+    // identifier-like run: letters, digits, _, ., $ (for @PLT-style tails
+    // we stop at @ separately). Used for mnemonics, registers, labels.
+    str lexIdent()
+    {
+        self.skipSpace();
+        usize start = self.pos;
+        while (self.pos < self.src.len)
+        {
+            u8 c = self.src.ptr[self.pos];
+            if (isAlnum(c) || c == (u8)'_' || c == (u8)'.' || c == (u8)'$') self.pos++;
+            else break;
+        }
+        if (start == self.pos) return str::empty();
+        return str::fromParts(self.src.ptr + start, self.pos - start);
+    }
+
+    // signed integer: 0x hex, 0b binary, leading-0 octal, or decimal
+    // (GAS: 010 = 8, 0b1010 = 10, bare 0 = 0; 0x/0b need at least one
+    // digit and 08-style mixes are rejected)
+    bool lexNumber(i64* out)
+    {
+        self.skipSpace();
+        bool neg = false;
+        if (self.pos < self.src.len && (self.src.ptr[self.pos] == (u8)'-' || self.src.ptr[self.pos] == (u8)'+'))
+        {
+            neg = self.src.ptr[self.pos] == (u8)'-';
+            self.pos++;
+        }
+        if (self.pos >= self.src.len || !isDigit(self.src.ptr[self.pos])) return false;
+        u64 v = 0;
+        if (self.src.ptr[self.pos] == (u8)'0' && self.pos + 1 < self.src.len &&
+            (self.src.ptr[self.pos + 1] == (u8)'x' || self.src.ptr[self.pos + 1] == (u8)'X'))
+        {
+            self.pos += 2;
+            if (self.pos >= self.src.len || !isHexDigit(self.src.ptr[self.pos])) return false;
+            while (self.pos < self.src.len && isHexDigit(self.src.ptr[self.pos]))
+            {
+                v = v * 16 + (u64)digitValue(self.src.ptr[self.pos]);
+                self.pos++;
+            }
+        }
+        else if (self.src.ptr[self.pos] == (u8)'0' && self.pos + 1 < self.src.len &&
+                 (self.src.ptr[self.pos + 1] == (u8)'b' || self.src.ptr[self.pos + 1] == (u8)'B'))
+        {
+            self.pos += 2;
+            if (self.pos >= self.src.len ||
+                (self.src.ptr[self.pos] != (u8)'0' && self.src.ptr[self.pos] != (u8)'1')) return false;
+            while (self.pos < self.src.len &&
+                   (self.src.ptr[self.pos] == (u8)'0' || self.src.ptr[self.pos] == (u8)'1'))
+            {
+                v = v * 2 + (u64)(self.src.ptr[self.pos] - (u8)'0');
+                self.pos++;
+            }
+        }
+        else if (self.src.ptr[self.pos] == (u8)'0')
+        {
+            // leading zero: octal — digits must be 0-7 (a bare "0" alone
+            // is just zero); 08/09 mixes are invalid like in GAS
+            self.pos++;
+            if (self.pos < self.src.len && isDigit(self.src.ptr[self.pos]) &&
+                self.src.ptr[self.pos] > (u8)'7') return false;
+            while (self.pos < self.src.len &&
+                   self.src.ptr[self.pos] >= (u8)'0' && self.src.ptr[self.pos] <= (u8)'7')
+            {
+                v = v * 8 + (u64)(self.src.ptr[self.pos] - (u8)'0');
+                self.pos++;
+            }
+        }
+        else
+        {
+            while (self.pos < self.src.len && isDigit(self.src.ptr[self.pos]))
+            {
+                v = v * 10 + (u64)digitValue(self.src.ptr[self.pos]);
+                self.pos++;
+            }
+        }
+        *out = neg ? -(i64)v : (i64)v;
+        return true;
+    }
+
+    // character literal: 'a' with C escapes (\n \t \r \0 \a \b \f \v
+    // \\ \' \" \xHH and 1-3 digit octal) → the decoded byte
+    bool lexChar(i64* out)
+    {
+        self.skipSpace();
+        if (self.pos >= self.src.len || self.src.ptr[self.pos] != (u8)'\'') return false;
+        self.pos++;
+        if (self.pos >= self.src.len) return false;
+        u8 c = self.src.ptr[self.pos];
+        u8 v = c;
+        if (c == (u8)'\\')
+        {
+            self.pos++;
+            if (self.pos >= self.src.len) return false;
+            u8 e = self.src.ptr[self.pos];
+            self.pos++;
+            v = e;
+            if (e == (u8)'n') v = (u8)'\n';
+            else if (e == (u8)'t') v = (u8)'\t';
+            else if (e == (u8)'r') v = (u8)'\r';
+            else if (e == (u8)'0') v = 0;
+            else if (e == (u8)'a') v = 7;
+            else if (e == (u8)'b') v = 8;
+            else if (e == (u8)'f') v = 12;
+            else if (e == (u8)'v') v = 11;
+            else if (e == (u8)'x')
+            {
+                u32 hv = 0;
+                u32 nd = 0;
+                while (nd < 2 && self.pos < self.src.len && isHexDigit(self.src.ptr[self.pos]))
+                {
+                    hv = hv * 16 + (u32)digitValue(self.src.ptr[self.pos]);
+                    self.pos++;
+                    nd++;
+                }
+                if (nd == 0) return false;
+                v = (u8)hv;
+            }
+            else if (e >= (u8)'0' && e <= (u8)'7')
+            {
+                u32 ov = (u32)(e - (u8)'0');
+                u32 nd = 1;
+                while (nd < 3 && self.pos < self.src.len &&
+                       self.src.ptr[self.pos] >= (u8)'0' && self.src.ptr[self.pos] <= (u8)'7')
+                {
+                    ov = ov * 8 + (u32)(self.src.ptr[self.pos] - (u8)'0');
+                    self.pos++;
+                    nd++;
+                }
+                v = (u8)ov;
+            }
+        }
+        else if (c == (u8)'\'')
+        {
+            return false; // '' has no value
+        }
+        else
+        {
+            self.pos++;
+        }
+        if (self.pos >= self.src.len || self.src.ptr[self.pos] != (u8)'\'') return false;
+        self.pos++;
+        *out = (i64)v;
+        return true;
+    }
+
+    // quoted string literal: "..." with C escapes (\n \t \r \0 \\ \" \a
+    // \b \f \v \xHH and 1-3 digit octal). Returns the decoded bytes as a
+    // malloc'd str (no trailing NUL); the caller frees. Unquoted input or
+    // an unterminated literal sets err and returns false.
+    bool lexQuoted(str* out, AsmParseError* err)
+    {
+        self.skipSpace();
+        if (self.pos >= self.src.len || self.src.ptr[self.pos] != (u8)'"')
+        {
+            err.msg = "expected string literal";
+            err.lineNo = self.lineNo;
+            return false;
+        }
+        self.pos++;
+        usize cap = self.src.len - self.pos;
+        u8* buf = (u8*)malloc(cap > 0 ? cap : 1);
+        if (buf == null)
+        {
+            err.msg = "out of memory";
+            err.lineNo = self.lineNo;
+            return false;
+        }
+        usize n = 0;
+        while (self.pos < self.src.len)
+        {
+            u8 c = self.src.ptr[self.pos];
+            if (c == (u8)'"')
+            {
+                self.pos++;
+                *out = str::fromParts(buf, n);
+                return true;
+            }
+            if (c == (u8)'\\')
+            {
+                self.pos++;
+                if (self.pos >= self.src.len) break;
+                u8 e = self.src.ptr[self.pos];
+                self.pos++;
+                u8 v = e;
+                if (e == (u8)'n') v = (u8)'\n';
+                else if (e == (u8)'t') v = (u8)'\t';
+                else if (e == (u8)'r') v = (u8)'\r';
+                else if (e == (u8)'0') v = 0;
+                else if (e == (u8)'a') v = 7;
+                else if (e == (u8)'b') v = 8;
+                else if (e == (u8)'f') v = 12;
+                else if (e == (u8)'v') v = 11;
+                else if (e == (u8)'x')
+                {
+                    u32 hv = 0;
+                    u32 nd = 0;
+                    while (nd < 2 && self.pos < self.src.len && isHexDigit(self.src.ptr[self.pos]))
+                    {
+                        hv = hv * 16 + (u32)digitValue(self.src.ptr[self.pos]);
+                        self.pos++;
+                        nd++;
+                    }
+                    v = (u8)hv;
+                }
+                else if (e >= (u8)'0' && e <= (u8)'7')
+                {
+                    u32 ov = (u32)(e - (u8)'0');
+                    u32 nd = 1;
+                    while (nd < 3 && self.pos < self.src.len &&
+                           self.src.ptr[self.pos] >= (u8)'0' && self.src.ptr[self.pos] <= (u8)'7')
+                    {
+                        ov = ov * 8 + (u32)(self.src.ptr[self.pos] - (u8)'0');
+                        self.pos++;
+                        nd++;
+                    }
+                    v = (u8)ov;
+                }
+                buf[n++] = v;
+                continue;
+            }
+            buf[n++] = c;
+            self.pos++;
+        }
+        free(buf);
+        err.msg = "unterminated string";
+        err.lineNo = self.lineNo;
+        return false;
+    }
+}
+
+// AVX-512 opmask tail after an operand: {%k1} or {%k1}{z}
+bool parseMask(AsmLexer* lx, AsmOperand* out, AsmParseError* err)
+{
+    lx.skipSpace();
+    if (lx.done() || lx.peek() != (u8)'{') return true;
+    lx.pos++;
+    lx.skipSpace();
+    if (!lx.done() && lx.peek() == (u8)'%') lx.pos++;
+    str mname = lx.lexIdent();
+    if (mname.isEmpty()) { err.msg = "empty opmask"; err.lineNo = lx.lineNo; return false; }
+    out.mask = mname;
+    lx.skipSpace();
+    if (!lx.eat((u8)'}'))
+    {
+        err.msg = "missing '}' in opmask";
+        err.lineNo = lx.lineNo;
+        return false;
+    }
+    lx.skipSpace();
+    if (!lx.done() && lx.peek() == (u8)'{')
+    {
+        lx.pos++;
+        lx.skipSpace();
+        if (!lx.eat((u8)'z'))
+        {
+            err.msg = "only {z} may follow an opmask";
+            err.lineNo = lx.lineNo;
+            return false;
+        }
+        out.maskZero = true;
+        lx.skipSpace();
+        if (!lx.eat((u8)'}'))
+        {
+            err.msg = "missing '}' after {z}";
+            err.lineNo = lx.lineNo;
+            return false;
+        }
+    }
+    return true;
+}
+
+// inside parens: base, index, scale — shared by the disp- and symbol-led
+// memory paths
+bool parseMemParens(AsmLexer* lx, AsmOperand* out, AsmParseError* err)
+{
+    lx.pos++; // consume '('
+    out.kind = AsmOpKind::Mem;
+    out.scale = 1;
+
+    lx.skipSpace();
+    if (!lx.done() && lx.peek() == (u8)'%')
+    {
+        lx.pos++;
+        str name = lx.lexIdent();
+        if (name.isEmpty()) { err.msg = "empty register in mem operand"; err.lineNo = lx.lineNo; return false; }
+        if (name.equals("rip")) out.rip = true;
+        else out.base = name;
+    }
+
+    if (lx.eat((u8)','))
+    {
+        lx.skipSpace();
+        if (!lx.done() && lx.peek() == (u8)'%')
+        {
+            lx.pos++;
+            str name = lx.lexIdent();
+            if (name.isEmpty()) { err.msg = "empty index register"; err.lineNo = lx.lineNo; return false; }
+            out.index = name;
+            if (lx.eat((u8)','))
+            {
+                i64 sc = 1;
+                if (!lx.lexNumber(&sc) || (sc != 1 && sc != 2 && sc != 4 && sc != 8))
+                {
+                    err.msg = "bad scale, want 1/2/4/8"; err.lineNo = lx.lineNo; return false;
+                }
+                out.scale = (u32)sc;
+            }
+        }
+    }
+
+    if (!lx.eat((u8)')'))
+    {
+        err.msg = "missing ')' in memory operand"; err.lineNo = lx.lineNo; return false;
+    }
+    return true;
+}
+
+// AT&T segment override prefix byte for %es:/%cs:/%ss:/%ds:/%fs:/%gs:;
+// 0 when the name is not a segment register. Kept as a raw byte so the
+// encoder can emit it ahead of REX without target knowledge here.
+u8 segPrefixByte(str name)
+{
+    if (name.equals("es")) return 0x26;
+    if (name.equals("cs")) return 0x2E;
+    if (name.equals("ss")) return 0x36;
+    if (name.equals("ds")) return 0x3E;
+    if (name.equals("fs")) return 0x64;
+    if (name.equals("gs")) return 0x65;
+    return 0;
+}
+
+// Parse one AT&T operand at the cursor. Memory: disp?( base? , index? , scale )?
+// with rip spelled (%rip). Registers keep the name without the %.
+bool parseAttOperand(AsmLexer* lx, AsmOperand* out, AsmParseError* err)
+{
+    lx.skipSpace();
+    // indirect call/jmp marker: call *%rax, jmp *(%rdi), call *foo — the
+    // '*' selects FF /2,/4 (or an absolute-memory form) over the direct
+    // E8/E9 relative encoding, so it must survive parsing
+    if (!lx.done() && lx.peek() == (u8)'*')
+    {
+        lx.pos++;
+        out.indirect = true;
+    }
+    lx.skipSpace();
+    if (lx.done()) { err.msg = "missing operand"; err.lineNo = lx.lineNo; return false; }
+
+    u8 c = lx.peek();
+
+    // register
+    if (c == (u8)'%')
+    {
+        lx.pos++;
+        str name = lx.lexIdent();
+        if (name.isEmpty()) { err.msg = "empty register name"; err.lineNo = lx.lineNo; return false; }
+        // segment override %fs:0x10 / %gs:foo(%rip): record the prefix
+        // byte, then parse the memory operand after the colon
+        u8 sbyte = segPrefixByte(name);
+        if (sbyte != 0 && lx.eat((u8)':'))
+        {
+            out.seg = sbyte;
+            return parseAttOperand(lx, out, err);
+        }
+        out.kind = AsmOpKind::Reg;
+        out.text = name;
+        return parseMask(lx, out, err);
+    }
+
+    // immediate
+    if (c == (u8)'$')
+    {
+        lx.pos++;
+        // allow a bare identifier as an address immediate (symbol ref);
+        // a leading '.' makes GAS local labels ($.L4) legal — but '.' +/-
+        // stays the current-location expression, not a symbol name
+        lx.skipSpace();
+        if (!lx.done() && (isAlpha(lx.peek()) || lx.peek() == (u8)'_' ||
+            (lx.peek() == (u8)'.' && lx.peekAt(1) != (u8)'+' && lx.peekAt(1) != (u8)'-')))
+        {
+            str name = lx.lexIdent();
+            if (lx.peek() == (u8)'@')
+            {
+                usize ts = lx.pos + 1;
+                lx.pos++;
+                str tail = lx.lexIdent();
+                // foo@PLT is one contiguous run in the source line: slice it
+                // in place — no allocation, nothing to free. A gap
+                // (foo@ PLT) keeps the bare name; reloc writers strip @
+                // tails anyway.
+                if (tail.len == 0 || tail.ptr == lx.src.ptr + ts)
+                {
+                    name = str::fromParts(name.ptr, name.len + 1 + tail.len);
+                }
+            }
+            // $sym+N / $sym-N: the addend rides in imm for emitImmOrSym's
+            // Abs32/Abs64 reloc
+            i64 add = 0;
+            lx.skipSpace();
+            if (!lx.done() && (lx.peek() == (u8)'+' || lx.peek() == (u8)'-'))
+            {
+                if (!lx.lexNumber(&add)) { err.msg = "bad symbol addend"; err.lineNo = lx.lineNo; return false; }
+            }
+            // $foo+4@PLT: the suffix sits past an addend — consume and drop
+            // it (it can't join the contiguous name slice)
+            lx.skipSpace();
+            if (lx.peek() == (u8)'@')
+            {
+                lx.pos++;
+                lx.lexIdent();
+            }
+            out.kind = AsmOpKind::Imm;
+            out.text = name;
+            out.sym = name;
+            out.hasSym = true;
+            out.imm = add;
+            return true;
+        }
+        // char literal: movb $'a', %al → imm 0x61
+        if (!lx.done() && lx.peek() == (u8)'\'')
+        {
+            i64 cv = 0;
+            if (!lx.lexChar(&cv)) { err.msg = "bad character literal"; err.lineNo = lx.lineNo; return false; }
+            out.kind = AsmOpKind::Imm;
+            out.imm = cv;
+            return true;
+        }
+        i64 v = 0;
+        if (!lx.lexNumber(&v)) { err.msg = "bad immediate"; err.lineNo = lx.lineNo; return false; }
+        out.kind = AsmOpKind::Imm;
+        out.imm = v;
+        return true;
+    }
+
+    // memory or relative branch: starts with disp, (, or .
+    // relative: .+N / .-N — a dot followed by sign
+    if (c == (u8)'.' && (lx.peekAt(1) == (u8)'+' || lx.peekAt(1) == (u8)'-'))
+    {
+        lx.pos++;
+        i64 v = 0;
+        if (!lx.lexNumber(&v)) { err.msg = "bad relative displacement"; err.lineNo = lx.lineNo; return false; }
+        out.kind = AsmOpKind::Rel;
+        out.imm = v;
+        return true;
+    }
+
+    // memory operand: optional displacement, optional symbol+disp, then '('
+    bool sawDisp = false;
+    i64 disp = 0;
+    if (c == (u8)'(' || isDigit(c) || c == (u8)'-' || c == (u8)'+')
+    {
+        if (c != (u8)'(')
+        {
+            if (!lx.lexNumber(&disp)) { err.msg = "bad displacement"; err.lineNo = lx.lineNo; return false; }
+            sawDisp = true;
+        }
+        lx.skipSpace();
+        if (lx.done() || lx.peek() != (u8)'(')
+        {
+            // bare number without parens is a relative branch target
+            out.kind = AsmOpKind::Rel;
+            out.imm = disp;
+            return true;
+        }
+    }
+    else if (isAlpha(c) || c == (u8)'_' || c == (u8)'.')
+    {
+        // symbol: ident [+- number]? ( … ) as a memory displacement, or a
+        // bare ident as a label reference; a leading '.' is a GAS local
+        // label (.L4) — the '.'+sign relative form returned above
+        str name = lx.lexIdent();
+        if (name.isEmpty()) { err.msg = "bad operand"; err.lineNo = lx.lineNo; return false; }
+        lx.skipSpace();
+        // @PLT tail right after the name: foo@PLT is one contiguous run in
+        // the source line — slice it in place. (A suffix past an addend or
+        // a space can't join the slice and is consumed below instead.)
+        if (lx.peek() == (u8)'@')
+        {
+            usize at = lx.pos;
+            usize ts = lx.pos + 1;
+            lx.pos++;
+            str tail = lx.lexIdent();
+            bool adj = (at == name.ptr + name.len) &&
+                       (tail.len == 0 || tail.ptr == lx.src.ptr + ts);
+            if (adj) name = str::fromParts(name.ptr, name.len + 1 + tail.len);
+        }
+        if (!lx.done() && (lx.peek() == (u8)'+' || lx.peek() == (u8)'-'))
+        {
+            i64 add = 0;
+            if (!lx.lexNumber(&add)) { err.msg = "bad symbol displacement"; err.lineNo = lx.lineNo; return false; }
+            disp = add;
+            sawDisp = true;
+            lx.skipSpace();
+        }
+        // foo+4@PLT: the suffix sits past an addend or space so it cannot
+        // be part of the contiguous name slice — consume and drop it; the
+        // relocs strip @ tails anyway and land on the bare name
+        if (lx.peek() == (u8)'@')
+        {
+            lx.pos++;
+            lx.lexIdent();
+            lx.skipSpace();
+        }
+        if (!lx.done() && lx.peek() == (u8)'(')
+        {
+            out.kind = AsmOpKind::Mem;
+            out.sym = name;
+            out.hasSym = true;
+            out.hasDisp = sawDisp;
+            out.disp = disp;
+            if (!parseMemParens(lx, out, err)) return false;
+            // AVX-512 {%k1}{z} follows memory destinations too
+            return parseMask(lx, out, err);
+        }
+        out.kind = AsmOpKind::Rel;
+        out.text = name;
+        // sym+N/sym-N: the addend rides in imm for the reloc writer
+        out.imm = sawDisp ? disp : 0;
+        return true;
+    }
+
+    // memory operand led by '(' with no displacement
+    if (lx.peek() != (u8)'(')
+    {
+        err.msg = "bad operand";
+        err.lineNo = lx.lineNo;
+        return false;
+    }
+    out.hasDisp = sawDisp;
+    out.disp = disp;
+    if (!parseMemParens(lx, out, err)) return false;
+    // AVX-512 {%k1}{z} follows memory destinations too
+    return parseMask(lx, out, err);
+}
+
+// One AT&T source line → AsmLine. Blank lines, comments, and directives
+// come back flagged; labels are captured; everything else must be
+// mnemonic + <=4 operands.
+bool parseAttLine(str src, u32 lineNo, AsmLine* out, AsmParseError* err)
+{
+    out.mnem = str::empty();
+    out.nops = 0;
+    out.lineNo = lineNo;
+    out.isDirective = false;
+    out.isEmpty = true;
+    out.label = str::empty();
+    out.hasLabel = false;
+    out.dargs = str::empty();
+    out.pfxLock = false;
+    out.pfxRep = false;
+    out.pfxRepne = false;
+    out.pfxData16 = false;
+    out.pfxData32 = false;
+    out.pfxAddr32 = false;
+
+    AsmLexer lx = AsmLexer::new(src, lineNo);
+    lx.skipSpace();
+    if (lx.done()) return true;
+
+    // label definition: ident ':' — captured so unit assembly can bind it
+    usize save = lx.pos;
+    str maybeLabel = lx.lexIdent();
+    lx.skipSpace();
+    if (!maybeLabel.isEmpty() && !lx.done() && lx.peek() == (u8)':')
+    {
+        lx.pos++;
+        out.label = maybeLabel;
+        out.hasLabel = true;
+        lx.skipSpace();
+        if (lx.done()) return true;
+    }
+    else
+    {
+        lx.pos = save;
+    }
+
+    // directives start with '.'
+    if (lx.peek() == (u8)'.')
+    {
+        out.isDirective = true;
+        out.isEmpty = false;
+        str full = lx.lexIdent(); // includes the leading '.'
+        out.mnem = full;
+        lx.skipSpace();
+        if (!lx.done())
+        {
+            out.dargs = str::fromParts(lx.src.ptr + lx.pos, lx.src.len - lx.pos);
+        }
+        return true;
+    }
+
+    // prefix words (lock, rep, repz, repnz, data16, data32, addr32) are
+    // recorded on the line so the encoder can emit them; prefixes must
+    // precede the mnemonic
+    while (!lx.done())
+    {
+        usize before = lx.pos;
+        str w = lx.lexIdent();
+        if (w.equals("lock")) { out.pfxLock = true; continue; }
+        if (w.equals("rep") || w.equals("repz")) { out.pfxRep = true; continue; }
+        if (w.equals("repnz") || w.equals("repne")) { out.pfxRepne = true; continue; }
+        if (w.equals("data16")) { out.pfxData16 = true; continue; }
+        if (w.equals("data32")) { out.pfxData32 = true; continue; }
+        if (w.equals("addr32")) { out.pfxAddr32 = true; continue; }
+        lx.pos = before;
+        break;
+    }
+
+    str mnem = lx.lexIdent();
+    if (mnem.isEmpty()) { err.msg = "expected mnemonic"; err.lineNo = lineNo; return false; }
+    out.mnem = mnem;
+    out.isEmpty = false;
+
+    // first operand follows the mnemonic with no comma; later ones are
+    // comma-separated
+    lx.skipSpace();
+    if (!lx.done())
+    {
+        AsmOperand op = asmOperandEmpty();
+        if (!parseAttOperand(&lx, &op, err)) return false;
+        out.ops[out.nops] = op;
+        out.nops++;
+    }
+    while (true)
+    {
+        lx.skipSpace();
+        if (lx.done() || lx.peek() != (u8)',') break;
+        if (out.nops >= 4) { err.msg = "too many operands"; err.lineNo = lineNo; return false; }
+        lx.pos++;
+        AsmOperand op = asmOperandEmpty();
+        if (!parseAttOperand(&lx, &op, err)) return false;
+        out.ops[out.nops] = op;
+        out.nops++;
+    }
+
+    lx.skipSpace();
+    if (!lx.done())
+    {
+        err.msg = "trailing text after operands";
+        err.lineNo = lineNo;
+        return false;
+    }
+    return true;
+}
+
+// Inline-asm constraint strings: comma-separated entries, each an optional
+// direction marker (=, +, &) then the class letter. Only what the IR path
+// needs to validate operands; encoding stays the encoder's job.
+pub enum AsmConClass
+{
+    ConGeneral,   // r
+    ConImm,       // i
+    ConMem,       // m
+    ConFloat,     // f
+    ConRegName,   // a c d b S D ... — specific register, reg holds it
+    ConUnknown
+}
+
+pub struct AsmConstraint
+{
+    str text;        // the raw entry, kept for diagnostics
+    bool isOut;      // '='
+    bool isInOut;    // '+'
+    bool earlyClobber; // '&'
+    AsmConClass cls;
+    str regName;     // single-letter class as a name, e.g. "a" for =a
+}
+
+// Parse a constraint list into out, returns the count. Returns 0xFFFF on
+// a malformed entry (err gets the reason).
+pub u32 parseConstraints(str text, AsmConstraint* out, u32 max, AsmParseError* err)
+{
+    u32 n = 0;
+    usize i = 0;
+    while (i <= text.len)
+    {
+        usize start = i;
+        while (i < text.len && text.ptr[i] != (u8)',') i++;
+        // slice [start, i)
+        usize a = start;
+        usize b = i;
+        while (a < b && isSpace(text.ptr[a])) a++;
+        while (b > a && isSpace(text.ptr[b - 1])) b--;
+        if (a < b)
+        {
+            if (n >= max) { err.msg = "too many constraints"; return 0xFFFF; }
+            AsmConstraint c = AsmConstraint {
+                .text = str::fromParts(text.ptr + a, b - a),
+                .isOut = false,
+                .isInOut = false,
+                .earlyClobber = false,
+                .cls = AsmConClass::ConUnknown,
+                .regName = str::empty()
+            };
+            usize p = a;
+            while (p < b)
+            {
+                u8 ch = text.ptr[p];
+                if (ch == (u8)'=') c.isOut = true;
+                else if (ch == (u8)'+') c.isInOut = true;
+                else if (ch == (u8)'&') c.earlyClobber = true;
+                else break;
+                p++;
+            }
+            if (p >= b) { err.msg = "constraint missing class letter"; err.lineNo = 0; return 0xFFFF; }
+            u8 letter = text.ptr[p];
+            if (letter == (u8)'r') c.cls = AsmConClass::ConGeneral;
+            else if (letter == (u8)'i') c.cls = AsmConClass::ConImm;
+            else if (letter == (u8)'m') c.cls = AsmConClass::ConMem;
+            else if (letter == (u8)'f') c.cls = AsmConClass::ConFloat;
+            else if (isAlpha(letter))
+            {
+                c.cls = AsmConClass::ConRegName;
+                c.regName = str::fromParts(text.ptr + p, 1);
+            }
+            else { err.msg = "unknown constraint class"; return 0xFFFF; }
+            out[n] = c;
+            n++;
+        }
+        if (i >= text.len) break;
+        i++; // skip the comma
+    }
+    return n;
+}

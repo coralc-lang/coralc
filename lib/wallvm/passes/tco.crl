@@ -1,0 +1,399 @@
+#[[no_drop_all]]
+import(lib) wallvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind, IrTypeKind, IrVarDebugInfo };
+import(lib) wallvm::irOps { IrOpcode };
+import(lib) std::mman { alloc, dealloc };
+import(lib) core::cchar { cchar };
+
+// Value map used for remapping during the transform.
+struct ValMap
+{
+    IrValue** keys;
+    IrValue** vals;
+    u32 count;
+    u32 cap;
+
+    void init()
+    {
+        self.keys = null;
+        self.vals = null;
+        self.count = 0;
+        self.cap = 0;
+    }
+
+    void put(IrValue* k, IrValue* v)
+    {
+        if (self.count >= self.cap)
+        {
+            u32 nc = self.cap ? self.cap * 2 : 8;
+            IrValue** nk = alloc<IrValue*>(nc);
+            IrValue** nv = alloc<IrValue*>(nc);
+            for (u32 i = 0; i < self.count; i++)
+            {
+                nk[i] = self.keys[i];
+                nv[i] = self.vals[i];
+            }
+            if (self.keys != null) dealloc<IrValue*>(self.keys);
+            if (self.vals != null) dealloc<IrValue*>(self.vals);
+            self.keys = nk;
+            self.vals = nv;
+            self.cap = nc;
+        }
+        self.keys[self.count] = k;
+        self.vals[self.count] = v;
+        self.count++;
+    }
+
+    IrValue* get(IrValue* k)
+    {
+        for (u32 i = 0; i < self.count; i++)
+            if (self.keys[i] == k) return self.vals[i];
+        return null;
+    }
+
+    void free()
+    {
+        if (self.keys != null) dealloc<IrValue*>(self.keys);
+        if (self.vals != null) dealloc<IrValue*>(self.vals);
+        self.keys = null;
+        self.vals = null;
+        self.count = 0;
+        self.cap = 0;
+    }
+};
+
+void freeInst(IrInst* inst)
+{
+    for (u32 i = 0; i < inst->nops; i++)
+        if (inst->ops[i] != null)
+            inst->ops[i]->removeUser(inst);
+    if (inst->capOps > 0) dealloc<IrValue*>(inst->ops);
+    if (inst->base.capUsers > 0) dealloc<IrInst*>(inst->base.users);
+    // the old file spelled these frees char, I use cchar, the dialect's name for it
+    if (inst->debugLoc.file != null) dealloc<cchar>(inst->debugLoc.file);
+    if (inst->varDbg != null)
+    {
+        for (u32 i = 0; i < inst->nvarDbg; i++)
+            if (inst->varDbg[i].varName != null)
+                dealloc<cchar>(inst->varDbg[i].varName);
+        dealloc<IrVarDebugInfo>(inst->varDbg);
+    }
+    dealloc<IrInst>(inst);
+}
+
+// Accumulator tail-call transform, converts a self-recursive tail call
+// wrapped in one associative combine into a loop with an accumulator.
+// Requires the recursive call to be the tail of its block with exactly the
+// function's parameters as arguments.
+pub struct AccumulatorTcoPass
+{
+    IrContext* ctx;
+    u64 transformed;
+
+    AccumulatorTcoPass new(IrContext* ctx)
+    {
+        return AccumulatorTcoPass {
+            .ctx = ctx,
+            .transformed = 0
+        };
+    }
+
+    bool run(IrFunc* func)
+    {
+        self.transformed = 0;
+        bool changed = false;
+        if (func->nparams == 0) return false;
+        if (func->retType == null || func->retType->kind == IrTypeKind::Void) return false;
+        if (func->isExtern) return false;
+        if (func->nblocks == 0) return false;
+        if (self.transform(func))
+        {
+            self.transformed++;
+            changed = true;
+        }
+        return changed;
+    }
+
+    IrValue* remap(IrValue* v, ValMap* valMap, ValMap* blkMap)
+    {
+        if (v == null) return null;
+        if (v->kind == IrValueKind::Inst)
+        {
+            IrValue* m = valMap->get(v);
+            if (m != null) return m;
+        }
+        else if (v->kind == IrValueKind::Block)
+        {
+            IrValue* m = blkMap->get(v);
+            if (m != null) return m;
+        }
+        return v;
+    }
+
+    bool transform(IrFunc* func)
+    {
+        IrBlock* e = func->blocks[0];
+        if (e->ninsts < func->nparams) return false;
+
+        IrInst* callInst = null;
+        IrBlock* cb = null;
+        u32 cbBi = 0;
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst->opcode == IrOpcode::Call && inst->nops >= 1 &&
+                    inst->ops[0] == &func->base)
+                {
+                    if (callInst != null) return false;
+                    callInst = inst;
+                    cb = bb;
+                    cbBi = bi;
+                }
+            }
+        }
+        if (callInst == null || cb == null) return false;
+        if (cb->ninsts < 3) return false;
+
+        if (cb->insts[cb->ninsts - 3] != callInst) return false;
+        IrInst* comb = cb->insts[cb->ninsts - 2];
+        IrInst* retInst = cb->insts[cb->ninsts - 1];
+        if (retInst->opcode != IrOpcode::Ret || retInst->nops < 1) return false;
+        if (comb->opcode != IrOpcode::Add && comb->opcode != IrOpcode::Mul) return false;
+        if (comb->nops != 2) return false;
+        IrValue* callRes = &callInst->base;
+        if (comb->ops[0] != callRes && comb->ops[1] != callRes) return false;
+        if (retInst->ops[0] != &comb->base) return false;
+        if (comb->base.nusers != 1) return false;
+
+        IrValue* v = comb->ops[0] == callRes ? comb->ops[1] : comb->ops[0];
+        if (v == callRes) return false;
+
+        u32 nargs = callInst->nops > 0 ? callInst->nops - 1 : 0;
+        if (nargs != func->nparams) return false;
+
+        for (u32 i = 1; i < callInst->nops; i++)
+        {
+            IrValue* a = callInst->ops[i];
+            if (a == null || a == callRes || a == &comb->base || a == &retInst->base) return false;
+        }
+        if (v == &comb->base || v == &retInst->base) return false;
+
+        IrValue* ident = (comb->opcode == IrOpcode::Add)
+            ? self.ctx->constInt(comb->base.type, 0)
+            : self.ctx->constInt(comb->base.type, 1);
+
+        IrBlock* ne = self.ctx->createBlock("acc_loop");
+        func->addBlock(ne);
+
+        IrInst* accPhi = null;
+        {
+            IrValue* ops[4] = { ident, &e->base, &e->base, &e->base };
+            accPhi = self.ctx->createInst(IrOpcode::Phi, comb->base.type, ops, 4, 0, 0);
+            ident->addUser(accPhi);
+            e->base.addUser(accPhi);
+            ne->addInst(accPhi);
+        }
+        IrInst** argPhi = alloc<IrInst*>(func->nparams);
+        for (u32 i = 0; i < func->nparams; i++)
+        {
+            IrInst* paramInst = e->insts[i];
+            IrValue* ops[4] = { &paramInst->base, &e->base, &e->base, &e->base };
+            argPhi[i] = self.ctx->createInst(IrOpcode::Phi, paramInst->base.type, ops, 4, 0, 0);
+            ops[0]->addUser(argPhi[i]);
+            e->base.addUser(argPhi[i]);
+            ne->addInst(argPhi[i]);
+        }
+
+        ValMap valMap;
+        valMap.init();
+        ValMap blkMap;
+        blkMap.init();
+        for (u32 i = 0; i < func->nparams; i++)
+            valMap.put(&e->insts[i]->base, &argPhi[i]->base);
+
+        u32 nblocks = func->nblocks;
+        IrBlock** clones = alloc<IrBlock*>(nblocks);
+        for (u32 bi = 0; bi < nblocks; bi++)
+        {
+            IrBlock* ob = func->blocks[bi];
+            IrBlock* nb = self.ctx->createBlock(ob->base.name);
+            func->addBlock(nb);
+            clones[bi] = nb;
+            blkMap.put(&ob->base, &nb->base);
+        }
+
+        for (u32 bi = 0; bi < nblocks; bi++)
+        {
+            IrBlock* ob = func->blocks[bi];
+            IrBlock* nb = clones[bi];
+            u32 start = (bi == 0) ? func->nparams : 0;
+            u32 end = (ob == cb) ? ob->ninsts - 3 : ob->ninsts;
+            for (u32 ii = start; ii < end; ii++)
+                self.cloneInst(ob->insts[ii], nb, &valMap, &blkMap);
+
+            if (ob != cb && nb->ninsts > 0)
+            {
+                IrInst* term = nb->insts[nb->ninsts - 1];
+                if (term->opcode == IrOpcode::Br && term->nops >= 1)
+                {
+                    IrValue* tgt = self.remap(term->ops[0], &valMap, &blkMap);
+                    if (tgt != null && tgt->kind == IrValueKind::Block)
+                        nb->addSucc((IrBlock*)tgt);
+                }
+                else if (term->opcode == IrOpcode::CondBr && term->nops >= 3)
+                {
+                    IrValue* t1 = self.remap(term->ops[1], &valMap, &blkMap);
+                    IrValue* t2 = self.remap(term->ops[2], &valMap, &blkMap);
+                    if (t1 != null && t1->kind == IrValueKind::Block)
+                        nb->addSucc((IrBlock*)t1);
+                    if (t2 != null && t2->kind == IrValueKind::Block)
+                        nb->addSucc((IrBlock*)t2);
+                }
+            }
+        }
+
+        {
+            IrValue* ops[1] = { &clones[0]->base };
+            IrInst* brInst = self.ctx->createInst(IrOpcode::Br, self.ctx->tyVoid(), ops, 1, 0, 0);
+            ops[0]->addUser(brInst);
+            ne->addInst(brInst);
+            ne->addSucc(clones[0]);
+        }
+
+        if (cb != e)
+        {
+            IrInst* capterm = e->insts[e->ninsts - 1];
+            for (u32 i = e->nsuccs; i > 0; i--)
+                e->succs[i - 1]->removePred(e);
+            if (e->succs != null) dealloc<IrBlock*>(e->succs);
+            e->succs = null;
+            e->nsuccs = 0;
+            e->capSuccs = 0;
+            freeInst(capterm);
+            e->ninsts--;
+        }
+        {
+            IrValue* ops[1] = { &ne->base };
+            IrInst* brInst = self.ctx->createInst(IrOpcode::Br, self.ctx->tyVoid(), ops, 1, 0, 0);
+            ops[0]->addUser(brInst);
+            e->addInst(brInst);
+            e->addSucc(ne);
+        }
+
+        IrBlock* cbClone = clones[cbBi];
+        IrValue* vv = self.remap(v, &valMap, &blkMap);
+        IrValue* accOps[2] = { &accPhi->base, vv };
+        IrInst* accNext = self.ctx->createInst(comb->opcode, comb->base.type, accOps, 2, 0, 0);
+        accOps[0]->addUser(accNext);
+        accOps[1]->addUser(accNext);
+        cbClone->addInst(accNext);
+
+        for (u32 i = 0; i < func->nparams; i++)
+        {
+            IrValue* an = self.remap(callInst->ops[i + 1], &valMap, &blkMap);
+            argPhi[i]->ops[2] = an;
+            argPhi[i]->ops[3] = &cbClone->base;
+            an->addUser(argPhi[i]);
+            cbClone->base.addUser(argPhi[i]);
+        }
+        accPhi->ops[2] = &accNext->base;
+        accPhi->ops[3] = &cbClone->base;
+        accNext->base.addUser(accPhi);
+        cbClone->base.addUser(accPhi);
+
+        {
+            IrValue* ops[1] = { &ne->base };
+            IrInst* brInst = self.ctx->createInst(IrOpcode::Br, self.ctx->tyVoid(), ops, 1, 0, 0);
+            ops[0]->addUser(brInst);
+            cbClone->addInst(brInst);
+            cbClone->addSucc(ne);
+        }
+
+        for (u32 bi = 0; bi < nblocks; bi++)
+        {
+            IrBlock* ob = func->blocks[bi];
+            if (ob == cb) continue;
+            IrBlock* nb = clones[bi];
+            for (u32 ii = 0; ii < nb->ninsts; ii++)
+            {
+                IrInst* inst = nb->insts[ii];
+                if (inst->opcode != IrOpcode::Ret || inst->nops < 1) continue;
+                IrValue* baseVal = inst->ops[0];
+                IrValue* fops[2] = { &accPhi->base, baseVal };
+                IrInst* final = self.ctx->createInst(comb->opcode, comb->base.type, fops, 2, 0, 0);
+                fops[0]->addUser(final);
+                fops[1]->addUser(final);
+                baseVal->removeUser(inst);
+                inst->ops[0] = &final->base;
+                final->base.addUser(inst);
+                nb->insertBefore(final, inst);
+            }
+        }
+
+        for (u32 bi = 1; bi < nblocks; bi++)
+        {
+            IrBlock* ob = func->blocks[bi];
+            for (u32 si = 0; si < ob->nsuccs; si++)
+                ob->succs[si]->removePred(ob);
+            for (u32 pi = 0; pi < ob->npreds; pi++)
+                ob->preds[pi]->removeSucc(ob);
+            for (u32 ii = 0; ii < ob->ninsts; ii++)
+                freeInst(ob->insts[ii]);
+            if (ob->insts != null) dealloc<IrInst*>(ob->insts);
+            if (ob->preds != null) dealloc<IrBlock*>(ob->preds);
+            if (ob->succs != null) dealloc<IrBlock*>(ob->succs);
+            func->removeBlock(ob);
+            dealloc<IrBlock>(ob);
+        }
+
+        for (u32 ii = func->nparams; ii < e->ninsts - 1; ii++)
+            freeInst(e->insts[ii]);
+        e->ninsts = func->nparams + 1;
+
+        valMap.free();
+        blkMap.free();
+        dealloc<IrBlock*>(clones);
+        dealloc<IrInst*>(argPhi);
+        return true;
+    }
+
+    IrInst* cloneInst(IrInst* old, IrBlock* nb, ValMap* valMap, ValMap* blkMap)
+    {
+        IrValue** newOps = alloc<IrValue*>(old->nops > 0 ? old->nops : 1);
+        for (u32 i = 0; i < old->nops; i++)
+        {
+            IrValue* op = old->ops[i];
+            if (op == null) { newOps[i] = null; continue; }
+            if (op->kind == IrValueKind::Inst)
+            {
+                IrValue* m = valMap->get(op);
+                if (m != null) { newOps[i] = m; continue; }
+            }
+            else if (op->kind == IrValueKind::Block)
+            {
+                IrValue* m = blkMap->get(op);
+                if (m != null) { newOps[i] = m; continue; }
+            }
+            newOps[i] = op;
+        }
+        IrInst* ni = self.ctx->createInst(old->opcode, old->base.type, newOps, old->nops,
+                                          (u64)old->icmpPred, (u64)old->fcmpPred);
+        nb->addInst(ni);
+        valMap->put(&old->base, &ni->base);
+        for (u32 i = 0; i < old->nops; i++)
+            if (newOps[i] != null)
+                newOps[i]->addUser(ni);
+        dealloc<IrValue*>(newOps);
+        return ni;
+    }
+}
+
+pub bool irPassAccumulate(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (ctx == null || func == null) return false;
+    AccumulatorTcoPass pass = AccumulatorTcoPass::new(ctx);
+    return pass.run(func);
+}

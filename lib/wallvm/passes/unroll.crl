@@ -1,0 +1,741 @@
+#[[no_drop_all]]
+// Full loop unrolling for loops with a statically known trip count.
+//
+// The pass recognizes the canonical loop form produced by mem2reg —
+//
+//   header:  phi iv = init, phi iv = add(phi, step)
+//            ... body ...
+//   latch:   icmp pred iv, bound  ->  CondBr header / exit
+//
+// (the test may live in the header instead, with the latch an
+// unconditional backedge). The trip count k is derived from the
+// comparison, the constant init/step/bound values, and the induction
+// variable's bit width; loops with non-constant bounds, multi-latch
+// loops, or unsupported tests are left alone.
+//
+// The body is then cloned k times with per-iteration value/block maps,
+// backedge targets point at the next iteration (or the exit for the last
+// one), header phis receive one incoming pair per iteration, and exit
+// block phis are extended with the k incoming copies. The original loop
+// blocks become unreachable and are removed. The unrolled code stays
+// semantically identical even without folding, the per-iteration tests
+// still evaluate (and always take the in-loop edge), so no rewrite of
+// the induction arithmetic is required.
+//
+// Because unrolling grows code, it is gated by a trip-count cap, a
+// per-loop instruction cap, and a per-function work budget, and it runs
+// in its own pipeline lane (pipelineLane) rather than the numbered
+// optimization levels.
+
+import(lib) wallvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind, IrVarDebugInfo };
+import(lib) wallvm::irOps { IrOpcode, IrICmpPred, irOpcodeIsTerminator };
+import(lib) wallvm::passes::loop_detect { IrLoop, irLoopDetectNatural };
+import(lib) wallvm::passes::licm { createPreheader };
+import(lib) std::mman { alloc, dealloc };
+import(lib) core::cchar { cchar };
+
+struct ValMap
+{
+    IrValue** keys;
+    IrValue** vals;
+    u32 count;
+    u32 cap;
+
+    void init()
+    {
+        self.keys = null;
+        self.vals = null;
+        self.count = 0;
+        self.cap = 0;
+    }
+
+    void put(IrValue* k, IrValue* v)
+    {
+        if (self.count >= self.cap)
+        {
+            u32 nc = self.cap ? self.cap * 2 : 8;
+            IrValue** nk = alloc<IrValue*>(nc);
+            IrValue** nv = alloc<IrValue*>(nc);
+            for (u32 i = 0; i < self.count; i++)
+            {
+                nk[i] = self.keys[i];
+                nv[i] = self.vals[i];
+            }
+            if (self.keys != null) dealloc<IrValue*>(self.keys);
+            if (self.vals != null) dealloc<IrValue*>(self.vals);
+            self.keys = nk;
+            self.vals = nv;
+            self.cap = nc;
+        }
+        self.keys[self.count] = k;
+        self.vals[self.count] = v;
+        self.count++;
+    }
+
+    IrValue* get(IrValue* k)
+    {
+        for (u32 i = 0; i < self.count; i++)
+            if (self.keys[i] == k) return self.vals[i];
+        return null;
+    }
+
+    void free()
+    {
+        if (self.keys != null) dealloc<IrValue*>(self.keys);
+        if (self.vals != null) dealloc<IrValue*>(self.vals);
+        self.keys = null;
+        self.vals = null;
+        self.count = 0;
+        self.cap = 0;
+    }
+};
+
+void freeInst(IrInst* inst)
+{
+    for (u32 i = 0; i < inst->nops; i++)
+        if (inst->ops[i] != null)
+            inst->ops[i]->removeUser(inst);
+    if (inst->capOps > 0) dealloc<IrValue*>(inst->ops);
+    if (inst->base.capUsers > 0) dealloc<IrInst*>(inst->base.users);
+    // I free these two as cchar, the old file spelled the type char
+    if (inst->debugLoc.file != null) dealloc<cchar>(inst->debugLoc.file);
+    if (inst->varDbg != null)
+    {
+        for (u32 i = 0; i < inst->nvarDbg; i++)
+            if (inst->varDbg[i].varName != null)
+                dealloc<cchar>(inst->varDbg[i].varName);
+        dealloc<IrVarDebugInfo>(inst->varDbg);
+    }
+    dealloc<IrInst>(inst);
+}
+
+pub struct UnrollPass
+{
+    IrContext* ctx;
+    u64 unrolled;
+    u32 maxTripCount;
+    u32 maxTotalInsts;
+    u32 maxWork;
+    u32 workUsed;
+
+    UnrollPass new(IrContext* ctx)
+    {
+        return UnrollPass {
+            .ctx = ctx,
+            .unrolled = 0,
+            .maxTripCount = 64,
+            .maxTotalInsts = 400,
+            .maxWork = 20000,
+            .workUsed = 0
+        };
+    }
+
+    bool isInLoop(IrLoop* lp, IrBlock* bb)
+    {
+        for (u32 i = 0; i < lp->nblocks; i++)
+            if (lp->blocks[i] == bb) return true;
+        return false;
+    }
+
+    u32 loopIndex(IrLoop* lp, u32* bIdx, IrBlock* bb)
+    {
+        for (u32 i = 0; i < lp->nblocks; i++)
+            if (lp->blocks[i] == bb) return i;
+        return ~0u;
+    }
+
+    IrICmpPred swappedPred(IrICmpPred p)
+    {
+        switch (p)
+        {
+            IrICmpPred::Slt => { return IrICmpPred::Sgt; },
+            IrICmpPred::Sle => { return IrICmpPred::Sge; },
+            IrICmpPred::Sgt => { return IrICmpPred::Slt; },
+            IrICmpPred::Sge => { return IrICmpPred::Sle; },
+            IrICmpPred::Ult => { return IrICmpPred::Ugt; },
+            IrICmpPred::Ule => { return IrICmpPred::Uge; },
+            IrICmpPred::Ugt => { return IrICmpPred::Ult; },
+            IrICmpPred::Uge => { return IrICmpPred::Ule; },
+            else => { return p; },
+        }
+    }
+
+    bool supportedPred(IrICmpPred p)
+    {
+        return p == IrICmpPred::Eq || p == IrICmpPred::Ne ||
+               p == IrICmpPred::Slt || p == IrICmpPred::Sle ||
+               p == IrICmpPred::Ult || p == IrICmpPred::Ule;
+    }
+
+    u64 signExtend(u64 v, u32 width)
+    {
+        if (width >= 64) return v;
+        u64 mask = (1ULL << width) - 1;
+        u64 m = v & mask;
+        if (((m >> (width - 1)) & 1) != 0)
+            m |= mask ^ 0xFFFFFFFFFFFFFFFF;
+        return m;
+    }
+
+    // Trip count for "loop continues while iv OP bound", iv from init by
+    // step each iteration. Returns 0 (with ok = false) when the loop does
+    // not terminate or the count cannot be proven.
+    u64 tripCount(IrICmpPred pred, u64 init, u64 step, u64 bound, u32 width, bool* ok)
+    {
+        *ok = true;
+        u64 mask = (width >= 64) ? 0xFFFFFFFFFFFFFFFF : ((1ULL << width) - 1);
+        if (step == 0) { *ok = false; return 0; }
+        if (pred == IrICmpPred::Eq || pred == IrICmpPred::Ne)
+        {
+            if ((bound & mask) < (init & mask)) { *ok = false; return 0; }
+            u64 d = (bound & mask) - (init & mask);
+            if (d % step != 0) { *ok = false; return 0; }
+            return d / step;
+        }
+        if (pred == IrICmpPred::Ult || pred == IrICmpPred::Ule)
+        {
+            u64 bi = init & mask;
+            u64 bb = bound & mask;
+            if (pred == IrICmpPred::Ult && bb <= bi) { *ok = false; return 0; }
+            if (pred == IrICmpPred::Ule && bb < bi) { *ok = false; return 0; }
+            u64 d = bb - bi;
+            u64 q = d / step;
+            u64 r = d % step;
+            // I test r against zero, conditions must be bool
+            return pred == IrICmpPred::Ult ? (q + ((r != 0) ? 1 : 0)) : (q + 1);
+        }
+        // signed
+        i64 initS = (i64)self.signExtend(init, width);
+        i64 boundS = (i64)self.signExtend(bound, width);
+        i64 stepS = (i64)self.signExtend(step, width);
+        if (stepS <= 0) { *ok = false; return 0; }
+        if (pred == IrICmpPred::Slt && boundS <= initS) { *ok = false; return 0; }
+        if (pred == IrICmpPred::Sle && boundS < initS) { *ok = false; return 0; }
+        u64 d = (u64)boundS - (u64)initS;
+        u64 q = d / step;
+        u64 r = d % step;
+        return pred == IrICmpPred::Slt ? (q + ((r != 0) ? 1 : 0)) : (q + 1);
+    }
+
+    // Verify the induction chain init -> init+step -> ... stays in range
+    // and (for lt-class preds) never reaches the bound.
+    bool chainOk(IrICmpPred pred, u64 init, u64 step, u64 bound, u32 width, u64 t)
+    {
+        u64 mask = (width >= 64) ? 0xFFFFFFFFFFFFFFFF : ((1ULL << width) - 1);
+        if (pred == IrICmpPred::Slt || pred == IrICmpPred::Sle)
+        {
+            i64 cur = (i64)self.signExtend(init, width);
+            i64 st = (i64)self.signExtend(step, width);
+            i64 bd = (i64)self.signExtend(bound, width);
+            for (u64 j = 1; j < t; j++)
+            {
+                i64 nx = cur + st;
+                if (nx <= cur) return false;
+                cur = nx;
+            }
+            if (pred == IrICmpPred::Slt && cur >= bd) return false;
+            if (pred == IrICmpPred::Sle && cur > bd) return false;
+            return true;
+        }
+        u64 cur = init & mask;
+        for (u64 j = 1; j < t; j++)
+        {
+            if (width < 64)
+            {
+                if (cur > (mask - step)) return false;
+                cur += step;
+            }
+            else
+            {
+                u64 nx = cur + step;
+                if (nx < cur) return false;
+                cur = nx;
+            }
+        }
+        if (pred == IrICmpPred::Eq || pred == IrICmpPred::Ne)
+        {
+            if ((cur & mask) != (bound & mask)) return false;
+        }
+        else
+        {
+            if (pred == IrICmpPred::Ult && (cur & mask) >= (bound & mask)) return false;
+            if (pred == IrICmpPred::Ule && (cur & mask) > (bound & mask)) return false;
+        }
+        return true;
+    }
+
+    IrValue* remapVal(IrValue* v, ValMap* vm, ValMap* bm)
+    {
+        if (v == null) return null;
+        if (v->kind == IrValueKind::Inst)
+        {
+            IrValue* m = vm->get(v);
+            if (m != null) return m;
+        }
+        else if (v->kind == IrValueKind::Block)
+        {
+            IrValue* m = bm->get(v);
+            if (m != null) return m;
+        }
+        return v;
+    }
+
+    IrInst* cloneInst(IrInst* old, IrBlock* dst, ValMap* vm, ValMap* bm)
+    {
+        IrValue** ops = alloc<IrValue*>(old->nops > 0 ? old->nops : 1);
+        for (u32 i = 0; i < old->nops; i++)
+            ops[i] = self.remapVal(old->ops[i], vm, bm);
+        IrInst* n = self.ctx->createInst(old->opcode, old->base.type, ops, old->nops,
+                                         (u64)old->icmpPred, (u64)old->fcmpPred);
+        dst->addInst(n);
+        for (u32 i = 0; i < old->nops; i++)
+            if (ops[i] != null)
+                ops[i]->addUser(n);
+        dealloc<IrValue*>(ops);
+        vm->put(&old->base, &n->base);
+        return n;
+    }
+
+    bool tryUnroll(IrFunc* func, IrLoop* lp)
+    {
+        IrBlock* header = lp->header;
+        if (header == null || header == func->blocks[0]) return false;
+        if (lp->nblocks == 0) return false;
+
+        // Single backedge, exactly one in-loop predecessor of the header.
+        u32 inLoopPreds = 0;
+        for (u32 i = 0; i < header->npreds; i++)
+            if (self.isInLoop(lp, header->preds[i])) inLoopPreds++;
+        if (inLoopPreds != 1) return false;
+        if (!self.isInLoop(lp, lp->latch)) return false;
+        for (u32 bi = 0; bi < lp->nblocks; bi++)
+        {
+            IrBlock* b = lp->blocks[bi];
+            if (b == header) continue;
+            for (u32 i = 0; i < b->npreds; i++)
+                if (!self.isInLoop(lp, b->preds[i])) return false;
+        }
+
+        // Find the loop test, header's CondBr first, then the latch's.
+        IrBlock* testBlock = null;
+        IrInst* icmp = null;
+        IrValue* iv = null;
+        IrValue* bound = null;
+        IrICmpPred op;
+
+        IrBlock* cands[2];
+        cands[0] = header;
+        cands[1] = lp->latch;
+        for (u32 c = 0; c < 2 && testBlock == null; c++)
+        {
+            IrBlock* cb = cands[c];
+            IrInst* term = cb->terminator();
+            if (term == null || term->opcode != IrOpcode::CondBr) continue;
+            IrValue* cond = term->nops > 0 ? term->ops[0] : null;
+            if (cond == null || cond->kind != IrValueKind::Inst) continue;
+            IrInst* ci = (IrInst*)cond;
+            if (ci->opcode != IrOpcode::ICmp) continue;
+            IrValue* a = ci->nops > 0 ? ci->ops[0] : null;
+            IrValue* b = ci->nops > 1 ? ci->ops[1] : null;
+            IrValue* ivCand = null;
+            IrValue* bdCand = null;
+            IrICmpPred opCand = (IrICmpPred)ci->icmpPred;
+            if (a != null && a->kind == IrValueKind::Inst &&
+                ((IrInst*)a)->opcode == IrOpcode::Phi &&
+                ((IrInst*)a)->parent == header)
+            {
+                ivCand = a;
+                bdCand = b;
+            }
+            else if (b != null && b->kind == IrValueKind::Inst &&
+                ((IrInst*)b)->opcode == IrOpcode::Phi &&
+                ((IrInst*)b)->parent == header)
+            {
+                ivCand = b;
+                bdCand = a;
+                opCand = self.swappedPred(opCand);
+            }
+            if (ivCand != null && bdCand != null && bdCand->kind == IrValueKind::ConstInt &&
+                self.supportedPred(opCand))
+            {
+                testBlock = cb;
+                icmp = ci;
+                iv = ivCand;
+                bound = bdCand;
+                op = opCand;
+            }
+        }
+        if (testBlock == null || iv == null || bound == null) return false;
+
+        // Induction, entry value (pred outside the loop) and backedge
+        // value (pred == latch) must be Add(phi, const).
+        IrValue* init = null;
+        IrValue* stepV = null;
+        IrInst* ivPhi = (IrInst*)iv;
+        for (u32 pi = 1; pi < ivPhi->nops; pi += 2)
+        {
+            IrBlock* pb = (IrBlock*)ivPhi->ops[pi];
+            if (!self.isInLoop(lp, pb))
+            {
+                if (init == null && ivPhi->ops[pi - 1]->kind == IrValueKind::ConstInt)
+                    init = ivPhi->ops[pi - 1];
+            }
+            else if (pb == lp->latch)
+            {
+                IrValue* bv = ivPhi->ops[pi - 1];
+                if (bv != null && bv->kind == IrValueKind::Inst)
+                {
+                    IrInst* bi = (IrInst*)bv;
+                    if (bi->opcode == IrOpcode::Add && bi->nops == 2)
+                    {
+                        if (bi->ops[0] == iv && bi->ops[1]->kind == IrValueKind::ConstInt)
+                            stepV = bi->ops[1];
+                        else if (bi->ops[1] == iv && bi->ops[0]->kind == IrValueKind::ConstInt)
+                            stepV = bi->ops[0];
+                    }
+                }
+            }
+        }
+        if (init == null || stepV == null) return false;
+
+        u32 width = iv->type != null ? iv->type->width : 64;
+        if (width == 0) width = 64;
+
+        bool ok = false;
+        u64 k = self.tripCount(op, init->valData, stepV->valData, bound->valData, width, &ok);
+        if (!ok || k == 0) return false;
+        if (k > self.maxTripCount) return false;
+        if (!self.chainOk(op, init->valData, stepV->valData, bound->valData, width, k)) return false;
+
+        u64 total = 0;
+        for (u32 bi = 0; bi < lp->nblocks; bi++)
+            total += lp->blocks[bi]->ninsts;
+        if (k * total > self.maxTotalInsts) return false;
+        if (self.workUsed + k * total > self.maxWork) return false;
+
+        // A single out-of-loop successor of the test block is the exit.
+        IrInst* testTerm = testBlock->terminator();
+        IrBlock* exitBlock = null;
+        for (u32 tj = 1; tj <= 2; tj++)
+        {
+            IrBlock* tb = (IrBlock*)testTerm->ops[tj];
+            if (!self.isInLoop(lp, tb)) { exitBlock = tb; }
+        }
+        if (exitBlock == null) return false;
+
+        self.performUnroll(func, lp, k, exitBlock);
+
+        self.workUsed += (u32)(k * total);
+        self.unrolled++;
+        return true;
+    }
+
+    void performUnroll(IrFunc* func, IrLoop* lp, u64 k,
+                       IrBlock* exitBlock)
+    {
+        IrBlock* header = lp->header;
+        u32 nb = lp->nblocks;
+        u32 headerIdx = self.loopIndex(lp, null, header);
+        u32 latchIdx = self.loopIndex(lp, null, lp->latch);
+
+        // Preheader, the loop's single entry block (ph -> header).
+        IrBlock* ph = createPreheader(self.ctx, lp, func);
+        if (ph == null) return;
+
+        // Per-iteration value/block maps and the block copy table.
+        ValMap* valMaps = alloc<ValMap>(k);
+        ValMap* blkMaps = alloc<ValMap>(k);
+        for (u32 i = 0; i < k; i++)
+        {
+            valMaps[i].init();
+            blkMaps[i].init();
+        }
+        IrBlock** copies = alloc<IrBlock*>(k * nb);
+
+        for (u32 i = 0; i < k; i++)
+            for (u32 bi = 0; bi < nb; bi++)
+            {
+                IrBlock* cp = self.ctx->createBlock(null);
+                func->addBlock(cp);
+                copies[i * nb + bi] = cp;
+                blkMaps[i].put(&lp->blocks[bi]->base, &cp->base);
+            }
+
+        // Execution order within one iteration, preds before succs.
+        u32* order = alloc<u32>(nb);
+        bool* placed = alloc<bool>(nb);
+        for (u32 bi = 0; bi < nb; bi++) placed[bi] = false;
+        u32 nOrder = 0;
+        while (nOrder < nb)
+        {
+            bool progressed = false;
+            for (u32 bi = 0; bi < nb; bi++)
+            {
+                if (placed[bi]) continue;
+                IrBlock* b = lp->blocks[bi];
+                bool ready = true;
+                for (u32 pi = 0; pi < b->npreds; pi++)
+                {
+                    if (self.isInLoop(lp, b->preds[pi]) &&
+                        !placed[self.loopIndex(lp, null, b->preds[pi])])
+                    { ready = false; break; }
+                }
+                if (ready)
+                {
+                    placed[bi] = true;
+                    order[nOrder++] = bi;
+                    progressed = true;
+                }
+            }
+            if (!progressed) break;
+        }
+
+        // Clone each iteration.
+        for (u32 i = 0; i < k; i++)
+        {
+            for (u32 oi = 0; oi < nOrder; oi++)
+            {
+                u32 bi = order[oi];
+                IrBlock* src = lp->blocks[bi];
+                IrBlock* dst = copies[i * nb + bi];
+                for (u32 ii = 0; ii < src->ninsts; ii++)
+                {
+                    IrInst* s = src->insts[ii];
+                    if (irOpcodeIsTerminator(s->opcode)) break;
+
+                    IrInst* n = null;
+                    if (s->opcode == IrOpcode::Phi && bi == headerIdx)
+                    {
+                        // Header phi, entry pair in the first iteration,
+                        // backedge pair (from the previous iteration) after.
+                        IrValue* v = null;
+                        IrValue* p = null;
+                        if (i == 0)
+                        {
+                            for (u32 pi = 1; pi < s->nops; pi += 2)
+                                if (s->ops[pi] == &ph->base) { v = s->ops[pi - 1]; break; }
+                            p = &ph->base;
+                        }
+                        else
+                        {
+                            for (u32 pi = 1; pi < s->nops; pi += 2)
+                                if (s->ops[pi] == &lp->latch->base) { v = s->ops[pi - 1]; break; }
+                            v = self.remapVal(v, &valMaps[i - 1], &blkMaps[i - 1]);
+                            p = &copies[(i - 1) * nb + latchIdx]->base;
+                        }
+                        IrValue** ops = alloc<IrValue*>(2);
+                        ops[0] = v;
+                        ops[1] = p;
+                        n = self.ctx->createInst(IrOpcode::Phi, s->base.type, ops, 2, 0, 0);
+                        dealloc<IrValue*>(ops);
+                        dst->addInst(n);
+                        if (v != null) v->addUser(n);
+                        p->addUser(n);
+                        valMaps[i].put(&s->base, &n->base);
+                    }
+                    else if (s->opcode == IrOpcode::Phi)
+                    {
+                        // Non-header phi, all predecessors in-loop, same
+                        // iteration.
+                        IrValue** ops = alloc<IrValue*>(s->nops);
+                        u32 np = 0;
+                        for (u32 pi = 0; pi < s->nops; pi += 2)
+                        {
+                            IrValue* v = self.remapVal(s->ops[pi], &valMaps[i], &blkMaps[i]);
+                            IrValue* p = self.remapVal(s->ops[pi + 1], &valMaps[i], &blkMaps[i]);
+                            ops[np++] = v;
+                            ops[np++] = p;
+                        }
+                        n = self.ctx->createInst(IrOpcode::Phi, s->base.type, ops, np, 0, 0);
+                        for (u32 pi = 0; pi < np; pi++)
+                            if (ops[pi] != null)
+                                ops[pi]->addUser(n);
+                        dealloc<IrValue*>(ops);
+                        dst->addInst(n);
+                        valMaps[i].put(&s->base, &n->base);
+                    }
+                    else
+                    {
+                        n = self.cloneInst(s, dst, &valMaps[i], &blkMaps[i]);
+                    }
+                }
+
+                // Terminator, backedge targets the next iteration's header
+                // (or the exit for the last one); other in-loop targets map
+                // to the same-iteration copy.
+                IrInst* st = src->insts[src->ninsts - 1];
+                if (!irOpcodeIsTerminator(st->opcode)) continue;
+                IrValue** ops = alloc<IrValue*>(st->nops > 0 ? st->nops : 1);
+                for (u32 tj = 0; tj < st->nops; tj++)
+                {
+                    IrValue* op = st->ops[tj];
+                    if (op != null && op->kind == IrValueKind::Block)
+                    {
+                        IrBlock* tb = (IrBlock*)op;
+                        IrBlock* target = null;
+                        if (tb == header)
+                        {
+                            if (i + 1 < k)
+                                target = copies[(i + 1) * nb + headerIdx];
+                            else
+                                target = exitBlock;
+                        }
+                        else if (self.isInLoop(lp, tb))
+                            target = (IrBlock*)blkMaps[i].get(op);
+                        else
+                            target = tb;
+                        ops[tj] = &target->base;
+                    }
+                    else
+                        ops[tj] = self.remapVal(op, &valMaps[i], &blkMaps[i]);
+                }
+                IrInst* nt = self.ctx->createInst(st->opcode, st->base.type, ops, st->nops,
+                                                  (u64)st->icmpPred, (u64)st->fcmpPred);
+                for (u32 tj = 0; tj < st->nops; tj++)
+                    if (ops[tj] != null)
+                        ops[tj]->addUser(nt);
+                dealloc<IrValue*>(ops);
+                dst->addInst(nt);
+                if (nt->opcode == IrOpcode::Br || nt->opcode == IrOpcode::CondBr)
+                {
+                    u32 ntgt = (u32)(nt->opcode == IrOpcode::Br ? 1 : 2);
+                    for (u32 tj = 0; tj < ntgt; tj++)
+                        dst->addSucc((IrBlock*)nt->ops[tj]);
+                }
+            }
+        }
+
+        // Point the preheader at the first iteration's header.
+        IrInst* phTerm = ph->terminator();
+        if (phTerm != null && phTerm->opcode == IrOpcode::Br &&
+            phTerm->ops[0] == &header->base)
+        {
+            header->base.removeUser(phTerm);
+            phTerm->ops[0] = &copies[0 * nb + headerIdx]->base;
+            copies[0 * nb + headerIdx]->base.addUser(phTerm);
+            ph->removeSucc(header);
+            header->removePred(ph);
+            ph->addSucc(copies[0 * nb + headerIdx]);
+        }
+
+        // Extend exit-block phis, each in-loop predecessor contributes one
+        // incoming pair per iteration.
+        for (u32 bi = 0; bi < nb; bi++)
+        {
+            IrBlock* b = lp->blocks[bi];
+            for (u32 si = 0; si < b->nsuccs; si++)
+            {
+                IrBlock* s = b->succs[si];
+                if (self.isInLoop(lp, s)) continue;
+                for (u32 ii = 0; ii < s->ninsts; ii++)
+                {
+                    IrInst* phi = s->insts[ii];
+                    if (phi->opcode != IrOpcode::Phi) break;
+                    u32 nrep = 0;
+                    for (u32 pi = 1; pi < phi->nops; pi += 2)
+                        if (phi->ops[pi] == &b->base) nrep++;
+                    if (nrep == 0) continue;
+                    u32 newN = phi->nops + nrep * (u32)(k - 1);
+                    IrValue** newOps = alloc<IrValue*>(newN);
+                    u32 ni = 0;
+                    for (u32 pi = 0; pi < phi->nops; pi += 2)
+                    {
+                        if (phi->ops[pi + 1] == &b->base)
+                        {
+                            if (phi->ops[pi] != null) phi->ops[pi]->removeUser(phi);
+                            b->base.removeUser(phi);
+                            for (u32 it = 0; it < k; it++)
+                            {
+                                IrValue* v = self.remapVal(phi->ops[pi], &valMaps[it], &blkMaps[it]);
+                                IrValue* p = &copies[it * nb + bi]->base;
+                                newOps[ni++] = v;
+                                newOps[ni++] = p;
+                                if (v != null) v->addUser(phi);
+                                p->addUser(phi);
+                            }
+                        }
+                        else
+                        {
+                            newOps[ni++] = phi->ops[pi];
+                            newOps[ni++] = phi->ops[pi + 1];
+                        }
+                    }
+                    if (phi->capOps > 0) dealloc<IrValue*>(phi->ops);
+                    phi->ops = newOps;
+                    phi->nops = newN;
+                    phi->capOps = newN;
+                }
+                s->removePred(b);
+                for (u32 it = 0; it < k; it++)
+                    s->addPred(copies[it * nb + bi]);
+            }
+        }
+
+        // Tear down every original loop block and remove it.
+        for (u32 bi = 0; bi < nb; bi++)
+        {
+            IrBlock* b = lp->blocks[bi];
+            for (u32 si = 0; si < b->nsuccs; si++)
+                b->succs[si]->removePred(b);
+            for (u32 pi = 0; pi < b->npreds; pi++)
+                b->preds[pi]->removeSucc(b);
+        }
+        for (u32 bi = 0; bi < nb; bi++)
+        {
+            IrBlock* b = lp->blocks[bi];
+            if (b->npreds != 0 || b->nsuccs != 0) continue;
+            for (u32 ii = 0; ii < b->ninsts; ii++)
+                freeInst(b->insts[ii]);
+            if (b->insts != null) dealloc<IrInst*>(b->insts);
+            if (b->preds != null) dealloc<IrBlock*>(b->preds);
+            if (b->succs != null) dealloc<IrBlock*>(b->succs);
+            func->removeBlock(b);
+            dealloc<IrBlock>(b);
+        }
+
+        for (u32 i = 0; i < k; i++)
+        {
+            valMaps[i].free();
+            blkMaps[i].free();
+        }
+        dealloc<ValMap>(valMaps);
+        dealloc<ValMap>(blkMaps);
+        dealloc<IrBlock*>(copies);
+        dealloc<u32>(order);
+        dealloc<bool>(placed);
+    }
+
+    bool run(IrFunc* func)
+    {
+        self.unrolled = 0;
+        self.workUsed = 0;
+        bool changed = false;
+        bool again = true;
+        u32 rounds = 0;
+        while (again && rounds < 16 && self.workUsed < self.maxWork)
+        {
+            again = false;
+            rounds++;
+            IrLoop** loops = irLoopDetectNatural(func);
+            for (u32 li = 0; loops[li] != null; li++)
+            {
+                if (self.tryUnroll(func, loops[li]))
+                {
+                    changed = true;
+                    again = true;
+                    break;
+                }
+            }
+            dealloc<IrLoop*>(loops);
+        }
+        return changed;
+    }
+}
+
+pub bool irPassUnroll(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (ctx == null || func == null) return false;
+    UnrollPass pass = UnrollPass::new(ctx);
+    return pass.run(func);
+}

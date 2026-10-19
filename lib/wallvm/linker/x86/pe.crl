@@ -1,0 +1,560 @@
+#[[no_drop_all]]
+/* pe.crl for linker
+ * PE32/PE32+ image pieces: header writing (DOS stub, COFF header,
+ * optional header, section table), export directory content, base
+ * relocation finalization, and parsing a PE image's export table
+ * into import records (so a .dll can be passed directly as input).
+ * The canonical sections and layout math come from layout.crl; the
+ * tail sections (.idata .edata .reloc) are placed by layout and
+ * filled here.
+ */
+
+import(lib) std::vec { Vec };
+import(lib) std::text::string { String };
+import elf { EM_X86_64, FMT_PE_EXE, FMT_PE_DLL, alignUp, fits, leU16, leU32, putU8, putU16, putU32, putU64 };
+import layout { Layout, defAddress };
+import resolve { GlobalDef, findDef };
+import object { ObjFile };
+import imports { Imports, sizeIdata, writeIdata };
+
+pub const u32 IMAGE_FILE_EXECUTABLE_IMAGE = 0x0002;
+pub const u32 IMAGE_FILE_LINE_NUMS_STRIPPED = 0x0004;
+pub const u32 IMAGE_FILE_LOCAL_SYMS_STRIPPED = 0x0008;
+pub const u32 IMAGE_FILE_32BIT_MACHINE = 0x0100;
+pub const u32 IMAGE_FILE_LARGE_ADDRESS_AWARE = 0x0020;
+pub const u32 IMAGE_FILE_DLL = 0x2000;
+
+pub const usize PE_SECHDR_SIZE = 40;
+pub const usize PE_DIR_COUNT = 16;
+
+/* section name table: canonical 8 + tail 3 */
+str _peName(usize i)
+{
+    if (i == 0) return str::fromParts((const u8*)".text", 5);
+    if (i == 1) return str::fromParts((const u8*)".rdata", 6);
+    if (i == 2) return str::fromParts((const u8*)".eh_fram", 8);
+    if (i == 3) return str::fromParts((const u8*)".note", 5);
+    if (i == 4) return str::fromParts((const u8*)".init_ar", 8);
+    if (i == 5) return str::fromParts((const u8*)".fini_ar", 8);
+    if (i == 6) return str::fromParts((const u8*)".data", 5);
+    if (i == 7) return str::fromParts((const u8*)".bss", 4);
+    if (i == 8) return str::fromParts((const u8*)".idata", 6);
+    if (i == 9) return str::fromParts((const u8*)".edata", 6);
+    return str::fromParts((const u8*)".reloc", 6);
+}
+
+u32 _peChars(usize i, bool is64)
+{
+    if (i == 0) return 0x60000020; /* code, exec, read */
+    if (i == 7) return 0xc0000080; /* uninit, read, write */
+    if (i == 6 || i == 4 || i == 5 || i == 8) return 0xc0000040; /* init, read, write */
+    if (i == 10) return 0x42000040; /* init, read, discardable */
+    if (i == 9) return 0x40000040; /* init, read */
+    if (i == 1 || i == 2 || i == 3) return 0x40000040; /* init, read */
+    return 0x40000040;
+}
+
+pub bool isPeImage(const u8* data, usize len)
+{
+    if (len < 0x40) return false;
+    return data[0] == 'M' && data[1] == 'Z';
+}
+
+usize _rvaToOff(const u8* data, usize len, usize secTbl, u16 nsec, u64 rva)
+{
+    for (u16 i = 0; i < nsec; i++)
+    {
+        const u8* sh = data + secTbl + (usize)i * PE_SECHDR_SIZE;
+        u64 va = leU32(sh + 12);
+        u64 vsz = leU32(sh + 8);
+        u64 rsz = leU32(sh + 16);
+        u64 span = vsz > rsz ? vsz : rsz;
+        if (rva >= va && rva < va + span)
+        {
+            u64 off = (u64)leU32(sh + 20) + (rva - va);
+            if (!fits((usize)off, 1, len)) return 0;
+            return (usize)off;
+        }
+    }
+    return 0;
+}
+
+bool _rvaStr(const u8* data, usize len, usize secTbl, u16 nsec, u64 rva, str* out)
+{
+    usize off = _rvaToOff(data, len, secTbl, nsec, rva);
+    if (off == 0) return false;
+    usize i = off;
+    while (i < len && data[i] != 0) i++;
+    if (i == len) return false;
+    *out = str::fromParts(data + off, i - off);
+    return true;
+}
+
+/* Reads the export directory of a PE image and registers every
+ * exported name as an import record (forwarded exports take their
+ * target DLL from the forwarder string).
+ */
+pub bool parsePeExports(str name, const u8* data, usize len, Imports* imps, String* err)
+{
+    if (!isPeImage(data, len))
+    {
+        err->pushView("linker: ");
+        err->pushView(name);
+        err->pushView(": not a PE image (bad MZ signature)");
+        return false;
+    }
+    u32 e = leU32(data + 0x3c);
+    if (!fits((usize)e, 24 + 2, len) || data[e] != 'P' || data[e + 1] != 'E' ||
+        data[e + 2] != 0 || data[e + 3] != 0)
+    {
+        err->pushView("linker: ");
+        err->pushView(name);
+        err->pushView(": bad PE signature");
+        return false;
+    }
+    usize coff = (usize)e + 4;
+    u16 nsec = leU16(data + coff + 2);
+    u16 optSize = leU16(data + coff + 16);
+    usize opt = coff + 20;
+    if (!fits(opt, (usize)optSize + 16 * 8, len))
+    {
+        err->pushView("linker: ");
+        err->pushView(name);
+        err->pushView(": optional header out of bounds");
+        return false;
+    }
+    u16 magic = leU16(data + opt);
+    usize dd;
+    if (magic == 0x20b) dd = opt + 112;
+    else if (magic == 0x10b) dd = opt + 96;
+    else
+    {
+        err->pushView("linker: ");
+        err->pushView(name);
+        err->pushView(": unknown PE optional header magic");
+        return false;
+    }
+    u32 expRva = leU32(data + dd + 0);
+    u32 expSz = leU32(data + dd + 4);
+    if (expRva == 0) return true; /* no exports */
+
+    usize secTbl = opt + optSize;
+    if (!fits(secTbl, (usize)nsec * PE_SECHDR_SIZE, len))
+    {
+        err->pushView("linker: ");
+        err->pushView(name);
+        err->pushView(": section table out of bounds");
+        return false;
+    }
+    usize p = _rvaToOff(data, len, secTbl, nsec, expRva);
+    if (p == 0 || !fits(p, 40, len))
+    {
+        err->pushView("linker: ");
+        err->pushView(name);
+        err->pushView(": export directory out of bounds");
+        return false;
+    }
+    u32 dllRva = leU32(data + p + 12);
+    u32 nfunc = leU32(data + p + 20);
+    u32 nnames = leU32(data + p + 24);
+    u32 eatRva = leU32(data + p + 28);
+    u32 npRva = leU32(data + p + 32);
+    u32 ordRva = leU32(data + p + 36);
+    if (nnames > 0x10000 || nfunc > 0x100000)
+    {
+        err->pushView("linker: ");
+        err->pushView(name);
+        err->pushView(": implausible export counts");
+        return false;
+    }
+    str dll = str::empty();
+    if (dllRva != 0) _rvaStr(data, len, secTbl, nsec, dllRva, &dll);
+    if (dll.len == 0) dll = name; /* fall back to the input file name */
+
+    usize npOff = _rvaToOff(data, len, secTbl, nsec, npRva);
+    usize ordOff = _rvaToOff(data, len, secTbl, nsec, ordRva);
+    usize eatOff = _rvaToOff(data, len, secTbl, nsec, eatRva);
+    if (npOff == 0 || ordOff == 0 || eatOff == 0)
+    {
+        err->pushView("linker: ");
+        err->pushView(name);
+        err->pushView(": export name tables out of bounds");
+        return false;
+    }
+    if (!fits(npOff, (usize)nnames * 4, len) || !fits(ordOff, (usize)nnames * 2, len))
+    {
+        err->pushView("linker: ");
+        err->pushView(name);
+        err->pushView(": export name tables out of bounds");
+        return false;
+    }
+    for (u32 i = 0; i < nnames; i++)
+    {
+        u32 symRva = leU32(data + npOff + (usize)i * 4);
+        u16 ordIdx = leU16(data + ordOff + (usize)i * 2);
+        if ((u32)ordIdx >= nfunc) continue;
+        if (!fits(eatOff + (usize)ordIdx * 4, 4, len)) continue;
+        u32 funcRva = leU32(data + eatOff + (usize)ordIdx * 4);
+        str sym = str::empty();
+        if (!_rvaStr(data, len, secTbl, nsec, symRva, &sym) || sym.len == 0) continue;
+        if (funcRva >= expRva && funcRva < expRva + expSz)
+        {
+            /* forwarded export: "dll.func" */
+            str fwd = str::empty();
+            if (!_rvaStr(data, len, secTbl, nsec, funcRva, &fwd)) continue;
+            usize dot = fwd.findByte('.');
+            if (dot == 0 || dot >= fwd.len) continue;
+            str fdll = fwd.slice(0, dot);
+            str ffunc = fwd.slice(dot + 1, fwd.len);
+            imps->add(fdll, ffunc, false, 0);
+        }
+        else
+        {
+            imps->add(dll, sym, false, 0);
+        }
+    }
+    return true;
+}
+
+/* Export directory size for the export list (module string first in
+ * the string area, then the sorted export names).
+ */
+pub usize sizeEdata(Vec<str>* exports, str moduleName)
+{
+    usize n = exports->count();
+    usize strStart = 40 + n * 4 + n * 4 + n * 2;
+    usize total = strStart;
+    str mod = moduleName.len > 0 ? moduleName : str::fromParts((const u8*)"coral", 5);
+    total += mod.len + 1;
+    for (usize i = 0; i < n; i++) total += exports->at(i).len + 1;
+    if (total % 4 != 0) total += 4 - total % 4;
+    return total;
+}
+
+usize _findExportDef(Vec<GlobalDef>* defs, str name)
+{
+    i64 i = findDef(defs, name);
+    if (i < 0) return 0;
+    return (usize)i + 1;
+}
+
+/* Writes the export directory into img at edata raw offset. */
+pub bool buildEdata(u8* img, Layout* L, Vec<GlobalDef>* defs, Vec<ObjFile>* objs, Vec<str>* exports, str moduleName, String* err)
+{
+    usize n = exports->count();
+    usize rawOff = (usize)L->edataOff;
+    u64 rvaBase = L->edataAddr - L->imageBase;
+    u8* base = img + rawOff;
+    str mod = moduleName.len > 0 ? moduleName : str::fromParts((const u8*)"coral", 5);
+
+    usize eatOff = 40;
+    usize npOff = eatOff + n * 4;
+    usize ordOff = npOff + n * 4;
+    usize strOff = ordOff + n * 2;
+    usize modOff = strOff;
+
+    /* module name string */
+    for (usize b = 0; b < mod.len; b++) base[modOff + b] = mod.ptr[b];
+    base[modOff + mod.len] = 0;
+    usize nameCur = modOff + mod.len + 1;
+
+    putU32(base + 12, (u32)(rvaBase + (u64)modOff)); /* Name */
+    putU32(base + 16, 1); /* Base */
+    putU32(base + 20, (u32)n); /* NumberOfFunctions */
+    putU32(base + 24, (u32)n); /* NumberOfNames */
+    putU32(base + 28, (u32)(rvaBase + (u64)eatOff));
+    putU32(base + 32, (u32)(rvaBase + (u64)npOff));
+    putU32(base + 36, (u32)(rvaBase + (u64)ordOff));
+
+    for (usize i = 0; i < n; i++)
+    {
+        str en = exports->at(i);
+        usize di = _findExportDef(defs, en);
+        if (di == 0)
+        {
+            err->pushView("linker: export is not defined: ");
+            err->pushView(en);
+            return false;
+        }
+        u64 addr = 0;
+        if (!defAddress(objs, L, defs->atPtr(di - 1), &addr, err)) return false;
+        putU32(base + eatOff + i * 4, (u32)(addr - L->imageBase));
+        putU32(base + npOff + i * 4, (u32)(rvaBase + (u64)nameCur));
+        putU16(base + ordOff + i * 2, (u16)i);
+        for (usize b = 0; b < en.len; b++) base[nameCur + b] = en.ptr[b];
+        base[nameCur + en.len] = 0;
+        nameCur += en.len + 1;
+    }
+    return true;
+}
+
+/* Writes the full PE header block: DOS stub, PE signature, COFF
+ * header, optional header with data directories, and all section
+ * headers. Requires layout to have placed every region.
+ */
+pub void writePeHeaders(u8* img, bool is64, bool isDll, u16 subsystem, Layout* L, Imports* imps)
+{
+    u16 mach = is64 ? 0x8664 : 0x14c;
+    u16 nsec = 11;
+    u16 optSize = is64 ? 240 : 224;
+    usize e = 0x80;
+    u8* dos = img;
+    dos[0] = 'M';
+    dos[1] = 'Z';
+    putU32(dos + 0x3c, (u32)e);
+    for (usize i = 2; i < 0x3c; i++) dos[i] = 0;
+    img[e] = 'P';
+    img[e + 1] = 'E';
+    img[e + 2] = 0;
+    img[e + 3] = 0;
+    usize coff = e + 4;
+    putU16(img + coff + 0, mach);
+    putU16(img + coff + 2, nsec);
+    putU32(img + coff + 4, 0); /* TimeDateStamp */
+    putU32(img + coff + 8, 0); /* PointerToSymbolTable */
+    putU32(img + coff + 12, 0); /* NumberOfSymbols */
+    putU16(img + coff + 16, optSize);
+    u32 chars = IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_LINE_NUMS_STRIPPED |
+                IMAGE_FILE_LOCAL_SYMS_STRIPPED;
+    if (is64) chars = chars | IMAGE_FILE_LARGE_ADDRESS_AWARE;
+    else chars = chars | IMAGE_FILE_32BIT_MACHINE;
+    if (isDll) chars = chars | IMAGE_FILE_DLL;
+    putU16(img + coff + 18, (u16)chars);
+
+    usize opt = coff + 20;
+    u8* o = img + opt;
+    putU16(o + 0, is64 ? 0x20b : 0x10b);
+    o[2] = 1; /* MajorLinkerVersion */
+    o[3] = 0;
+    /* SizeOfCode / initialized / uninitialized (advisory) */
+    putU32(o + 4, (u32)alignUp(L->secs.at(0).size, 0x1000));
+    u32 initSz = 0;
+    for (usize i = 1; i <= 6; i++) initSz = initSz + (u32)alignUp(L->secs.at(i).size, 0x1000);
+    putU32(o + 8, initSz + (u32)alignUp(L->idataSize, 0x1000) + (u32)alignUp(L->edataSize, 0x1000) + (u32)alignUp(L->relocSize, 0x1000));
+    putU32(o + 12, (u32)L->secs.at(7).size);
+    putU32(o + 16, (u32)(L->entry - L->imageBase)); /* AddressOfEntryPoint */
+    putU32(o + 20, (u32)(L->secs.at(0).addr - L->imageBase)); /* BaseOfCode */
+    if (!is64) putU32(o + 24, (u32)(L->secs.at(6).addr - L->imageBase)); /* BaseOfData */
+    usize ibOff = is64 ? 24 : 28;
+    if (is64) putU64(o + ibOff, L->imageBase);
+    else putU32(o + ibOff, (u32)L->imageBase);
+    usize p = is64 ? 32 : 32;
+    /* both: SectionAlignment @32, FileAlignment @36 (PE32 BaseOfData
+     * occupies 24..28 so alignments still land at 32/36) */
+    putU32(o + 32, 0x1000);
+    putU32(o + 36, 0x1000);
+    putU16(o + 40, 6); /* MajorOperatingSystemVersion */
+    putU16(o + 42, 0);
+    putU16(o + 44, 6); /* MajorSubsystemVersion */
+    putU16(o + 46, 0);
+    putU32(o + 48, 0); /* Win32VersionValue */
+    putU32(o + 52, (u32)L->imageEnd); /* SizeOfImage */
+    putU32(o + 56, 0x1000); /* SizeOfHeaders */
+    putU32(o + 60, 0); /* CheckSum */
+    putU16(o + 64, subsystem);
+    putU16(o + 66, 0x0140); /* NX_COMPAT | DYNAMIC_BASE */
+    if (is64) putU16(o + 66, (u16)(0x0140 | 0x0020)); /* HIGH_ENTROPY_VA */
+    putU32(o + 68, 0x100000); /* SizeOfStackReserve */
+    putU32(o + 72, 0x1000); /* SizeOfStackCommit */
+    putU32(o + 76, 0x100000); /* SizeOfHeapReserve */
+    putU32(o + 80, 0x1000); /* SizeOfHeapCommit */
+    putU32(o + 84, 0); /* LoaderFlags */
+    putU32(o + 88, (u32)PE_DIR_COUNT); /* NumberOfRvaAndSizes */
+
+    usize dd = opt + (is64 ? 112 : 96);
+    /* [0] export */
+    if (L->edataSize > 0)
+    {
+        putU32(img + dd + 0, (u32)(L->edataAddr - L->imageBase));
+        putU32(img + dd + 4, (u32)L->edataSize);
+    }
+    /* [1] import: descriptors only */
+    usize nD = 0;
+    for (usize i = 0; i < imps->recs.count(); i++)
+    {
+        str dll = imps->recs.at(i).dll;
+        bool seen = false;
+        for (usize j = 0; j < i; j++)
+        {
+            if (imps->recs.at(j).dll.equals(dll)) { seen = true; break; }
+        }
+        if (!seen) nD++;
+    }
+    if (imps->recs.count() > 0)
+    {
+        putU32(img + dd + 8, (u32)(L->idataAddr - L->imageBase));
+        putU32(img + dd + 12, (u32)((nD + 1) * 20));
+    }
+    /* [5] base relocations */
+    putU32(img + dd + 40, (u32)(L->relocAddr - L->imageBase));
+    putU32(img + dd + 44, (u32)L->relocSize);
+
+    /* section table */
+    usize secTbl = opt + optSize;
+    for (usize i = 0; i < 11; i++)
+    {
+        u8* sh = img + secTbl + i * PE_SECHDR_SIZE;
+        str nm = _peName(i);
+        for (usize b = 0; b < 8; b++) sh[b] = (b < nm.len) ? nm.ptr[b] : 0;
+        u64 va = 0;
+        u64 vsize = 0;
+        u64 rawOff = 0;
+        u64 rawSize = 0;
+        if (i < 8)
+        {
+            vsize = L->secs.at(i).size;
+            va = L->secs.at(i).addr - L->imageBase;
+            if (i == 7)
+            {
+                rawOff = 0;
+                rawSize = 0;
+            }
+            else
+            {
+                rawOff = L->secs.at(i).offset;
+                rawSize = alignUp(vsize, 0x1000);
+            }
+        }
+        else if (i == 8)
+        {
+            vsize = L->idataSize;
+            va = L->idataAddr - L->imageBase;
+            rawOff = L->idataOff;
+            rawSize = alignUp(vsize, 0x1000);
+        }
+        else if (i == 9)
+        {
+            vsize = L->edataSize;
+            va = L->edataAddr - L->imageBase;
+            rawOff = L->edataOff;
+            rawSize = alignUp(vsize, 0x1000);
+        }
+        else
+        {
+            vsize = L->relocSize;
+            va = L->relocAddr - L->imageBase;
+            rawOff = L->relocOff;
+            rawSize = alignUp(vsize, 0x1000);
+        }
+        putU32(sh + 8, (u32)vsize);
+        putU32(sh + 12, (u32)va);
+        putU32(sh + 16, (u32)rawSize);
+        putU32(sh + 20, (u32)rawOff);
+        putU32(sh + 24, 0);
+        putU32(sh + 28, 0);
+        putU16(sh + 32, 0);
+        putU16(sh + 34, 0);
+        putU32(sh + 36, _peChars(i, is64));
+    }
+}
+
+/* Sorts fixups ascending (counting sort by page, insertion within a
+ * page) in place through a scratch buffer, then writes base
+ * relocation blocks at .reloc and patches the .reloc section header
+ * and data directory with the actual size.
+ */
+pub bool finalizeReloc(u8* img, bool is64, Layout* L, Vec<u32>* fixups, String* err)
+{
+    usize secTbl = 0x80 + 4 + 20 + (is64 ? 240 : 224);
+    u8* relocSh = img + secTbl + 10 * PE_SECHDR_SIZE;
+    usize n = fixups->count();
+    if (n == 0)
+    {
+        putU32(relocSh + 8, 0);
+        putU32(relocSh + 16, 0);
+        usize dd = 0x80 + 4 + 20 + (is64 ? 112 : 96);
+        putU32(img + dd + 44, 0);
+        return true;
+    }
+
+    /* is it already ascending? */
+    bool sorted = true;
+    for (usize i = 1; i < n; i++)
+    {
+        if (fixups->at(i) < fixups->at(i - 1)) { sorted = false; break; }
+    }
+    if (!sorted)
+    {
+        u32 maxOff = fixups->at(0);
+        for (usize i = 1; i < n; i++)
+            if (fixups->at(i) > maxOff) maxOff = fixups->at(i);
+        usize pages = (usize)(maxOff >> 12) + 1;
+        u32* counts = alloc<u32>(pages);
+        for (usize i = 0; i < pages; i++) counts[i] = 0;
+        for (usize i = 0; i < n; i++) counts[fixups->at(i) >> 12]++;
+        u32* starts = alloc<u32>(pages);
+        u32 acc = 0;
+        for (usize i = 0; i < pages; i++)
+        {
+            starts[i] = acc;
+            acc = acc + counts[i];
+        }
+        u32* out = alloc<u32>(n);
+        for (usize i = 0; i < n; i++)
+        {
+            u32 v = fixups->at(i);
+            u32* st = starts + (v >> 12);
+            out[*st] = v;
+            *st = *st + 1;
+        }
+        for (usize i = 0; i < n; i++) *fixups->atPtr(i) = out[i];
+        dealloc<u32>(counts);
+        dealloc<u32>(starts);
+        dealloc<u32>(out);
+        /* insertion within each page (stable groups, small) */
+        usize i = 0;
+        while (i < n)
+        {
+            u32 page = fixups->at(i) >> 12;
+            usize j = i + 1;
+            while (j < n && (fixups->at(j) >> 12) == page) j++;
+            for (usize a = i + 1; a < j; a++)
+            {
+                u32 key = fixups->at(a);
+                usize b = a;
+                while (b > i && fixups->at(b - 1) > key)
+                {
+                    *fixups->atPtr(b) = fixups->at(b - 1);
+                    b--;
+                }
+                *fixups->atPtr(b) = key;
+            }
+            i = j;
+        }
+    }
+
+    u8* p = img + (usize)L->relocOff;
+    usize written = 0;
+    usize i = 0;
+    while (i < n)
+    {
+        u32 pageRva = fixups->at(i) & ~0xfffu;
+        usize j = i;
+        while (j < n && (fixups->at(j) & ~0xfffu) == pageRva) j++;
+        usize cnt = j - i;
+        u32 blockSize = (u32)(8 + cnt * 2);
+        if (blockSize % 4 != 0) blockSize += 2;
+        if (!fits((usize)L->relocOff + written, (usize)blockSize, 0xffffffffu))
+        {
+            err->pushView("linker: base relocation table exceeds reserve");
+            return false;
+        }
+        putU32(p + written + 0, pageRva);
+        putU32(p + written + 4, blockSize);
+        for (usize k = 0; k < cnt; k++)
+        {
+            u16 entry = (u16)((fixups->at(i + k) & 0xfff) | 0x3000); /* ABSOLUTE */
+            putU16(p + written + 8 + k * 2, entry);
+        }
+        if (blockSize == 8 + cnt * 2 + 2) putU16(p + written + 8 + cnt * 2, 0);
+        written += blockSize;
+        i = j;
+    }
+
+    u64 actual = (u64)written;
+    putU32(relocSh + 8, (u32)actual); /* VirtualSize */
+    putU32(relocSh + 16, (u32)alignUp(actual, 0x1000)); /* SizeOfRawData */
+    usize dd = 0x80 + 4 + 20 + (is64 ? 112 : 96);
+    putU32(img + dd + 44, (u32)actual); /* BaseRelocationTable.Size */
+    return true;
+}

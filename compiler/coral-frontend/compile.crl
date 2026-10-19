@@ -1,0 +1,324 @@
+#[[no_drop_all]]
+// frontend/compile.crl: single-file compile (coralc name.crl -o name).
+
+import common::slice { Slice };
+import args { Options };
+import io { readFile, sliceCStr, writeFile };
+import sem::analyze { CompileUnit, analyzeForCompile, freeUnit };
+import build::arena { Arena };
+import backend::codegen { generateC, CodegenResult };
+import hir::hir { build, printHir, HirModule };
+import build::parser { CrlbParser };
+import build::ast { CrlbNode, CrlbNodeKind, Value, ValueArray };
+import(lib) core::cchar { cchar };
+import(lib) std::mman { alloc, dealloc };
+import(lib) std::vec { Vec };
+import(lib) std::result { Result };
+import(lib) std::io::fs { IoError };
+import(lib) std::io::process { spawn, writeStdin, waitFor, pollfd, Process, ProcessResult };
+import(lib) platform::libc { printf, close, read, write, poll };
+
+bool endsWithCrl(Slice s)
+{
+    if (s.len < 4) return false;
+    return s.ptr[s.len - 4] == 46 && s.ptr[s.len - 3] == 99 &&
+           s.ptr[s.len - 2] == 114 && s.ptr[s.len - 1] == 108;
+}
+
+// default output: input with a trailing `.crl` stripped
+Slice defaultOutput(Slice input)
+{
+    if (endsWithCrl(input)) return Slice::from(input.ptr, input.len - 4);
+    return input;
+}
+
+/* feed the generated C to gcc through a pipe: no .c file ever touches the
+ * disk. gcc's diagnostics are dropped unless showGcc. Returns gcc's exit
+ * status (127 = could not start / wait for gcc). */
+i32 runGcc(str outPath, str opt, Slice cCode, bool hasMain, bool showGcc)
+{
+    Vec<str> args = Vec<str>::new();
+    args.push("-std=gnu11");
+    args.push("-x");
+    args.push("c");
+    args.push("-");
+    if (opt.len == 7 && opt.ptr[0] == 114 && opt.ptr[1] == 101 && opt.ptr[2] == 108 && opt.ptr[3] == 101 && opt.ptr[4] == 97 && opt.ptr[5] == 115 && opt.ptr[6] == 101)
+    {
+        args.push("-O2");
+    }
+    else if (opt.len == 4 && opt.ptr[0] == 115 && opt.ptr[1] == 105 && opt.ptr[2] == 122 && opt.ptr[3] == 101)
+    {
+        args.push("-Os");
+    }
+    else if (opt.len == 2 && opt.ptr[0] == 79 && opt.ptr[1] == 51)
+    {
+        args.push("-O3");
+    }
+    else
+    {
+        args.push("-O0");
+        args.push("-g");
+    }
+    if (!hasMain) args.push("-c");
+    else args.push("-s");
+    args.push("-o");
+    args.push(outPath);
+    args.push("-lm");
+
+    Result<Process, IoError> sr = spawn("gcc", &args);
+    if (sr.isErr()) return 127;
+    Process p = sr.unwrap();
+
+    usize off = 0;
+    while (off < cCode.len)
+    {
+        Result<isize, IoError> wr = writeStdin(&p, (const cchar*)(cCode.ptr + off), cCode.len - off);
+        if (wr.isErr()) break;
+        isize n = wr.unwrap();
+        if (n <= 0) break;
+        off = off + (usize)n;
+    }
+    /* EOF for gcc, then drain both output pipes so gcc can never block
+     * writing diagnostics while we wait for it */
+    close((i32)p.stdinFd);
+
+    u8* buf = alloc<u8>(4096);
+    if (buf != null)
+    {
+        bool stdoutOpen = true;
+        bool stderrOpen = true;
+        while (stdoutOpen || stderrOpen)
+        {
+            pollfd fds[2];
+            i32 outIdx = -1;
+            i32 errIdx = -1;
+            usize nfds = 0;
+            if (stdoutOpen) { outIdx = (i32)nfds; fds[nfds].fd = (i32)p.stdoutFd; fds[nfds].events = 1; fds[nfds].revents = 0; nfds++; }
+            if (stderrOpen) { errIdx = (i32)nfds; fds[nfds].fd = (i32)p.stderrFd; fds[nfds].events = 1; fds[nfds].revents = 0; nfds++; }
+            if (nfds == 0) break;
+            i32 prc = poll((rawptr)fds, nfds, -1);
+            if (prc <= 0) break;
+            usize i = 0;
+            while (i < nfds)
+            {
+                if ((fds[i].revents & 17) == 0) { i++; continue; }
+                isize n = read(fds[i].fd, buf, 4096);
+                if (n <= 0)
+                {
+                    close(fds[i].fd);
+                    if ((i32)i == outIdx) stdoutOpen = false;
+                    else if ((i32)i == errIdx) stderrOpen = false;
+                }
+                else if (showGcc)
+                {
+                    if ((i32)i == outIdx) write(1, (const cchar*)buf, (usize)n);
+                    else write(2, (const cchar*)buf, (usize)n);
+                }
+                i++;
+            }
+        }
+        dealloc<u8>(buf);
+    }
+
+    Result<ProcessResult, IoError> gw = waitFor(&p);
+    if (gw.isErr()) return 127;
+    return gw.unwrap().exitCode;
+}
+
+bool codeHasSlice(Slice code, str pat)
+{
+    if (code.ptr == null || code.len < pat.len) return false;
+    usize i = 0;
+    while (i + pat.len <= code.len)
+    {
+        bool m = true;
+        usize j = 0;
+        while (j < pat.len)
+        {
+            if (code.ptr[i + j] != pat.ptr[j]) { m = false; break; }
+            j++;
+        }
+        if (m) return true;
+        i++;
+    }
+    return false;
+}
+
+bool codeHasMain(Slice code)
+{
+    if (codeHasSlice(code, "int32_t main(")) return true;
+    return codeHasSlice(code, "void main(");
+}
+
+/* one compilation unit → one binary/object. The build path calls this with
+ * the builder's in-memory module table; single-file mode passes nulls. */
+pub i32 compileUnitTo(str inPath, str outPath, Slice* flagsN, Slice* flagsV, u32 nFlags, usize errorLimit, bool allowIntPtr, bool noPrelude, bool quiet, bool dryRun, Slice* modKeys, Slice* modVals, u32 modLen, str opt, bool emitC, bool showGcc)
+{
+    usize len = 0;
+    Slice src = readFile(inPath, &len);
+    u8* inZ = sliceCStr(Slice::fromStr(inPath));
+    if (src.ptr == null) {
+        printf(C"error: cannot read %s\n", inZ);
+        dealloc<u8>(inZ);
+        return 1;
+    }
+    CompileUnit unit = analyzeForCompile(src.ptr, len, inZ, flagsN, flagsV, nFlags, errorLimit, allowIntPtr, noPrelude, quiet, modKeys, modVals, modLen, false, null);
+    if (unit.ctx == null) {
+        printf(C"error: compile failed (%d errors)\n",
+               (i32)(unit.parseErrors + unit.semanticErrors + unit.monoErrors));
+        dealloc<u8>(inZ);
+        return 2;
+    }
+
+    // generated C sits next to the output: <out>.c
+    usize outLen = outPath.len;
+    u8* cPath = alloc<u8>(outLen + 3);
+    if (cPath == null) { freeUnit(&unit); dealloc<u8>(inZ); return 1; }
+    usize ci = 0;
+    while (ci < outLen) { cPath[ci] = outPath.ptr[ci]; ci++; }
+    cPath[ci] = 46; cPath[ci + 1] = 99; cPath[ci + 2] = 0;
+
+    Arena a;
+    a.init(4194304);
+    CodegenResult cg = generateC(unit.ctx, unit.file, unit.mono, &a);
+    if (cg.errors > 0 || cg.cCode.ptr == null) {
+        printf(C"error: codegen failed (%d errors)\n", (i32)cg.errors);
+        a.freeAll();
+        dealloc<u8>(cPath);
+        dealloc<u8>(inZ);
+        freeUnit(&unit);
+        return 3;
+    }
+
+    if (emitC)
+    {
+        if (!writeFile(str { .ptr = cPath, .len = outLen + 2 }, cg.cCode)) {
+            printf(C"error: cannot write %s\n", cPath);
+            a.freeAll();
+            dealloc<u8>(cPath);
+            dealloc<u8>(inZ);
+            freeUnit(&unit);
+            return 3;
+        }
+        printf(C"coral: emit %s (%d bytes)\n", cPath, (i32)cg.cCode.len);
+    }
+
+    i32 rc = 0;
+    if (dryRun) {
+        u8* outZ = sliceCStr(Slice::fromStr(outPath));
+        printf(C"coral: dry run, would link %s\n", outZ);
+        dealloc<u8>(outZ);
+    } else {
+        /* helper/library files emit no main: compile to an object instead
+         * of linking an executable (which would fail with undefined main) */
+        bool hasMain = codeHasMain(cg.cCode);
+        i32 st = runGcc(outPath, opt, cg.cCode, hasMain, showGcc);
+        if (st != 0) {
+            printf(C"error: gcc failed (status %d); rerun with --show-gcc for details\n", (i32)st);
+            rc = 3;
+        } else {
+            u8* outZ = sliceCStr(Slice::fromStr(outPath));
+            printf(C"coral: built %s -> %s\n", inZ, outZ);
+            dealloc<u8>(outZ);
+        }
+    }
+
+    a.freeAll();
+    dealloc<u8>(cPath);
+    dealloc<u8>(inZ);
+    freeUnit(&unit);
+    return rc;
+}
+
+pub i32 compileFile(Options* opts)
+{
+    /* also surfacing build-file flags: the manifest's `flags = [ "NAME=VALUE",
+     * ... ]` list merges into the compile-time flag table (see Options).  */
+    if (opts->buildFileSet)
+    {
+        usize fbuflen = 0;
+        Slice fsrc = readFile(opts->buildFile.asStr(), &fbuflen);
+        if (fsrc.ptr != null && fbuflen > 0)
+        {
+            Arena fa;
+            fa.init(1 << 18);
+            CrlbParser fp;
+            fp.init(&fa, fsrc);
+            CrlbNode* rootp = fp.parseFile();
+            if (rootp != null && fp.errors == 0)
+            {
+                usize bi = 0;
+                while (bi < rootp.children.len)
+                {
+                    CrlbNode* c = rootp.children.data + bi;
+                    if (c.kind == CrlbNodeKind::Build)
+                    {
+                        // find fields.
+                        usize fi = 0;
+                        while (fi < c.fields.len)
+                        {
+                            CrlbField* f = c.fields.data + fi;
+                            if (f.name.len == 5 && f.name.ptr[0] == 102 && f.name.ptr[1] == 108 && f.name.ptr[2] == 97 && f.name.ptr[3] == 103 && f.name.ptr[4] == 115)
+                            {
+                                // Value::List
+                                usize vi = 0;
+                                ValueArray* va = f.value.payload.List.value;
+                                if (va != null) {
+                                while (vi < va.len)
+                                {
+                                    Value* v = va.data + (u32)vi;
+                                    if (v.tag == Value::String)
+                                    {
+                                        usize si = 0;
+                                        usize ev = v.payload.String.value.len;
+                                        while (si < ev)
+                                        {
+                                            if (v.payload.String.value.ptr[si] == 61) break;
+                                            si++;
+                                        }
+                                        if (si > 0 && si < ev && opts->flagsCount < 32)
+                                        {
+                                            if (opts->flagNames == null)
+                                            {
+                                                opts->flagNames = alloc<Slice>(32);
+                                                opts->flagValues = alloc<Slice>(32);
+                                            }
+                                            opts->flagNames[opts->flagsCount] = Slice::from(v.payload.String.value.ptr, (usize)si);
+                                            opts->flagValues[opts->flagsCount] = Slice::from(v.payload.String.value.ptr + si + 1, ev - si - 1);
+                                            opts->flagsCount++;
+                                        }
+                                    }
+                                    vi++;
+                                }
+                                }
+                            }
+                            fi++;
+                        }
+                    }
+                    bi++;
+                }
+            }
+        }
+    }
+    // output binary path: -o or input minus `.crl`
+    Slice out = opts.output;
+    if (out.ptr == null || out.len == 0) out = defaultOutput(opts.input);
+
+    i32 rc = compileUnitTo(opts.input.asStr(), out.asStr(), opts->flagNames, opts->flagValues, opts->flagsCount, opts->errorLimit, opts->allowIntPtr, opts->noPrelude, opts->quiet, opts->dryRun, null, null, 0, opts->opt.asStr(), opts->emitC, opts->showGcc);
+    if (rc == 0 && opts.emitHir) {
+        // HIR dump needs a second analysis pass; cheap enough for a debug flag
+        usize hlen = 0;
+        Slice hsrc = readFile(opts.input.asStr(), &hlen);
+        if (hsrc.ptr != null) {
+            u8* inZ = sliceCStr(opts.input);
+            CompileUnit hunit = analyzeForCompile(hsrc.ptr, hlen, inZ, opts->flagNames, opts->flagValues, opts->flagsCount, opts->errorLimit, opts->allowIntPtr, opts->noPrelude, true, null, null, 0, false, null);
+            dealloc<u8>(inZ);
+            if (hunit.ctx != null) {
+                HirModule* hir = build(hunit.ctx, hunit.file, hunit.mono, hunit.ctx.intern(opts.input.asStr()));
+                printHir(hunit.ctx, hir);
+                freeUnit(&hunit);
+            }
+        }
+    }
+    return rc;
+}

@@ -1,0 +1,607 @@
+#[[no_drop_all]]
+// parser/type.crl: type parsing
+//
+// base type then suffixes (fn-pointer, pointer, slice, array), with the
+// const/comptime wrappers peeled off in parseType. every constructor here
+// allocates a fresh entry except internKind, which dedups primitives.
+
+import diag { code { ErrorCode }, engine { DiagnosticEngine } };
+import common::token { Token, TokenKind };
+import ast {
+    types { Ty, TypeKind, TypeEntry },
+    id { Str, NodeId },
+    node { Node, NodeKind },
+    expr { Expr, ExprKind }
+};
+import context::context { AstContext, TyListBuilder };
+import base { Parser, ParserMark };
+import parser;
+import(lib) std::mman { dealloc, realloc };
+
+pub extend Parser
+{
+    /* `T(params)` is a fn-pointer type only when what follows `(` can be a
+     * parameter type (or the list is empty). Without this a statement like
+     * `take(&a[1]);` speculatively reads `take(` as a function type,
+     * error recovery lands on `[`, and the decl-vs-expr guess commits a
+     * bogus declaration full of PAR errors. */
+    bool fnTypeAhead()
+    {
+        if (self.current.kind != TokenKind::LParen) return false;
+        ParserMark m = self.save();
+        self.advance();
+        bool ok = self.current.kind == TokenKind::RParen || self.isTypeStart();
+        self.restore(m);
+        return ok;
+    }
+
+    // suffixes on a base type: fn-pointer, pointer, slice, array
+    Ty parseTypeSuffix(Ty base)
+    {
+        /* a split `>>` (nested generics, e.g. `zero<E<i32, i32>>(a, b)`)
+         * leaves pendingGreater set with the cursor already past BOTH
+         * closers; a following `(` is the call's argument list, never a
+         * fn-pointer type suffix, so it must not be absorbed as types */
+        if (base != 0 && !self.pendingGreater && self.fnTypeAhead())
+        {
+            /* fn-pointer type over a keyword base: `void(i32)`,
+             * `rawptr(rawptr)`, `u32(rawptr)`: RET(params) */
+            self.advance();
+            TyListBuilder fpParams;
+            self.ctx.tyListInit(&fpParams);
+            if (self.current.kind != TokenKind::RParen)
+            {
+                Ty fpParam = self.parseType();
+                if (!self.ctx.tyListAppend(&fpParams, fpParam)) self.reportAllocFailed();
+                while (self.match(TokenKind::Comma))
+                {
+                    fpParam = self.parseType();
+                    if (!self.ctx.tyListAppend(&fpParams, fpParam)) self.reportAllocFailed();
+                }
+            }
+            self.expect(TokenKind::RParen);
+            u32 fpCount = fpParams.len;
+            Ty* fpValues = self.ctx.tyListFinish(&fpParams);
+            base = self.makeFunctionPointer(0, base, fpValues, fpCount);
+        }
+        while (self.match(TokenKind::Star)) {
+             base = self.makePointer(base); }
+
+        while (self.current.kind == TokenKind::LBracket)
+        {
+            self.advance();
+            if (self.match(TokenKind::RBracket)) {
+                base = self.makeSlice(base);
+            } else {
+                self.parseExpr();
+                self.expect(TokenKind::RBracket);
+                base = self.makeArray(base, 0);
+            }
+        }
+        return base;
+    }
+
+    // `const T` / `comptime T` wrap whatever the suffix chain produced
+    Ty parseType()
+    {
+        if (self.current.kind == TokenKind::Flag) return self.parseFlagType();
+        if (self.match(TokenKind::Const))
+        {
+            Ty inner = self.parseType();
+            return self.makeConst(inner);
+        }
+        if (self.match(TokenKind::Comptime))
+        {
+            Ty inner = self.parseType();
+            return self.makeComptime(inner);
+        }
+        return self.parseTypeSuffix(self.parseBaseType());
+    }
+
+    /* `name[N]` / `name[]` Array suffix attached to a declarator.
+     * N is an integer literal, or a same-file `const T N = <int literal>`,
+     * resolved through the prescanConstInts table, so declaration order
+     * within the file does not matter (cross-file consts need sema's
+     * declare-all pass from text.txt and are not supported yet). */
+    Ty parseDeclaratorArray(Ty base)
+    {
+        if (self.current.kind != TokenKind::LBracket) return base;
+        self.advance();
+        if (self.match(TokenKind::RBracket)) return self.makeSlice(base);
+        SourceLoc sizeLoc = self.tokenLoc(self.current);
+        NodeId sizeExpr = self.parseExpr();
+        self.expect(TokenKind::RBracket);
+        u32 v = 0;
+        bool ok = false;
+        Str sizeName = 0;
+        {
+            Node* sn = self.ctx.nodes + sizeExpr.index;
+            if (sn.kind.tag == NodeKind::Expr)
+            {
+                Expr se = sn.kind.payload.Expr.value;
+                if (se.kind.tag == ExprKind::IntLit)
+                {
+                    v = (u32)se.kind.payload.IntLit.value;
+                    ok = true;
+                }
+                else if (se.kind.tag == ExprKind::Ident)
+                {
+                    sizeName = se.kind.payload.Ident.name;
+                    u64 cv = 0;
+                    if (self.lookupConstInt(se.kind.payload.Ident.name, &cv)) { v = (u32)cv; ok = true; }
+                }
+            }
+        }
+        if (!ok)
+        {
+            if (sizeName != 0)
+            {
+                /* a bare name: possibly a generic parameter of the
+                 * enclosing struct/fn. sema rejects it when it is not
+                 * (runtime variable, unknown name) with a located error */
+                Ty inner = self.parseDeclaratorArray(base);
+                return self.makeArrayParam(inner, sizeName, sizeLoc);
+            }
+            self.reportCurrentError(ErrorCode::ParseExpectedExpr, "array size must be an integer literal, a const int, or a generic parameter");
+            return base;
+        }
+        /* rightmost suffix is the innermost dimension:
+         * `T x[A][B]` → Array(Array(T, B), A) so the outer dim is A */
+        Ty inner = self.parseDeclaratorArray(base);
+        return self.makeArray(inner, v);
+    }
+
+    // same-file const-int table lookup (see Parser.constNames)
+    bool lookupConstInt(Str name, u64* out)
+    {
+        u32 i = 0;
+        while (i < self.constLen)
+        {
+            if (self.constNames[i] == name)
+            {
+                *out = self.constValues[i];
+                return true;
+            }
+            i++;
+        }
+        return false;
+    }
+
+    // grow-and-append for the const-int prescan table. names arrive
+    // interned, so the equality check in lookupConstInt is an id compare
+    void addConstInt(Str name, u64 value)
+    {
+        if (name == 0) return;
+        if (self.constLen >= self.constCap)
+        {
+            u32 newCap = 8;
+            if (self.constCap > 0) newCap = self.constCap * 2;
+            Str* names = realloc<Str>(self.constNames, (usize)newCap);
+            if (names == null) { self.reportAllocFailed(); return; }
+            self.constNames = names;
+            u64* values = realloc<u64>(self.constValues, (usize)newCap);
+            if (values == null) { self.reportAllocFailed(); return; }
+            self.constValues = values;
+            self.constCap = newCap;
+        }
+        self.constNames[self.constLen] = name;
+        self.constValues[self.constLen] = value;
+        self.constLen++;
+    }
+
+    /* tokens allowed between `const` and `=` in the prescan head:
+     * identifiers, `::`, and the builtin type keywords (usize/u32/...
+     * lex as their own TokenKinds, not Ident) */
+    bool isConstHeadToken(TokenKind k)
+    {
+        if (k == TokenKind::Ident || k == TokenKind::ColonColon) return true;
+        if (k == TokenKind::Void || k == TokenKind::Bool || k == TokenKind::Char) return true;
+        if (k == TokenKind::U8 || k == TokenKind::I8 || k == TokenKind::U16 || k == TokenKind::I16) return true;
+        if (k == TokenKind::U32 || k == TokenKind::I32 || k == TokenKind::U64 || k == TokenKind::I64) return true;
+        if (k == TokenKind::U128 || k == TokenKind::I128 || k == TokenKind::F32 || k == TokenKind::F64) return true;
+        if (k == TokenKind::Usize || k == TokenKind::Isize || k == TokenKind::Rawptr || k == TokenKind::Str) return true;
+        return false;
+    }
+
+    /* text.txt pass 1 in miniature (fast variant): re-lex the whole file
+     * once before parsing and record every `const T NAME = <int literal>`
+     * into the table, so declarator array sizes (`u8 buf[N]`) resolve no
+     * matter where the const is declared; coral needs no forward
+     * declarations. Pattern: const, then head tokens (idents/`::`/type
+     * keywords), then `=`, one int literal, `;`; anything else (fns,
+     * pointer consts, `#[[const]]`, non-literal values) resets the scan.
+     * Lexer diagnostics are muted for this dry run; the real parse
+     * reports them once. */
+    void prescanConstInts()
+    {
+        DiagnosticEngine* savedDiag = self.lexer.diag;
+        self.lexer.diag = null;
+        ParserMark m = self.save();
+        u32 state = 0;   // 0 hunt, 1 head, 2 value, 3 expect ';'
+        u32 headCount = 0;
+        u64 value = 0;
+        Str name = 0;
+        while (!self.atEnd())
+        {
+            TokenKind k = self.current.kind;
+            if (state == 0)
+            {
+                if (k == TokenKind::Const)
+                {
+                    state = 1;
+                    headCount = 0;
+                    name = 0;
+                }
+                self.advance();
+                continue;
+            }
+            if (state == 1)
+            {
+                if (self.isConstHeadToken(k))
+                {
+                    if (k == TokenKind::Ident)
+                        name = self.ctx.intern(self.current.data.asStr());
+                    headCount++;
+                    self.advance();
+                    continue;
+                }
+                if (k == TokenKind::Equal && headCount > 0) { state = 2; self.advance(); continue; }
+                state = 0;
+                continue;
+            }
+            if (state == 2)
+            {
+                if (k == TokenKind::Dec || k == TokenKind::Hex ||
+                    k == TokenKind::Bin || k == TokenKind::Oct)
+                {
+                    value = self.current.number;
+                    state = 3;
+                    self.advance();
+                    continue;
+                }
+                state = 0;
+                continue;
+            }
+            if (k == TokenKind::Semicolon)
+            {
+                self.addConstInt(name, value);
+                state = 0;
+                self.advance();
+                continue;
+            }
+            state = 0;
+        }
+        self.restore(m);
+        self.lexer.diag = savedDiag;
+    }
+
+    // called at the end of parseFile; the table is per-parser
+    void freeConstTable()
+    {
+        if (self.constNames != null)
+        {
+            dealloc<Str>(self.constNames);
+            self.constNames = null;
+        }
+        if (self.constValues != null)
+        {
+            dealloc<u64>(self.constValues);
+            self.constValues = null;
+        }
+        self.constLen = 0;
+        self.constCap = 0;
+    }
+
+    /* ── type node constructors ── */
+    // all fresh entries; internKind is the one exception
+
+    Ty makeVoid()
+    {
+        TypeKind k;
+        k.tag = TypeKind::Void;
+        return self.internKind(k);
+    }
+    
+    Ty makeNamed(Str name) { return self.makeNamedArgs(name, null, 0); }
+
+    Ty makeNamedArgs(Str name, Ty* args, u32 argsLen)
+    {
+        TypeKind k;
+        k = TypeKind::Named{ .name = name, .genericArgs = args, .genericArgsLen = argsLen };
+        Ty t = self.allocTypeKind(k);
+        /* record where the name was spelled: codegen needs the file to
+         * pick the right decl when two files declare the same type name */
+        TypeEntry* te = self.ctx.types + t;
+        te.loc = self.tokenLoc(self.current);
+        return t;
+    }
+
+    /* speculative `<A, B>` generic-argument list. consumeGreater handles
+     * `>>` so nested generics split correctly. on any error (or a missing
+     * `>`) the whole attempt is rewound to before the `<` and the partial
+     * arg array freed; the caller then reads `<` as a less-than. the
+     * error-count guard catches parseType errors, which are non-fatal */
+    bool parseGenericArguments(rawptr* outArgs, u32* outLen)
+    {
+        *outArgs = null;
+        *outLen = 0;
+        if (self.current.kind != TokenKind::Less) return false;
+        ParserMark mark = self.save();
+        self.advance();
+        TyListBuilder args;
+        self.ctx.tyListInit(&args);
+        bool ok = true;
+        if (self.current.kind == TokenKind::Greater || self.current.kind == TokenKind::Shr) {
+            ok = self.consumeGreater();
+        }
+        else
+        {
+            u32 errorsBefore = self.errorCount();
+            while (true)
+            {
+                Ty arg = 0;
+                /* comptime value argument (`Arr<i32, 4>`): an integer literal
+                 * is not a type, store it as a ValueInt type-table entry */
+                if (self.current.kind == TokenKind::Dec || self.current.kind == TokenKind::Hex ||
+                    self.current.kind == TokenKind::Bin || self.current.kind == TokenKind::Oct)
+                {
+                    u64 value = self.current.number;
+                    TypeKind vk;
+                    vk = TypeKind::ValueInt{ .value = value };
+                    arg = self.allocTypeKind(vk);
+                    self.advance();
+                }
+                else arg = self.parseType();
+                if (self.errorCount() > errorsBefore || !self.ctx.tyListAppend(&args, arg))
+                {
+                    ok = false;
+                    break;
+                }
+                if (!self.match(TokenKind::Comma)) break;
+            }
+            if (ok) ok = self.consumeGreater();
+        }
+        if (!ok)
+        {
+            if (args.data != null) dealloc<Ty>(args.data);
+            self.restore(mark);
+            return false;
+        }
+        *outLen = args.len;
+        *outArgs = (rawptr)self.ctx.tyListFinish(&args);
+        self.endSpeculation();
+        return true;
+    }
+    
+    Ty makePointer(Ty base)
+    {
+        TypeKind k;
+        k = TypeKind::Pointer{ .base = base };
+        return self.allocTypeKind(k);
+    }
+
+    Ty makeConst(Ty base)
+    {
+        TypeKind k;
+        k = TypeKind::Const{ .base = base };
+        return self.allocTypeKind(k);
+    }
+    
+    Ty makeComptime(Ty base)
+    {
+        TypeKind k;
+        k = TypeKind::Comptime{ .base = base };
+        return self.allocTypeKind(k);
+    }
+
+    Ty makeSlice(Ty base)
+    {
+        TypeKind k;
+        k = TypeKind::Slice{ .base = base };
+        return self.allocTypeKind(k);
+    }
+
+    Ty makeArray(Ty base, u32 len)
+    {
+        TypeKind k;
+        k = TypeKind::Array{ .base = base, .len = len, .sizeParam = 4294967295, .sizeName = 0 };
+        return self.allocTypeKind(k);
+    }
+
+    /* `T data[N]`: size is a name, resolved to a generic parameter index
+     * (or rejected by sema when it is not one) once the owning decl's
+     * generic list is known */
+    Ty makeArrayParam(Ty base, Str name, SourceLoc loc)
+    {
+        TypeKind k;
+        k = TypeKind::Array{ .base = base, .len = 0, .sizeParam = 4294967295, .sizeName = name };
+        Ty t = self.allocTypeKind(k);
+        /* record where the size was spelled: sema errors point here */
+        TypeEntry* te = self.ctx.types + t;
+        te.loc = loc;
+        return t;
+    }
+
+    Ty makeTuple(Ty* elems, u32 len)
+    {
+        TypeKind k;
+        k = TypeKind::Tuple{ .elems = elems, .elemsLen = len };
+        return self.allocTypeKind(k);
+    }
+
+    Ty makeFunctionPointer(Str name, Ty returnType, Ty* params, u32 paramsLen)
+    {
+        TypeKind k;
+        k = TypeKind::FnPtr{ .returnType = returnType, .params = params, .paramsLen = paramsLen, .name = name };
+        return self.allocTypeKind(k);
+    }
+
+    Ty allocTypeKind(TypeKind kind)
+    {
+        Ty id = self.ctx.allocTypeSlot();
+        if (id == 0 || self.ctx.types == null) {
+            self.reportAllocFailed();
+            return 0;
+        }
+        TypeEntry* e = self.ctx.types + id;
+        e.kind = kind;
+        e.loc.data = 0;
+        return id;
+    }
+
+    /* payload-less primitive kinds (Bool, Char, integers, floats, Void,
+     * Usize, Isize, Rawptr, Str, ...) are identified by tag alone: reuse
+     * the existing entry instead of allocating a duplicate, so every
+     * `bool` in every file shares one index; the sema helpers
+     * (boolType(), i32Type(), ...) return the FIRST entry with that tag
+     * and index equality must hold against them. Kinds with payloads
+     * (Named, Pointer, Array, ...) go through allocTypeKind. */
+    Ty internKind(TypeKind kind)
+    {
+        u32 i = 1;
+        while (i < self.ctx.typesLen)
+        {
+            if (self.ctx.types[i].kind.tag == kind.tag) return i;
+            i++;
+        }
+        return self.allocTypeKind(kind);
+    }
+
+    Ty parseBaseType()
+    {
+        // `any T` → `any<T>`; a tag wrapper, not a real generic
+        if (self.match(TokenKind::Any))
+        {
+            Token tTok = self.expect(TokenKind::Ident);
+            Str tn = self.ctx.intern(tTok.data.asStr());
+            Ty recv = self.makeNamedArgs(tn, null, 0);
+            return self.makeNamedArgs(self.ctx.intern("any"), &recv, 1);
+        }
+        if (self.match(TokenKind::Self)) return self.makeNamed(self.ctx.intern("self"));
+        if (self.match(TokenKind::Void)) return self.makeVoid();
+        if (self.match(TokenKind::Bool)) { TypeKind k; k.tag = TypeKind::Bool; return self.internKind(k); }
+        if (self.match(TokenKind::Char)) { TypeKind k; k.tag = TypeKind::Char; return self.internKind(k); }
+        if (self.match(TokenKind::U8)) { TypeKind k; k.tag = TypeKind::U8; return self.internKind(k); }
+        if (self.match(TokenKind::I8)) { TypeKind k; k.tag = TypeKind::I8; return self.internKind(k); }
+        if (self.match(TokenKind::U16)) { TypeKind k; k.tag = TypeKind::U16; return self.internKind(k); }
+        if (self.match(TokenKind::I16)) { TypeKind k; k.tag = TypeKind::I16; return self.internKind(k); }
+        if (self.match(TokenKind::U32)) { TypeKind k; k.tag = TypeKind::U32; return self.internKind(k); }
+        if (self.match(TokenKind::I32)) { TypeKind k; k.tag = TypeKind::I32; return self.internKind(k); }
+        if (self.match(TokenKind::U64)) { TypeKind k; k.tag = TypeKind::U64; return self.internKind(k); }
+        if (self.match(TokenKind::I64)) { TypeKind k; k.tag = TypeKind::I64; return self.internKind(k); }
+        if (self.match(TokenKind::U128)) { TypeKind k; k.tag = TypeKind::U128; return self.internKind(k); }
+        if (self.match(TokenKind::I128)) { TypeKind k; k.tag = TypeKind::I128; return self.internKind(k); }
+        if (self.match(TokenKind::F32)) { TypeKind k; k.tag = TypeKind::F32; return self.internKind(k); }
+        if (self.match(TokenKind::F64)) { TypeKind k; k.tag = TypeKind::F64; return self.internKind(k); }
+        if (self.match(TokenKind::Usize)) { TypeKind k; k.tag = TypeKind::Usize; return self.internKind(k); }
+        if (self.match(TokenKind::Isize)) { TypeKind k; k.tag = TypeKind::Isize; return self.internKind(k); }
+        if (self.match(TokenKind::Rawptr)) { TypeKind k; k.tag = TypeKind::Rawptr; return self.internKind(k); }
+        if (self.match(TokenKind::Str)) { TypeKind k; k.tag = TypeKind::Str; return self.internKind(k); }
+
+        if (self.current.kind == TokenKind::Ident)
+        {
+            Token nameTok = self.advance();
+            Str name = self.ctx.intern(nameTok.data.asStr());
+            while (self.match(TokenKind::ColonColon)) {
+                Token seg = self.expectName();
+                /* qualified type paths keep the final segment: sibling
+                 * imports merge their symbols flat, the same rule qualified
+                 * calls use for fn names (`fios::fileOpen` resolves by
+                 * `fileOpen`), so `fios::FileHandle` binds `FileHandle` */
+                name = self.ctx.intern(seg.data.asStr());
+            }
+    
+            Ty* genericArgs = null;
+            u32 genericArgsLen = 0;
+            self.parseGenericArguments((rawptr*)&genericArgs, &genericArgsLen);
+            /* pendingGreater means a split `>>` already closed the generic
+             * list and the cursor sits at what follows it; `zero<E<i32, i32>>(a, b)`
+             * has a call's `(` there, not a fn-type suffix */
+            if (!self.pendingGreater && self.fnTypeAhead())
+            {
+                self.advance();
+                TyListBuilder params;
+                self.ctx.tyListInit(&params);
+                if (self.current.kind != TokenKind::RParen)
+                {
+                    Ty param = self.parseType();
+                    if (!self.ctx.tyListAppend(&params, param)) self.reportAllocFailed();
+                    while (self.match(TokenKind::Comma))
+                    {
+                        param = self.parseType();
+                        if (!self.ctx.tyListAppend(&params, param)) self.reportAllocFailed();
+                    }
+                }
+                self.expect(TokenKind::RParen);
+                u32 count = params.len;
+                Ty* values = self.ctx.tyListFinish(&params);
+                // `T(params)`: a function type returning T taking params
+                Ty ret = self.makeNamedArgs(name, genericArgs, genericArgsLen);
+                return self.makeFunctionPointer(name, ret, values, count);
+            }
+             return self.makeNamedArgs(name, genericArgs, genericArgsLen);
+        }
+
+        if (self.current.kind == TokenKind::LParen)
+        {
+            /* parenthesized type lists are not part of the language: the
+             * only tuple spelling is `struct(A, B)`. report once but keep
+             * parsing so the rest of the line still checks. */
+            self.reportCurrentError(ErrorCode::ParseExpectedType, "tuple types are written 'struct(A, B)'");
+            self.advance();
+            TyListBuilder elems;
+            self.ctx.tyListInit(&elems);
+            if (self.current.kind != TokenKind::RParen)
+            {
+                Ty elem = self.parseType();
+                if (!self.ctx.tyListAppend(&elems, elem)) self.reportAllocFailed();
+                while (self.match(TokenKind::Comma))
+                {
+                    elem = self.parseType();
+                    if (!self.ctx.tyListAppend(&elems, elem)) self.reportAllocFailed();
+                }
+            }
+            self.expect(TokenKind::RParen);
+            u32 count = elems.len;
+            Ty* values = self.ctx.tyListFinish(&elems);
+            return self.makeTuple(values, count);
+        }
+
+        if (self.current.kind == TokenKind::Struct)
+        {
+            // `struct(A, B)`: the second tuple spelling, same node kind
+            self.advance();
+            self.expect(TokenKind::LParen);
+            TyListBuilder elems;
+            self.ctx.tyListInit(&elems);
+            if (self.current.kind != TokenKind::RParen)
+            {
+                Ty elem = self.parseType();
+                if (!self.ctx.tyListAppend(&elems, elem)) self.reportAllocFailed();
+                while (self.match(TokenKind::Comma))
+                {
+                    elem = self.parseType();
+                    if (!self.ctx.tyListAppend(&elems, elem)) self.reportAllocFailed();
+                }
+            }
+            self.expect(TokenKind::RParen);
+            u32 count = elems.len;
+            Ty* values = self.ctx.tyListFinish(&elems);
+            return self.makeTuple(values, count);
+        }
+
+        // nothing matched: report and eat one token (unless EOF) so the
+        // caller's loop always moves
+        self.reportCurrentError(ErrorCode::ParseExpectedType, "expected a type");
+        if (!self.atEnd()) self.advance();
+        return 0;
+    }
+
+    // no callers anywhere: a leftover stub. real slots come from
+    // allocTypeKind; this just reports and hands back 0
+    Ty allocType()
+    {
+        self.reportAllocFailed();
+        return 0;
+    }
+}

@@ -1,0 +1,192 @@
+#[[no_drop_all]]
+import(lib) wallvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind };
+import(lib) wallvm::irOps { IrOpcode };
+
+// Idempotent Op Removal / Redundant Write Suppression,
+// detects consecutive identical store operations to the same memory location
+// with no intervening read or side effect, and strips the redundant write.
+// Also handles redundant loads (load from same address when value hasn't changed),
+// redundant GEP chains, redundant bitcasts.
+pub struct IdempotentPass
+{
+    IrContext* ctx;
+    u64 removals;
+
+    IdempotentPass new(IrContext* ctx)
+    {
+        return IdempotentPass {
+            .ctx = ctx,
+            .removals = 0
+        };
+    }
+
+    bool run(IrFunc* func)
+    {
+        self.removals = 0;
+        bool anyChanged = false;
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            u32 ii = 0;
+            while (ii < bb->ninsts)
+            {
+                if (self.processInst(bb, ii)) {
+                    anyChanged = true;
+                    // Instruction removed or rewritten; restart this block from 0
+                    // (indices shifted) but don't restart from block 0
+                    ii = 0;
+                }
+                else {
+                    ii++;
+                }
+            }
+        }
+        return anyChanged;
+    }
+
+    bool processInst(IrBlock* bb, u32 idx)
+    {
+        IrInst* inst = bb->insts[idx];
+
+        // Pattern 1 — Consecutive identical stores to same address
+        // store [addr], val1; ... store [addr], val2  where val1 == val2
+        if (inst->opcode == IrOpcode::Store && inst->nops >= 2)
+        {
+            IrValue* addr = inst->ops[1];
+            IrValue* val = inst->ops[0];
+
+            // Look backwards for an earlier store to the same address
+            for (u32 pi = idx; pi > 0; pi--)
+            {
+                IrInst* prev = bb->insts[pi - 1];
+                if (prev == inst) continue;
+
+                // Stop at side effects
+                if (prev->opcode == IrOpcode::Call ||
+                    prev->opcode == IrOpcode::Store ||
+                    prev->opcode == IrOpcode::AtomicStore ||
+                    prev->opcode == IrOpcode::AtomicLoad ||
+                    prev->opcode == IrOpcode::AtomicRmw ||
+                    prev->opcode == IrOpcode::Fence ||
+                    prev->opcode == IrOpcode::InlineAsm)
+                    break;
+
+                if (prev->opcode == IrOpcode::Load && prev->nops >= 1)
+                {
+                    // If the load reads from the same address as our store,
+                    // the store is the last write and a previous store is redundant
+                    if (prev->ops[0] == addr)
+                        break; // intervening load reads from same addr - keep store
+                }
+
+                if (prev->opcode == IrOpcode::Store && prev->nops >= 2)
+                {
+                    if (prev->ops[1] == addr && prev->ops[0] == val)
+                    {
+                        // Same address, same value, no side effects between - remove earlier store
+                        // Actually remove the EARLIER (redundant) store
+                        for (u32 ri = 0; ri < prev->nops; ri++)
+                            if (prev->ops[ri] != null) prev->ops[ri]->removeUser(prev);
+                        for (u32 ri = pi - 1; ri + 1 < bb->ninsts; ri++)
+                            bb->insts[ri] = bb->insts[ri + 1];
+                        bb->ninsts--;
+                        self.removals++;
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // Pattern 2 — Redundant load, load from address that was just stored to
+        // store [addr], val; load [addr] -> val (bypass the load)
+        if (inst->opcode == IrOpcode::Load && inst->nops >= 1)
+        {
+            IrValue* addr = inst->ops[0];
+
+            for (u32 pi = idx; pi > 0; pi--)
+            {
+                IrInst* prev = bb->insts[pi - 1];
+                if (prev == inst) continue;
+
+                // Stop at side effects that might modify memory
+                if (prev->opcode == IrOpcode::Call ||
+                    prev->opcode == IrOpcode::Store ||
+                    prev->opcode == IrOpcode::AtomicStore ||
+                    prev->opcode == IrOpcode::AtomicLoad ||
+                    prev->opcode == IrOpcode::AtomicRmw ||
+                    prev->opcode == IrOpcode::Fence ||
+                    prev->opcode == IrOpcode::InlineAsm)
+                    break;
+
+                if (prev->opcode == IrOpcode::Store && prev->nops >= 2)
+                {
+                    if (prev->ops[1] == addr)
+                    {
+                        // Load from address that was just stored to
+                        // Replace load uses with the stored value
+                        inst->base.replaceAllUses(prev->ops[0]);
+                        inst->erase();
+                        self.removals++;
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // Pattern 3 — Redundant bitcast of bitcast
+        if (inst->opcode == IrOpcode::Bitcast && inst->nops == 1 &&
+            inst->ops[0]->kind == IrValueKind::Inst)
+        {
+            IrInst* inner = (IrInst*)inst->ops[0];
+            if (inner->opcode == IrOpcode::Bitcast && inner->nops == 1)
+            {
+                // Same type bitcast chain is identity
+                inst->base.replaceAllUses(inner->ops[0]);
+                inst->erase();
+                self.removals++;
+                return true;
+            }
+        }
+
+        // Pattern 4 — Redundant GEP with zero index
+        // gep base, 0 -> base
+        if (inst->opcode == IrOpcode::Gep && inst->nops >= 2)
+        {
+            bool allZero = true;
+            for (u32 oi = 1; oi < inst->nops; oi++)
+            {
+                if (inst->ops[oi] == null || inst->ops[oi]->kind != IrValueKind::ConstInt ||
+                    inst->ops[oi]->valData != 0)
+                {
+                    allZero = false;
+                    break;
+                }
+            }
+            if (allZero)
+            {
+                inst->base.replaceAllUses(inst->ops[0]);
+                inst->erase();
+                self.removals++;
+                return true;
+            }
+        }
+
+        // Pattern 5 — Redundant alloca that is never used (dead alloca)
+        if (inst->opcode == IrOpcode::Alloca && inst->base.nusers == 0)
+        {
+            inst->erase();
+            self.removals++;
+            return true;
+        }
+
+        return false;
+    }
+}
+
+pub bool irPassIdempotent(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (ctx == null || func == null) return false;
+    IdempotentPass pass = IdempotentPass::new(ctx);
+    return pass.run(func);
+}

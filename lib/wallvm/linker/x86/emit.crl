@@ -1,0 +1,239 @@
+#[[no_drop_all]]
+/* emit.crl for linker
+ * Builds the output image in one pass: headers, segment contents,
+ * output symbol table, string tables, section headers. Relocations
+ * are applied afterwards by reloc.crl against this buffer.
+ */
+
+import(lib) std::vec { Vec };
+import(lib) std::text::string { String };
+import(lib) std::mman { alloc, dealloc, copy };
+import elf { SHT_SYMTAB, SHT_STRTAB, SHT_NOBITS, SHN_UNDEF, SHN_ABS, SHN_COMMON, STT_SECTION, STT_FILE, OUT_NONE, EM_X86_64, PT_LOAD, PT_GNU_STACK, PF_R, PF_W, PF_X, SHDR32_SIZE, SHDR64_SIZE, SYM32_SIZE, SYM64_SIZE, alignUp, putU64, writeEhdr64, writeEhdr32, writePhdr64, writePhdr32, writeShdr64, writeShdr32, writeSym64, writeSym32 };
+import object { ObjFile, Section, Sym };
+import resolve { GlobalDef };
+import layout { Layout, OutSec, Piece, defAddress, localAddress };
+
+bool _wantLocal(ObjFile* obj, Sym* sym)
+{
+    if (sym->name.len == 0) return false;
+    if (sym->type == STT_SECTION || sym->type == STT_FILE) return false;
+    if (sym->shndx == SHN_UNDEF || sym->shndx == SHN_COMMON) return false;
+    if ((usize)sym->shndx >= obj->secs.count()) return false;
+    if (obj->secs.at((usize)sym->shndx).outIdx == OUT_NONE) return false;
+    return true;
+}
+
+void _zero(u8* p, usize n)
+{
+    usize i = 0;
+    while (i + 8 <= n)
+    {
+        putU64(p + i, 0);
+        i += 8;
+    }
+    while (i < n)
+    {
+        p[i] = 0;
+        i++;
+    }
+}
+
+void _wEhdr(u8* img, bool is64, u16 machine, u64 entry, u64 shoff, u16 phnum, u16 shnum, u16 shstrndx)
+{
+    if (is64) writeEhdr64(img, machine, entry, shoff, phnum, shnum, shstrndx);
+    else writeEhdr32(img, machine, entry, shoff, phnum, shnum, shstrndx);
+}
+
+void _wPhdr(u8* img, bool is64, usize idx, u32 type, u32 flags, u64 off, u64 vaddr, u64 filesz, u64 memsz, u64 align)
+{
+    if (is64) writePhdr64(img, idx, type, flags, off, vaddr, filesz, memsz, align);
+    else writePhdr32(img, idx, type, flags, off, vaddr, filesz, memsz, align);
+}
+
+void _wShdr(u8* img, bool is64, usize idx, u32 name, u32 type, u64 flags, u64 addr, u64 off, u64 size, u32 link, u32 info, u64 addralign, u64 entsize)
+{
+    if (is64) writeShdr64(img, idx, name, type, flags, addr, off, size, link, info, addralign, entsize);
+    else writeShdr32(img, idx, name, type, flags, addr, off, size, link, info, addralign, entsize);
+}
+
+void _wSym(u8* img, bool is64, usize off, u32 name, u8 info, u16 shndx, u64 value, u64 size)
+{
+    if (is64) writeSym64(img, off, name, info, 0, shndx, value, size);
+    else writeSym32(img, off, name, info, 0, shndx, value, size);
+}
+
+u32 _pushName(String* tbl, str name)
+{
+    u32 off = (u32)tbl->len;
+    tbl->pushView(name);
+    tbl->pushChar(0);
+    return off;
+}
+
+pub bool emitImage(u16 machine, bool emitSymtab, Vec<ObjFile>* objs, Vec<GlobalDef>* defs, Layout* L, u8** outImg, usize* outLen, String* err)
+{
+    bool is64 = machine == EM_X86_64;
+    usize nsec = L->secs.count();
+    usize es = is64 ? SYM64_SIZE : SYM32_SIZE;
+    usize shdrSize = is64 ? SHDR64_SIZE : SHDR32_SIZE;
+    u32 phnum = L->hasRW ? 3 : 2;
+
+    usize nLocal = 0;
+    usize strtabLen = 1;
+    if (emitSymtab)
+    {
+        for (usize o = 0; o < objs->count(); o++)
+        {
+            ObjFile* obj = objs->atPtr(o);
+            for (usize i = 0; i < obj->firstGlobal; i++)
+            {
+                Sym* sym = obj->syms.atPtr(i);
+                if (!_wantLocal(obj, sym)) continue;
+                nLocal++;
+                strtabLen += sym->name.len + 1;
+            }
+        }
+        for (usize d = 0; d < defs->count(); d++)
+        {
+            strtabLen += defs->at(d).name.len + 1;
+        }
+    }
+    usize nGlobal = emitSymtab ? defs->count() : 0;
+    usize nSyms = nLocal + nGlobal;
+
+    String shstr = String::new();
+    shstr.pushChar(0);
+    Vec<u32> shstrOffs = Vec<u32>::new();
+    for (usize i = 0; i < nsec; i++)
+        shstrOffs.push(_pushName(&shstr, L->secs.at(i).name));
+    u32 offSymtabName = 0;
+    u32 offStrtabName = 0;
+    if (emitSymtab)
+    {
+        offSymtabName = _pushName(&shstr, ".symtab");
+        offStrtabName = _pushName(&shstr, ".strtab");
+    }
+    u32 offShstrName = _pushName(&shstr, ".shstrtab");
+
+    u64 tailBase = alignUp(L->fileEnd, 8);
+    u64 symtabOff = 0;
+    u64 strtabOff = 0;
+    if (emitSymtab)
+    {
+        symtabOff = tailBase;
+        strtabOff = symtabOff + (u64)nSyms * (u64)es;
+    }
+    u64 shstrtabOff = emitSymtab ? strtabOff + (u64)strtabLen : tailBase;
+    u64 shdrOff = alignUp(shstrtabOff + (u64)shstr.len, 8);
+    u64 shnum = 1 + (u64)nsec + (emitSymtab ? 2 : 0) + 1;
+    u64 shstrndx = shnum - 1;
+    u64 fileSize = shdrOff + shnum * (u64)shdrSize;
+    if (fileSize > 0xffffffffu)
+    {
+        shstr.free();
+        shstrOffs.dispose();
+        err->pushView("linker: output image exceeds 4 GiB (M1 limit)");
+        return false;
+    }
+
+    u8* img = alloc<u8>((usize)fileSize);
+    _zero(img, (usize)fileSize);
+
+    _wEhdr(img, is64, machine, L->entry, shdrOff, (u16)phnum, (u16)shnum, (u16)shstrndx);
+    u64 base = L->imageBase;
+    _wPhdr(img, is64, 0, PT_LOAD, PF_R | PF_X, 0, base, L->rxEnd, L->rxEnd, 0x1000);
+    if (L->hasRW)
+        _wPhdr(img, is64, 1, PT_LOAD, PF_R | PF_W, L->rwOff, base + L->rwOff, L->rwFilesz, L->rwMemsz, 0x1000);
+    _wPhdr(img, is64, (usize)phnum - 1, PT_GNU_STACK, PF_R | PF_W, 0, 0, 0, 0, 0x10);
+
+    for (usize i = 0; i < nsec; i++)
+    {
+        OutSec* out = L->secs.atPtr(i);
+        if (out->type == SHT_NOBITS || out->size == 0) continue;
+        for (usize j = 0; j < out->pieces.count(); j++)
+        {
+            Piece* p = out->pieces.atPtr(j);
+            Section* in = objs->atPtr(p->objIdx)->secs.atPtr(p->secIdx);
+            copy<u8>(img + (usize)out->offset + (usize)p->offset, (u8*)in->data + (usize)in->offset, (usize)p->size);
+        }
+    }
+
+    if (emitSymtab)
+    {
+        usize idx = 0;
+        usize st = 1;
+        for (usize o = 0; o < objs->count(); o++)
+        {
+            ObjFile* obj = objs->atPtr(o);
+            for (usize i = 0; i < obj->firstGlobal; i++)
+            {
+                Sym* sym = obj->syms.atPtr(i);
+                if (!_wantLocal(obj, sym)) continue;
+                u32 nameOff = (u32)st;
+                copy<u8>(img + (usize)strtabOff + st, (u8*)sym->name.ptr, sym->name.len);
+                st += sym->name.len + 1;
+                u64 value = 0;
+                if (!localAddress(objs, L, o, i, &value, err))
+                {
+                    dealloc<u8>(img);
+                    shstr.free();
+                    shstrOffs.dispose();
+                    return false;
+                }
+                Section* in = obj->secs.atPtr((usize)sym->shndx);
+                u16 shndx = sym->shndx == SHN_ABS ? SHN_ABS : (u16)(in->outIdx + 1);
+                _wSym(img, is64, (usize)symtabOff + idx * es, nameOff, (u8)((sym->bind << 4) | sym->type), shndx, value, sym->size);
+                idx++;
+            }
+        }
+        for (usize d = 0; d < defs->count(); d++)
+        {
+            GlobalDef* def = defs->atPtr(d);
+            u64 value = 0;
+            if (!defAddress(objs, L, def, &value, err))
+            {
+                dealloc<u8>(img);
+                shstr.free();
+                shstrOffs.dispose();
+                return false;
+            }
+            u32 nameOff = (u32)st;
+            copy<u8>(img + (usize)strtabOff + st, (u8*)def->name.ptr, def->name.len);
+            st += def->name.len + 1;
+            u16 shndx;
+            if (def->shndx == SHN_ABS) shndx = SHN_ABS;
+            else if (def->common) shndx = (u16)(L->bssIdx + 1);
+            else
+            {
+                Section* in = objs->atPtr(def->objIdx)->secs.atPtr((usize)def->shndx);
+                shndx = (u16)(in->outIdx + 1);
+            }
+            _wSym(img, is64, (usize)symtabOff + idx * es, nameOff, (u8)((def->bind << 4) | def->type), shndx, value, def->size);
+            idx++;
+        }
+    }
+
+    copy<u8>(img + (usize)shstrtabOff, (u8*)shstr.ptr, shstr.len);
+
+    usize si = 1;
+    for (usize i = 0; i < nsec; i++)
+    {
+        OutSec* out = L->secs.atPtr(i);
+        _wShdr(img, is64, si, shstrOffs.at(i), out->type, out->flags, out->addr, out->offset, out->size, 0, 0, out->align, 0);
+        si++;
+    }
+    if (emitSymtab)
+    {
+        _wShdr(img, is64, si, offSymtabName, SHT_SYMTAB, 0, 0, symtabOff, (u64)nSyms * (u64)es, (u32)(si + 1), (u32)nLocal, 8, (u64)es);
+        si++;
+        _wShdr(img, is64, si, offStrtabName, SHT_STRTAB, 0, 0, strtabOff, (u64)strtabLen, 0, 0, 1, 0);
+        si++;
+    }
+    _wShdr(img, is64, si, offShstrName, SHT_STRTAB, 0, 0, shstrtabOff, (u64)shstr.len, 0, 0, 1, 0);
+
+    shstr.free();
+    shstrOffs.dispose();
+    *outImg = img;
+    *outLen = (usize)fileSize;
+    return true;
+}

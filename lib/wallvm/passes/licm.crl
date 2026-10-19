@@ -1,0 +1,401 @@
+#[[no_drop_all]]
+import(lib) wallvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind, FunctionAnalysisCache };
+import(lib) wallvm::irOps { IrOpcode, irOpcodeIsTerminator, irOpcodeIsMemory };
+import(lib) wallvm::passes::alias_analysis { AliasAnalysis };
+import(lib) wallvm::passes::loop_detect { IrLoop, irLoopDetectNatural };
+import(lib) std::mman { alloc, dealloc };
+
+bool isInsideLoop(IrBlock* bb, IrLoop* lp)
+{
+    for (u32 i = 0; i < lp->nblocks; i++)
+        if (lp->blocks[i] == bb) return true;
+    return false;
+}
+
+// Creates a preheader for the loop (or reuses the existing one) and rewires
+// the external predecessors and header phis accordingly.
+pub IrBlock* createPreheader(IrContext* ctx, IrLoop* lp, IrFunc* func)
+{
+    IrBlock* header = lp->header;
+    IrValue* headerVal = &header->base;
+
+    u32 extCap = header->npreds > 0 ? header->npreds : 4;
+    IrBlock** extPreds = alloc<IrBlock*>(extCap);
+    u32 nextPreds = 0;
+    for (u32 i = 0; i < header->npreds; i++)
+    {
+        if (!isInsideLoop(header->preds[i], lp))
+        {
+            if (nextPreds >= extCap)
+            {
+                u32 nc = extCap * 2;
+                IrBlock** np = alloc<IrBlock*>(nc);
+                for (u32 j = 0; j < nextPreds; j++) np[j] = extPreds[j];
+                dealloc<IrBlock*>(extPreds);
+                extPreds = np;
+                extCap = nc;
+            }
+            extPreds[nextPreds++] = header->preds[i];
+        }
+    }
+    if (nextPreds == 0)
+    {
+        dealloc<IrBlock*>(extPreds);
+        return null;
+    }
+
+    IrBlock* preheader = ctx->createBlock("preheader");
+    func->addBlock(preheader);
+    IrValue* preVal = &preheader->base;
+
+    u32 i = 0;
+    while (i < header->npreds)
+    {
+        IrBlock* pred = header->preds[i];
+        if (!isInsideLoop(pred, lp))
+        {
+            IrInst* term = pred->terminator();
+            if (term != null)
+            {
+                if (term->opcode == IrOpcode::Br && term->ops[0] == headerVal)
+                {
+                    headerVal->removeUser(term);
+                    term->ops[0] = preVal;
+                    preVal->addUser(term);
+                }
+                else if (term->opcode == IrOpcode::CondBr)
+                {
+                    for (u32 j = 1; j <= 2; j++)
+                    {
+                        if (term->ops[j] == headerVal)
+                        {
+                            headerVal->removeUser(term);
+                            term->ops[j] = preVal;
+                            preVal->addUser(term);
+                        }
+                    }
+                }
+            }
+
+            pred->removeSucc(header);
+            header->removePred(pred);
+            pred->addSucc(preheader);
+        }
+        else { i++; }
+    }
+
+    preheader->addSucc(header);
+
+    IrValue** ops = alloc<IrValue*>(1);
+    ops[0] = headerVal;
+    IrInst* brInst = ctx->createInst(IrOpcode::Br, ctx->tyVoid(), ops, 1, 0, 0);
+    dealloc<IrValue*>(ops);
+    brInst->parent = preheader;
+    preheader->addInst(brInst);
+    headerVal->addUser(brInst);
+
+    // The external predecessors no longer branch to the header directly, so
+    // the header's phis must be rewired to take their values via the preheader.
+    for (u32 ii = 0; ii < header->ninsts; ii++)
+    {
+        IrInst* phi = header->insts[ii];
+        if (phi->opcode != IrOpcode::Phi) break;
+
+        if (nextPreds == 1)
+        {
+            for (u32 oi = 1; oi < phi->nops; oi += 2)
+            {
+                if (phi->ops[oi] == &extPreds[0]->base)
+                {
+                    extPreds[0]->base.removeUser(phi);
+                    phi->ops[oi] = preVal;
+                    preVal->addUser(phi);
+                    break;
+                }
+            }
+        }
+        else
+        {
+            // Merge the external incoming values in a phi inside the preheader
+            u32 nExt = nextPreds;
+            IrValue** phOps = alloc<IrValue*>(nExt * 2);
+            for (u32 pi = 0; pi < nExt; pi++)
+            {
+                IrValue* v = phi->nops > 0 ? phi->ops[0] : null;
+                for (u32 oi = 1; oi < phi->nops; oi += 2)
+                {
+                    if (phi->ops[oi] == &extPreds[pi]->base)
+                    {
+                        v = phi->ops[oi - 1];
+                        break;
+                    }
+                }
+                phOps[pi * 2] = v;
+                phOps[pi * 2 + 1] = &extPreds[pi]->base;
+            }
+            IrInst* ph = ctx->createInst(IrOpcode::Phi, phi->base.type, phOps, nExt * 2, 0, 0);
+            for (u32 oi = 0; oi < nExt * 2; oi++)
+                if (phOps[oi] != null)
+                    phOps[oi]->addUser(ph);
+            dealloc<IrValue*>(phOps);
+
+            // Insert the phi at the front of the preheader (before its br)
+            for (u32 j = preheader->ninsts; j > 0; j--)
+                preheader->insts[j] = preheader->insts[j - 1];
+            preheader->insts[0] = ph;
+            ph->parent = preheader;
+            preheader->ninsts++;
+
+            // Rebuild the header phi with internal pairs + (preheader phi, preheader)
+            u32 ninternal = 0;
+            for (u32 oi = 1; oi < phi->nops; oi += 2)
+                if (isInsideLoop((IrBlock*)phi->ops[oi], lp)) ninternal++;
+            u32 newOpsCount = ninternal * 2 + 2;
+            IrValue** newOps = alloc<IrValue*>(newOpsCount);
+            u32 k = 0;
+            for (u32 oi = 0; oi < phi->nops; oi += 2)
+            {
+                IrBlock* pb = (IrBlock*)phi->ops[oi + 1];
+                if (isInsideLoop(pb, lp))
+                {
+                    newOps[k++] = phi->ops[oi];
+                    newOps[k++] = phi->ops[oi + 1];
+                }
+                else
+                {
+                    if (phi->ops[oi] != null) phi->ops[oi]->removeUser(phi);
+                    pb->base.removeUser(phi);
+                }
+            }
+            newOps[k++] = &ph->base;
+            newOps[k++] = preVal;
+            ph->base.addUser(phi);
+            preVal->addUser(phi);
+
+            if (phi->capOps > 0) dealloc<IrValue*>(phi->ops);
+            phi->ops = newOps;
+            phi->nops = newOpsCount;
+            phi->capOps = newOpsCount;
+        }
+    }
+
+    dealloc<IrBlock*>(extPreds);
+
+    lp->preheader = preheader;
+    return preheader;
+}
+
+pub bool isLoopInvariant(IrInst* inst, IrLoop* lp)
+{
+    if (irOpcodeIsTerminator(inst->opcode)) return false;
+    if (inst->opcode == IrOpcode::Phi) return false;
+    if (inst->opcode == IrOpcode::Call) return false;
+
+    // For memory ops, only allow Load and Gep (Gep is just pointer arithmetic)
+    if (irOpcodeIsMemory(inst->opcode))
+    {
+        if (inst->opcode != IrOpcode::Load &&
+            inst->opcode != IrOpcode::Gep)
+            return false;
+    }
+
+    for (u32 i = 0; i < inst->nops; i++)
+    {
+        IrValue* op = inst->ops[i];
+        if (op == null) continue;
+        if (op->kind == IrValueKind::ConstInt) continue;
+        if (op->kind == IrValueKind::ConstFloat) continue;
+        if (op->kind == IrValueKind::Block) continue;
+        if (op->kind == IrValueKind::Func) continue;
+
+        if (op->kind == IrValueKind::Inst)
+        {
+            IrInst* opInst = (IrInst*)op;
+            if (isInsideLoop(opInst->parent, lp))
+                return false;
+            continue;
+        }
+
+        return false;
+    }
+
+    return true;
+}
+
+bool loopHasInvariantInst(IrLoop* lp)
+{
+    for (u32 bi = 0; bi < lp->nblocks; bi++)
+    {
+        IrBlock* bb = lp->blocks[bi];
+        for (u32 ii = 0; ii < bb->ninsts; ii++)
+            if (isLoopInvariant(bb->insts[ii], lp)) return true;
+    }
+    return false;
+}
+
+bool loopIsReadOnly(IrLoop* lp)
+{
+    for (u32 bi = 0; bi < lp->nblocks; bi++)
+    {
+        IrBlock* bb = lp->blocks[bi];
+        for (u32 ii = 0; ii < bb->ninsts; ii++)
+        {
+            IrInst* inst = bb->insts[ii];
+            if (inst->opcode == IrOpcode::Store ||
+                inst->opcode == IrOpcode::AtomicStore ||
+                inst->opcode == IrOpcode::Call)
+                return false;
+        }
+    }
+    return true;
+}
+
+pub void hoistToPreheader(IrInst* inst, IrBlock* preheader)
+{
+    IrBlock* oldBlock = inst->parent;
+    if (oldBlock == null) return;
+
+    bool found = false;
+    for (u32 i = 0; i < oldBlock->ninsts; i++)
+    {
+        if (oldBlock->insts[i] == inst)
+        {
+            for (u32 j = i; j < oldBlock->ninsts - 1; j++)
+                oldBlock->insts[j] = oldBlock->insts[j + 1];
+            oldBlock->ninsts--;
+            found = true;
+            break;
+        }
+    }
+    if (!found) return;
+
+    IrInst* term = preheader->terminator();
+    u32 insertPos = preheader->ninsts;
+    if (term != null)
+    {
+        for (u32 i = 0; i < preheader->ninsts; i++)
+        {
+            if (preheader->insts[i] == term)
+            { insertPos = i; break; }
+        }
+    }
+
+    if (preheader->ninsts >= preheader->capInsts)
+    {
+        u32 newCap = preheader->capInsts ? preheader->capInsts * 2 : 8;
+        IrInst** newInsts = alloc<IrInst*>(newCap);
+        for (u32 i = 0; i < preheader->ninsts; i++)
+            newInsts[i] = preheader->insts[i];
+        if (preheader->insts != null) dealloc<IrInst*>(preheader->insts);
+        preheader->insts = newInsts;
+        preheader->capInsts = newCap;
+    }
+
+    for (u32 i = preheader->ninsts; i > insertPos; i--)
+        preheader->insts[i] = preheader->insts[i - 1];
+
+    preheader->insts[insertPos] = inst;
+    inst->parent = preheader;
+    preheader->ninsts++;
+}
+
+pub bool irPassLicm(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (ctx == null || func == null) return false;
+
+    IrLoop** loops = irLoopDetectNatural(func);
+    if (loops == null) return false;
+
+    // Build alias analysis for the function
+    FunctionAnalysisCache* cache = ctx->getOrCreateAnalysisCache(func);
+    AliasAnalysis* aaPtr = (AliasAnalysis*)cache->aliasAnalysis;
+    AliasAnalysis aa;
+    bool ownAA = false;
+    if (aaPtr != null && cache->generation == ctx->analysisGeneration)
+    {
+        aa = *aaPtr;
+    }
+    else
+    {
+        aa = AliasAnalysis::new(ctx);
+        aa.analyze(func);
+        ownAA = true;
+    }
+
+    bool changed = false;
+
+    for (u32 li = 0; loops[li] != null; li++)
+    {
+        IrLoop* lp = loops[li];
+        if (!loopHasInvariantInst(lp)) continue;
+
+        bool isReadOnly = loopIsReadOnly(lp);
+
+        IrBlock* preheader = createPreheader(ctx, lp, func);
+        if (preheader == null) continue;
+
+        bool loopChanged = false;
+
+        for (u32 bi = 0; bi < lp->nblocks; bi++)
+        {
+            IrBlock* bb = lp->blocks[bi];
+            u32 ii = 0;
+            while (ii < bb->ninsts)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (isLoopInvariant(inst, lp))
+                {
+                    if (inst->opcode == IrOpcode::Load && !isReadOnly)
+                    {
+                        if (inst->nops >= 1 && !loadMayAliasLoopStore(inst, lp, &aa))
+                        {
+                        }
+                        else
+                        {
+                            ii++;
+                            continue;
+                        }
+                    }
+                    hoistToPreheader(inst, preheader);
+                    loopChanged = true;
+                }
+                else
+                {
+                    ii++;
+                }
+            }
+        }
+
+        if (loopChanged) changed = true;
+    }
+
+    if (ownAA) aa.deinit();
+    dealloc<IrLoop*>(loops);
+    return changed;
+}
+
+// Check if a load instruction may alias with any store in the loop.
+// Returns true if the load address may be written by a store in the loop.
+bool loadMayAliasLoopStore(IrInst* loadInst, IrLoop* lp, AliasAnalysis* aa)
+{
+    if (loadInst == null || loadInst->nops < 1) return true;
+    IrValue* loadAddr = loadInst->ops[0];
+
+    for (u32 bi = 0; bi < lp->nblocks; bi++)
+    {
+        IrBlock* bb = lp->blocks[bi];
+        for (u32 ii = 0; ii < bb->ninsts; ii++)
+        {
+            IrInst* inst = bb->insts[ii];
+            if (inst->opcode == IrOpcode::Store && inst->nops >= 2)
+            {
+                if (!aa->isNoAlias(loadAddr, inst->ops[1]))
+                    return true;
+            }
+            if (inst->opcode == IrOpcode::Call || inst->opcode == IrOpcode::InlineAsm)
+                return true;
+        }
+    }
+    return false;
+}

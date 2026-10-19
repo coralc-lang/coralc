@@ -1,0 +1,277 @@
+#[[no_drop_all]]
+import(lib) wallvm::irtypes { IrFunc, IrBlock, IrInst, IrValue, IrValueKind };
+import(lib) wallvm::irOps { IrOpcode, IrICmpPred };
+
+// Static Branch-Condition Factoring (Guard Extraction)
+// Identifies adjacent basic blocks that evaluate overlapping boolean
+// sub-expressions (e.g., checking x > 5 in one branch and later
+// x > 5 && y < 10), and factors out the dominant invariant checks
+// into a single leading block. This is a purely logical CFG
+// transformation that reduces redundant comparisons.
+//
+// Also flattens redundant branch inversions, when block A tests
+// cond and jumps to B, and B tests !cond and jumps to C, the
+// second branch can often be folded.
+pub struct BranchFactoringPass
+{
+    u64 factors;
+
+    BranchFactoringPass new() {     return BranchFactoringPass { .factors = 0 }; }
+
+    bool run(IrFunc* func)
+    {
+        self.factors = 0;
+        bool changed = true;
+        while (changed)
+        {
+            changed = false;
+            // Pass 1, collapse inverted branch pairs
+            changed = self.collapseInversions(func) || changed;
+            // Pass 2, factor common conditions from successor blocks
+            changed = self.factorCommonGuards(func) || changed;
+        }
+        return self.factors > 0;
+    }
+
+    bool collapseInversions(IrFunc* func)
+    {
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            if (bb->ninsts == 0) continue;
+
+            IrInst* term = bb->insts[bb->ninsts - 1];
+            if (term->opcode != IrOpcode::CondBr || term->nops < 3) continue;
+
+            IrValue* cond = term->ops[0];
+            IrBlock* trueTgt = (IrBlock*)term->ops[1];
+            IrBlock* falseTgt = (IrBlock*)term->ops[2];
+
+            // Check if the true target ends with an inverted branch on the same condition
+            if (trueTgt->npreds == 1 && trueTgt->ninsts >= 1 && trueTgt->parent == func)
+            {
+                IrInst* ttTerm = trueTgt->insts[trueTgt->ninsts - 1];
+                if (ttTerm->opcode == IrOpcode::CondBr && ttTerm->nops >= 3)
+                {
+                    IrValue* ttCond = ttTerm->ops[0];
+                    // Check if the condition is the inverse (ICmp with inverted predicate)
+                    if (self.isInvertedCond(cond, ttCond))
+                    {
+                        IrBlock* ttTrue = (IrBlock*)ttTerm->ops[1];
+                        IrBlock* ttFalse = (IrBlock*)ttTerm->ops[2];
+
+                        // true branch of original -> false branch of inverted
+                        // false branch of original -> true branch of inverted
+                        // Rewrite, cond_br cond, A, B where A has !cond, so A's true goes to B
+                        // Simplify by merging the two branches into one
+                        if (ttTrue == falseTgt)
+                        {
+                            // Already the right pattern, cond ? A : B where A tests !cond
+                            // A's true target = B (the false target of original)
+                            // This means, if cond -> A, if !cond in A -> B
+                            // Equivalent to, cond ? (if !cond -> B) : B = always B
+                            // Actually this means, cond -> A, and A's true branch goes to B
+                            // So the path is, cond -> A -> B, !cond -> B
+                            // This simplifies to, always B (A is dead code)
+                            // Only if A has no other side effects
+                            if (trueTgt->hasNoSideEffects() && trueTgt->ninsts <= 2)
+                            {
+                                // Replace cond_br with br to falseTgt
+                                term->ops[0]->removeUser(term);
+                                term->ops[1]->removeUser(term);
+                                term->ops[2]->removeUser(term);
+                                falseTgt->base.addUser(term);
+                                term->nops = 1;
+                                term->opcode = IrOpcode::Br;
+                                term->ops[0] = &falseTgt->base;
+
+                                bb->nsuccs = 1;
+                                bb->succs[0] = falseTgt;
+                                trueTgt->removePred(bb);
+                                self.factors++;
+                                return true;
+                            }
+                        }
+
+                        if (ttFalse == falseTgt)
+                        {
+                            // cond -> A, A's false -> B (same as original false)
+                            // Path, cond -> A -> B (if A's !cond), !cond -> B
+                            // A is reached only when cond is true, and A immediately
+                            // branches on !cond -> A is dead code (cond and !cond can't both be true)
+                            if (trueTgt->hasNoSideEffects() && trueTgt->ninsts <= 2)
+                            {
+                                term->ops[0]->removeUser(term);
+                                term->ops[1]->removeUser(term);
+                                term->ops[2]->removeUser(term);
+                                falseTgt->base.addUser(term);
+                                term->nops = 1;
+                                term->opcode = IrOpcode::Br;
+                                term->ops[0] = &falseTgt->base;
+
+                                bb->nsuccs = 1;
+                                bb->succs[0] = falseTgt;
+                                trueTgt->removePred(bb);
+                                self.factors++;
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Same check for false target
+            if (falseTgt->npreds == 1 && falseTgt->ninsts >= 1 && falseTgt->parent == func)
+            {
+                IrInst* ftTerm = falseTgt->insts[falseTgt->ninsts - 1];
+                if (ftTerm->opcode == IrOpcode::CondBr && ftTerm->nops >= 3)
+                {
+                    IrValue* ftCond = ftTerm->ops[0];
+                    if (self.isInvertedCond(cond, ftCond))
+                    {
+                        IrBlock* ftTrue = (IrBlock*)ftTerm->ops[1];
+                        IrBlock* ftFalse = (IrBlock*)ftTerm->ops[2];
+
+                        if (ftTrue == trueTgt && falseTgt->hasNoSideEffects() && falseTgt->ninsts <= 2)
+                        {
+                            term->ops[0]->removeUser(term);
+                            term->ops[1]->removeUser(term);
+                            term->ops[2]->removeUser(term);
+                            trueTgt->base.addUser(term);
+                            term->nops = 1;
+                            term->opcode = IrOpcode::Br;
+                            term->ops[0] = &trueTgt->base;
+
+                            bb->nsuccs = 1;
+                            bb->succs[0] = trueTgt;
+                            falseTgt->removePred(bb);
+                            self.factors++;
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    bool factorCommonGuards(IrFunc* func)
+    {
+        // Look for blocks where two successors both test the same condition
+        // on the same value, and factor the test into the predecessor.
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            if (bb->ninsts == 0 || bb->nsuccs < 2) continue;
+
+            IrInst* term = bb->insts[bb->ninsts - 1];
+            if (term->opcode != IrOpcode::CondBr || term->nops < 3) continue;
+
+            IrBlock* trueTgt = (IrBlock*)term->ops[1];
+            IrBlock* falseTgt = (IrBlock*)term->ops[2];
+
+            // Check if both targets have the same ICmp on the same value
+            if (trueTgt->ninsts >= 1 && falseTgt->ninsts >= 1 &&
+                trueTgt->parent == func && falseTgt->parent == func)
+            {
+                IrInst* ttTerm = trueTgt->insts[trueTgt->ninsts - 1];
+                IrInst* ftTerm = falseTgt->insts[falseTgt->ninsts - 1];
+
+                if (ttTerm->opcode == IrOpcode::ICmp && ftTerm->opcode == IrOpcode::ICmp &&
+                    ttTerm->nops == 2 && ftTerm->nops == 2)
+                {
+                    // Check if both compare the same value
+                    if (ttTerm->ops[0] == ftTerm->ops[0] && ttTerm->ops[1] == ftTerm->ops[1])
+                    {
+                        // Same comparison, different predicates - might be redundant
+                        // If the predicates are complementary (e.g., eq/ne, slt/sge)
+                        // and both targets eventually lead to the same place,
+                        // one branch is redundant
+                        if (ttTerm->icmpPred != ftTerm->icmpPred)
+                        {
+                            // Check if both targets' branches lead to the same blocks
+                            IrInst* ttBr = null;
+                            IrInst* ftBr = null;
+                            for (u32 ii = 0; ii < trueTgt->ninsts; ii++)
+                                if (trueTgt->insts[ii]->opcode == IrOpcode::Br)
+                                    { ttBr = trueTgt->insts[ii]; break; }
+                            for (u32 ii = 0; ii < falseTgt->ninsts; ii++)
+                                if (falseTgt->insts[ii]->opcode == IrOpcode::Br)
+                                    { ftBr = falseTgt->insts[ii]; break; }
+
+                            if (ttBr != null && ftBr != null && ttBr->nops == 1 && ftBr->nops == 1 &&
+                                ttBr->ops[0] == ftBr->ops[0])
+                            {
+                                // Both branches go to the same target
+                                // The second comparison is always redundant
+                                // Merge, replace cond_br with br to the shared target
+                                IrBlock* shared = (IrBlock*)ttBr->ops[0];
+                                term->ops[0]->removeUser(term);
+                                term->ops[1]->removeUser(term);
+                                term->ops[2]->removeUser(term);
+                                shared->base.addUser(term);
+                                term->nops = 1;
+                                term->opcode = IrOpcode::Br;
+                                term->ops[0] = &shared->base;
+
+                                bb->nsuccs = 1;
+                                bb->succs[0] = shared;
+                                trueTgt->removePred(bb);
+                                falseTgt->removePred(bb);
+                                shared->addPred(bb);
+                                self.factors++;
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    // Check if two conditions are logical inverses of each other
+    bool isInvertedCond(IrValue* a, IrValue* b)
+    {
+        if (a == null || b == null) return false;
+        if (a->kind != IrValueKind::Inst || b->kind != IrValueKind::Inst)
+            return false;
+
+        IrInst* ai = (IrInst*)a;
+        IrInst* bi = (IrInst*)b;
+
+        if (ai->opcode != IrOpcode::ICmp || bi->opcode != IrOpcode::ICmp)
+            return false;
+        if (ai->nops != 2 || bi->nops != 2) return false;
+
+        // Same operands, inverted predicate
+        if (ai->ops[0] != bi->ops[0] || ai->ops[1] != bi->ops[1]) return false;
+
+        return self.invertPred(ai->icmpPred) == bi->icmpPred;
+    }
+
+    IrICmpPred invertPred(IrICmpPred p)
+    {
+        switch (p)
+        {
+            IrICmpPred::Eq => { return IrICmpPred::Ne; },
+            IrICmpPred::Ne => { return IrICmpPred::Eq; },
+            IrICmpPred::Slt => { return IrICmpPred::Sge; },
+            IrICmpPred::Sle => { return IrICmpPred::Sgt; },
+            IrICmpPred::Sgt => { return IrICmpPred::Sle; },
+            IrICmpPred::Sge => { return IrICmpPred::Slt; },
+            IrICmpPred::Ult => { return IrICmpPred::Uge; },
+            IrICmpPred::Ule => { return IrICmpPred::Ugt; },
+            IrICmpPred::Ugt => { return IrICmpPred::Ule; },
+            IrICmpPred::Uge => { return IrICmpPred::Ult; },
+            else => { return p; },
+        }
+    }
+}
+
+pub bool irPassBranchFactoring(IrFunc* func, rawptr userdata)
+{
+    if (func == null) return false;
+    BranchFactoringPass pass = BranchFactoringPass::new();
+    return pass.run(func);
+}

@@ -1,0 +1,508 @@
+#[[no_drop_all]]
+/* coff.crl for linker
+ * Parses COFF relocatable objects (x86_64 / i386 .obj) into the same
+ * flat ObjFile view the ELF parser produces, so resolve/layout/reloc
+ * treat both formats alike. COFF relocations keep their native type
+ * numbers with Reloc.fmt = 1 (reloc.crl branches on fmt). Names and
+ * section bodies are slices into the caller's buffer, like ELF.
+ */
+
+import(lib) std::vec { Vec };
+import(lib) std::text::string { String };
+import(lib) std::result { Result };
+import(lib) std::mman { alloc, dealloc };
+import elf { SHT_PROGBITS, SHT_NOBITS, SHF_WRITE, SHF_ALLOC, SHF_EXECINSTR, SHN_UNDEF, SHN_ABS, SHN_COMMON, STB_LOCAL, STB_GLOBAL, STB_WEAK, STT_NOTYPE, STT_FUNC, STT_SECTION, STT_FILE, OUT_NONE, EM_X86_64, EM_386, ELFCLASS32, ELFCLASS64, fits, leU16, leU32, strFromTable };
+import object { ObjFile, Section, Sym, Reloc };
+
+pub const u16 IMAGE_FILE_MACHINE_I386 = 0x14c;
+pub const u16 IMAGE_FILE_MACHINE_AMD64 = 0x8664;
+
+pub const u32 IMAGE_SCN_CNT_CODE = 0x20;
+pub const u32 IMAGE_SCN_CNT_INITIALIZED_DATA = 0x40;
+pub const u32 IMAGE_SCN_CNT_UNINITIALIZED_DATA = 0x80;
+pub const u32 IMAGE_SCN_LNK_INFO = 0x200;
+pub const u32 IMAGE_SCN_LNK_REMOVE = 0x800;
+pub const u32 IMAGE_SCN_LNK_NRELOC_OVFL = 0x01000000;
+pub const u32 IMAGE_SCN_MEM_DISCARDABLE = 0x02000000;
+pub const u32 IMAGE_SCN_MEM_EXECUTE = 0x20000000;
+pub const u32 IMAGE_SCN_MEM_READ = 0x40000000;
+pub const u32 IMAGE_SCN_MEM_WRITE = 0x80000000;
+
+pub const u8 IMAGE_SYM_CLASS_EXTERNAL = 2;
+pub const u8 IMAGE_SYM_CLASS_STATIC = 3;
+pub const u8 IMAGE_SYM_CLASS_FILE = 22;
+pub const u8 IMAGE_SYM_CLASS_SECTION = 23;
+pub const u8 IMAGE_SYM_CLASS_WEAK_EXTERNAL = 24;
+
+/* x86_64 relocation types */
+pub const u16 IMAGE_REL_AMD64_ADDR64 = 0x0001;
+pub const u16 IMAGE_REL_AMD64_ADDR32 = 0x0002;
+pub const u16 IMAGE_REL_AMD64_ADDR32NB = 0x0003;
+pub const u16 IMAGE_REL_AMD64_REL32 = 0x0004;
+pub const u16 IMAGE_REL_AMD64_SECREL = 0x000a;
+pub const u16 IMAGE_REL_AMD64_SECREL7 = 0x000b;
+pub const u16 IMAGE_REL_AMD64_SECTION = 0x000e;
+
+/* i386 relocation types */
+pub const u16 IMAGE_REL_I386_ABSOLUTE = 0x0000;
+pub const u16 IMAGE_REL_I386_DIR32 = 0x0006;
+pub const u16 IMAGE_REL_I386_DIR32NB = 0x0007;
+pub const u16 IMAGE_REL_I386_SECTION = 0x000a;
+pub const u16 IMAGE_REL_I386_SECREL = 0x000b;
+pub const u16 IMAGE_REL_I386_REL32 = 0x0014;
+
+/* short import member header (inside import libraries) */
+pub const u16 IMPORT_OBJECT_HDR_SIG2 = 0xffff;
+
+pub const usize COFF_HDR_SIZE = 20;
+pub const usize COFF_SECHDR_SIZE = 40;
+pub const usize COFF_SYMENT_SIZE = 18;
+pub const usize COFF_REL_SIZE = 10;
+pub const usize COFF_IMPORT_HDR_SIZE = 20;
+
+String _coffErr(str name, str what)
+{
+    String s = String::new();
+    s.pushView("linker: ");
+    s.pushView(name);
+    s.pushView(": ");
+    s.pushView(what);
+    return s;
+}
+
+Result<ObjFile, String> _fail(ObjFile* f, String msg)
+{
+    f->dispose();
+    return Result<ObjFile, String>::Err { .error = msg };
+}
+
+pub bool isCoffMachine(u16 m)
+{
+    return m == IMAGE_FILE_MACHINE_AMD64 || m == IMAGE_FILE_MACHINE_I386;
+}
+
+/* True when the buffer begins with a short import object header. */
+pub bool isImportHeader(const u8* data, usize len)
+{
+    if (len < COFF_IMPORT_HDR_SIZE) return false;
+    return leU16(data) == 0 && leU16(data + 2) == IMPORT_OBJECT_HDR_SIG2;
+}
+
+/* Reads a decimal field (space-padded) from up to n bytes. */
+i64 _decField(const u8* p, usize n)
+{
+    i64 v = 0;
+    bool hasAny = false;
+    for (usize i = 0; i < n; i++)
+    {
+        u8 c = p[i];
+        if (c == ' ') { if (hasAny) break; continue; }
+        if (c < '0' || c > '9') return -1;
+        hasAny = true;
+        v = v * 10 + (i64)(c - '0');
+    }
+    return hasAny ? v : -1;
+}
+
+u32 _secAlign(u32 chars)
+{
+    u32 a = (chars >> 20) & 7;
+    if (a == 0) return 1;
+    u32 v = 1;
+    for (u32 k = 1; k < a; k++) v = v * 2;
+    return v;
+}
+
+bool _debugName(str name)
+{
+    if (name.equals(".pdata")) return true;
+    if (name.equals(".xdata")) return true;
+    if (name.equals(".voltbl")) return true;
+    if (name.startsWith(".debug")) return true;
+    if (name.startsWith(".gfids")) return true;
+    if (name.startsWith(".chks64")) return true;
+    return false;
+}
+
+/* Translates COFF section flags into the SHF-style flags layout's
+ * bucketing understands. Discarded/debug sections become non-ALLOC
+ * and are dropped by layout.
+ */
+u64 _translateFlags(str name, u32 c)
+{
+    bool info = (c & IMAGE_SCN_LNK_INFO) != 0;
+    bool remove = (c & IMAGE_SCN_LNK_REMOVE) != 0;
+    bool discard = (c & IMAGE_SCN_MEM_DISCARDABLE) != 0;
+    if (info || remove) return 0;
+    if (discard && !name.startsWith(".note")) return 0;
+    if (_debugName(name)) return 0;
+    bool udata = (c & IMAGE_SCN_CNT_UNINITIALIZED_DATA) != 0;
+    bool exec = (c & IMAGE_SCN_MEM_EXECUTE) != 0;
+    bool code = (c & IMAGE_SCN_CNT_CODE) != 0;
+    bool init = (c & IMAGE_SCN_CNT_INITIALIZED_DATA) != 0;
+    bool read = (c & IMAGE_SCN_MEM_READ) != 0;
+    bool write = (c & IMAGE_SCN_MEM_WRITE) != 0;
+    if (udata) return SHF_ALLOC | SHF_WRITE;
+    if (exec || code) return SHF_ALLOC | SHF_EXECINSTR;
+    if (init || read)
+    {
+        u64 f = SHF_ALLOC;
+        if (write) f = f | SHF_WRITE;
+        return f;
+    }
+    return 0;
+}
+
+/* Section header name: "/nnn" long-name index or inline 8 chars. */
+bool _secName(const u8* p, const u8* data, usize strtabOff, usize strtabSize, str* out)
+{
+    if (p[0] == '/' && p[1] >= '0' && p[1] <= '9')
+    {
+        i64 off = _decField(p + 1, 7);
+        if (off < 0) return false;
+        return strFromTable(data, strtabOff, strtabSize, (usize)off, out);
+    }
+    usize i = 0;
+    while (i < 8 && p[i] != 0) i++;
+    *out = str::fromParts(p, i);
+    return true;
+}
+
+/* Parses a COFF symbol-table name (inline 8 chars or string table). */
+bool _symName(const u8* p, const u8* data, usize strtabOff, usize strtabSize, str* out)
+{
+    if (p[0] == 0 && p[1] == 0 && p[2] == 0 && p[3] == 0)
+    {
+        u32 off = leU32(p + 4);
+        if (off == 0) { *out = str::empty(); return true; }
+        return strFromTable(data, strtabOff, strtabSize, (usize)off, out);
+    }
+    usize i = 0;
+    while (i < 8 && p[i] != 0) i++;
+    *out = str::fromParts(p, i);
+    return true;
+}
+
+void _addExportsFromDirective(ObjFile* f, const u8* d, usize n)
+{
+    usize i = 0;
+    while (i < n)
+    {
+        while (i < n && (d[i] == ' ' || d[i] == '\t')) i++;
+        if (i >= n) break;
+        usize start = i;
+        while (i < n && d[i] != ' ' && d[i] != '\t') i++;
+        str tok = str::fromParts(d + start, i - start);
+        if (tok.len > 8 && tok.startsWith("/EXPORT:"))
+        {
+            usize j = 8;
+            usize e = j;
+            while (e < tok.len && tok.ptr[e] != ',') e++;
+            if (e > j) f->exports.push(tok.slice(j, e));
+        }
+    }
+}
+
+pub Result<ObjFile, String> parseObjectCoff(str name, const u8* data, usize len)
+{
+    ObjFile f = ObjFile::empty(name, data, len);
+    f.firstGlobal = 0;
+    if (len < COFF_HDR_SIZE)
+        return _fail(&f, _coffErr(name, "truncated COFF header"));
+    u16 mach = leU16(data);
+    if (mach == IMAGE_FILE_MACHINE_AMD64)
+    {
+        f.machine = EM_X86_64;
+        f.cls = ELFCLASS64;
+    }
+    else if (mach == IMAGE_FILE_MACHINE_I386)
+    {
+        f.machine = EM_386;
+        f.cls = ELFCLASS32;
+    }
+    else
+        return _fail(&f, _coffErr(name, "unsupported COFF machine"));
+
+    u16 nsec = leU16(data + 2);
+    u32 symptr = leU32(data + 8);
+    u32 nsymRaw = leU32(data + 12);
+    u16 optSize = leU16(data + 16);
+    usize secStart = (usize)COFF_HDR_SIZE + (usize)optSize;
+    if (!fits(secStart, (usize)nsec * COFF_SECHDR_SIZE, len))
+        return _fail(&f, _coffErr(name, "section headers out of bounds"));
+
+    /* string table follows the symbol table */
+    usize strtabOff = 0;
+    usize strtabSize = 0;
+    if (nsymRaw > 0 && !fits((usize)symptr, (usize)nsymRaw * COFF_SYMENT_SIZE, len))
+        return _fail(&f, _coffErr(name, "symbol table out of bounds"));
+    usize maybeStr = (usize)symptr + (usize)nsymRaw * COFF_SYMENT_SIZE;
+    if ((nsymRaw > 0 || symptr > 0) && fits(maybeStr, 4, len))
+    {
+        u32 sz = leU32(data + maybeStr);
+        if (sz >= 4 && fits(maybeStr, (usize)sz, len))
+        {
+            strtabOff = maybeStr;
+            strtabSize = (usize)sz;
+        }
+    }
+
+    for (u16 i = 0; i < nsec; i++)
+    {
+        const u8* p = data + secStart + (usize)i * COFF_SECHDR_SIZE;
+        Section s = Section::empty();
+        if (!_secName(p, data, strtabOff, strtabSize, &s.name))
+            return _fail(&f, _coffErr(name, "bad section name"));
+        u32 chars = leU32(p + 36);
+        s.size = leU32(p + 16);
+        s.offset = leU32(p + 20);
+        s.flags = _translateFlags(s.name, chars);
+        s.type = (chars & IMAGE_SCN_CNT_UNINITIALIZED_DATA) != 0
+                     ? SHT_NOBITS
+                     : SHT_PROGBITS;
+        if (s.flags == 0) s.type = SHT_PROGBITS;
+        s.addralign = _secAlign(chars);
+        if ((chars & IMAGE_SCN_CNT_UNINITIALIZED_DATA) == 0)
+        {
+            if (!fits((usize)s.offset, (usize)s.size, len))
+            {
+                String e = _coffErr(name, "section ");
+                e.pushView(s.name);
+                e.pushView(" out of bounds");
+                return _fail(&f, e);
+            }
+        }
+        f.secs.push(s);
+        Vec<Reloc> bucket = Vec<Reloc>::new();
+        f.rels.push(bucket);
+    }
+
+    /* export directives from .drectve */
+    for (usize i = 0; i < f.secs.count(); i++)
+    {
+        Section* s = f.secs.atPtr(i);
+        if (s->name.equals(".drectve"))
+            _addExportsFromDirective(&f, data + (usize)s->offset, (usize)s->size);
+    }
+
+    /* symbols (with auxiliary-entry index map for reloc symbol indices) */
+    usize mapLen = nsymRaw > 0 ? (usize)nsymRaw : 1;
+    u32* map = alloc<u32>(mapLen);
+    for (usize k = 0; k < mapLen; k++) map[k] = 0;
+    if (nsymRaw > 0 && (symptr == 0 || !fits((usize)symptr, (usize)nsymRaw * COFF_SYMENT_SIZE, len)))
+    {
+        dealloc<u32>(map);
+        return _fail(&f, _coffErr(name, "symbol table out of bounds"));
+    }
+    usize i = 0;
+    while (i < (usize)nsymRaw)
+    {
+        const u8* p = data + (usize)symptr + i * COFF_SYMENT_SIZE;
+        Sym sym;
+        sym.value = 0;
+        sym.size = 0;
+        sym.bind = STB_LOCAL;
+        sym.type = STT_NOTYPE;
+        sym.shndx = 0;
+        if (!_symName(p, data, strtabOff, strtabSize, &sym.name))
+        {
+            dealloc<u32>(map);
+            return _fail(&f, _coffErr(name, "bad symbol name"));
+        }
+        sym.value = leU32(p + 8);
+        i32 secNum = (i16)leU16(p + 12);
+        u16 cotype = leU16(p + 14);
+        u8 cls = p[16];
+        u8 naux = p[17];
+
+        if (cls == IMAGE_SYM_CLASS_EXTERNAL) sym.bind = STB_GLOBAL;
+        else if (cls == IMAGE_SYM_CLASS_WEAK_EXTERNAL) sym.bind = STB_WEAK;
+        else sym.bind = STB_LOCAL;
+
+        if (cls == IMAGE_SYM_CLASS_FILE) sym.type = STT_FILE;
+        else if (cls == IMAGE_SYM_CLASS_SECTION) sym.type = STT_SECTION;
+        else if ((cotype & 0xf0) == 0x20) sym.type = STT_FUNC;
+        else sym.type = STT_NOTYPE;
+
+        if (secNum > 0)
+        {
+            sym.shndx = (u16)(secNum - 1);
+        }
+        else if (secNum == -1)
+        {
+            sym.shndx = SHN_ABS;
+        }
+        else if (cls == IMAGE_SYM_CLASS_EXTERNAL && sym.value != 0)
+        {
+            /* undefined external with a value is a COMMON block */
+            sym.shndx = SHN_COMMON;
+            sym.size = sym.value;
+            sym.value = 8; /* alignment carried in value, ELF-style */
+        }
+        else
+        {
+            sym.shndx = SHN_UNDEF;
+            sym.value = 0;
+        }
+
+        f.syms.push(sym);
+        u32 ourIdx = (u32)(f.syms.count() - 1);
+        map[i] = ourIdx;
+        usize j = 1;
+        while (j <= (usize)naux)
+        {
+            if (i + j >= (usize)nsymRaw)
+            {
+                dealloc<u32>(map);
+                return _fail(&f, _coffErr(name, "aux entry overruns symbol table"));
+            }
+            map[i + j] = ourIdx;
+            j++;
+        }
+        i = i + 1 + (usize)naux;
+    }
+
+    /* relocations */
+    for (u16 si = 0; si < nsec; si++)
+    {
+        const u8* p = data + secStart + (usize)si * COFF_SECHDR_SIZE;
+        u32 chars = leU32(p + 36);
+        u32 ptrRel = leU32(p + 24);
+        usize nrel = leU16(p + 32);
+        if (nrel == 0) continue;
+        usize start = 0;
+        if ((chars & IMAGE_SCN_LNK_NRELOC_OVFL) != 0)
+        {
+            if (!fits((usize)ptrRel, COFF_REL_SIZE, len))
+            {
+                dealloc<u32>(map);
+                return _fail(&f, _coffErr(name, "overflow relocation header out of bounds"));
+            }
+            u32 real = leU32(data + (usize)ptrRel);
+            nrel = real > 0 ? (usize)(real - 1) : 0;
+            start = COFF_REL_SIZE;
+        }
+        if (nrel == 0) continue;
+        if (!fits((usize)ptrRel + start, nrel * COFF_REL_SIZE, len))
+        {
+            dealloc<u32>(map);
+            return _fail(&f, _coffErr(name, "relocations out of bounds"));
+        }
+        Vec<Reloc>* bucket = f.rels.atPtr(si);
+        for (usize k = 0; k < nrel; k++)
+        {
+            const u8* q = data + (usize)ptrRel + start + k * COFF_REL_SIZE;
+            u32 off = leU32(q);
+            u32 symIdx = leU32(q + 4);
+            u16 typ = leU16(q + 8);
+            if (symIdx >= (usize)nsymRaw)
+            {
+                dealloc<u32>(map);
+                return _fail(&f, _coffErr(name, "relocation has bad symbol index"));
+            }
+            if (typ == IMAGE_REL_I386_ABSOLUTE) continue;
+            Reloc r;
+            r.offset = off;
+            r.sym = map[symIdx];
+            r.type = typ;
+            r.addend = 0;
+            r.rela = false;
+            r.fmt = 1;
+            bucket->push(r);
+        }
+    }
+
+    dealloc<u32>(map);
+    return Result<ObjFile, String>::Ok { .value = f };
+}
+
+/* Parses a short import member: header + symbol\0dll\0 strings (the
+ * string order varies between writers, so the DLL is identified by
+ * its extension when both strings are present). Slices are taken from
+ * the member buffer. Returns false when the member is malformed.
+ */
+pub bool parseImportMember(const u8* data, usize len, str* outName, str* outDll, bool* outOrdinal, u16* outOrd)
+{
+    if (!isImportHeader(data, len)) return false;
+    u16 typ = leU16(data + 18);
+    u32 sizeOfData = leU32(data + 12);
+    bool byOrdinal = ((typ >> 2) & 0x7) == 0; /* NAME_TYPE in bits 2..4, 0 = ordinal */
+    u16 ordinal = (u16)(leU32(data + 16) & 0xffff);
+    usize strOff = COFF_IMPORT_HDR_SIZE;
+    if (!fits(strOff, sizeOfData, len)) return false;
+    usize end = strOff + sizeOfData;
+
+    usize s1s = strOff;
+    usize i = strOff;
+    while (i < end && data[i] != 0) i++;
+    if (i >= end) return false;
+    usize s1e = i;
+    i++;
+    usize s2s = i;
+    usize s2e = i;
+    if (i < end)
+    {
+        while (i < end && data[i] != 0) i++;
+        s2e = i;
+    }
+    str s1 = str::fromParts(data + s1s, s1e - s1s);
+    str s2 = str::fromParts(data + s2s, s2e - s2s);
+    if (s1.len == 0 && s2.len == 0) return false;
+
+    bool s2Dll = s2.endsWith(".dll") || s2.endsWith(".DLL") ||
+                 s2.endsWith(".ocx") || s2.endsWith(".drv") ||
+                 s2.endsWith(".exe") || s2.endsWith(".sys");
+    bool s1Dll = s1.endsWith(".dll") || s1.endsWith(".DLL") ||
+                 s1.endsWith(".ocx") || s1.endsWith(".drv") ||
+                 s1.endsWith(".exe") || s1.endsWith(".sys");
+
+    str symName;
+    str dllName;
+    if (s2.len == 0)
+    {
+        symName = s1;
+        dllName = str::empty();
+    }
+    else if (s2Dll && !s1Dll)
+    {
+        symName = s1;
+        dllName = s2;
+    }
+    else if (s1Dll && !s2Dll)
+    {
+        symName = s2;
+        dllName = s1;
+    }
+    else
+    {
+        symName = s1;
+        dllName = s2;
+    }
+
+    /* NAME_TYPE normalization for named imports */
+    if (!byOrdinal)
+    {
+        u32 nameType = (typ >> 2) & 0x7;
+        if (nameType == 2) /* NAME_NOPREFIX */
+        {
+            if (symName.len > 0 && (symName.ptr[0] == '_' || symName.ptr[0] == '@' || symName.ptr[0] == '?'))
+                symName = symName.slice(1, symName.len);
+        }
+        else if (nameType == 3) /* NAME_UNDECORATE */
+        {
+            if (symName.len > 0 && (symName.ptr[0] == '_' || symName.ptr[0] == '@' || symName.ptr[0] == '?'))
+                symName = symName.slice(1, symName.len);
+            usize e = symName.len;
+            while (e > 0 && symName.ptr[e - 1] >= '0' && symName.ptr[e - 1] <= '9') e--;
+            if (e > 0 && symName.ptr[e - 1] == '@' && e < symName.len)
+                symName = symName.slice(0, e);
+        }
+    }
+    if (symName.len == 0) return false;
+
+    *outName = symName;
+    *outDll = dllName;
+    *outOrdinal = byOrdinal;
+    *outOrd = ordinal;
+    return true;
+}

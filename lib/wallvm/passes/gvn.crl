@@ -1,0 +1,276 @@
+#[[no_drop_all]]
+import(lib) wallvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, FunctionAnalysisCache };
+import(lib) wallvm::irOps { IrOpcode, irOpcodeIsCommutative };
+import(lib) wallvm::domtree { IrDomTree, irDomtreeNew, irDomtreeFree };
+import(lib) wallvm::passes::alias_analysis { AliasAnalysis };
+import(lib) std::mman { alloc, dealloc };
+
+struct ExprTable
+{
+    IrInst** insts;
+    u32 count;
+    u32 cap;
+    AliasAnalysis* aliasAnalysis;
+
+    void init()
+    {
+        self = ExprTable {
+            .insts = null,
+            .count = 0,
+            .cap = 0,
+            .aliasAnalysis = null
+        };
+    }
+
+    void cloneFrom(ExprTable* other)
+    {
+        self.count = other->count;
+        self.cap = other->count;
+        self.aliasAnalysis = other->aliasAnalysis;
+        if (self.cap == 0) {
+            self.insts = null;
+            return;
+        }
+        self.insts = alloc<IrInst*>(self.cap);
+        for (u32 i = 0; i < self.count; i++)
+            self.insts[i] = other->insts[i];
+    }
+
+    void add(IrInst* inst)
+    {
+        if (self.count >= self.cap)
+        {
+            u32 nc = self.cap ? self.cap * 2 : 32;
+            IrInst** ni = alloc<IrInst*>(nc);
+            for (u32 i = 0; i < self.count; i++)
+                ni[i] = self.insts[i];
+            if (self.insts != null) dealloc<IrInst*>(self.insts);
+            self.insts = ni;
+            self.cap = nc;
+        }
+        self.insts[self.count++] = inst;
+    }
+
+    void free()
+    {
+        if (self.insts != null) dealloc<IrInst*>(self.insts);
+        self.insts = null;
+        self.count = 0;
+        self.cap = 0;
+    }
+}
+
+bool isCandidate(IrInst* inst)
+{
+    switch (inst->opcode)
+    {
+        IrOpcode::Add |
+        IrOpcode::Sub |
+        IrOpcode::Mul |
+        IrOpcode::And |
+        IrOpcode::Or |
+        IrOpcode::Xor |
+        IrOpcode::Shl |
+        IrOpcode::Lshr |
+        IrOpcode::Ashr |
+        IrOpcode::SMin |
+        IrOpcode::SMax |
+        IrOpcode::UMin |
+        IrOpcode::UMax |
+        IrOpcode::ICmp |
+        IrOpcode::FAdd |
+        IrOpcode::FSub |
+        IrOpcode::FMul |
+        IrOpcode::FDiv |
+        IrOpcode::FCmp |
+        IrOpcode::Trunc |
+        IrOpcode::Zext |
+        IrOpcode::Sext |
+        IrOpcode::FpTrunc |
+        IrOpcode::FpExt |
+        IrOpcode::FpToSi |
+        IrOpcode::SiToFp |
+        IrOpcode::FpToUi |
+        IrOpcode::UiToFp |
+        IrOpcode::Bitcast |
+        IrOpcode::Neg |
+        IrOpcode::Not |
+        IrOpcode::Abs |
+        IrOpcode::FAbs |
+        IrOpcode::FSqrt |
+        IrOpcode::CtPop |
+        IrOpcode::CtLz |
+        IrOpcode::CtTz |
+        IrOpcode::Rotl |
+        IrOpcode::Rotr |
+        IrOpcode::Bswap |
+        IrOpcode::Select |
+        IrOpcode::Load => { return true; },
+
+        else => { return false; },
+    }
+}
+
+bool sameOperands(IrInst* a, IrInst* b)
+{
+    if (a->nops != b->nops) return false;
+    for (u32 i = 0; i < a->nops; i++)
+        if (a->ops[i] != b->ops[i]) return false;
+    return true;
+}
+
+bool areEquivalent(IrInst* a, IrInst* b, AliasAnalysis* aa)
+{
+    if (a->opcode != b->opcode) return false;
+    if (a->base.type != b->base.type) return false;
+    if (a->nops != b->nops) return false;
+    if (a->opcode == IrOpcode::ICmp && a->icmpPred != b->icmpPred) return false;
+    if (a->opcode == IrOpcode::FCmp && a->fcmpPred != b->fcmpPred) return false;
+
+    // For loads, check if they must-alias the same address
+    if (a->opcode == IrOpcode::Load)
+    {
+        if (a->nops >= 1 && b->nops >= 1)
+        {
+            if (aa != null && aa->isMustAlias(a->ops[0], b->ops[0]))
+                return true;
+            if (a->ops[0] == b->ops[0])
+                return true;
+        }
+        return false;
+    }
+
+    if (sameOperands(a, b)) return true;
+
+    if (a->nops == 2 && irOpcodeIsCommutative(a->opcode))
+    {
+        if (a->ops[0] == b->ops[1] && a->ops[1] == b->ops[0])
+            return true;
+    }
+
+    return false;
+}
+
+IrInst* findEquivalent(ExprTable* table, IrInst* inst)
+{
+    for (u32 i = 0; i < table->count; i++)
+        if (areEquivalent(table->insts[i], inst, table->aliasAnalysis))
+            return table->insts[i];
+    return null;
+}
+
+bool processBlock(IrBlock* bb, ExprTable* table)
+{
+    bool changed = false;
+    u32 ii = 0;
+    while (ii < bb->ninsts)
+    {
+        IrInst* inst = bb->insts[ii];
+
+        // Invalidate loads in the expression table when a store aliases with them
+        if (inst->opcode == IrOpcode::Store && inst->nops >= 2)
+        {
+            IrValue* storeAddr = inst->ops[1];
+            u32 wi = 0;
+            while (wi < table->count)
+            {
+                IrInst* entry = table->insts[wi];
+                if (entry->opcode == IrOpcode::Load && entry->nops >= 1)
+                {
+                    // Remove if the store may-alias with the load (i.e., NOT no-alias)
+                    if (table->aliasAnalysis == null || !table->aliasAnalysis->isNoAlias(entry->ops[0], storeAddr))
+                    {
+                        // May-alias — remove from expression table
+                        table->insts[wi] = table->insts[--table->count];
+                        continue;
+                    }
+                }
+                wi++;
+            }
+            ii++;
+            continue;
+        }
+
+        // Invalidate loads when a call is encountered (may alias with any load)
+        if (inst->opcode == IrOpcode::Call || inst->opcode == IrOpcode::InlineAsm)
+        {
+            table->count = 0;
+            ii++;
+            continue;
+        }
+
+        if (!isCandidate(inst))
+        {
+            ii++;
+            continue;
+        }
+
+        IrInst* existing = findEquivalent(table, inst);
+        if (existing != null)
+        {
+            inst->base.replaceAllUses(&existing->base);
+            inst->erase();
+            changed = true;
+            continue;
+        }
+
+        table->add(inst);
+        ii++;
+    }
+    return changed;
+}
+
+bool processDomSubtree(IrFunc* func, IrDomTree* dt, IrBlock* bb, ExprTable* incoming)
+{
+    ExprTable local;
+    local.init();
+    local.cloneFrom(incoming);
+
+    bool changed = processBlock(bb, &local);
+
+    for (u32 i = 0; i < dt->nblocks; i++)
+    {
+        if (dt->blocks[i] == bb) continue;
+        if (dt->idoms[i] == bb)
+        {
+            if (processDomSubtree(func, dt, dt->blocks[i], &local))
+                changed = true;
+        }
+    }
+
+    local.free();
+    return changed;
+}
+
+pub bool irPassGvn(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (ctx == null || func == null || func->nblocks == 0) return false;
+
+    IrDomTree* dt = irDomtreeNew(func);
+    if (dt == null) return false;
+
+    // Build alias analysis for the function
+    FunctionAnalysisCache* cache = ctx->getOrCreateAnalysisCache(func);
+    AliasAnalysis* aaPtr = (AliasAnalysis*)cache->aliasAnalysis;
+    AliasAnalysis aa;
+    bool ownAA = false;
+    if (aaPtr != null && cache->generation == ctx->analysisGeneration) {
+        aa = *aaPtr;
+    }
+    else {
+        aa = AliasAnalysis::new(ctx);
+        aa.analyze(func);
+        ownAA = true;
+    }
+
+    ExprTable root;
+    root.init();
+    root.aliasAnalysis = &aa;
+    bool changed = processDomSubtree(func, dt, func->blocks[0], &root);
+    root.free();
+
+    if (ownAA) aa.deinit();
+    irDomtreeFree(dt);
+    return changed;
+}

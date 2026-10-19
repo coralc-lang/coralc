@@ -1,0 +1,2561 @@
+#[[no_drop_all]]
+import(lib) wallvm::irtypes { IrContext, IrModule, IrFunc, IrBlock, IrInst, IrType, IrTypeKind, IrValue, IrValueKind, IrGlobal, IrStringConst, IrStructType, IrArrayConst };
+import(lib) wallvm::irOps { IrOpcode, IrICmpPred, IrFCmpPred, IrAtomicOrdering, IrAtomicRmwOp };
+import(lib) wallvm::irMetadata { MetadataSet, attachInstMetadata, attachFuncMetadata, attachGlobalMetadata, attachStringMetadata, addInt, addString, addIRValue, addFloat, addBool, addType };
+import(lib) std::mman { alloc, dealloc, copy };
+import(lib) core::cchar { cchar };
+import(lib) platform::libc { strtod };
+
+// what a deferred name patches when its scope closes
+enum FixupTarget
+{
+    InstOp,
+    MetaEntry,
+    GlobalInit,
+    ArrayElem
+}
+
+// %refs used before their def (phi bodies, metadata) and @refs used before
+// the decl, both patched when their scope closes; names are owned copies
+// because takeIdent slices the input buffer
+struct Fixup
+{
+    str name;
+    u8 kind;        // 1 = % value (function scope), 2 = @ symbol (module scope)
+    FixupTarget target;
+    IrInst* inst;
+    u32 opIdx;
+    MetadataSet* mdSet;
+    u32 mdIdx;
+    IrGlobal* global;
+    IrArrayConst* arr;
+    u32 arrIdx;
+}
+
+pub struct IrParser
+{
+    IrContext* ctx;
+    str input;
+    usize pos;
+    usize len;
+    cchar cur;
+    u32 line;
+    bool hadError;
+    str errMsg;
+    u32 errLine;
+
+    str* valueNames;
+    IrValue** values;
+    u32 numValues;
+    u32 capValues;
+
+    str* blockNames;
+    IrBlock** blocks;
+    u32 numBlocks;
+    u32 capBlocks;
+
+    Fixup* fixups;
+    u32 numFixs;
+    u32 capFixs;
+
+    IrFunc* currentFunc;
+    IrBlock* currentBlock;
+    IrModule* currentModule;
+}
+
+struct NumToken
+{
+    bool isFloat;
+    bool isHex;
+    i64 i;
+    u64 u;
+    f64 f;
+}
+
+struct AtomRef
+{
+    IrValue* val;
+    str name;   // set while pending
+    bool pending;
+    bool isSym;
+}
+
+struct OpList
+{
+    IrValue** ops;
+    str* pend;
+    u8* kinds;  // 0 none, 1 value, 2 symbol
+    u32 n;
+    u32 cap;
+}
+
+struct MetaAtom
+{
+    u32 kind;   // 0 int, 1 float, 2 string, 3 ir value, 4 type, 5 bool
+    i64 i;
+    f64 f;
+    str s;
+    IrValue* v;
+    IrType* ty;
+    str ref;        // deferred %/@ name (kind 3 with v == null)
+    bool refIsSym;
+}
+
+pub IrParser new(IrContext* ctx)
+{
+    return IrParser {
+        .ctx = ctx,
+        .input = str::empty(),
+        .pos = 0,
+        .len = 0,
+        .cur = 0,
+        .line = 1,
+        .hadError = false,
+        .errMsg = str::empty(),
+        .errLine = 0,
+        .valueNames = null,
+        .values = null,
+        .numValues = 0,
+        .capValues = 0,
+        .blockNames = null,
+        .blocks = null,
+        .numBlocks = 0,
+        .capBlocks = 0,
+        .fixups = null,
+        .numFixs = 0,
+        .capFixs = 0,
+        .currentFunc = null,
+        .currentBlock = null,
+        .currentModule = null
+    };
+}
+
+pub void destroy(IrParser* p)
+{
+    for (u32 i = 0; i < p->numValues; i++)
+        dealloc<cchar>((cchar*)p->valueNames[i].ptr);
+    if (p->valueNames) dealloc<str>(p->valueNames);
+    if (p->values) dealloc<IrValue*>(p->values);
+    for (u32 i = 0; i < p->numBlocks; i++)
+        dealloc<cchar>((cchar*)p->blockNames[i].ptr);
+    if (p->blockNames) dealloc<str>(p->blockNames);
+    if (p->blocks) dealloc<IrBlock*>(p->blocks);
+    for (u32 i = 0; i < p->numFixs; i++)
+        dealloc<cchar>((cchar*)p->fixups[i].name.ptr);
+    if (p->fixups) dealloc<Fixup>(p->fixups);
+    if (p->errMsg.len > 0) dealloc<cchar>((cchar*)p->errMsg.ptr);
+}
+
+pub str getError(IrParser* p) { return p->errMsg; }
+pub u32 getErrorLine(IrParser* p) { return p->errLine; }
+
+str dupStr(str s)
+{
+    cchar* b = alloc<cchar>(s.len + 1);
+    for (usize i = 0; i < s.len; i++) b[i] = (cchar)s.ptr[i];
+    b[s.len] = 0;
+    return str::fromParts((const u8*)b, s.len);
+}
+
+cchar* dupCstr(str s)
+{
+    cchar* b = alloc<cchar>(s.len + 1);
+    for (usize i = 0; i < s.len; i++) b[i] = (cchar)s.ptr[i];
+    b[s.len] = 0;
+    return b;
+}
+
+f64 f64FromBits(u64 b)
+{
+    f64 d;
+    copy<cchar>((cchar*)&d, (cchar*)&b, 8);
+    return d;
+}
+
+void parseError(IrParser* p, str msg)
+{
+    if (p->hadError) return;
+    p->hadError = true;
+    p->errMsg = dupStr(msg);
+    p->errLine = p->line;
+}
+
+void advance(IrParser* p)
+{
+    if (p->cur == '\n') p->line = p->line + 1;
+    if (p->pos + 1 < p->len) {
+        p->pos = p->pos + 1;
+        p->cur = (cchar)p->input.ptr[p->pos];
+    }
+    else {
+        p->pos = p->len;
+        p->cur = 0;
+    }
+}
+
+cchar peekByte(IrParser* p, usize off)
+{
+    if (p->pos + off < p->len) return (cchar)p->input.ptr[p->pos + off];
+    return 0;
+}
+
+// eats spaces, tabs and // comments but stops at the newline, so a
+// construct that may end the line can tell it did
+void skipSpaces(IrParser* p)
+{
+    while (!p->hadError)
+    {
+        cchar c = p->cur;
+        if (c == ' ' || c == '\t' || c == '\r') { advance(p); continue; }
+        if (c == '/' && peekByte(p, 1) == '/') {
+            while (p->cur != '\n' && p->cur != 0) advance(p);
+            continue;
+        }
+        break;
+    }
+}
+
+void skipWs(IrParser* p)
+{
+    while (!p->hadError)
+    {
+        cchar c = p->cur;
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') { advance(p); continue; }
+        if (c == '/' && peekByte(p, 1) == '/') {
+            while (p->cur != '\n' && p->cur != 0) advance(p);
+            continue;
+        }
+        break;
+    }
+}
+
+bool matchChar(IrParser* p, cchar c)
+{
+    if (p->cur == c) { advance(p); return true; }
+    return false;
+}
+
+bool expectChar(IrParser* p, cchar c, str what)
+{
+    skipSpaces(p);
+    if (p->cur == c) { advance(p); return true; }
+    parseError(p, what);
+    return false;
+}
+
+bool isIdentStart(cchar c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+}
+
+bool isIdentChar(cchar c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-';
+}
+
+bool isHexDigit(cchar c)
+{
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+u32 hexVal(cchar c)
+{
+    if (c >= '0' && c <= '9') return (u32)(c - '0');
+    if (c >= 'a' && c <= 'f') return (u32)(c - 'a') + 10;
+    return (u32)(c - 'A') + 10;
+}
+
+str peekIdent(IrParser* p)
+{
+    usize i = p->pos;
+    while (i < p->len && isIdentChar((cchar)p->input.ptr[i])) i = i + 1;
+    if (i == p->pos) return str::empty();
+    return str::fromParts(p->input.ptr + p->pos, i - p->pos);
+}
+
+str takeIdent(IrParser* p)
+{
+    if (!isIdentStart(p->cur) && !(p->cur >= '0' && p->cur <= '9'))
+    {
+        parseError(p, "expected identifier");
+        return str::empty();
+    }
+    usize start = p->pos;
+    while (isIdentChar(p->cur)) advance(p);
+    return str::fromParts(p->input.ptr + start, p->pos - start);
+}
+
+bool isTypeWord(str w)
+{
+    return w.equals("void") || w.equals("i1") || w.equals("i8") || w.equals("i16") ||
+           w.equals("i32") || w.equals("i64") || w.equals("f32") || w.equals("f64") ||
+           w.equals("ptr") || w.equals("array") || w.equals("vector") ||
+           w.equals("func") || w.equals("struct");
+}
+
+str parseStringLiteral(IrParser* p)
+{
+    if (p->cur != '"') { parseError(p, "expected string"); return str::empty(); }
+    advance(p);
+    usize cap = 16;
+    usize n = 0;
+    cchar* buf = alloc<cchar>(cap);
+    while (true)
+    {
+        cchar c = p->cur;
+        if (c == 0)
+        {
+            parseError(p, "unterminated string");
+            dealloc<cchar>(buf);
+            return str::empty();
+        }
+        if (c == '"') { advance(p); break; }
+        if (c == '\\')
+        {
+            advance(p);
+            cchar e = p->cur;
+            if (e == 'n') { c = '\n'; advance(p); }
+            else if (e == 't') { c = '\t'; advance(p); }
+            else if (e == '\\') { c = '\\'; advance(p); }
+            else if (e == '"') { c = '"'; advance(p); }
+            else if (e == 'x')
+            {
+                advance(p);
+                if (!isHexDigit(p->cur) || !isHexDigit(peekByte(p, 1))) {
+                    parseError(p, "bad \\x escape");
+                    dealloc<cchar>(buf);
+                    return str::empty();
+                }
+                u32 v = hexVal(p->cur);
+                advance(p);
+                v = v * 16 + hexVal(p->cur);
+                advance(p);
+                c = (cchar)v;
+            }
+            else {
+                parseError(p, "unknown escape");
+                dealloc<cchar>(buf);
+                return str::empty();
+            }
+        }
+        else advance(p);
+        if (n >= cap) {
+            usize newCap = cap * 2;
+            cchar* nb = alloc<cchar>(newCap);
+            copy<cchar>(nb, buf, n);
+            dealloc<cchar>(buf);
+            buf = nb;
+            cap = newCap;
+        }
+        buf[n] = c;
+        n = n + 1;
+    }
+    return str::fromParts((const u8*)buf, n);
+}
+
+NumToken parseNumber(IrParser* p)
+{
+    NumToken t;
+    t.isFloat = false;
+    t.isHex = false;
+    t.i = 0;
+    t.u = 0;
+    t.f = 0;
+    bool neg = false;
+    usize tokStart = p->pos;
+    if (p->cur == '-') { neg = true; advance(p); }
+    if (p->cur == '0' && (peekByte(p, 1) == 'x' || peekByte(p, 1) == 'X'))
+    {
+        advance(p);
+        advance(p);
+        u64 v = 0;
+        if (!isHexDigit(p->cur)) parseError(p, "expected hex digits");
+        while (isHexDigit(p->cur))
+        {
+            v = v * 16 + hexVal(p->cur);
+            advance(p);
+        }
+        t.isHex = true;
+        t.u = v;
+        t.i = (i64)v;
+        return t;
+    }
+    if (!(p->cur >= '0' && p->cur <= '9')) {
+        parseError(p, "expected number");
+        return t;
+    }
+    u64 dec = 0;
+    while (p->cur >= '0' && p->cur <= '9') {
+        dec = dec * 10 + (u64)(p->cur - '0');
+        advance(p);
+    }
+    if (p->cur == '.')
+    {
+        t.isFloat = true;
+        advance(p);
+        while (p->cur >= '0' && p->cur <= '9') advance(p);
+    }
+    if (p->cur == 'e' || p->cur == 'E')
+    {
+        cchar n1 = peekByte(p, 1);
+        if (n1 == '+' || n1 == '-' || (n1 >= '0' && n1 <= '9'))
+        {
+            t.isFloat = true;
+            advance(p);
+            if (p->cur == '+' || p->cur == '-') advance(p);
+            while (p->cur >= '0' && p->cur <= '9') advance(p);
+        }
+    }
+    if (t.isFloat)
+    {
+        // strtod over the exact token span (the '-' included) so the value
+        // is the correctly rounded double, not accumulated-digit slop
+        t.f = strtod((const cchar*)(p->input.ptr + tokStart), null);
+    }
+    else
+    {
+        t.i = neg ? -(i64)dec : (i64)dec;
+        t.u = (u64)t.i;
+    }
+    return t;
+}
+
+IrType* parseType(IrParser* p);
+
+IrType* parseTypeAfter(IrParser* p, str w)
+{
+    if (w.equals("void")) return p->ctx->tyVoid();
+    if (w.equals("i1")) return p->ctx->tyInt(1);
+    if (w.equals("i8")) return p->ctx->tyInt(8);
+    if (w.equals("i16")) return p->ctx->tyInt(16);
+    if (w.equals("i32")) return p->ctx->tyInt(32);
+    if (w.equals("i64")) return p->ctx->tyInt(64);
+    if (w.equals("f32")) return p->ctx->tyFloat();
+    if (w.equals("f64")) return p->ctx->tyDouble();
+    if (w.equals("ptr")) {
+        str n = peekIdent(p);
+        if (!n.isEmpty() && isTypeWord(n)) return p->ctx->tyPtr(parseType(p));
+        return p->ctx->tyPtr(null);
+    }
+    if (w.equals("array") || w.equals("vector"))
+    {
+        IrType* elem = parseType(p);
+        if (!elem) return null;
+        skipSpaces(p);
+        if (!(p->cur >= '0' && p->cur <= '9')) { parseError(p, "expected element count"); return null; }
+        u64 count = 0;
+        while (p->cur >= '0' && p->cur <= '9') {
+            count = count * 10 + (u64)(p->cur - '0');
+            advance(p);
+        }
+        if (w.equals("array")) return p->ctx->tyArray(elem, (u32)count);
+        return p->ctx->tyVector(elem, (u32)count);
+    }
+    if (w.equals("func"))
+    {
+        IrType* ret = parseType(p);
+        if (!ret) return null;
+        if (!expectChar(p, '(', "expected '(' in function type")) return null;
+        IrType** params = null;
+        u32 n = 0;
+        u32 cap = 0;
+        bool vararg = false;
+        skipWs(p);
+        if (p->cur != ')')
+        {
+            while (!p->hadError)
+            {
+                if (p->cur == '.' && peekByte(p, 1) == '.' && peekByte(p, 2) == '.')
+                {
+                    advance(p);
+                    advance(p);
+                    advance(p);
+                    vararg = true;
+                    break;
+                }
+                IrType* pt = parseType(p);
+                if (!pt) return null;
+                if (n >= cap)
+                {
+                    u32 newCap = cap == 0 ? 4 : cap * 2;
+                    IrType** np = alloc<IrType*>(newCap);
+                    if (params) {
+                        copy<IrType*>(np, params, n);
+                        dealloc<IrType*>(params);
+                    }
+                    params = np;
+                    cap = newCap;
+                }
+                params[n] = pt;
+                n = n + 1;
+                skipWs(p);
+                if (p->cur == ',') { advance(p); skipWs(p); continue; }
+                break;
+            }
+        }
+        if (!expectChar(p, ')', "expected ')' in function type")) return null;
+        // the type system keeps the params array from here on
+        return p->ctx->tyFunc(ret, params, n, vararg);
+    }
+    if (w.equals("struct"))
+    {
+        skipSpaces(p);
+        if (p->cur == '@')
+        {
+            advance(p);
+            str name = takeIdent(p);
+            if (p->hadError) return null;
+            IrStructType* st = null;
+            if (p->currentModule)
+            {
+                for (u32 i = 0; i < p->currentModule->nstructs; i++)
+                {
+                    if (p->currentModule->structs[i]->name.equals(name))
+                    {
+                        st = p->currentModule->structs[i];
+                        break;
+                    }
+                }
+            }
+            if (!st) { parseError(p, "unknown struct type"); return null; }
+            return p->ctx->tyStruct(st);
+        }
+        if (p->cur == '{')
+        {
+            advance(p);
+            IrType** fts = null;
+            u32 n = 0;
+            u32 cap = 0;
+            skipWs(p);
+            if (p->cur != '}')
+            {
+                while (!p->hadError)
+                {
+                    IrType* ft = parseType(p);
+                    if (!ft) return null;
+                    if (n >= cap)
+                    {
+                        u32 newCap = cap == 0 ? 4 : cap * 2;
+                        IrType** nf = alloc<IrType*>(newCap);
+                        if (fts)
+                        {
+                            copy<IrType*>(nf, fts, n);
+                            dealloc<IrType*>(fts);
+                        }
+                        fts = nf;
+                        cap = newCap;
+                    }
+                    fts[n] = ft;
+                    n = n + 1;
+                    skipWs(p);
+                    if (p->cur == ',') { advance(p); skipWs(p); continue; }
+                    break;
+                }
+            }
+            if (!expectChar(p, '}', "expected '}' in struct type")) return null;
+            IrStructType* st = p->ctx->createStructType(str::empty(), fts, null, n);
+            if (p->currentModule)
+            {
+                // struct types intern by structure, so a structurally equal
+                // twin in the side table already answers to this type —
+                // keep one entry instead of one per use site
+                IrStructType* twin = null;
+                for (u32 i = 0; i < p->currentModule->nstructs; i++)
+                {
+                    if (p->currentModule->structs[i]->irType == st->irType)
+                    {
+                        twin = p->currentModule->structs[i];
+                        break;
+                    }
+                }
+                if (twin)
+                {
+                    dealloc<u32>(st->offsets);
+                    dealloc<IrType*>(st->fieldTypes);
+                    dealloc<IrStructType>(st);
+                    return p->ctx->tyStruct(twin);
+                }
+                p->currentModule->addStruct(st);
+            }
+            return p->ctx->tyStruct(st);
+        }
+        parseError(p, "expected struct body or @name");
+        return null;
+    }
+    parseError(p, "unknown type");
+    return null;
+}
+
+IrType* parseType(IrParser* p)
+{
+    skipWs(p);
+    if (p->hadError) return null;
+    str w = peekIdent(p);
+    if (w.isEmpty()) { parseError(p, "expected type"); return null; }
+    for (usize i = 0; i < w.len; i++) advance(p);
+    return parseTypeAfter(p, w);
+}
+
+void addValue(IrParser* p, str name, IrValue* v)
+{
+    if (p->numValues >= p->capValues)
+    {
+        u32 newCap = p->capValues == 0 ? 32 : p->capValues * 2;
+        str* nn = alloc<str>(newCap);
+        IrValue** nv = alloc<IrValue*>(newCap);
+        if (p->valueNames)
+        {
+            copy<str>(nn, p->valueNames, p->numValues);
+            dealloc<str>(p->valueNames);
+            dealloc<IrValue*>(p->values);
+        }
+        p->valueNames = nn;
+        p->values = nv;
+        p->capValues = newCap;
+    }
+    p->valueNames[p->numValues] = dupStr(name);
+    p->values[p->numValues] = v;
+    p->numValues = p->numValues + 1;
+}
+
+IrValue* findValue(IrParser* p, str name)
+{
+    for (u32 i = 0; i < p->numValues; i++)
+        if (p->valueNames[i].equals(name)) return p->values[i];
+    return null;
+}
+
+void addBlockName(IrParser* p, str name, IrBlock* bb)
+{
+    if (p->numBlocks >= p->capBlocks)
+    {
+        u32 newCap = p->capBlocks == 0 ? 16 : p->capBlocks * 2;
+        str* nn = alloc<str>(newCap);
+        IrBlock** nb = alloc<IrBlock*>(newCap);
+        if (p->blockNames)
+        {
+            copy<str>(nn, p->blockNames, p->numBlocks);
+            dealloc<str>(p->blockNames);
+            dealloc<IrBlock*>(p->blocks);
+        }
+        p->blockNames = nn;
+        p->blocks = nb;
+        p->capBlocks = newCap;
+    }
+    p->blockNames[p->numBlocks] = dupStr(name);
+    p->blocks[p->numBlocks] = bb;
+    p->numBlocks = p->numBlocks + 1;
+}
+
+IrBlock* findBlock(IrParser* p, str name)
+{
+    for (u32 i = 0; i < p->numBlocks; i++)
+        if (p->blockNames[i].equals(name)) return p->blocks[i];
+    return null;
+}
+
+IrValue* findSymbol(IrParser* p, str name)
+{
+    IrModule* m = p->currentModule;
+    if (!m) return null;
+    for (u32 i = 0; i < m->nfuncs; i++)
+    {
+        cchar* fn = m->funcs[i]->base.name;
+        if (fn && str::fromCstr((const cchar::cchar*)fn).equals(name)) return &m->funcs[i]->base;
+    }
+    for (u32 i = 0; i < m->nglobals; i++)
+    {
+        cchar* gn = m->globals[i]->base.name;
+        if (gn && str::fromCstr((const cchar::cchar*)gn).equals(name)) return &m->globals[i]->base;
+    }
+    for (u32 i = 0; i < m->nconstStrings; i++)
+    {
+        cchar* sn = m->constStrings[i]->base.name;
+        if (sn && str::fromCstr((const cchar::cchar*)sn).equals(name)) return &m->constStrings[i]->base;
+    }
+    return null;
+}
+
+Fixup* fixupGrow(IrParser* p)
+{
+    if (p->numFixs >= p->capFixs)
+    {
+        u32 newCap = p->capFixs == 0 ? 16 : p->capFixs * 2;
+        Fixup* nf = alloc<Fixup>(newCap);
+        if (p->fixups)
+        {
+            copy<Fixup>(nf, p->fixups, p->numFixs);
+            dealloc<Fixup>(p->fixups);
+        }
+        p->fixups = nf;
+        p->capFixs = newCap;
+    }
+    Fixup* f = &p->fixups[p->numFixs];
+    p->numFixs = p->numFixs + 1;
+    return f;
+}
+
+void addFixup(IrParser* p, IrInst* inst, u32 opIdx, str name, u8 kind)
+{
+    Fixup* f = fixupGrow(p);
+    f->name = dupStr(name);
+    f->kind = kind;
+    f->target = FixupTarget::InstOp;
+    f->inst = inst;
+    f->opIdx = opIdx;
+    f->mdSet = null;
+    f->mdIdx = 0;
+    f->global = null;
+    f->arr = null;
+    f->arrIdx = 0;
+}
+
+// a metadata value slot survives entry-array growth because the fixup
+// stores the index, never the pointer
+void addMetaFixup(IrParser* p, MetadataSet* md, u32 mdIdx, str name, u8 kind)
+{
+    Fixup* f = fixupGrow(p);
+    f->name = dupStr(name);
+    f->kind = kind;
+    f->target = FixupTarget::MetaEntry;
+    f->inst = null;
+    f->opIdx = 0;
+    f->mdSet = md;
+    f->mdIdx = mdIdx;
+    f->global = null;
+    f->arr = null;
+    f->arrIdx = 0;
+}
+
+void addGlobalFixup(IrParser* p, IrGlobal* g, str name)
+{
+    Fixup* f = fixupGrow(p);
+    f->name = dupStr(name);
+    f->kind = 2;
+    f->target = FixupTarget::GlobalInit;
+    f->inst = null;
+    f->opIdx = 0;
+    f->mdSet = null;
+    f->mdIdx = 0;
+    f->global = g;
+    f->arr = null;
+    f->arrIdx = 0;
+}
+
+// aggregate init elements fill slots in a freshly built constArray — fresh
+// because constArray does not unique, so no other value shares the slots
+void addArrayFixup(IrParser* p, IrArrayConst* ac, u32 idx, str name)
+{
+    Fixup* f = fixupGrow(p);
+    f->name = dupStr(name);
+    f->kind = 2;
+    f->target = FixupTarget::ArrayElem;
+    f->inst = null;
+    f->opIdx = 0;
+    f->mdSet = null;
+    f->mdIdx = 0;
+    f->global = null;
+    f->arr = ac;
+    f->arrIdx = idx;
+}
+
+// phi operands may name a value the text defines later, everything else
+// has to be in scope the moment it is read
+IrValue* parseAtom(IrParser* p, IrType* ty, bool allowFwd, bool allowDeferSym, AtomRef* r)
+{
+    r->val = null;
+    r->name = str::empty();
+    r->pending = false;
+    r->isSym = false;
+    skipWs(p);
+    if (p->hadError) return null;
+    cchar c = p->cur;
+    if (c == '%')
+    {
+        advance(p);
+        str name = takeIdent(p);
+        if (p->hadError) return null;
+        IrValue* v = findValue(p, name);
+        if (!v)
+        {
+            if (allowFwd)
+            {
+                r->name = name;
+                r->pending = true;
+                r->isSym = false;
+                return null;
+            }
+            parseError(p, "undefined value");
+            return null;
+        }
+        r->val = v;
+        return v;
+    }
+    if (c == '@')
+    {
+        advance(p);
+        str name = takeIdent(p);
+        if (p->hadError) return null;
+        IrValue* v = findSymbol(p, name);
+        if (!v)
+        {
+            if (allowDeferSym)
+            {
+                r->name = name;
+                r->pending = true;
+                r->isSym = true;
+                return null;
+            }
+            parseError(p, "undefined symbol");
+            return null;
+        }
+        r->val = v;
+        return v;
+    }
+    if (c == '-' && (isIdentStart(peekByte(p, 1))))
+    {
+        advance(p);
+        str w = peekIdent(p);
+        if (w.equals("inf"))
+        {
+            for (usize i = 0; i < w.len; i++) advance(p);
+            IrType* ft = ty && ty->kind == IrTypeKind::Float ? ty : p->ctx->tyDouble();
+            r->val = p->ctx->constFloat(ft, -f64FromBits(0x7FF0000000000000));
+            return r->val;
+        }
+        if (w.equals("nan"))
+        {
+            for (usize i = 0; i < w.len; i++) advance(p);
+            IrType* ft = ty && ty->kind == IrTypeKind::Float ? ty : p->ctx->tyDouble();
+            r->val = p->ctx->constFloat(ft, -f64FromBits(0x7FF8000000000000));
+            return r->val;
+        }
+        parseError(p, "expected value");
+        return null;
+    }
+    if (c == '-' || (c >= '0' && c <= '9') ||
+        (c == '.' && peekByte(p, 1) >= '0' && peekByte(p, 1) <= '9'))
+    {
+        NumToken t = parseNumber(p);
+        if (p->hadError) return null;
+        if (t.isFloat)
+        {
+            IrType* ft = ty && ty->kind == IrTypeKind::Float ? ty : p->ctx->tyDouble();
+            r->val = p->ctx->constFloat(ft, t.f);
+            return r->val;
+        }
+        if (t.isHex && ty && ty->kind == IrTypeKind::Float)
+        {
+            u64 bits = ty->width == 32 ? (u32)t.u : t.u;
+            r->val = p->ctx->constFloat(ty, f64FromBits(bits));
+            return r->val;
+        }
+        IrType* it = ty ? ty : p->ctx->tyInt(64);
+        r->val = p->ctx->constInt(it, t.u);
+        return r->val;
+    }
+    if (isIdentStart(c))
+    {
+        str w = peekIdent(p);
+        if (w.equals("true") || w.equals("false"))
+        {
+            bool b = w.equals("true");
+            for (usize i = 0; i < w.len; i++) advance(p);
+            IrType* it = ty ? ty : p->ctx->tyInt(1);
+            r->val = p->ctx->constInt(it, b ? 1 : 0);
+            return r->val;
+        }
+        if (w.equals("inf") || w.equals("nan"))
+        {
+            bool isn = w.equals("nan");
+            for (usize i = 0; i < w.len; i++) advance(p);
+            IrType* ft = ty && ty->kind == IrTypeKind::Float ? ty : p->ctx->tyDouble();
+            f64 v = isn ? f64FromBits(0x7FF8000000000000) : f64FromBits(0x7FF0000000000000);
+            r->val = p->ctx->constFloat(ft, v);
+            return r->val;
+        }
+        parseError(p, "expected value");
+        return null;
+    }
+    parseError(p, "expected value");
+    return null;
+}
+
+void opsInit(OpList* l)
+{
+    l->ops = null;
+    l->pend = null;
+    l->kinds = null;
+    l->n = 0;
+    l->cap = 0;
+}
+
+void opsPush(OpList* l, IrValue* v, str pend, u8 kind)
+{
+    if (l->n >= l->cap)
+    {
+        u32 newCap = l->cap == 0 ? 8 : l->cap * 2;
+        IrValue** no = alloc<IrValue*>(newCap);
+        str* np = alloc<str>(newCap);
+        u8* nk = alloc<u8>(newCap);
+        if (l->ops)
+        {
+            copy<IrValue*>(no, l->ops, l->n);
+            copy<str>(np, l->pend, l->n);
+            copy<u8>(nk, l->kinds, l->n);
+            dealloc<IrValue*>(l->ops);
+            dealloc<str>(l->pend);
+            dealloc<u8>(l->kinds);
+        }
+        l->ops = no;
+        l->pend = np;
+        l->kinds = nk;
+        l->cap = newCap;
+    }
+    l->ops[l->n] = v;
+    l->pend[l->n] = pend;
+    l->kinds[l->n] = kind;
+    l->n = l->n + 1;
+}
+
+void opsPushRef(OpList* l, AtomRef* r)
+{
+    u8 kind = 0;
+    if (r->pending) kind = r->isSym ? 2 : 1;
+    opsPush(l, r->val, r->name, kind);
+}
+
+void opsFree(OpList* l)
+{
+    if (l->ops) dealloc<IrValue*>(l->ops);
+    if (l->pend) dealloc<str>(l->pend);
+    if (l->kinds) dealloc<u8>(l->kinds);
+    l->ops = null;
+    l->pend = null;
+    l->kinds = null;
+    l->n = 0;
+    l->cap = 0;
+}
+
+IrInst* emitFinish(IrParser* p, IrOpcode op, IrType* ty, OpList* l, u64 icmpP, u64 fcmpP)
+{
+    IrInst* inst = p->ctx->createInst(op, ty, l->ops, l->n, icmpP, fcmpP);
+    if (p->currentBlock) p->currentBlock->addInst(inst);
+    for (u32 i = 0; i < l->n; i++)
+        if (l->ops[i]) l->ops[i]->addUser(inst);
+    for (u32 i = 0; i < l->n; i++)
+        if (l->kinds[i] == 1) addFixup(p, inst, i, l->pend[i], 1);
+        else if (l->kinds[i] == 2) addFixup(p, inst, i, l->pend[i], 2);
+    opsFree(l);
+    return inst;
+}
+
+IrBlock* parseBlockRef(IrParser* p)
+{
+    skipWs(p);
+    if (p->hadError) return null;
+    str name = takeIdent(p);
+    if (p->hadError) return null;
+    IrBlock* bb = findBlock(p, name);
+    if (!bb) parseError(p, "unknown block");
+    return bb;
+}
+
+IrAtomicOrdering parseOrdering(IrParser* p)
+{
+    skipWs(p);
+    str w = takeIdent(p);
+    if (p->hadError) return IrAtomicOrdering::SeqCst;
+    IrAtomicOrdering o = IrAtomicOrdering::SeqCst;
+    bool ok = true;
+    if (w.equals("relaxed")) o = IrAtomicOrdering::Relaxed;
+    else if (w.equals("acquire")) o = IrAtomicOrdering::Acquire;
+    else if (w.equals("release")) o = IrAtomicOrdering::Release;
+    else if (w.equals("acq_rel")) o = IrAtomicOrdering::AcqRel;
+    else if (w.equals("seq_cst")) o = IrAtomicOrdering::SeqCst;
+    else ok = false;
+    if (!ok) parseError(p, "unknown ordering");
+    return o;
+}
+
+IrAtomicRmwOp parseRmwOp(IrParser* p)
+{
+    skipWs(p);
+    str w = takeIdent(p);
+    if (p->hadError) return IrAtomicRmwOp::Xchg;
+    IrAtomicRmwOp o = IrAtomicRmwOp::Xchg;
+    bool ok = true;
+    if (w.equals("xchg")) o = IrAtomicRmwOp::Xchg;
+    else if (w.equals("add")) o = IrAtomicRmwOp::Add;
+    else if (w.equals("sub")) o = IrAtomicRmwOp::Sub;
+    else if (w.equals("and")) o = IrAtomicRmwOp::And;
+    else if (w.equals("nand")) o = IrAtomicRmwOp::Nand;
+    else if (w.equals("or")) o = IrAtomicRmwOp::Or;
+    else if (w.equals("xor")) o = IrAtomicRmwOp::Xor;
+    else if (w.equals("max")) o = IrAtomicRmwOp::Max;
+    else if (w.equals("min")) o = IrAtomicRmwOp::Min;
+    else if (w.equals("umax")) o = IrAtomicRmwOp::UMax;
+    else if (w.equals("umin")) o = IrAtomicRmwOp::UMin;
+    else ok = false;
+    if (!ok) parseError(p, "unknown rmw operation");
+    return o;
+}
+
+IrICmpPred parseICmpPred(IrParser* p)
+{
+    skipWs(p);
+    str w = takeIdent(p);
+    if (p->hadError) return IrICmpPred::Eq;
+    IrICmpPred v = IrICmpPred::Eq;
+    bool ok = true;
+    if (w.equals("eq")) v = IrICmpPred::Eq;
+    else if (w.equals("ne")) v = IrICmpPred::Ne;
+    else if (w.equals("slt")) v = IrICmpPred::Slt;
+    else if (w.equals("sle")) v = IrICmpPred::Sle;
+    else if (w.equals("sgt")) v = IrICmpPred::Sgt;
+    else if (w.equals("sge")) v = IrICmpPred::Sge;
+    else if (w.equals("ult")) v = IrICmpPred::Ult;
+    else if (w.equals("ule")) v = IrICmpPred::Ule;
+    else if (w.equals("ugt")) v = IrICmpPred::Ugt;
+    else if (w.equals("uge")) v = IrICmpPred::Uge;
+    else ok = false;
+    if (!ok) parseError(p, "unknown icmp predicate");
+    return v;
+}
+
+IrFCmpPred parseFCmpPred(IrParser* p)
+{
+    skipWs(p);
+    str w = takeIdent(p);
+    if (p->hadError) return IrFCmpPred::Oeq;
+    IrFCmpPred v = IrFCmpPred::Oeq;
+    bool ok = true;
+    if (w.equals("oeq")) v = IrFCmpPred::Oeq;
+    else if (w.equals("one")) v = IrFCmpPred::One;
+    else if (w.equals("olt")) v = IrFCmpPred::Olt;
+    else if (w.equals("ole")) v = IrFCmpPred::Ole;
+    else if (w.equals("ogt")) v = IrFCmpPred::Ogt;
+    else if (w.equals("oge")) v = IrFCmpPred::Oge;
+    else if (w.equals("ueq")) v = IrFCmpPred::Ueq;
+    else if (w.equals("une")) v = IrFCmpPred::Une;
+    else if (w.equals("ult")) v = IrFCmpPred::Ult;
+    else if (w.equals("ule")) v = IrFCmpPred::Ule;
+    else if (w.equals("ugt")) v = IrFCmpPred::Ugt;
+    else if (w.equals("uge")) v = IrFCmpPred::Uge;
+    else ok = false;
+    if (!ok) parseError(p, "unknown fcmp predicate");
+    return v;
+}
+
+IrType* elementTypeAt(IrType* agg, u32 idx, bool* ok)
+{
+    *ok = true;
+    if (!agg) { *ok = false; return null; }
+    if (agg->kind == IrTypeKind::Array || agg->kind == IrTypeKind::Vector) return agg->elem;
+    // field types ride on the interned struct type itself now — the
+    // module side-table only carries names and offsets
+    if (agg->kind == IrTypeKind::Struct)
+    {
+        if (idx >= agg->nparams) { *ok = false; return null; }
+        return agg->params[idx];
+    }
+    *ok = false;
+    return null;
+}
+
+void instrEnd(IrParser* p)
+{
+    skipSpaces(p);
+    if (p->hadError) return;
+    if (p->cur == '\n' || p->cur == 0 || p->cur == '}') return;
+    parseError(p, "extra tokens after instruction");
+}
+
+bool isLineEnd(IrParser* p)
+{
+    skipSpaces(p);
+    return p->cur == '\n' || p->cur == 0 || p->cur == '}' || p->cur == '!';
+}
+
+bool isBinShape(str w)
+{
+    return w.equals("add") || w.equals("sub") || w.equals("mul") || w.equals("sdiv") ||
+           w.equals("udiv") || w.equals("srem") || w.equals("urem") || w.equals("and") ||
+           w.equals("or") || w.equals("xor") || w.equals("shl") || w.equals("ashr") ||
+           w.equals("lshr") || w.equals("rotl") || w.equals("rotr") || w.equals("smin") ||
+           w.equals("smax") || w.equals("umin") || w.equals("umax") ||
+           w.equals("fadd") || w.equals("fsub") || w.equals("fmul") || w.equals("fdiv") ||
+           w.equals("vadd") || w.equals("vsub") || w.equals("vmul") || w.equals("vdiv") ||
+           w.equals("vfadd") || w.equals("vfsub") || w.equals("vfmul") || w.equals("vfdiv") ||
+           w.equals("vmin") || w.equals("vmax");
+}
+
+IrOpcode binShapeOpcode(str w)
+{
+    if (w.equals("add")) return IrOpcode::Add;
+    if (w.equals("sub")) return IrOpcode::Sub;
+    if (w.equals("mul")) return IrOpcode::Mul;
+    if (w.equals("sdiv")) return IrOpcode::SDiv;
+    if (w.equals("udiv")) return IrOpcode::UDiv;
+    if (w.equals("srem")) return IrOpcode::SRem;
+    if (w.equals("urem")) return IrOpcode::URem;
+    if (w.equals("and")) return IrOpcode::And;
+    if (w.equals("or")) return IrOpcode::Or;
+    if (w.equals("xor")) return IrOpcode::Xor;
+    if (w.equals("shl")) return IrOpcode::Shl;
+    if (w.equals("ashr")) return IrOpcode::Ashr;
+    if (w.equals("lshr")) return IrOpcode::Lshr;
+    if (w.equals("rotl")) return IrOpcode::Rotl;
+    if (w.equals("rotr")) return IrOpcode::Rotr;
+    if (w.equals("smin")) return IrOpcode::SMin;
+    if (w.equals("smax")) return IrOpcode::SMax;
+    if (w.equals("umin")) return IrOpcode::UMin;
+    if (w.equals("umax")) return IrOpcode::UMax;
+    if (w.equals("fadd")) return IrOpcode::FAdd;
+    if (w.equals("fsub")) return IrOpcode::FSub;
+    if (w.equals("fmul")) return IrOpcode::FMul;
+    if (w.equals("fdiv")) return IrOpcode::FDiv;
+    if (w.equals("vadd")) return IrOpcode::VecAdd;
+    if (w.equals("vsub")) return IrOpcode::VecSub;
+    if (w.equals("vmul")) return IrOpcode::VecMul;
+    if (w.equals("vdiv")) return IrOpcode::VecDiv;
+    if (w.equals("vfadd")) return IrOpcode::VecFAdd;
+    if (w.equals("vfsub")) return IrOpcode::VecFSub;
+    if (w.equals("vfmul")) return IrOpcode::VecFMul;
+    if (w.equals("vfdiv")) return IrOpcode::VecFDiv;
+    if (w.equals("vmin")) return IrOpcode::VecMin;
+    return IrOpcode::VecMax;
+}
+
+bool isUnaryShape(str w)
+{
+    return w.equals("neg") || w.equals("not") || w.equals("abs") || w.equals("ctpop") ||
+           w.equals("ctlz") || w.equals("cttz") || w.equals("bswap") || w.equals("fabs") ||
+           w.equals("fsqrt") || w.equals("vbroadcast");
+}
+
+IrOpcode unaryShapeOpcode(str w)
+{
+    if (w.equals("neg")) return IrOpcode::Neg;
+    if (w.equals("not")) return IrOpcode::Not;
+    if (w.equals("abs")) return IrOpcode::Abs;
+    if (w.equals("ctpop")) return IrOpcode::CtPop;
+    if (w.equals("ctlz")) return IrOpcode::CtLz;
+    if (w.equals("cttz")) return IrOpcode::CtTz;
+    if (w.equals("bswap")) return IrOpcode::Bswap;
+    if (w.equals("fabs")) return IrOpcode::FAbs;
+    if (w.equals("fsqrt")) return IrOpcode::FSqrt;
+    return IrOpcode::VecBroadcast;
+}
+
+bool isCastShape(str w)
+{
+    return w.equals("trunc") || w.equals("zext") || w.equals("sext") || w.equals("fptrunc") ||
+           w.equals("fpext") || w.equals("fptosi") || w.equals("sitofp") || w.equals("fptoui") ||
+           w.equals("uitofp") || w.equals("bitcast");
+}
+
+IrOpcode castOpcode(str w)
+{
+    if (w.equals("trunc")) return IrOpcode::Trunc;
+    if (w.equals("zext")) return IrOpcode::Zext;
+    if (w.equals("sext")) return IrOpcode::Sext;
+    if (w.equals("fptrunc")) return IrOpcode::FpTrunc;
+    if (w.equals("fpext")) return IrOpcode::FpExt;
+    if (w.equals("fptosi")) return IrOpcode::FpToSi;
+    if (w.equals("sitofp")) return IrOpcode::SiToFp;
+    if (w.equals("fptoui")) return IrOpcode::FpToUi;
+    if (w.equals("uitofp")) return IrOpcode::UiToFp;
+    return IrOpcode::Bitcast;
+}
+
+// one `!key = atom, …` clause's value list — `!key` alone leaves hadEq
+// false and the commit side turns that into the conventional = 1
+u32 parseMetaValues(IrParser* p, MetaAtom* vals, u32 max, bool* hadEq)
+{
+    *hadEq = false;
+    u32 n = 0;
+    skipSpaces(p);
+    if (p->cur != '=') return 0;
+    advance(p);
+    *hadEq = true;
+    while (!p->hadError)
+    {
+        if (n >= max) break;
+        skipWs(p);
+        MetaAtom a;
+        a.kind = 0;
+        a.i = 0;
+        a.f = 0;
+        a.s = str::empty();
+        a.v = null;
+        a.ty = null;
+        a.ref = str::empty();
+        a.refIsSym = false;
+        cchar c = p->cur;
+        if (c == '"')
+        {
+            a.s = parseStringLiteral(p);
+            a.kind = 2;
+        }
+        else if (c == '%' || c == '@')
+        {
+            bool isSym = c == '@';
+            advance(p);
+            str vn = takeIdent(p);
+            if (p->hadError) return n;
+            a.kind = 3;
+            if (isSym) a.v = findSymbol(p, vn);
+            else a.v = findValue(p, vn);
+            if (!a.v)
+            {
+                // forward ref: names point into the input buffer, the
+                // fixup dups whatever the commit side hands it
+                a.ref = vn;
+                a.refIsSym = isSym;
+            }
+        }
+        else if (c == '-' || (c >= '0' && c <= '9') ||
+                 (c == '.' && peekByte(p, 1) >= '0' && peekByte(p, 1) <= '9'))
+        {
+            NumToken t = parseNumber(p);
+            if (p->hadError) return n;
+            if (t.isFloat) { a.kind = 1; a.f = t.f; }
+            else { a.kind = 0; a.i = t.i; }
+        }
+        else if (isIdentStart(c))
+        {
+            str w = peekIdent(p);
+            if (w.equals("true") || w.equals("false"))
+            {
+                a.kind = 5;
+                a.i = w.equals("true") ? 1 : 0;
+                for (usize i = 0; i < w.len; i++) advance(p);
+            }
+            else if (isTypeWord(w))
+            {
+                a.ty = parseType(p);
+                if (p->hadError) return n;
+                a.kind = 4;
+            }
+            else {
+                parseError(p, "expected metadata value");
+                return n;
+            }
+        }
+        else {
+            parseError(p, "expected metadata value");
+            return n;
+        }
+        vals[n] = a;
+        n = n + 1;
+        skipSpaces(p);
+        if (p->cur == ',') { advance(p); continue; }
+        break;
+    }
+    return n;
+}
+
+void commitMetaValue(IrParser* p, MetadataSet* md, str key, MetaAtom* a, bool inFunc)
+{
+    if (a->kind == 0) addInt(md, key, (usize)a->i);
+    else if (a->kind == 1) addFloat(md, key, a->f);
+    else if (a->kind == 2) addString(md, key, a->s);
+    else if (a->kind == 5) addBool(md, key, a->i != 0);
+    else if (a->kind == 4) addType(md, key, a->ty);
+    else
+    {
+        if (a->v) { addIRValue(md, key, a->v); return; }
+        if (!a->refIsSym && !inFunc)
+        {
+            parseError(p, "value reference in global metadata");
+            return;
+        }
+        addIRValue(md, key, null);
+        addMetaFixup(p, md, md->numEntries - 1, a->ref, a->refIsSym ? 2 : 1);
+    }
+}
+
+// clause dispatch shared by instruction, function, global and string meta
+void commitMetaClause(IrParser* p, MetadataSet* md, str key, MetaAtom* vals, u32 n, bool hadEq, bool inFunc)
+{
+    if (!hadEq)
+    {
+        addInt(md, key, 1);
+        return;
+    }
+    for (u32 i = 0; i < n; i++)
+    {
+        commitMetaValue(p, md, key, &vals[i], inFunc);
+        if (p->hadError) return;
+    }
+}
+
+void parseMetaInstr(IrParser* p, IrInst* inst)
+{
+    while (!p->hadError)
+    {
+        skipSpaces(p);
+        if (p->cur != '!') return;
+        advance(p);
+        str key = takeIdent(p);
+        if (p->hadError) return;
+        MetaAtom vals[8];
+        bool hadEq = false;
+        u32 n = parseMetaValues(p, vals, 8, &hadEq);
+        if (p->hadError) return;
+        if (key.equals("var") && n >= 4 &&
+            vals[0].kind == 2 && vals[1].kind == 4 &&
+            vals[2].kind == 0 && vals[3].kind == 0)
+        {
+            u32 argIdx = (n >= 5 && vals[4].kind == 0) ? (u32)vals[4].i : 0xFFFFFFFF;
+            inst->addVarDebug(vals[0].s, vals[1].ty, (u32)vals[2].i, (u32)vals[3].i, argIdx);
+        }
+        else commitMetaClause(p, attachInstMetadata(inst), key, vals, n, hadEq, true);
+    }
+}
+
+void parseInstruction(IrParser* p)
+{
+    str resultName = str::empty();
+    if (p->cur == '%')
+    {
+        advance(p);
+        resultName = takeIdent(p);
+        if (p->hadError) return;
+        skipSpaces(p);
+        if (p->cur != '=') { parseError(p, "expected '=' after result name"); return; }
+        advance(p);
+        skipSpaces(p);
+    }
+    str opw = takeIdent(p);
+    if (p->hadError) return;
+
+    OpList l;
+    opsInit(&l);
+    IrInst* inst = null;
+    IrType* ty = null;
+
+    if (opw.equals("br"))
+    {
+        IrBlock* bb = parseBlockRef(p);
+        if (!bb) { opsFree(&l); return; }
+        opsPush(&l, &bb->base, str::empty(), 0);
+        inst = emitFinish(p, IrOpcode::Br, p->ctx->tyVoid(), &l, 0, 0);
+        if (p->currentBlock) p->currentBlock->addSucc(bb);
+    }
+    else if (opw.equals("cond_br"))
+    {
+        AtomRef c;
+        parseAtom(p, p->ctx->tyInt(1), false, true, &c);
+        if (p->hadError) { opsFree(&l); return; }
+        opsPushRef(&l, &c);
+        if (!expectChar(p, ',', "expected ',' in cond_br")) { opsFree(&l); return; }
+        IrBlock* t = parseBlockRef(p);
+        if (!t) { opsFree(&l); return; }
+        if (!expectChar(p, ',', "expected ',' in cond_br")) { opsFree(&l); return; }
+        IrBlock* e = parseBlockRef(p);
+        if (!e) { opsFree(&l); return; }
+        opsPush(&l, &t->base, str::empty(), 0);
+        opsPush(&l, &e->base, str::empty(), 0);
+        inst = emitFinish(p, IrOpcode::CondBr, p->ctx->tyVoid(), &l, 0, 0);
+        if (p->currentBlock)
+        {
+            p->currentBlock->addSucc(t);
+            p->currentBlock->addSucc(e);
+        }
+    }
+    else if (opw.equals("ret"))
+    {
+        if (isLineEnd(p)) {
+            inst = emitFinish(p, IrOpcode::Ret, p->ctx->tyVoid(), &l, 0, 0);
+        }
+        else {
+            ty = parseType(p);
+            if (!ty) { opsFree(&l); return; }
+            AtomRef v;
+            parseAtom(p, ty, false, true, &v);
+            if (p->hadError) { opsFree(&l); return; }
+            opsPushRef(&l, &v);
+            inst = emitFinish(p, IrOpcode::Ret, ty, &l, 0, 0);
+        }
+    }
+    else if (opw.equals("unreachable") || opw.equals("noret")) {
+        inst = emitFinish(p,
+                          opw.equals("unreachable") ? IrOpcode::Unreachable : IrOpcode::Noret,
+                          p->ctx->tyVoid(), &l, 0, 0);
+    }
+    else if (isBinShape(opw))
+    {
+        ty = parseType(p);
+        if (!ty) { opsFree(&l); return; }
+        AtomRef a;
+        parseAtom(p, ty, false, true, &a);
+        if (p->hadError) { opsFree(&l); return; }
+        if (!expectChar(p, ',', "expected ','")) { opsFree(&l); return; }
+        AtomRef b;
+        parseAtom(p, ty, false, true, &b);
+        if (p->hadError) { opsFree(&l); return; }
+        opsPushRef(&l, &a);
+        opsPushRef(&l, &b);
+        inst = emitFinish(p, binShapeOpcode(opw), ty, &l, 0, 0);
+    }
+    else if (opw.equals("fma"))
+    {
+        ty = parseType(p);
+        if (!ty) { opsFree(&l); return; }
+        AtomRef a;
+        parseAtom(p, ty, false, true, &a);
+        if (p->hadError) { opsFree(&l); return; }
+        if (!expectChar(p, ',', "expected ',' in fma")) { opsFree(&l); return; }
+        AtomRef b;
+        parseAtom(p, ty, false, true, &b);
+        if (p->hadError) { opsFree(&l); return; }
+        if (!expectChar(p, ',', "expected ',' in fma")) { opsFree(&l); return; }
+        AtomRef c;
+        parseAtom(p, ty, false, true, &c);
+        if (p->hadError) { opsFree(&l); return; }
+        opsPushRef(&l, &a);
+        opsPushRef(&l, &b);
+        opsPushRef(&l, &c);
+        inst = emitFinish(p, IrOpcode::Fma, ty, &l, 0, 0);
+    }
+    else if (isUnaryShape(opw))
+    {
+        ty = parseType(p);
+        if (!ty) { opsFree(&l); return; }
+        AtomRef a;
+        parseAtom(p, ty, false, true, &a);
+        if (p->hadError) { opsFree(&l); return; }
+        opsPushRef(&l, &a);
+        inst = emitFinish(p, unaryShapeOpcode(opw), ty, &l, 0, 0);
+    }
+    else if (isCastShape(opw))
+    {
+        IrType* src = parseType(p);
+        if (!src) { opsFree(&l); return; }
+        AtomRef a;
+        parseAtom(p, src, false, true, &a);
+        if (p->hadError) { opsFree(&l); return; }
+        skipSpaces(p);
+        str kw = takeIdent(p);
+        if (p->hadError) { opsFree(&l); return; }
+        if (!kw.equals("to")) { parseError(p, "expected 'to' in cast"); opsFree(&l); return; }
+        ty = parseType(p);
+        if (!ty) { opsFree(&l); return; }
+        opsPushRef(&l, &a);
+        inst = emitFinish(p, castOpcode(opw), ty, &l, 0, 0);
+    }
+    else if (opw.equals("icmp"))
+    {
+        IrICmpPred pred = parseICmpPred(p);
+        if (p->hadError) { opsFree(&l); return; }
+        ty = parseType(p);
+        if (!ty) { opsFree(&l); return; }
+        AtomRef a;
+        parseAtom(p, ty, false, true, &a);
+        if (p->hadError) { opsFree(&l); return; }
+        if (!expectChar(p, ',', "expected ',' in icmp")) { opsFree(&l); return; }
+        AtomRef b;
+        parseAtom(p, ty, false, true, &b);
+        if (p->hadError) { opsFree(&l); return; }
+        opsPushRef(&l, &a);
+        opsPushRef(&l, &b);
+        inst = emitFinish(p, IrOpcode::ICmp, p->ctx->tyInt(1), &l, (u64)pred, 0);
+    }
+    else if (opw.equals("fcmp"))
+    {
+        IrFCmpPred pred = parseFCmpPred(p);
+        if (p->hadError) { opsFree(&l); return; }
+        ty = parseType(p);
+        if (!ty) { opsFree(&l); return; }
+        AtomRef a;
+        parseAtom(p, ty, false, true, &a);
+        if (p->hadError) { opsFree(&l); return; }
+        if (!expectChar(p, ',', "expected ',' in fcmp")) { opsFree(&l); return; }
+        AtomRef b;
+        parseAtom(p, ty, false, true, &b);
+        if (p->hadError) { opsFree(&l); return; }
+        opsPushRef(&l, &a);
+        opsPushRef(&l, &b);
+        inst = emitFinish(p, IrOpcode::FCmp, p->ctx->tyInt(1), &l, 0, (u64)pred);
+    }
+    else if (opw.equals("alloca"))
+    {
+        ty = parseType(p);
+        if (!ty) { opsFree(&l); return; }
+        inst = emitFinish(p, IrOpcode::Alloca, p->ctx->tyPtr(ty), &l, 0, 0);
+    }
+    else if (opw.equals("load"))
+    {
+        ty = parseType(p);
+        if (!ty) { opsFree(&l); return; }
+        AtomRef a;
+        parseAtom(p, ty, false, true, &a);
+        if (p->hadError) { opsFree(&l); return; }
+        opsPushRef(&l, &a);
+        inst = emitFinish(p, IrOpcode::Load, ty, &l, 0, 0);
+    }
+    else if (opw.equals("store"))
+    {
+        ty = parseType(p);
+        if (!ty) { opsFree(&l); return; }
+        AtomRef a;
+        parseAtom(p, ty, false, true, &a);
+        if (p->hadError) { opsFree(&l); return; }
+        if (!expectChar(p, ',', "expected ',' in store")) { opsFree(&l); return; }
+        AtomRef dst;
+        parseAtom(p, null, false, true, &dst);
+        if (p->hadError) { opsFree(&l); return; }
+        opsPushRef(&l, &a);
+        opsPushRef(&l, &dst);
+        inst = emitFinish(p, IrOpcode::Store, p->ctx->tyVoid(), &l, 0, 0);
+    }
+    else if (opw.equals("gep"))
+    {
+        AtomRef base;
+        parseAtom(p, null, false, false, &base);
+        if (p->hadError) { opsFree(&l); return; }
+        opsPushRef(&l, &base);
+        while (!p->hadError)
+        {
+            skipSpaces(p);
+            if (p->cur != ',') break;
+            advance(p);
+            skipWs(p);
+            if (p->cur == '-' || (p->cur >= '0' && p->cur <= '9'))
+            {
+                NumToken t = parseNumber(p);
+                if (p->hadError) { opsFree(&l); return; }
+                opsPush(&l, p->ctx->constInt(p->ctx->tyInt(64), t.u), str::empty(), 0);
+            }
+            else
+            {
+                AtomRef ix;
+                parseAtom(p, null, false, false, &ix);
+                if (p->hadError) { opsFree(&l); return; }
+                opsPushRef(&l, &ix);
+            }
+        }
+        IrType* rt = base.val ? base.val->type : null;
+        if (!rt || rt->kind != IrTypeKind::Ptr)
+        {
+            parseError(p, "gep base must be a pointer");
+            opsFree(&l);
+            return;
+        }
+        rt = rt->elem;
+        for (u32 i = 1; i < l.n; i++)
+        {
+            if (rt->kind == IrTypeKind::Array || rt->kind == IrTypeKind::Vector)
+            {
+                rt = rt->elem;
+            }
+            else if (rt->kind == IrTypeKind::Struct)
+            {
+                IrValue* ixv = l.ops[i];
+                if (!ixv || ixv->kind != IrValueKind::ConstInt)
+                {
+                    parseError(p, "gep struct index must be constant");
+                    opsFree(&l);
+                    return;
+                }
+                bool ok = false;
+                IrType* ft = elementTypeAt(rt, (u32)ixv->valData, &ok);
+                if (!ok)
+                {
+                    parseError(p, "gep index out of range");
+                    opsFree(&l);
+                    return;
+                }
+                rt = ft;
+            }
+            else
+            {
+                parseError(p, "gep index into non-aggregate type");
+                opsFree(&l);
+                return;
+            }
+        }
+        inst = emitFinish(p, IrOpcode::Gep, p->ctx->tyPtr(rt), &l, 0, 0);
+    }
+    else if (opw.equals("call"))
+    {
+        ty = parseType(p);
+        if (!ty) { opsFree(&l); return; }
+        AtomRef callee;
+        parseAtom(p, null, false, true, &callee);
+        if (p->hadError) { opsFree(&l); return; }
+        opsPushRef(&l, &callee);
+        if (!expectChar(p, '(', "expected '(' in call")) { opsFree(&l); return; }
+        skipWs(p);
+        while (!p->hadError && p->cur != ')')
+        {
+            IrType* at = parseType(p);
+            if (!at) { opsFree(&l); return; }
+            AtomRef a;
+            parseAtom(p, at, false, true, &a);
+            if (p->hadError) { opsFree(&l); return; }
+            opsPushRef(&l, &a);
+            skipWs(p);
+            if (p->cur == ',') { advance(p); skipWs(p); continue; }
+            break;
+        }
+        if (!expectChar(p, ')', "expected ')' in call")) { opsFree(&l); return; }
+        inst = emitFinish(p, IrOpcode::Call, ty, &l, 0, 0);
+    }
+    else if (opw.equals("phi"))
+    {
+        ty = parseType(p);
+        if (!ty) { opsFree(&l); return; }
+        while (!p->hadError)
+        {
+            skipSpaces(p);
+            if (p->cur != '[') break;
+            advance(p);
+            AtomRef v;
+            parseAtom(p, ty, true, true, &v);
+            if (p->hadError) { opsFree(&l); return; }
+            if (!expectChar(p, ',', "expected ',' in phi pair")) { opsFree(&l); return; }
+            IrBlock* bb = parseBlockRef(p);
+            if (!bb) { opsFree(&l); return; }
+            if (!expectChar(p, ']', "expected ']' in phi pair")) { opsFree(&l); return; }
+            opsPushRef(&l, &v);
+            opsPush(&l, &bb->base, str::empty(), 0);
+            skipSpaces(p);
+            if (p->cur == ',') { advance(p); continue; }
+            break;
+        }
+        if (l.n == 0)
+        {
+            parseError(p, "phi needs at least one incoming pair");
+            opsFree(&l);
+            return;
+        }
+        inst = emitFinish(p, IrOpcode::Phi, ty, &l, 0, 0);
+    }
+    else if (opw.equals("select"))
+    {
+        IrType* ct = parseType(p);
+        if (!ct) { opsFree(&l); return; }
+        AtomRef c;
+        parseAtom(p, ct, false, true, &c);
+        if (p->hadError) { opsFree(&l); return; }
+        if (!expectChar(p, ',', "expected ',' in select")) { opsFree(&l); return; }
+        ty = parseType(p);
+        if (!ty) { opsFree(&l); return; }
+        AtomRef a;
+        parseAtom(p, ty, false, true, &a);
+        if (p->hadError) { opsFree(&l); return; }
+        if (!expectChar(p, ',', "expected ',' in select")) { opsFree(&l); return; }
+        IrType* t2 = parseType(p);
+        if (!t2) { opsFree(&l); return; }
+        AtomRef b;
+        parseAtom(p, t2, false, true, &b);
+        if (p->hadError) { opsFree(&l); return; }
+        opsPushRef(&l, &c);
+        opsPushRef(&l, &a);
+        opsPushRef(&l, &b);
+        inst = emitFinish(p, IrOpcode::Select, ty, &l, 0, 0);
+    }
+    else if (opw.equals("extractvalue") || opw.equals("insertvalue"))
+    {
+        ty = parseType(p);
+        if (!ty) { opsFree(&l); return; }
+        AtomRef agg;
+        parseAtom(p, ty, false, true, &agg);
+        if (p->hadError) { opsFree(&l); return; }
+        if (!expectChar(p, ',', "expected ','")) { opsFree(&l); return; }
+        if (opw.equals("insertvalue"))
+        {
+            IrType* vt = parseType(p);
+            if (!vt) { opsFree(&l); return; }
+            AtomRef v;
+            parseAtom(p, vt, false, true, &v);
+            if (p->hadError) { opsFree(&l); return; }
+            if (!expectChar(p, ',', "expected ',' in insertvalue")) { opsFree(&l); return; }
+            skipWs(p);
+            if (!(p->cur >= '0' && p->cur <= '9')) { parseError(p, "expected index"); opsFree(&l); return; }
+            NumToken idx = parseNumber(p);
+            if (p->hadError) { opsFree(&l); return; }
+            opsPushRef(&l, &agg);
+            opsPushRef(&l, &v);
+            opsPush(&l, p->ctx->constInt(p->ctx->tyInt(32), idx.u), str::empty(), 0);
+            inst = emitFinish(p, IrOpcode::InsertValue, ty, &l, 0, 0);
+        }
+        else
+        {
+            skipWs(p);
+            if (!(p->cur >= '0' && p->cur <= '9')) { parseError(p, "expected index"); opsFree(&l); return; }
+            NumToken idx = parseNumber(p);
+            if (p->hadError) { opsFree(&l); return; }
+            bool ok = false;
+            IrType* ft = elementTypeAt(ty, (u32)idx.u, &ok);
+            if (!ok) { parseError(p, "extractvalue index out of range"); opsFree(&l); return; }
+            opsPushRef(&l, &agg);
+            opsPush(&l, p->ctx->constInt(p->ctx->tyInt(32), idx.u), str::empty(), 0);
+            inst = emitFinish(p, IrOpcode::ExtractValue, ft, &l, 0, 0);
+        }
+    }
+    else if (opw.equals("shufflevector"))
+    {
+        ty = parseType(p);
+        if (!ty) { opsFree(&l); return; }
+        AtomRef a;
+        parseAtom(p, ty, false, true, &a);
+        if (p->hadError) { opsFree(&l); return; }
+        if (!expectChar(p, ',', "expected ',' in shufflevector")) { opsFree(&l); return; }
+        AtomRef b;
+        parseAtom(p, ty, false, true, &b);
+        if (p->hadError) { opsFree(&l); return; }
+        opsPushRef(&l, &a);
+        opsPushRef(&l, &b);
+        while (!p->hadError)
+        {
+            skipSpaces(p);
+            if (p->cur != ',') break;
+            advance(p);
+            skipWs(p);
+            if (!(p->cur >= '0' && p->cur <= '9')) { parseError(p, "expected mask index"); opsFree(&l); return; }
+            NumToken ix = parseNumber(p);
+            if (p->hadError) { opsFree(&l); return; }
+            opsPush(&l, p->ctx->constInt(p->ctx->tyInt(32), ix.u), str::empty(), 0);
+        }
+        inst = emitFinish(p, IrOpcode::ShuffleVector, ty, &l, 0, 0);
+    }
+    else if (opw.equals("extractelement"))
+    {
+        ty = parseType(p);
+        if (!ty) { opsFree(&l); return; }
+        if (ty->kind != IrTypeKind::Vector) { parseError(p, "extractelement needs a vector"); opsFree(&l); return; }
+        AtomRef v;
+        parseAtom(p, ty, false, true, &v);
+        if (p->hadError) { opsFree(&l); return; }
+        if (!expectChar(p, ',', "expected ',' in extractelement")) { opsFree(&l); return; }
+        skipWs(p);
+        if (!(p->cur >= '0' && p->cur <= '9')) { parseError(p, "expected index"); opsFree(&l); return; }
+        NumToken ix = parseNumber(p);
+        if (p->hadError) { opsFree(&l); return; }
+        opsPushRef(&l, &v);
+        opsPush(&l, p->ctx->constInt(p->ctx->tyInt(32), ix.u), str::empty(), 0);
+        inst = emitFinish(p, IrOpcode::ExtractElement, ty->elem, &l, 0, 0);
+    }
+    else if (opw.equals("insertelement"))
+    {
+        ty = parseType(p);
+        if (!ty) { opsFree(&l); return; }
+        if (ty->kind != IrTypeKind::Vector) { parseError(p, "insertelement needs a vector"); opsFree(&l); return; }
+        AtomRef v;
+        parseAtom(p, ty, false, true, &v);
+        if (p->hadError) { opsFree(&l); return; }
+        if (!expectChar(p, ',', "expected ',' in insertelement")) { opsFree(&l); return; }
+        IrType* et = parseType(p);
+        if (!et) { opsFree(&l); return; }
+        AtomRef e;
+        parseAtom(p, et, false, true, &e);
+        if (p->hadError) { opsFree(&l); return; }
+        if (!expectChar(p, ',', "expected ',' in insertelement")) { opsFree(&l); return; }
+        skipWs(p);
+        if (!(p->cur >= '0' && p->cur <= '9')) { parseError(p, "expected index"); opsFree(&l); return; }
+        NumToken ix = parseNumber(p);
+        if (p->hadError) { opsFree(&l); return; }
+        opsPushRef(&l, &v);
+        opsPushRef(&l, &e);
+        opsPush(&l, p->ctx->constInt(p->ctx->tyInt(32), ix.u), str::empty(), 0);
+        inst = emitFinish(p, IrOpcode::InsertElement, ty, &l, 0, 0);
+    }
+    else if (opw.equals("atomic_load"))
+    {
+        ty = parseType(p);
+        if (!ty) { opsFree(&l); return; }
+        AtomRef a;
+        parseAtom(p, ty, false, true, &a);
+        if (p->hadError) { opsFree(&l); return; }
+        if (!expectChar(p, ',', "expected ',' in atomic_load")) { opsFree(&l); return; }
+        IrAtomicOrdering ord = parseOrdering(p);
+        if (p->hadError) { opsFree(&l); return; }
+        opsPushRef(&l, &a);
+        inst = emitFinish(p, IrOpcode::AtomicLoad, ty, &l, (u64)ord, 0);
+    }
+    else if (opw.equals("atomic_store"))
+    {
+        ty = parseType(p);
+        if (!ty) { opsFree(&l); return; }
+        AtomRef a;
+        parseAtom(p, ty, false, true, &a);
+        if (p->hadError) { opsFree(&l); return; }
+        if (!expectChar(p, ',', "expected ',' in atomic_store")) { opsFree(&l); return; }
+        AtomRef dst;
+        parseAtom(p, null, false, true, &dst);
+        if (p->hadError) { opsFree(&l); return; }
+        if (!expectChar(p, ',', "expected ',' in atomic_store")) { opsFree(&l); return; }
+        IrAtomicOrdering ord = parseOrdering(p);
+        if (p->hadError) { opsFree(&l); return; }
+        opsPushRef(&l, &a);
+        opsPushRef(&l, &dst);
+        inst = emitFinish(p, IrOpcode::AtomicStore, p->ctx->tyVoid(), &l, (u64)ord, 0);
+    }
+    else if (opw.equals("atomic_rmw"))
+    {
+        IrAtomicRmwOp rop = parseRmwOp(p);
+        if (p->hadError) { opsFree(&l); return; }
+        ty = parseType(p);
+        if (!ty) { opsFree(&l); return; }
+        AtomRef dst;
+        parseAtom(p, ty, false, true, &dst);
+        if (p->hadError) { opsFree(&l); return; }
+        if (!expectChar(p, ',', "expected ',' in atomic_rmw")) { opsFree(&l); return; }
+        AtomRef v;
+        parseAtom(p, ty, false, true, &v);
+        if (p->hadError) { opsFree(&l); return; }
+        if (!expectChar(p, ',', "expected ',' in atomic_rmw")) { opsFree(&l); return; }
+        IrAtomicOrdering ord = parseOrdering(p);
+        if (p->hadError) { opsFree(&l); return; }
+        opsPushRef(&l, &dst);
+        opsPushRef(&l, &v);
+        inst = emitFinish(p, IrOpcode::AtomicRmw, ty, &l, (u64)rop, (u64)ord);
+    }
+    else if (opw.equals("atomic_cmpxchg"))
+    {
+        ty = parseType(p);
+        if (!ty) { opsFree(&l); return; }
+        AtomRef dst;
+        parseAtom(p, ty, false, true, &dst);
+        if (p->hadError) { opsFree(&l); return; }
+        if (!expectChar(p, ',', "expected ',' in atomic_cmpxchg")) { opsFree(&l); return; }
+        AtomRef cmp;
+        parseAtom(p, ty, false, true, &cmp);
+        if (p->hadError) { opsFree(&l); return; }
+        if (!expectChar(p, ',', "expected ',' in atomic_cmpxchg")) { opsFree(&l); return; }
+        AtomRef v;
+        parseAtom(p, ty, false, true, &v);
+        if (p->hadError) { opsFree(&l); return; }
+        if (!expectChar(p, ',', "expected ',' in atomic_cmpxchg")) { opsFree(&l); return; }
+        IrAtomicOrdering so = parseOrdering(p);
+        if (p->hadError) { opsFree(&l); return; }
+        if (!expectChar(p, ',', "expected ',' in atomic_cmpxchg")) { opsFree(&l); return; }
+        IrAtomicOrdering fo = parseOrdering(p);
+        if (p->hadError) { opsFree(&l); return; }
+        opsPushRef(&l, &dst);
+        opsPushRef(&l, &cmp);
+        opsPushRef(&l, &v);
+        inst = emitFinish(p, IrOpcode::AtomicCmpXchg, ty, &l, (u64)so, (u64)fo);
+    }
+    else if (opw.equals("fence"))
+    {
+        IrAtomicOrdering ord = parseOrdering(p);
+        if (p->hadError) { opsFree(&l); return; }
+        inst = emitFinish(p, IrOpcode::Fence, p->ctx->tyVoid(), &l, (u64)ord, 0);
+    }
+    else if (opw.equals("gc_root"))
+    {
+        AtomRef a;
+        parseAtom(p, null, false, false, &a);
+        if (p->hadError) { opsFree(&l); return; }
+        if (!a.val) { parseError(p, "gc_root needs a pointer value"); opsFree(&l); return; }
+        opsPushRef(&l, &a);
+        inst = emitFinish(p, IrOpcode::GcRoot, a.val->type, &l, 0, 0);
+    }
+    else if (opw.equals("gc_writebarrier"))
+    {
+        AtomRef a;
+        parseAtom(p, null, false, true, &a);
+        if (p->hadError) { opsFree(&l); return; }
+        if (!expectChar(p, ',', "expected ',' in gc_writebarrier")) { opsFree(&l); return; }
+        AtomRef b;
+        parseAtom(p, null, false, true, &b);
+        if (p->hadError) { opsFree(&l); return; }
+        opsPushRef(&l, &a);
+        opsPushRef(&l, &b);
+        inst = emitFinish(p, IrOpcode::GcWriteBarrier, p->ctx->tyVoid(), &l, 0, 0);
+    }
+    else if (opw.equals("gc_safepoint"))
+    {
+        inst = emitFinish(p, IrOpcode::GcSafepoint, p->ctx->tyVoid(), &l, 0, 0);
+    }
+    else if (opw.equals("inlineasm"))
+    {
+        skipSpaces(p);
+        bool vol = false;
+        str vw = peekIdent(p);
+        if (vw.equals("volatile"))
+        {
+            for (usize i = 0; i < vw.len; i++) advance(p);
+            vol = true;
+        }
+        ty = parseType(p);
+        if (!ty) { opsFree(&l); return; }
+        skipSpaces(p);
+        str tmpl = parseStringLiteral(p);
+        if (p->hadError) { opsFree(&l); return; }
+        if (!expectChar(p, ':', "expected ':' after asm template")) { opsFree(&l); return; }
+        str cons = parseStringLiteral(p);
+        if (p->hadError) { opsFree(&l); return; }
+        if (!expectChar(p, ':', "expected ':' after asm constraints")) { opsFree(&l); return; }
+        str clob = parseStringLiteral(p);
+        if (p->hadError) { opsFree(&l); return; }
+        if (!expectChar(p, '(', "expected '(' after asm strings")) { opsFree(&l); return; }
+        skipWs(p);
+        while (!p->hadError && p->cur != ')')
+        {
+            IrType* at = parseType(p);
+            if (!at) { opsFree(&l); return; }
+            AtomRef a;
+            parseAtom(p, at, false, true, &a);
+            if (p->hadError) { opsFree(&l); return; }
+            opsPushRef(&l, &a);
+            skipWs(p);
+            if (p->cur == ',') { advance(p); skipWs(p); continue; }
+            break;
+        }
+        if (!expectChar(p, ')', "expected ')' after asm operands")) { opsFree(&l); return; }
+        inst = emitFinish(p, IrOpcode::InlineAsm, ty, &l, 0, 0);
+        inst->asmString = tmpl;
+        inst->asmConstraints = cons;
+        inst->asmClobbers = clob;
+        inst->asmNumSideEffects = vol ? 1 : 0;
+    }
+    else if (opw.equals("landingpad"))
+    {
+        parseError(p, "landingpad is reserved");
+        opsFree(&l);
+        return;
+    }
+    else
+    {
+        parseError(p, "unknown opcode");
+        opsFree(&l);
+        return;
+    }
+
+    if (p->hadError) return;
+    if (!resultName.isEmpty())
+    {
+        if (inst->base.type == p->ctx->tyVoid())
+        {
+            parseError(p, "void instruction has no result");
+            return;
+        }
+        inst->base.name = dupCstr(resultName);
+        addValue(p, resultName, &inst->base);
+    }
+    parseMetaInstr(p, inst);
+    if (!p->hadError) instrEnd(p);
+}
+
+// collect the labels first so cond_br can name blocks defined further down
+void prescanBody(IrParser* p, IrFunc* f)
+{
+    usize i = p->pos + 1;
+    u32 depth = 1;
+    bool lineStart = true;
+    bool inStr = false;
+    while (i < p->len)
+    {
+        cchar c = (cchar)p->input.ptr[i];
+        if (inStr)
+        {
+            if (c == '\\' && i + 1 < p->len) { i = i + 2; continue; }
+            if (c == '"') inStr = false;
+            i = i + 1;
+            continue;
+        }
+        if (c == '/' && i + 1 < p->len && (cchar)p->input.ptr[i + 1] == '/')
+        {
+            while (i < p->len && (cchar)p->input.ptr[i] != '\n') i = i + 1;
+            continue;
+        }
+        if (c == '"') { inStr = true; i = i + 1; lineStart = false; continue; }
+        if (c == '{') { depth = depth + 1; i = i + 1; lineStart = false; continue; }
+        if (c == '}')
+        {
+            depth = depth - 1;
+            if (depth == 0) return;
+            i = i + 1;
+            lineStart = false;
+            continue;
+        }
+        if (c == '\n') { lineStart = true; i = i + 1; continue; }
+        if (depth == 1 && lineStart && (c == ' ' || c == '\t')) { i = i + 1; continue; }
+        if (depth == 1 && lineStart && isIdentStart(c))
+        {
+            usize j = i;
+            while (j < p->len && isIdentChar((cchar)p->input.ptr[j])) j = j + 1;
+            usize k = j;
+            while (k < p->len && ((cchar)p->input.ptr[k] == ' ' || (cchar)p->input.ptr[k] == '\t')) k = k + 1;
+            if (k < p->len && (cchar)p->input.ptr[k] == ':')
+            {
+                str name = str::fromParts(p->input.ptr + i, j - i);
+                IrBlock* bb = p->ctx->createBlock(name);
+                f->addBlock(bb);
+                addBlockName(p, name, bb);
+            }
+            i = j;
+            lineStart = false;
+            continue;
+        }
+        if (depth == 1 && lineStart) lineStart = false;
+        i = i + 1;
+    }
+}
+
+void parseFuncBody(IrParser* p, IrFunc* f)
+{
+    prescanBody(p, f);
+    advance(p);
+    p->currentBlock = null;
+    while (!p->hadError)
+    {
+        skipWs(p);
+        if (p->hadError) return;
+        if (p->cur == 0) { parseError(p, "unterminated function body"); return; }
+        if (p->cur == '}') { advance(p); return; }
+        if (p->cur == '%') { parseInstruction(p); continue; }
+        if (isIdentStart(p->cur))
+        {
+            str w = peekIdent(p);
+            usize j = p->pos + w.len;
+            while (j < p->len && ((cchar)p->input.ptr[j] == ' ' || (cchar)p->input.ptr[j] == '\t')) j = j + 1;
+            if (j < p->len && (cchar)p->input.ptr[j] == ':')
+            {
+                for (usize x = 0; x < w.len; x++) advance(p);
+                skipSpaces(p);
+                if (p->cur != ':') { parseError(p, "expected ':' after label"); return; }
+                advance(p);
+                IrBlock* bb = findBlock(p, w);
+                if (!bb) { parseError(p, "unknown label"); return; }
+                p->currentBlock = bb;
+                instrEnd(p);
+                continue;
+            }
+            parseInstruction(p);
+            continue;
+        }
+        parseError(p, "expected label or instruction");
+        return;
+    }
+}
+
+void resolveFuncFixups(IrParser* p)
+{
+    u32 w = 0;
+    for (u32 i = 0; i < p->numFixs; i++)
+    {
+        Fixup* f = &p->fixups[i];
+        if (f->kind == 1)
+        {
+            IrValue* v = findValue(p, f->name);
+            if (!v)
+            {
+                parseError(p, "undefined value");
+                return;
+            }
+            if (f->target == FixupTarget::InstOp)
+            {
+                f->inst->ops[f->opIdx] = v;
+                v->addUser(f->inst);
+            }
+            else f->mdSet->entries[f->mdIdx].value.irVal = v;
+            dealloc<cchar>((cchar*)f->name.ptr);
+        }
+        else
+        {
+            if (w != i) p->fixups[w] = p->fixups[i];
+            w = w + 1;
+        }
+    }
+    p->numFixs = w;
+}
+
+void parseFuncMeta(IrParser* p, IrFunc* f)
+{
+    while (!p->hadError)
+    {
+        skipSpaces(p);
+        if (p->cur != '!') return;
+        advance(p);
+        str key = takeIdent(p);
+        if (p->hadError) return;
+        MetaAtom vals[8];
+        bool hadEq = false;
+        u32 n = parseMetaValues(p, vals, 8, &hadEq);
+        if (p->hadError) return;
+        commitMetaClause(p, attachFuncMetadata(f), key, vals, n, hadEq, true);
+    }
+}
+
+void parseFuncDecl(IrParser* p)
+{
+    skipWs(p);
+    if (p->cur != '@') { parseError(p, "expected '@' before function name"); return; }
+    advance(p);
+    str name = takeIdent(p);
+    if (p->hadError) return;
+
+    for (u32 i = 0; i < p->numValues; i++) dealloc<cchar>((cchar*)p->valueNames[i].ptr);
+    p->numValues = 0;
+    for (u32 i = 0; i < p->numBlocks; i++) dealloc<cchar>((cchar*)p->blockNames[i].ptr);
+    p->numBlocks = 0;
+
+    if (!expectChar(p, '(', "expected '(' after function name")) return;
+    IrType** paramTypes = null;
+    str* pnames = null;
+    u32 nparams = 0;
+    u32 capParams = 0;
+    bool vararg = false;
+    skipWs(p);
+    if (p->cur != ')')
+    {
+        while (!p->hadError)
+        {
+            if (p->cur == '.' && peekByte(p, 1) == '.' && peekByte(p, 2) == '.')
+            {
+                advance(p);
+                advance(p);
+                advance(p);
+                vararg = true;
+                break;
+            }
+            str pname = str::empty();
+            bool named = false;
+            if (p->cur == '%')
+            {
+                advance(p);
+                pname = takeIdent(p);
+                if (p->hadError) break;
+                if (!expectChar(p, ':', "expected ':' after parameter name")) break;
+                named = true;
+            }
+            IrType* pt = parseType(p);
+            if (p->hadError) break;
+            if (nparams >= capParams)
+            {
+                u32 newCap = capParams == 0 ? 8 : capParams * 2;
+                IrType** npt = alloc<IrType*>(newCap);
+                str* nnp = alloc<str>(newCap);
+                if (paramTypes)
+                {
+                    copy<IrType*>(npt, paramTypes, nparams);
+                    copy<str>(nnp, pnames, nparams);
+                    dealloc<IrType*>(paramTypes);
+                    dealloc<str>(pnames);
+                }
+                paramTypes = npt;
+                pnames = nnp;
+                capParams = newCap;
+            }
+            paramTypes[nparams] = pt;
+            pnames[nparams] = named ? pname : str::empty();
+            nparams = nparams + 1;
+            skipWs(p);
+            if (p->cur == ',') { advance(p); skipWs(p); continue; }
+            break;
+        }
+    }
+    if (p->hadError) return;
+    if (!expectChar(p, ')', "expected ')' after parameters")) return;
+
+    IrType* retTy = p->ctx->tyVoid();
+    str tw = peekIdent(p);
+    if (isTypeWord(tw))
+    {
+        retTy = parseType(p);
+        if (p->hadError) return;
+    }
+
+    IrFunc* f = p->ctx->createFunc(name, retTy, paramTypes, nparams);
+    if (vararg) f->base.type = p->ctx->tyFunc(retTy, paramTypes, nparams, true);
+    p->currentFunc = f;
+    p->currentModule->addFunc(f);
+
+    for (u32 i = 0; i < nparams; i++)
+    {
+        IrValue* av = alloc<IrValue>(1);
+        bool named = !pnames[i].isEmpty();
+        *av = IrValue { IrValueKind::Arg, paramTypes[i], p->ctx->nextValueId(), 0,
+            named ? dupCstr(pnames[i]) : null, null, 0, 0 };
+        if (named) addValue(p, pnames[i], av);
+        f->addArg(av);
+    }
+    if (pnames) dealloc<str>(pnames);
+
+    skipSpaces(p);
+    if (peekIdent(p).equals("extern"))
+    {
+        str kw = takeIdent(p);
+        skipWs(p);
+        str lib = parseStringLiteral(p);
+        if (p->hadError) return;
+        skipWs(p);
+        str sym;
+        if (p->cur == '"')
+        {
+            sym = parseStringLiteral(p);
+            if (p->hadError) return;
+        }
+        else sym = dupStr(name);
+        f->isExtern = true;
+        f->externLib = lib;
+        f->externSym = sym;
+    }
+    parseFuncMeta(p, f);
+    if (p->hadError) return;
+    skipSpaces(p);
+    if (f->isExtern)
+    {
+        if (p->cur != ';') { parseError(p, "expected ';' after extern function"); return; }
+        advance(p);
+        // no body is coming — close the %refs (params) now so they cannot
+        // leak into the next function's scope
+        resolveFuncFixups(p);
+        return;
+    }
+    if (p->cur != '{') { parseError(p, "expected '{' or 'extern' in function"); return; }
+    parseFuncBody(p, f);
+    if (p->hadError) return;
+    resolveFuncFixups(p);
+}
+
+void parseTypeDecl(IrParser* p)
+{
+    skipWs(p);
+    if (p->cur != '@') { parseError(p, "expected '@' in type declaration"); return; }
+    advance(p);
+    str name = takeIdent(p);
+    if (p->hadError) return;
+    if (!expectChar(p, '=', "expected '=' in type declaration")) return;
+    skipWs(p);
+    str kw = peekIdent(p);
+    if (!kw.equals("struct")) { parseError(p, "expected struct after '='"); return; }
+    for (usize i = 0; i < kw.len; i++) advance(p);
+    if (!expectChar(p, '{', "expected struct body")) return;
+    IrType** fts = null;
+    str* fns = null;
+    u32 n = 0;
+    u32 cap = 0;
+    skipWs(p);
+    if (p->cur != '}')
+    {
+        while (!p->hadError)
+        {
+            str fn = takeIdent(p);
+            if (p->hadError) break;
+            if (!expectChar(p, ':', "expected ':' in struct field")) break;
+            IrType* ft = parseType(p);
+            if (p->hadError) break;
+            if (n >= cap)
+            {
+                u32 newCap = cap == 0 ? 8 : cap * 2;
+                IrType** nft = alloc<IrType*>(newCap);
+                str* nfn = alloc<str>(newCap);
+                if (fts)
+                {
+                    copy<IrType*>(nft, fts, n);
+                    copy<str>(nfn, fns, n);
+                    dealloc<IrType*>(fts);
+                    dealloc<str>(fns);
+                }
+                fts = nft;
+                fns = nfn;
+                cap = newCap;
+            }
+            fts[n] = ft;
+            fns[n] = dupStr(fn);
+            n = n + 1;
+            skipWs(p);
+            if (p->cur == ',') { advance(p); skipWs(p); continue; }
+            break;
+        }
+    }
+    if (p->hadError) return;
+    if (!expectChar(p, '}', "expected '}' in struct body")) return;
+    if (!expectChar(p, ';', "expected ';' after type declaration")) return;
+    IrStructType* st = p->ctx->createStructType(dupStr(name), fts, fns, n);
+    p->currentModule->addStruct(st);
+}
+
+// `= [ … ]` array/vector initializers: elements are atoms of the element
+// type or nested lists; a @sym element defers until the module closes
+IrValue* parseAggregateInit(IrParser* p, IrType* ty)
+{
+    if (ty->kind != IrTypeKind::Array && ty->kind != IrTypeKind::Vector)
+    {
+        parseError(p, "aggregate initializer requires array or vector type");
+        return null;
+    }
+    IrType* elemTy = ty->elem;
+    u32 cap = ty->count > 0 ? ty->count : 1;
+    IrValue** elems = alloc<IrValue*>(cap);
+    str* pend = alloc<str>(cap);
+    u32 n = 0;
+    while (!p->hadError)
+    {
+        skipWs(p);
+        if (p->cur == ']') break;
+        if (p->cur == '[')
+        {
+            if (elemTy->kind != IrTypeKind::Array && elemTy->kind != IrTypeKind::Vector)
+            {
+                parseError(p, "nested list where scalar expected");
+                break;
+            }
+            IrValue* sub = parseAggregateInit(p, elemTy);
+            if (p->hadError) break;
+            if (n >= ty->count)
+            {
+                parseError(p, "too many aggregate elements");
+                break;
+            }
+            elems[n] = sub;
+            pend[n] = str::empty();
+            n = n + 1;
+        }
+        else
+        {
+            if (elemTy->kind == IrTypeKind::Array || elemTy->kind == IrTypeKind::Vector)
+            {
+                parseError(p, "expected nested list for aggregate element");
+                break;
+            }
+            if (elemTy->kind == IrTypeKind::Struct || elemTy->kind == IrTypeKind::Func)
+            {
+                parseError(p, "unsupported aggregate element type");
+                break;
+            }
+            if (n >= ty->count)
+            {
+                parseError(p, "too many aggregate elements");
+                break;
+            }
+            AtomRef r;
+            parseAtom(p, elemTy, false, true, &r);
+            if (p->hadError) break;
+            if (r.pending)
+            {
+                elems[n] = null;
+                pend[n] = r.name;
+            }
+            else
+            {
+                elems[n] = r.val;
+                pend[n] = str::empty();
+            }
+            n = n + 1;
+        }
+        skipWs(p);
+        if (p->cur == ',') { advance(p); continue; }
+        break;
+    }
+    if (p->hadError) { dealloc<IrValue*>(elems); dealloc<str>(pend); return null; }
+    if (p->cur != ']')
+    {
+        parseError(p, "expected ']' in aggregate initializer");
+        dealloc<IrValue*>(elems);
+        dealloc<str>(pend);
+        return null;
+    }
+    advance(p);
+    if (n != ty->count)
+    {
+        parseError(p, "aggregate initializer length does not match type");
+        dealloc<IrValue*>(elems);
+        dealloc<str>(pend);
+        return null;
+    }
+    IrArrayConst* ac = p->ctx->constArray(elemTy, elems, n);
+    for (u32 i = 0; i < n; i++)
+        if (pend[i].len > 0) addArrayFixup(p, ac, i, pend[i]);
+    dealloc<IrValue*>(elems);
+    dealloc<str>(pend);
+    return &ac->base;
+}
+
+void parseGlobalDecl(IrParser* p)
+{
+    skipSpaces(p);
+    bool isConst = false;
+    if (peekIdent(p).equals("const"))
+    {
+        str kw = takeIdent(p);
+        isConst = true;
+    }
+    skipWs(p);
+    if (p->cur != '@') { parseError(p, "expected '@' in global declaration"); return; }
+    advance(p);
+    str name = takeIdent(p);
+    if (p->hadError) return;
+    if (!expectChar(p, ':', "expected ':' in global declaration")) return;
+    IrType* ty = parseType(p);
+    if (p->hadError) return;
+    IrValue* init = null;
+    str initRef = str::empty();
+    skipSpaces(p);
+    if (p->cur == '=')
+    {
+        advance(p);
+        skipWs(p);
+        if (p->cur == '[')
+        {
+            init = parseAggregateInit(p, ty);
+            if (p->hadError) return;
+        }
+        else
+        {
+            AtomRef r;
+            parseAtom(p, ty, false, true, &r);
+            if (p->hadError) return;
+            init = r.val;
+            if (r.pending) initRef = r.name;
+        }
+    }
+    IrGlobal* g = p->ctx->createGlobal(name, ty, isConst, false, init, p->ctx->irTypeAlignOf(ty));
+    p->currentModule->addGlobal(g);
+    if (initRef.len > 0) addGlobalFixup(p, g, initRef);
+    while (!p->hadError)
+    {
+        skipSpaces(p);
+        if (p->cur != '!') break;
+        advance(p);
+        str key = takeIdent(p);
+        if (p->hadError) return;
+        MetaAtom vals[8];
+        bool hadEq = false;
+        u32 n = parseMetaValues(p, vals, 8, &hadEq);
+        if (p->hadError) return;
+        if (hadEq && n == 1 && vals[0].kind == 0 && key.equals("alignment"))
+        {
+            // codegen reads the field, the printer round-trips the
+            // metadata — an explicit value lands in both
+            g->alignment = (u32)vals[0].i;
+            addInt(attachGlobalMetadata(g), key, (usize)vals[0].i);
+        }
+        else commitMetaClause(p, attachGlobalMetadata(g), key, vals, n, hadEq, false);
+    }
+    if (p->hadError) return;
+    if (!expectChar(p, ';', "expected ';' after global declaration")) return;
+}
+
+void parseStringDecl(IrParser* p)
+{
+    skipWs(p);
+    if (p->cur != '@') { parseError(p, "expected '@' in string declaration"); return; }
+    advance(p);
+    str name = takeIdent(p);
+    if (p->hadError) return;
+    if (!expectChar(p, ':', "expected ':' in string declaration")) return;
+    skipWs(p);
+    str data = parseStringLiteral(p);
+    if (p->hadError) return;
+    IrStringConst* sc = p->ctx->createStringConst(data, (u32)data.len);
+    dealloc<cchar>((cchar*)data.ptr);
+    sc->base.name = dupCstr(name);
+    p->currentModule->addConstString(sc);
+    while (!p->hadError)
+    {
+        skipSpaces(p);
+        if (p->cur != '!') break;
+        advance(p);
+        str key = takeIdent(p);
+        if (p->hadError) return;
+        MetaAtom vals[8];
+        bool hadEq = false;
+        u32 n = parseMetaValues(p, vals, 8, &hadEq);
+        if (p->hadError) return;
+        commitMetaClause(p, attachStringMetadata(sc), key, vals, n, hadEq, false);
+    }
+    if (p->hadError) return;
+    if (!expectChar(p, ';', "expected ';' after string declaration")) return;
+}
+
+void resolveModuleFixups(IrParser* p)
+{
+    for (u32 i = 0; i < p->numFixs; i++)
+    {
+        Fixup* f = &p->fixups[i];
+        if (f->kind != 2) continue;
+        IrValue* v = findSymbol(p, f->name);
+        if (!v)
+        {
+            parseError(p, "undefined symbol");
+            return;
+        }
+        if (f->target == FixupTarget::InstOp)
+        {
+            f->inst->ops[f->opIdx] = v;
+            v->addUser(f->inst);
+        }
+        else if (f->target == FixupTarget::MetaEntry)
+        {
+            // metadata refs are not operands — no use-list entry
+            f->mdSet->entries[f->mdIdx].value.irVal = v;
+        }
+        else if (f->target == FixupTarget::GlobalInit) f->global->initVal = v;
+        else f->arr->elems[f->arrIdx] = v;
+        dealloc<cchar>((cchar*)f->name.ptr);
+    }
+    p->numFixs = 0;
+}
+
+pub IrModule* parseModule(IrParser* p, str text)
+{
+    p->input = text;
+    p->len = text.len;
+    p->pos = 0;
+    p->line = 1;
+    p->hadError = false;
+    if (p->errMsg.len > 0) { dealloc<cchar>((cchar*)p->errMsg.ptr); p->errMsg = str::empty(); }
+    p->errLine = 0;
+    p->numValues = 0;
+    p->numBlocks = 0;
+    p->numFixs = 0;
+    p->currentFunc = null;
+    p->currentBlock = null;
+    p->cur = p->len > 0 ? (cchar)text.ptr[0] : 0;
+
+    skipWs(p);
+    str modName = "parsed";
+    if (peekIdent(p).equals("module"))
+    {
+        str kw = takeIdent(p);
+        skipWs(p);
+        if (p->cur != '"') { parseError(p, "expected module name string"); return null; }
+        modName = parseStringLiteral(p);
+        if (p->hadError) return null;
+    }
+    p->currentModule = p->ctx->createModule(modName);
+
+    while (!p->hadError)
+    {
+        skipWs(p);
+        if (p->hadError) break;
+        if (p->cur == 0) break;
+        str w = peekIdent(p);
+        if (w.isEmpty()) { parseError(p, "expected declaration"); break; }
+        if (w.equals("type"))
+        {
+            takeIdent(p);
+            parseTypeDecl(p);
+        }
+        else if (w.equals("global"))
+        {
+            takeIdent(p);
+            parseGlobalDecl(p);
+        }
+        else if (w.equals("string"))
+        {
+            takeIdent(p);
+            parseStringDecl(p);
+        }
+        else if (w.equals("func"))
+        {
+            takeIdent(p);
+            parseFuncDecl(p);
+        }
+        else { parseError(p, "expected declaration"); break; }
+    }
+    if (p->hadError) return null;
+    resolveModuleFixups(p);
+    if (p->hadError) return null;
+    return p->currentModule;
+}

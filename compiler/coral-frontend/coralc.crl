@@ -1,0 +1,341 @@
+#[[no_drop_all]]
+/* frontend/coralc.crl: the single coralc entry point.
+ *
+ * One executable: build-file parsing + builder + (later) compile.
+ * Args come from /proc/self/cmdline (NUL-separated), not argc/argv.
+ */
+
+import common::slice { Slice };
+import build {
+    arena { Arena },
+    parser { CrlbParser },
+    ast { CrlbNode, CrlbNodeKind, CrlbField },
+    builder { builderRunEx, Builder, bFileExists, bWriteAllFps, bMkdirParent, bTaskIndex }
+};
+import args { Options, Command, parseArgs, usage, addFlagPair };
+import io { readFile, sliceCStr };
+import map { runMap };
+import init { runInit };
+import tasks { runTask };
+import compile { compileFile, compileUnitTo };
+import diag::explain { explain };
+import lsp { server { runServer } };
+
+import(lib) core::cchar { cchar };
+import(lib) std::mman { alloc, dealloc };
+import(lib) std::concurrent::signal { ignore, SIGPIPE };
+import(lib) platform::libc { printf, system };
+
+pub i32 main()
+{
+    // a child (gcc) that exits before we finish piping the source must not
+    // kill us with SIGPIPE; writes then just fail with EPIPE
+    ignore(SIGPIPE);
+    Options opts;
+    if (!parseArgs(&opts)) {
+        usage();
+        return 2;
+    }
+    if (opts.help) {
+        usage();
+        return 0;
+    }
+    if (opts.version) {
+        printf(C"coralc 0.1.0 (coral compiler; build driver: single-TU compile phase)\n");
+        return 0;
+    }
+    if (opts.explainSet) {
+        explain(str { .ptr = opts.explain.ptr, .len = opts.explain.len });
+        return 0;
+    }
+    if (opts.serve) {
+        return runServer(opts.buildFile, opts.buildFileSet);
+    }
+
+    switch (opts.cmd)
+    {
+        Command::Compile => { return compileFile(&opts); },
+        Command::Init => { return runInit(&opts); },
+        Command::Run => {}, // stub
+        Command::Task => {}, // stub
+        Command::Build => {}, // stub
+        Command::Map => {}, // stub
+        else => { return 2; },
+    }
+
+    Slice buildPath = opts.buildFile;
+    usize len = 0;
+    Slice src = readFile(buildPath.asStr(), &len);
+
+    if (src.ptr == null && !opts.buildFileSet) {
+        buildPath = Slice::fromStr("build.crlb");
+        src = readFile(buildPath.asStr(), &len);
+    }
+    if (src.ptr == null) {
+        printf(C"coralc: cannot read %s\n", sliceCStr(buildPath));
+        return 1;
+    }
+
+    Arena a;
+    a.init(4194304);
+    CrlbParser p;
+    p.init(&a, src);
+    CrlbNode* root = p.parseFile();
+    if (root == null || p.errors > 0) {
+        printf(C"coralc: parse failed, errors=%d\n", (i32)p.errors);
+        return 2;
+    }
+
+    // expand include "other.crlb" decls (relative to the including file)
+    {
+        u32 idepth = 0;
+        while (idepth < 8)
+        {
+            bool anyInc = false;
+            usize i = 0;
+            while (i < root.children.len)
+            {
+                CrlbNode* c = root.children.data + i;
+                if (c.kind != CrlbNodeKind::Include || !c.hasPayload) { i++; continue; }
+                anyInc = true;
+                usize sep = 0;
+                usize k = 0;
+                while (k < buildPath.len)
+                {
+                    if (buildPath.ptr[k] == '/') sep = k + 1;
+                    k++;
+                }
+                usize blen = sep > 0 ? sep : 0;
+                usize plen = c.payload.len;
+                u8* joined = alloc<u8>(blen + plen + 1);
+                k = 0;
+                while (k < blen) { joined[k] = buildPath.ptr[k]; k++; }
+                usize j = 0;
+                while (j < plen) { joined[blen + j] = c.payload.ptr[j]; j++; }
+                joined[blen + plen] = 0;
+                usize ilen = 0;
+                Slice isrc = readFile(str { .ptr = joined, .len = blen + plen }, &ilen);
+                if (isrc.ptr == null)
+                {
+                    printf(C"coralc: cannot read include \"%s\"\n", joined);
+                    return 2;
+                }
+                CrlbParser ip;
+                ip.init(&a, isrc);
+                CrlbNode* iroot = ip.parseFile();
+                dealloc<u8>(joined);
+                if (iroot == null || ip.errors > 0) { printf(C"coralc: include parse failed\n"); return 2; }
+                usize nl = root.children.len - i - 1;
+                CrlbNode* grown = (CrlbNode*)a.alloc((root.children.len + iroot.children.len) * @sizeof(CrlbNode), 8);
+                k = 0;
+                while (k < i) { grown[k] = root.children.data[k]; k++; }
+                k = 0;
+                while (k < iroot.children.len) { grown[i + k] = iroot.children.data[k]; k++; }
+                k = 0;
+                while (k < nl) { grown[i + iroot.children.len + k] = root.children.data[i + 1 + k]; k++; }
+                root.children.data = grown;
+                root.children.cap = root.children.len + iroot.children.len;
+                root.children.len += iroot.children.len - 1;
+                i += iroot.children.len;
+            }
+            if (!anyInc) break;
+            idepth++;
+        }
+    }
+
+    /* merge extends "base.crlb" into build blocks: base fields fill gaps,
+     * the child's own fields always win */
+    {
+        u32 edepth = 0;
+        while (edepth < 8)
+        {
+            bool anyExt = false;
+            usize i = 0;
+            while (i < root.children.len)
+            {
+                CrlbNode* c = root.children.data + i;
+                i++;
+                if (!c.hasExtends) continue;
+                anyExt = true;
+                Slice target = c.extendsTarget;
+                usize k = 0;
+                usize nl = 0;
+                
+                while (target.ptr[k] != 0 && k < target.len) { nl++; k++; }
+                usize sep = 0;
+                k = 0;
+                
+                while (k < buildPath.len) { if (buildPath.ptr[k] == '/') sep = k + 1; k++; }
+                u8* joined = alloc<u8>(sep + nl + 1);
+                k = 0;
+                
+                while (k < sep) { joined[k] = buildPath.ptr[k]; k++; }
+                usize j = 0;
+                while (j < nl) { joined[sep + j] = target.ptr[j]; j++; }
+                joined[sep + nl] = 0;
+                usize elen = 0;
+                Slice esrc = readFile(str { .ptr = joined, .len = sep + nl }, &elen);
+                
+                dealloc<u8>(joined);
+                
+                if (esrc.ptr == null) { printf(C"coralc: cannot read extends target\n"); return 2; }
+                CrlbParser ep;
+                ep.init(&a, esrc);
+                
+                CrlbNode* eroot = ep.parseFile();
+                if (eroot == null || ep.errors > 0) { printf(C"coralc: extends target parse failed\n"); return 2; }
+                CrlbNode* ebuild = null;
+                usize q = 0;
+                while (q < eroot.children.len)
+                {
+                    if (eroot.children.data[q].kind == CrlbNodeKind::Build) { ebuild = eroot.children.data + q; break; }
+                    q++;
+                }
+                if (ebuild == null) { continue; }
+                usize newcap = c.fields.len + ebuild.fields.len;
+                CrlbField* merged = (CrlbField*)a.alloc(newcap * @sizeof(CrlbField), 8);
+                k = 0;
+                while (k < c.fields.len) { merged[k] = c.fields.data[k]; k++; }
+                usize w = c.fields.len;
+                usize m = 0;
+                while (m < ebuild.fields.len)
+                {
+                    CrlbField* bf = ebuild.fields.data + m;
+                    bool found = false;
+                    usize f = 0;
+                    while (f < c.fields.len)
+                    {
+                        CrlbField* cf = c.fields.data + f;
+                        if (cf.name.len == bf.name.len)
+                        {
+                            usize eq = 0;
+                            bool same = true;
+                            while (eq < cf.name.len) { if (cf.name.ptr[eq] != bf.name.ptr[eq]) { same = false; break; } eq++; }
+                            if (same) { found = true; break; }
+                        }
+                        f++;
+                    }
+                    if (!found) { merged[w] = bf[0]; w++; }
+                    m++;
+                }
+                c.fields.data = merged;
+                c.fields.cap = newcap;
+                c.fields.len = w;
+                c.hasExtends = false;
+            }
+            if (!anyExt) break;
+            edepth++;
+        }
+    }
+
+    switch (opts.cmd)
+    {
+        Command::Map => { return runMap(&opts, root, &a, src); },
+        else => {},
+    }
+
+    Builder b;
+    b.compilePhaseReached = false;
+    i32 errs = builderRunEx(root, &a, opts.force, opts.mapOnly, opts.dryRun, false, &b);
+    if (errs != 0) return 3;
+    if (opts.mapOnly) return 0;
+
+    /* merge build-file flags into the CLI flag table. CLI flags occupy the
+     * low indices and the parser first-match-wins, so CLI values beat crlb
+     * values when both set the same name. */
+    {
+        u32 cf = 0;
+        while (cf < b.crlbFlagPairs)
+        {
+            addFlagPair(&opts, b.crlbFlagNames[cf], b.crlbFlagValues[cf]);
+            cf++;
+        }
+        if (b.crlbAllowIntPtr) opts.allowIntPtr = true;
+        if (b.crlbQuiet) opts.quiet = true;
+    }
+
+    /* task commands: `coralc run` executes task "run" if the build file
+     * defines one (else the output binary); `coralc <name>` runs that task.
+     * Every task path builds first. */
+    bool wantTask = opts.cmd == Command::Run || opts.cmd == Command::Task;
+    bool haveTask = false;
+    str taskName = Slice::fromStr("run").asStr();
+    if (opts.cmd == Command::Task)
+    {
+        taskName = opts.input.asStr();
+        if (bTaskIndex(&b, taskName) < 0)
+        {
+            printf(C"coralc: no task \"%.*s\" in the build file\n", (i32)opts.input.len, opts.input.ptr);
+            return 2;
+        }
+        haveTask = true;
+    }
+    else if (opts.cmd == Command::Run)
+    {
+        haveTask = bTaskIndex(&b, "run") >= 0;
+    }
+
+    // up to date: nothing stale, the output binary exists, no --force
+    u8* outZ = sliceCStr(b.output);
+    if (outZ == null || b.output.len == 0)
+    {
+        printf(C"coralc: build block needs output = \"path\" (the linked binary)\n");
+        return 3;
+    }
+    if (!opts.force && !b.anyStale && !opts.dryRun && bFileExists(b.output.asStr()))
+    {
+        printf(C"coralc: up to date (%s)\n", outZ);
+        b.compilePhaseReached = true;
+        if (wantTask)
+        {
+            if (haveTask)
+            {
+                i32 st = runTask(&b, taskName, 0);
+                if (st != 0) return st;
+            }
+            else
+            {
+                i32 st = system((const cchar*)outZ);
+                if (st != 0) return 3;
+            }
+        }
+        return 0;
+    }
+
+    /* compile phase: one unit (the entry module's closure) → one binary.
+     * the loader resolves imports through the builder's in-memory module
+     * table first, then falls back to lib-root probing. */
+    if (!bMkdirParent(b.output.asStr()))
+    {
+        printf(C"coralc: cannot create output directory for %s\n", outZ);
+        return 3;
+    }
+    if (b.entryPath.ptr == null)
+    {
+        printf(C"coralc: entry module not resolved\n");
+        return 3;
+    }
+    i32 rc = compileUnitTo(b.entryPath.asStr(), b.output.asStr(), opts.flagNames, opts.flagValues, opts.flagsCount,
+                           opts.errorLimit, opts.allowIntPtr, opts.noPrelude, opts.quiet, opts.dryRun,
+                           b.modKeys, b.modVals, b.modLen, b.opt.asStr(), opts.emitC, opts.showGcc);
+    if (rc == 0)
+    {
+        b.compilePhaseReached = true;
+        if (!opts.dryRun) bWriteAllFps(&b);
+        if (wantTask)
+        {
+            if (haveTask)
+            {
+                i32 st = runTask(&b, taskName, 0);
+                if (st != 0) return st;
+            }
+            else
+            {
+                i32 st = system((const cchar*)outZ);
+                if (st != 0) return 3;
+            }
+        }
+        return 0;
+    }
+    return 3;
+}

@@ -1,0 +1,377 @@
+#[[no_drop_all]]
+/* diagnostics/engine.crl: diagnostic engine
+ *
+ * Owns the file table (file id -> path + buffer) and the error counters.
+ * Every diagnostic funnels through error.crl, which owns the formatting.
+ * Call sites report a stable ErrorCode + SourceLoc + message + optional
+ * help line; the engine resolves the location against the right file.
+ */
+
+import(lib) std::mman { alloc, dealloc, realloc };
+import(lib) std::vec { Vec };
+import(lib) std::text::string { String };
+import(lib) platform::libc { write };
+import code { ErrorCode, codeStr };
+import error { render };
+import ast::id { SourceLoc, locFile, locLine, locCol };
+
+/* structured copy of one diagnostic, for consumers that are not the
+ * terminal (LSP publishDiagnostics). positions are 1-based byte
+ * line/column; endCol is one past the last byte of the highlighted word
+ * (col + 1 when the position is not on a word). */
+pub struct DiagRecord
+{
+    String code;
+    String level;
+    String message;
+    String file;
+    String lineText;
+    String help;
+    u32 line;
+    u32 col;
+    u32 endCol;
+
+    void dispose()
+    {
+        self.code.free();
+        self.level.free();
+        self.message.free();
+        self.file.free();
+        self.lineText.free();
+        self.help.free();
+    }
+}
+
+/* owning list of records; no drop trait on purpose — ownership moves
+ * explicitly between engine and caller via moveRecordsTo/dispose */
+pub struct DiagList
+{
+    DiagRecord* items;
+    u32 len;
+    u32 cap;
+
+    void init()
+    {
+        self.items = null;
+        self.len = 0;
+        self.cap = 0;
+    }
+
+    void push(DiagRecord r)
+    {
+        if (self.len >= self.cap)
+        {
+            u32 nc = self.cap > 0 ? self.cap * 2 : 16;
+            self.items = realloc<DiagRecord>(self.items, (usize)nc);
+            self.cap = nc;
+        }
+        self.items[self.len] = r;
+        self.len++;
+    }
+
+    void dispose()
+    {
+        u32 i = 0;
+        while (i < self.len)
+        {
+            DiagRecord* it = self.items + i;
+            it->dispose();
+            i++;
+        }
+        dealloc<DiagRecord>(self.items);
+        self.items = null;
+        self.len = 0;
+        self.cap = 0;
+    }
+}
+
+u32 recordEndCol(str lineText, u32 col)
+{
+    if (col == 0) return 0;
+    usize i = (usize)(col - 1);
+    usize start = i;
+    while (i < lineText.len)
+    {
+        u8 c = lineText.ptr[i];
+        bool word = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95;
+        if (!word) break;
+        i++;
+    }
+    if (i == start) return col + 1;
+    return (u32)i + 1;
+}
+
+pub struct DiagnosticEngine
+{
+    usize errors;
+    usize warnings;
+    usize errorLimit;
+    bool limitNotified;
+    // `-w`: suppress all diagnostic rendering (counters still track)
+    bool silenced;
+    usize lexerErrors;
+    usize parserErrors;
+    u8* bufStart;
+    u8* bufEnd;
+    Vec<str> filePaths;
+    Vec<u8*> fileBufs;
+    Vec<u8*> fileBufEnds;
+    u32 fileCount;
+    /* collect structured records alongside rendering (LSP mode); off by
+     * default so normal compiles don't pay for the copies */
+    bool collect;
+    DiagList records;
+
+    void init(u8* bufStart, u8* bufEnd)
+    {
+        // bufStart/bufEnd are the main file, used when a loc names no
+        // known file. limit of 20 mirrors clang; silenced is -w
+        self = DiagnosticEngine {
+            .errors = 0,
+            .warnings = 0,
+            .errorLimit = 20,
+            .limitNotified = false,
+            .silenced = false,
+            .lexerErrors = 0,
+            .parserErrors = 0,
+            .bufStart = bufStart,
+            .bufEnd = bufEnd,
+            .filePaths = Vec<str>::new(),
+            .fileBufs = Vec<u8*>::new(),
+            .fileBufEnds = Vec<u8*>::new(),
+            .fileCount = 0,
+            .collect = false,
+            .records = DiagList { .items = null, .len = 0, .cap = 0 },
+        };
+    }
+
+    /* hand the collected records to `out` (taking ownership); with a null
+     * `out` the records are dropped */
+    void moveRecordsTo(DiagList* out)
+    {
+        if (out == null)
+        {
+            self.records.dispose();
+            return;
+        }
+        *out = self.records;
+        self.records.init();
+    }
+
+    /* release every table this engine owns. the source buffers recorded
+     * in fileBufs/fileBufEnds belong to the compile unit, not the engine,
+     * so only the path copies and the arrays go here */
+    void deinit()
+    {
+        usize i = 0;
+        while (i < self.filePaths.len)
+        {
+            str p = self.filePaths.at(i);
+            if (p.ptr != null) dealloc<u8>(p.ptr);
+            i++;
+        }
+        self.filePaths.dispose();
+        self.fileBufs.dispose();
+        self.fileBufEnds.dispose();
+        self.records.dispose();
+    }
+
+    usize errorCount() { return self.errors; }
+    usize warningCount() { return self.warnings; }
+    usize lexerErrorCount() { return self.lexerErrors; }
+    usize parserErrorCount() { return self.parserErrors; }
+    bool hasErrors() { return self.errors > 0; }
+    // -ferror-limit=N (0 = unlimited); stop rendering the N+1st error
+    bool tooManyErrors() { return self.errorLimit != 0 && self.errors > self.errorLimit; }
+
+    // register a source file; returns its file id
+    u32 addFile(u8* path, usize pathLen, u8* bufStart, u8* bufEnd)
+    {
+        u32 id = self.fileCount;
+        /* copy the path; the lib loader frees its candidate paths while
+         * this table lives for the whole compile */
+        u8* pcopy = alloc<u8>(pathLen + 1);
+        if (pcopy != null)
+        {
+            usize pi = 0;
+            while (pi < pathLen) { pcopy[pi] = path[pi]; pi++; }
+            pcopy[pathLen] = 0;
+            self.filePaths.push(str { .ptr = pcopy, .len = pathLen });
+        }
+        else
+        {
+            self.filePaths.push(str { .ptr = path, .len = pathLen });
+        }
+        self.fileBufs.push(bufStart);
+        self.fileBufEnds.push(bufEnd);
+        self.fileCount++;
+        return id;
+    }
+
+    /* byte pointer for (line, col). walks the file from byte 0 on every
+     * call; O(offset), but this only runs when a diagnostic renders, so
+     * it's cold. line/col are 1-based; 0 means "don't bother" */
+    u8* locPtr(SourceLoc loc)
+    {
+        u32 file = locFile(loc);
+        u32 line = locLine(loc);
+        u32 col = locCol(loc);
+        if (file >= self.fileCount) return self.bufStart;
+        u8* buf = self.fileBufs.at((usize)file);
+        u8* end = self.fileBufEnds.at((usize)file);
+        if (buf == null) return null;
+        if (line == 0) return buf;
+        u32 curLine = 1;
+        u8* p = buf;
+        while (p < end && curLine < line)
+        {
+            if (p[0] == 10) curLine++;
+            p++;
+        }
+        if (col == 0) col = 1;
+        u32 c = 1;
+        while (p < end && c < col && p[0] != 10 && p[0] != 13)
+        {
+            p++;
+            c++;
+        }
+        return p;
+    }
+
+    void emitError(ErrorCode code, SourceLoc loc, str msg, str help)
+    {
+        // count first, maybe render second: over-limit errors still bump
+        // the counter, so hasErrors() stays honest
+        self.errors++;
+        if (self.tooManyErrors())
+        {
+            if (!self.limitNotified)
+            {
+                self.limitNotified = true;
+                str note = "note: too many errors emitted, stopping now (use -ferror-limit=0 to disable)\n";
+                write(2, note.ptr, note.len);
+            }
+            return;
+        }
+        self.renderAt(code, "error", loc, msg, help);
+    }
+
+    void emitWarning(ErrorCode code, SourceLoc loc, str msg, str help)
+    {
+        self.warnings++;
+        if (self.tooManyErrors()) return;
+        self.renderAt(code, "warning", loc, msg, help);
+    }
+
+    /* report a diagnostic permitted by an escape-hatch flag (e.g.
+     * --allow-int-ptr): rendered like an error but not counted, so the
+     * build still succeeds; -w silences the rendering */
+    void emitAllowed(ErrorCode code, SourceLoc loc, str msg, str help)
+    {
+        self.renderAt(code, "error", loc, msg, help);
+    }
+
+    void emitNote(ErrorCode code, SourceLoc loc, str msg, str help)
+    {
+        self.renderAt(code, "note", loc, msg, help);
+    }
+
+    void emitFatal(ErrorCode code, SourceLoc loc, str msg, str help)
+    {
+        self.errors++;
+        self.renderAt(code, "fatal error", loc, msg, help);
+    }
+
+    void addRecord(str code, str level, str msg, str path, u32 line, u32 col, str lineText, str help)
+    {
+        self.records.push(DiagRecord {
+            .code = String::from(code),
+            .level = String::from(level),
+            .message = String::from(msg),
+            .file = String::from(path),
+            .lineText = String::from(lineText),
+            .help = String::from(help),
+            .line = line,
+            .col = col,
+            .endCol = recordEndCol(lineText, col),
+        });
+    }
+
+    void renderAt(ErrorCode code, str level, SourceLoc loc, str msg, str help)
+    {
+        // silenced: no textual rendering. with `collect` the position is
+        // still resolved so structured records stay accurate in LSP mode.
+        if (self.silenced && !self.collect) return;
+
+        str path = str::empty();
+        str lineText = str::empty();
+        str prevText = str::empty();
+        u32 line = 0;
+        u32 col = 0;
+        usize prevLineNo = 0;
+
+        u32 file = locFile(loc);
+        if (file < self.fileCount)
+        {
+            u8* ptr = self.locPtr(loc);
+            if (ptr != null)
+            {
+                line = locLine(loc);
+                col = locCol(loc);
+                u8* fileBuf = self.fileBufs.at((usize)file);
+                u8* fileEnd = self.fileBufEnds.at((usize)file);
+
+                u8* lineStart = ptr;
+                // widen [ptr] to the full physical line; harmless to split on \r here
+                while (lineStart > fileBuf)
+                {
+                    u8* prev = lineStart - 1;
+                    if (prev[0] == '\n') break;
+                    lineStart = prev;
+                }
+
+                u8* lineEnd = ptr;
+                while (lineEnd < fileEnd)
+                {
+                    if (lineEnd[0] == '\n') break;
+                    if (lineEnd[0] == '\r') break;
+                    lineEnd++;
+                }
+
+                usize lineLen = (usize)(lineEnd - lineStart);
+                lineText = str { .ptr = lineStart, .len = lineLen };
+
+                // the line before the error, for context
+                if (line > 1 && lineStart > fileBuf)
+                {
+                    // lineStart - 1 is the '\n'; walk back one more line for the
+                    // "previous line" context shown above the error line
+                    u8* prevEnd = lineStart - 1;             // the newline before
+                    if (prevEnd > fileBuf)
+                    {
+                        u8* prevStart = prevEnd;
+                        while (prevStart > fileBuf && prevStart[-1] != '\n') prevStart--;
+                        usize plen = (usize)(prevEnd - prevStart);
+                        // trim a trailing \r
+                        if (plen > 0 && prevStart[plen - 1] == 13) plen--;
+                        prevText = str { .ptr = prevStart, .len = plen };
+                        prevLineNo = (usize)(line - 1);
+                    }
+                }
+                path = self.filePaths.at((usize)file);
+            }
+        }
+
+        if (!self.silenced)
+        {
+            render(codeStr(code), level, msg,
+                   path, (usize)line, (usize)col,
+                   prevText, prevLineNo,
+                   lineText, help);
+        }
+        if (self.collect)
+        {
+            self.addRecord(codeStr(code), level, msg, path, line, col, lineText, help);
+        }
+    }
+}

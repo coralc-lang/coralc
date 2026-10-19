@@ -1,0 +1,606 @@
+#[[no_drop_all]]
+// Object model + structured writers: the assembler produces an AsmObject
+// (sections + symbol table + relocation records), and three sinks turn it
+// into bytes — ELF64 relocatable, PE/COFF x86-64, and flat raw. Symbols
+// that are only referenced stay undefined with relocation records so an
+// external linker resolves them; raw applies every relocation against a
+// caller-supplied base and requires everything defined.
+import(lib) wallvm::asm::common { AsmParseError };
+import(lib) wallvm::asm::x86::common { AsmBytes };
+
+pub const u32 ASM_MAX_SYMS = 512;
+pub const u32 ASM_MAX_RELOCS = 1024;
+
+// relocation kinds — mapped to ELF/COFF codes by the writers
+pub enum AsmRelocKind
+{
+    RelAbs64,   // absolute 64-bit (R_X86_64_64 / IMAGE_REL_AMD64_ADDR64)
+    RelAbs32,   // absolute 32-bit (R_X86_64_32 / IMAGE_REL_AMD64_ADDR32)
+    RelPc32,    // PC-relative 32-bit (R_X86_64_PC32 / IMAGE_REL_AMD64_REL32)
+    RelPlt32    // PLT-style PC-relative (R_X86_64_PLT32 / REL32)
+}
+
+pub struct AsmSymbol
+{
+    str name;
+    u64 value;      // offset within its section when defined
+    i32 section;    // 0 = undefined, 1 = text, 2 = data
+    bool defined;
+    bool global;    // external linkage: .globl / .extern
+    bool weak;      // STB_WEAK binding (ELF); COFF treats as external
+    bool isFunc;    // STT_FUNC / COFF function descriptor
+    u8 vis;         // ELF st_other visibility: 0 default, 1 internal,
+                    // 2 hidden, 3 protected
+}
+
+pub struct AsmReloc
+{
+    u64 offset;     // byte offset within the section
+    str symbol;     // target symbol name
+    u8 kind;        // AsmRelocKind
+    i64 addend;
+    i32 section;    //1 text, 2 data
+}
+
+pub struct AsmSection
+{
+    str name;
+    AsmBytes data;
+}
+
+pub struct AsmObject
+{
+    AsmSection text;
+    AsmSection data;
+    AsmSymbol syms[ASM_MAX_SYMS];
+    u32 nsyms;
+    AsmReloc relocs[ASM_MAX_RELOCS];
+    u32 nrelocs;
+}
+
+pub AsmObject asmObjectNew()
+{
+    AsmObject o = AsmObject {
+        .text = AsmSection { .name = ".text", .data = AsmBytes::new() },
+        .data = AsmSection { .name = ".data", .data = AsmBytes::new() },
+        .nsyms = 0,
+        .nrelocs = 0
+    };
+    return o;
+}
+
+pub void asmObjectDeinit(AsmObject* o)
+{
+    o.text.data.deinit();
+    o.data.data.deinit();
+    o.nsyms = 0;
+    o.nrelocs = 0;
+}
+
+// find a symbol by name, or -1
+pub i32 asmFindSym(AsmObject* o, str name)
+{
+    for (u32 i = 0; i < o.nsyms; i++)
+    {
+        if (o.syms[i].name.equals(name)) return (i32)i;
+    }
+    return -1;
+}
+
+// find or create (undefined, local) and return its index
+pub i32 asmFindOrAddSym(AsmObject* o, str name)
+{
+    i32 ex = asmFindSym(o, name);
+    if (ex >= 0) return ex;
+    if (o.nsyms >= ASM_MAX_SYMS) return -1;
+    u32 i = o.nsyms;
+    o.syms[i] = AsmSymbol {
+        .name = name, .value = 0, .section = 0,
+        .defined = false, .global = false, .weak = false,
+        .isFunc = false, .vis = 0
+    };
+    o.nsyms++;
+    return (i32)i;
+}
+
+pub bool asmAddReloc(AsmObject* o, u64 offset, str symbol, u8 kind, i64 addend, i32 section)
+{
+    if (o.nrelocs >= ASM_MAX_RELOCS) return false;
+    // reference guarantees the name exists in the symbol table: without
+    // this, a reloc to a not-yet-defined (or external) name dies at write
+    // time as "relocation to unknown symbol"
+    if (asmFindOrAddSym(o, symbol) < 0) return false;
+    u32 i = o.nrelocs;
+    o.relocs[i] = AsmReloc {
+        .offset = offset, .symbol = symbol, .kind = kind,
+        .addend = addend, .section = section
+    };
+    o.nrelocs++;
+    return true;
+}
+
+// ------------------------------------------------------------------
+// ELF64 relocatable (ET_REL, x86-64). Layout:
+//   ehdr | shdrs(8) | .text | .data | .rela.text | .rela.data |
+//   .symtab | .strtab | .shstrtab
+// ------------------------------------------------------------------
+
+const u64 ELF_R_64 = 1;
+const u64 ELF_R_PC32 = 2;
+const u64 ELF_R_PLT32 = 4;
+const u64 ELF_R_32 = 10;
+
+u64 elfRelocType(u8 kind)
+{
+    switch (kind)
+    {
+        AsmRelocKind::RelAbs64 => { return ELF_R_64; },
+        AsmRelocKind::RelAbs32 => { return ELF_R_32; },
+        AsmRelocKind::RelPc32 => { return ELF_R_PC32; },
+        AsmRelocKind::RelPlt32 => { return ELF_R_PLT32; },
+        else => { return ELF_R_64; },
+    }
+}
+
+bool shstrStr(AsmBytes* b, str s)
+{
+    for (u32 i = 0; i < s.len; i++) { if (!b.u8b(s.ptr[i])) return false; }
+    return b.u8b(0);
+}
+
+bool writePad(AsmBytes* out, u64 n)
+{
+    for (u64 i = 0; i < n; i++) { if (!out.u8b(0)) return false; }
+    return true;
+}
+
+bool elfShdr(AsmBytes* out, u32 name, u32 type, u64 flags, u64 off,
+                    u64 size, u32 link, u32 info, u64 align, u64 entsize)
+{
+    if (!out.u32b(name)) return false;
+    if (!out.u32b(type)) return false;
+    if (!out.u64b(flags)) return false;
+    if (!out.u64b(0)) return false; // addr
+    if (!out.u64b(off)) return false;
+    if (!out.u64b(size)) return false;
+    if (!out.u32b(link)) return false;
+    if (!out.u32b(info)) return false;
+    if (!out.u64b(align)) return false;
+    if (!out.u64b(entsize)) return false;
+    return true;
+}
+
+// zero the in-place field each relocation points at (ELF .rela carries the
+// addend in the rela entry, so the section bytes stay zero at those spots)
+bool elfZeroRelocs(AsmBytes* buf, AsmObject* o, i32 sec)
+{
+    for (u32 i = 0; i < o.nrelocs; i++)
+    {
+        AsmReloc* r = &o.relocs[i];
+        if (r.section != sec) continue;
+        u64 n = (r.kind == AsmRelocKind::RelAbs64) ? 8 : 4;
+        for (u64 k = 0; k < n; k++)
+        {
+            u64 at = r.offset + k;
+            if (at >= buf.len) return false;
+            buf.data[at] = 0;
+        }
+    }
+    return true;
+}
+
+pub bool emitElf(AsmObject* o, AsmBytes* out, AsmParseError* err)
+{
+    // section slots: 0 null, 1 .text, 2 .data, 3 .rela.text, 4 .rela.data,
+    // 5 .symtab, 6 .strtab, 7 .shstrtab
+    const u32 SHNUM = 8;
+
+    // copy section bytes (relocated fields zeroed)
+    AsmBytes text = AsmBytes::new();
+    AsmBytes data = AsmBytes::new();
+    for (u32 i = 0; i < o.text.data.len; i++) { if (!text.u8b(o.text.data.data[i])) return false; }
+    for (u32 i = 0; i < o.data.data.len; i++) { if (!data.u8b(o.data.data.data[i])) return false; }
+    if (!elfZeroRelocs(&text, o, 1)) { err.msg = "reloc offset past end of .text"; return false; }
+    if (!elfZeroRelocs(&data, o, 2)) { err.msg = "reloc offset past end of .data"; return false; }
+
+    // symtab order: null, locals (defined non-global non-weak), then
+    // globals + weak + undefined; map name → symtab index for the rela
+    // writers
+    i32 map[ASM_MAX_SYMS];
+    for (u32 i = 0; i < ASM_MAX_SYMS; i++) map[i] = -1;
+    // emitted order recorded by walking twice
+    u32 emitted = 0;
+    // pass 1: locals
+    for (u32 i = 0; i < o.nsyms; i++)
+    {
+        if (!o.syms[i].global && !o.syms[i].weak && o.syms[i].defined) { map[i] = (i32)(++emitted); }
+    }
+    u32 firstGlobal = emitted + 1; // +1 for the null symbol
+    // pass 2: globals + weak + undefined
+    for (u32 i = 0; i < o.nsyms; i++)
+    {
+        AsmSymbol* s = &o.syms[i];
+        if (s->global || s->weak || !s->defined) { map[i] = (i32)(++emitted); }
+    }
+    u32 nsymsTotal = emitted + 1; // null symbol
+
+    // string tables
+    AsmBytes strtab = AsmBytes::new();
+    AsmBytes shstr = AsmBytes::new();
+    if (!strtab.u8b(0)) return false;
+    if (!shstr.u8b(0)) return false;
+    // strtab name offsets follow symtab emission order
+    u32 nameOff[ASM_MAX_SYMS];
+    // null symbol has no name
+    // walk emission order again to place names — rebuild the order list
+    u32 order[ASM_MAX_SYMS + 1]; // symtab index → object symbol index (0 = null)
+    order[0] = 0xFFFFFFFF;
+    u32 oi = 1;
+    for (u32 i = 0; i < o.nsyms; i++)
+    {
+        if (!o.syms[i].global && !o.syms[i].weak && o.syms[i].defined) { order[oi++] = i; }
+    }
+    for (u32 i = 0; i < o.nsyms; i++)
+    {
+        AsmSymbol* s = &o.syms[i];
+        if (s->global || s->weak || !s->defined) { order[oi++] = i; }
+    }
+    for (u32 si = 1; si < nsymsTotal; si++)
+    {
+        AsmSymbol* s = &o.syms[order[si]];
+        nameOff[order[si]] = strtab.len;
+        for (u32 k = 0; k < s.name.len; k++) { if (!strtab.u8b(s.name.ptr[k])) return false; }
+        if (!strtab.u8b(0)) return false;
+    }
+
+    // shstrtab names
+    u32 shnText = shstr.len; if (!shstrStr(&shstr, ".text")) return false;
+    u32 shnData = shstr.len; if (!shstrStr(&shstr, ".data")) return false;
+    u32 shnRelaT = shstr.len; if (!shstrStr(&shstr, ".rela.text")) return false;
+    u32 shnRelaD = shstr.len; if (!shstrStr(&shstr, ".rela.data")) return false;
+    u32 shnSym = shstr.len; if (!shstrStr(&shstr, ".symtab")) return false;
+    u32 shnStr = shstr.len; if (!shstrStr(&shstr, ".strtab")) return false;
+    u32 shnShstr = shstr.len; if (!shstrStr(&shstr, ".shstrtab")) return false;
+
+    // rela bodies
+    AsmBytes relaT = AsmBytes::new();
+    AsmBytes relaD = AsmBytes::new();
+    for (u32 i = 0; i < o.nrelocs; i++)
+    {
+        AsmReloc* r = &o.relocs[i];
+        AsmBytes* dst = r.section == 2 ? &relaD : &relaT;
+        i32 symIdx = -1;
+        for (u32 s = 0; s < o.nsyms; s++)
+        {
+            if (o.syms[s].name.equals(r.symbol)) { symIdx = map[s]; break; }
+        }
+        if (symIdx < 0) { err.msg = "relocation to unknown symbol"; return false; }
+        if (!dst.u64b(r.offset)) return false;
+        if (!dst.u64b(((u64)symIdx << 32) | elfRelocType(r.kind))) return false;
+        if (!dst.u64b((u64)r.addend)) return false;
+    }
+
+    // lay out: ehdr 64 + shdrs 8*64, then section bodies
+    u64 off = 64 + (u64)SHNUM * 64;
+    u64 offText = off; off += text.len;
+    off = (off + 15) & ~(u64)15;
+    u64 offData = off; off += data.len;
+    off = (off + 7) & ~(u64)7;
+    u64 offRelaT = off; off += relaT.len;
+    off = (off + 7) & ~(u64)7;
+    u64 offRelaD = off; off += relaD.len;
+    off = (off + 7) & ~(u64)7;
+    u64 offSym = off; off += (u64)nsymsTotal * 24;
+    u64 offStr = off; off += strtab.len;
+    u64 offShstr = off; off += shstr.len;
+
+    // e_ident + header
+    if (!out.u8b(0x7F) || !out.u8b((u8)'E') || !out.u8b((u8)'L') || !out.u8b((u8)'F')) return false;
+    if (!out.u8b(2) || !out.u8b(1) || !out.u8b(1) || !out.u8b(0)) return false; // class64, LE, ver1, sysv
+    for (u32 i = 0; i < 8; i++) { if (!out.u8b(0)) return false; }
+    if (!out.u16b(1)) return false;   // ET_REL
+    if (!out.u16b(62)) return false;  // EM_X86_64
+    if (!out.u32b(1)) return false;   // version
+    if (!out.u64b(0)) return false;   // entry
+    if (!out.u64b(0)) return false;   // phoff
+    if (!out.u64b(64)) return false;  // shoff
+    if (!out.u32b(0)) return false;   // flags
+    if (!out.u16b(64)) return false;  // ehsize
+    if (!out.u16b(0)) return false;   // phentsize
+    if (!out.u16b(0)) return false;   // phnum
+    if (!out.u16b(64)) return false;  // shentsize
+    if (!out.u16b(SHNUM)) return false;
+    if (!out.u16b(7)) return false;   // shstrndx
+
+    // section headers
+    // null
+    for (u32 i = 0; i < 64; i++) { if (!out.u8b(0)) return false; }
+    // .text PROGBITS AX
+    if (!elfShdr(out, shnText, 1, 6, offText, text.len, 0, 0, 16, 0)) return false;
+    // .data PROGBITS WA
+    if (!elfShdr(out, shnData, 1, 3, offData, data.len, 0, 0, 8, 0)) return false;
+    // .rela.text RELA linksymtab(5) info.text(1)
+    if (!elfShdr(out, shnRelaT, 4, 0, offRelaT, relaT.len, 5, 1, 8, 24)) return false;
+    if (!elfShdr(out, shnRelaD, 4, 0, offRelaD, relaD.len, 5, 2, 8, 24)) return false;
+    // .symtab SYMTAB link .strtab(6) info = first global
+    if (!elfShdr(out, shnSym, 2, 0, offSym, (u64)nsymsTotal * 24, 6, firstGlobal, 8, 24)) return false;
+    if (!elfShdr(out, shnStr, 3, 0, offStr, strtab.len, 0, 0, 1, 0)) return false;
+    if (!elfShdr(out, shnShstr, 3, 0, offShstr, shstr.len, 0, 0, 1, 0)) return false;
+
+    // bodies (text was padded conceptually by alignment gaps — write pad)
+    u64 cur = 64 + (u64)SHNUM * 64;
+    if (!writePad(out, offText - cur)) return false;
+    for (u32 i = 0; i < text.len; i++) { if (!out.u8b(text.data[i])) return false; }
+    if (!writePad(out, offData - out.len)) return false;
+    for (u32 i = 0; i < data.len; i++) { if (!out.u8b(data.data[i])) return false; }
+    if (!writePad(out, offRelaT - out.len)) return false;
+    for (u32 i = 0; i < relaT.len; i++) { if (!out.u8b(relaT.data[i])) return false; }
+    if (!writePad(out, offRelaD - out.len)) return false;
+    for (u32 i = 0; i < relaD.len; i++) { if (!out.u8b(relaD.data[i])) return false; }
+    if (!writePad(out, offSym - out.len)) return false;
+
+    // symtab entries in emission order
+    if (!out.u32b(0) || !out.u8b(0) || !out.u8b(0) || !out.u16b(0) ||
+        !out.u64b(0) || !out.u64b(0)) return false; // null symbol
+    for (u32 si = 1; si < nsymsTotal; si++)
+    {
+        AsmSymbol* s = &o.syms[order[si]];
+        // undefined names are externals for the linker (STB_GLOBAL) even
+        // without .globl — a forward local that gets defined later lands
+        // here as defined+non-global and stays STB_LOCAL
+        u8 bind = s.weak ? 2 : ((s.global || !s.defined) ? 1 : 0);
+        u8 typ = s.isFunc ? 2 : (s.defined ? 1 : 0);
+        u16 shndx = 0;
+        if (s.defined) shndx = s.section == 2 ? 2 : 1;
+        if (!out.u32b(nameOff[order[si]])) return false;
+        if (!out.u8b((u8)((bind << 4) | typ))) return false;
+        if (!out.u8b(s.vis)) return false;
+        if (!out.u16b(shndx)) return false;
+        if (!out.u64b(s.defined ? s.value : 0)) return false;
+        if (!out.u64b(0)) return false;
+    }
+    for (u32 i = 0; i < strtab.len; i++) { if (!out.u8b(strtab.data[i])) return false; }
+    for (u32 i = 0; i < shstr.len; i++) { if (!out.u8b(shstr.data[i])) return false; }
+
+    text.deinit(); data.deinit(); strtab.deinit(); shstr.deinit();
+    relaT.deinit(); relaD.deinit();
+    return true;
+}
+
+// ------------------------------------------------------------------
+// PE/COFF x86-64 (.obj). One or two sections, relocations kept in place
+// (COFF carries the addend inside the relocated field itself).
+// ------------------------------------------------------------------
+
+const u16 COFF_REL_ADDR64 = 1;
+const u16 COFF_REL_ADDR32 = 2;
+const u16 COFF_REL_REL32 = 4;
+
+u16 coffRelocType(u8 kind)
+{
+    switch (kind)
+    {
+        AsmRelocKind::RelAbs64 => { return COFF_REL_ADDR64; },
+        AsmRelocKind::RelAbs32 => { return COFF_REL_ADDR32; },
+        AsmRelocKind::RelPc32 => { return COFF_REL_REL32; },
+        AsmRelocKind::RelPlt32 => { return COFF_REL_REL32; },
+        else => { return COFF_REL_REL32; },
+    }
+}
+
+bool coffName8(AsmBytes* out, str name)
+{
+    u32 n = name.len > 8 ? 8 : name.len;
+    for (u32 i = 0; i < n; i++) { if (!out.u8b(name.ptr[i])) return false; }
+    for (u32 i = n; i < 8; i++) { if (!out.u8b(0)) return false; }
+    return true;
+}
+
+pub bool emitCoff(AsmObject* o, AsmBytes* out, AsmParseError* err)
+{
+    bool hasData = o.data.data.len > 0;
+    u32 nsec = hasData ? 2 : 1;
+
+    // symbol table order: locals first, then externals; name → index map
+    i32 map[ASM_MAX_SYMS];
+    u32 order[ASM_MAX_SYMS];
+    u32 nOrder = 0;
+    for (u32 i = 0; i < o.nsyms; i++)
+    {
+        if (o.syms[i].defined && !o.syms[i].global) { map[i] = (i32)nOrder; order[nOrder++] = i; }
+    }
+    for (u32 i = 0; i < o.nsyms; i++)
+    {
+        AsmSymbol* s = &o.syms[i];
+        if (s->global || !s->defined) { map[i] = (i32)nOrder; order[nOrder++] = i; }
+    }
+
+    // string table for names longer than 8 bytes (size prefix included)
+    AsmBytes strtab = AsmBytes::new();
+    if (!strtab.u32b(0)) return false; // patched at the end
+    u32 nameOff[ASM_MAX_SYMS];
+    for (u32 i = 0; i < nOrder; i++)
+    {
+        AsmSymbol* s = &o.syms[order[i]];
+        if (s.name.len > 8)
+        {
+            nameOff[order[i]] = strtab.len;
+            for (u32 k = 0; k < s.name.len; k++) { if (!strtab.u8b(s.name.ptr[k])) return false; }
+            if (!strtab.u8b(0)) return false;
+        }
+    }
+    // patch size
+    for (u32 i = 0; i < 4; i++) strtab.data[i] = (u8)((strtab.len >> (8 * i)) & 0xFF);
+
+    // header sizes: filehdr 20 + section headers + raw data + relocs
+    u32 secHdrOff = 20;
+    u32 rawOff = secHdrOff + nsec * 40;
+    u32 textReloOff = rawOff + o.text.data.len + (hasData ? o.data.data.len : 0);
+    u32 dataReloOff = textReloOff;
+    u32 nrelText = 0, nrelData = 0;
+    for (u32 i = 0; i < o.nrelocs; i++)
+    {
+        if (o.relocs[i].section == 2) nrelData++; else nrelText++;
+    }
+    dataReloOff = textReloOff + nrelText * 10;
+    u32 symOff = dataReloOff + nrelData * 10;
+
+    // COFF symbol index references count every 18-byte entry; section
+    // numbers are 1-based. File header:
+    if (!out.u16b(0x8664)) return false;  // machine
+    if (!out.u16b((u16)nsec)) return false;
+    if (!out.u32b(0)) return false;       // timestamp
+    if (!out.u32b(symOff)) return false;
+    if (!out.u32b(nOrder)) return false;
+    if (!out.u16b(0)) return false;       // optional header size
+    if (!out.u16b(0)) return false;       // characteristics
+
+    // section headers
+    // .text: CNT_CODE | MEM_EXECUTE | MEM_READ
+    if (!coffSecHdr(out, ".text", o.text.data.len, rawOff, textReloOff, nrelText, 0x60000020)) return false;
+    if (hasData)
+    {
+        // .data: CNT_INITIALIZED_DATA | MEM_READ | MEM_WRITE
+        if (!coffSecHdr(out, ".data", o.data.data.len, rawOff + o.text.data.len, dataReloOff, nrelData, 0xC0000040)) return false;
+    }
+
+    // raw section data
+    for (u32 i = 0; i < o.text.data.len; i++) { if (!out.u8b(o.text.data.data[i])) return false; }
+    if (hasData)
+    {
+        for (u32 i = 0; i < o.data.data.len; i++) { if (!out.u8b(o.data.data.data[i])) return false; }
+    }
+
+    // relocations, text then data
+    for (u32 i = 0; i < o.nrelocs; i++)
+    {
+        AsmReloc* r = &o.relocs[i];
+        if (r.section == 1)
+        {
+            if (!coffReloc(out, r, map, o)) return false;
+        }
+    }
+    if (hasData)
+    {
+        for (u32 i = 0; i < o.nrelocs; i++)
+        {
+            AsmReloc* r = &o.relocs[i];
+            if (r.section == 2)
+            {
+                if (!coffReloc(out, r, map, o)) return false;
+            }
+        }
+    }
+
+    // symbols
+    for (u32 i = 0; i < nOrder; i++)
+    {
+        AsmSymbol* s = &o.syms[order[i]];
+        if (s.name.len > 8)
+        {
+            if (!out.u32b(0) || !out.u32b(nameOff[order[i]])) return false;
+        }
+        else
+        {
+            if (!coffName8(out, s.name)) return false;
+        }
+        u32 value = s.defined ? (u32)s.value : 0;
+        i16 secnum = 0;
+        if (s.defined) secnum = s.section == 2 ? 2 : 1;
+        u16 typ = s.isFunc ? 0x20 : 0; // function descriptor
+        // undefined → external (2), matching GAS; forward locals that get
+        // defined later stay static (3)
+        u8 cls = (s.global || s.weak || !s.defined) ? 2 : 3; // external : static
+        if (!out.u32b(value)) return false;
+        if (!out.u16b((u16)secnum)) return false;
+        if (!out.u16b(typ)) return false;
+        if (!out.u8b(cls)) return false;
+        if (!out.u8b(0)) return false; // aux count
+    }
+    for (u32 i = 0; i < strtab.len; i++) { if (!out.u8b(strtab.data[i])) return false; }
+    strtab.deinit();
+    return true;
+}
+
+bool coffSecHdr(AsmBytes* out, str name, u32 size, u32 rawData, u32 relOff, u32 nrel, u32 flags)
+{
+    if (!coffName8(out, name)) return false;
+    if (!out.u32b(0)) return false; // virtual size
+    if (!out.u32b(0)) return false; // virtual address
+    if (!out.u32b(size)) return false;
+    if (!out.u32b(rawData)) return false;
+    if (!out.u32b(nrel > 0 ? relOff : 0)) return false;
+    if (!out.u32b(0)) return false; // line numbers
+    if (!out.u16b((u16)nrel)) return false;
+    if (!out.u16b(0)) return false;
+    if (!out.u32b(flags)) return false;
+    return true;
+}
+
+bool coffReloc(AsmBytes* out, AsmReloc* r, i32* map, AsmObject* o)
+{
+    i32 symIdx = -1;
+    for (u32 s = 0; s < o.nsyms; s++)
+    {
+        if (o.syms[s].name.equals(r.symbol)) { symIdx = map[s]; break; }
+    }
+    if (symIdx < 0) return false;
+    if (!out.u32b((u32)r.offset)) return false;
+    if (!out.u32b((u32)symIdx)) return false;
+    if (!out.u16b(coffRelocType(r.kind))) return false;
+    return true;
+}
+
+// ------------------------------------------------------------------
+// Flat raw: text bytes only, every relocation applied against `base`.
+// Anything still undefined is an error — raw leaves nothing for a linker.
+// ------------------------------------------------------------------
+
+pub bool emitRaw(AsmObject* o, u64 base, AsmBytes* out, AsmParseError* err)
+{
+    for (u32 i = 0; i < o.text.data.len; i++) { if (!out.u8b(o.text.data.data[i])) return false; }
+    for (u32 i = 0; i < o.nrelocs; i++)
+    {
+        AsmReloc* r = &o.relocs[i];
+        if (r.section != 1) continue;
+        i32 si = asmFindSym(o, r.symbol);
+        if (si < 0 || !o.syms[si].defined)
+        {
+            err.msg = "raw output needs every symbol defined";
+            return false;
+        }
+        u64 sval = o.syms[si].value + base;
+        u64 place = base + r.offset;
+        if (r.kind == AsmRelocKind::RelAbs64)
+        {
+            u64 v = sval + (u64)r.addend;
+            if (r.offset + 8 > out.len) return false;
+            for (u32 k = 0; k < 8; k++) out.data[r.offset + k] = (u8)((v >> (8 * k)) & 0xFF);
+        }
+        else if (r.kind == AsmRelocKind::RelAbs32)
+        {
+            i64 v = (i64)sval + r.addend;
+            if (v < -2147483648 || v > 2147483647)
+            {
+                err.msg = "raw reloc does not fit abs32";
+                return false;
+            }
+            if (r.offset + 4 > out.len) return false;
+            u32 u = (i32)v;
+            for (u32 k = 0; k < 4; k++) out.data[r.offset + k] = (u8)((u >> (8 * k)) & 0xFF);
+        }
+        else
+        {
+            i64 v = (i64)sval + r.addend - (i64)place;
+            if (v < -2147483648 || v > 2147483647)
+            {
+                err.msg = "raw reloc does not fit rel32";
+                return false;
+            }
+            if (r.offset + 4 > out.len) return false;
+            u32 u = (i32)v;
+            for (u32 k = 0; k < 4; k++) out.data[r.offset + k] = (u8)((u >> (8 * k)) & 0xFF);
+        }
+    }
+    return true;
+}

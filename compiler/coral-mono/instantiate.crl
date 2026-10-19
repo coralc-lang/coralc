@@ -1,0 +1,615 @@
+#[[no_drop_all]]
+/* mono/instantiate.crl: drains the collect queue: turns each work item
+ * into a MonoInstance, checks its signature once, then re-collects its
+ * body with the instance's substitutions active so nested generic calls
+ * (and their callees) enqueue too. run() iterates to a fixpoint because
+ * every pass over the work list can append more work. */
+
+import ast::id { Str, NodeId };
+import ast::types { Ty, TypeEntry, TypeKind };
+import ast::node { Node, NodeKind };
+import ast::decl { Decl, DeclKind, GenericParam };
+import ast::stmt { Stmt, StmtKind };
+import context::context { AstContext };
+import sem::sema { Sema };
+import mono { MonoContext, MonoDeclKind, MonoInstance, MonoInstanceKind, MonoSubstitution };
+import collect;
+import comptime { CtEval, ctEvalStmts };
+
+import(lib) std::mman { alloc, dealloc, zero };
+import(lib) platform::libc { printf };
+
+pub extend MonoContext
+{
+    /* one entry per generic slot, in slot order: explicit `<T, U>`
+     * params first, then bare-T params that weren't named there. Both
+     * name and index are filled because lookup sites have different
+     * information in hand. Caller owns the result. */
+    MonoSubstitution* buildSubstitutions(NodeId declaration, Ty* arguments, u32 argumentsLen)
+    {
+        u32 count = self.genericCount(declaration);
+        if (count == 0) return null;
+        MonoSubstitution* result = alloc<MonoSubstitution>((usize)count);
+        if (result == null)
+        {
+            self.errors++;
+            return null;
+        }
+        zero<MonoSubstitution>(result, (usize)count);
+        u32 next = 0;
+        Decl* decl = self.declAt(declaration);
+        if (decl == null) return result;
+        NodeId* params = null;
+        u32 paramCount = 0;
+        switch (decl->kind.tag)
+        {
+            DeclKind::Struct => {
+                params = decl->kind.payload.Struct.genericParams;
+                paramCount = decl->kind.payload.Struct.genericParamsLen;
+            },
+
+            DeclKind::Variant => {
+                params = decl->kind.payload.Variant.genericParams;
+                paramCount = decl->kind.payload.Variant.genericParamsLen;
+            },
+
+            DeclKind::Union => {
+                params = decl->kind.payload.Union.genericParams;
+                paramCount = decl->kind.payload.Union.genericParamsLen;
+            },
+
+            DeclKind::Trait => {
+                params = decl->kind.payload.Trait.genericParams;
+                paramCount = decl->kind.payload.Trait.genericParamsLen;
+            },
+
+            DeclKind::Func => {
+                params = decl->kind.payload.Func.genericParams;
+                paramCount = decl->kind.payload.Func.genericParamsLen;
+            },
+            else => {}
+        }
+        u32 i = 0;
+        while (i < paramCount && next < argumentsLen)
+        {
+            Node* node = self.nodeAt(params[i]);
+            if (node != null && node->kind.tag == NodeKind::GenericParam)
+            {
+                GenericParam* param = &node->kind.payload.GenericParam.value;
+                result[next].parameter = param->name;
+                result[next].index = next;
+                result[next].declaration = params[i];
+                result[next].typeNode = arguments[next];
+                next++;
+            }
+            i++;
+        }
+        if (decl->kind.tag == DeclKind::Func)
+        {
+            i = 0;
+            while (i < decl->kind.payload.Func.paramsLen && next < argumentsLen)
+            {
+                NodeId paramId = decl->kind.payload.Func.params[i];
+                if (self.isTypeParameter(paramId))
+                {
+                    Str name = self.parameterName(paramId);
+                    if (!self.nameInGenericParams(declaration, name))
+                    {
+                        result[next].parameter = name;
+                        result[next].index = next;
+                        result[next].declaration = paramId;
+                        result[next].typeNode = arguments[next];
+                        next++;
+                    }
+                }
+                i++;
+            }
+        }
+        return result;
+    }
+
+    bool sameArguments(Ty* left, Ty* right, u32 len)
+    {
+        u32 i = 0;
+        while (i < len)
+        {
+            if (!self.sema.sameType(left[i], right[i])) return false;
+            i++;
+        }
+        return true;
+    }
+
+    /* linear scan for an existing instance. Currently uncalled:
+     * addInstance repeats the same scan inline because it needs the
+     * index, not just a yes/no. */
+    bool hasInstance(MonoDeclKind kind, Str name, Ty* arguments, u32 argumentsLen, u64 valueKey)
+    {
+        u32 i = 0;
+        while (i < self.instancesLen)
+        {
+            if ((u8)self.instances[i].kind == (u8)kind && self.instances[i].name == name &&
+                self.instances[i].argumentsLen == argumentsLen &&
+                self.instances[i].valueKey == valueKey &&
+                self.sameArguments(self.instances[i].arguments, arguments, argumentsLen))
+                return true;
+            i++;
+        }
+        return false;
+    }
+
+    /* find-or-append keyed by (decl, arg types, valueKey). A new entry
+     * copies everything it needs from the transient work item. Returns
+     * the instance index through outIndex. */
+    bool addInstance(NodeId declaration, Ty* arguments, u32 argumentsLen,
+                     u64 valueKey, u32 packArity, Str* literalNames, NodeId* literalNodes, u32 literalsLen,
+                     Ty* tailTypes, NodeId* tailNodes, u32 tailLen,
+                     u32* outIndex)
+    {
+        Decl* decl = self.declAt(declaration);
+        if (decl == null) return false;
+        Str name = self.declarationName(declaration);
+        MonoDeclKind kind;
+        if (decl->kind.tag == DeclKind::Func) kind = MonoDeclKind::FunctionDecl;
+        else kind = MonoDeclKind::TypeDecl;
+        u32 foundIdx = 0;
+        bool found = false;
+        u32 scan = 0;
+        while (scan < self.instancesLen)
+        {
+            if ((u8)self.instances[scan].kind == (u8)kind && self.instances[scan].name == name &&
+                self.instances[scan].argumentsLen == argumentsLen &&
+                self.instances[scan].valueKey == valueKey &&
+                self.sameArguments(self.instances[scan].arguments, arguments, argumentsLen))
+            {
+                found = true;
+                foundIdx = scan;
+                break;
+            }
+            scan++;
+        }
+        if (found)
+        {
+            if (outIndex != null) *outIndex = foundIdx;
+            return true;
+        }
+        if (!self.reserveInstances()) return false;
+        MonoInstance* instance = self.instances + self.instancesLen;
+        if (decl->kind.tag == DeclKind::Func) instance.kind = MonoInstanceKind::FunctionInstance;
+        else instance.kind = MonoInstanceKind::TypeInstance;
+        instance.name = name;
+        instance.declaration = declaration;
+        instance.typeNode = 0;
+        instance.returnType = 0;
+        instance.paramTypes = null;
+        instance.paramTypesLen = 0;
+        instance.arguments = self.copyTypes(arguments, argumentsLen);
+        instance.argumentsLen = argumentsLen;
+        instance.substitutions = self.buildSubstitutions(declaration, arguments, argumentsLen);
+        instance.substitutionsLen = self.genericCount(declaration);
+        instance.valueKey = valueKey;
+        instance.packArity = packArity;
+        instance.literalNames = null;
+        instance.literalNodes = null;
+        instance.literalsLen = 0;
+        instance.tailTypes = null;
+        instance.tailNodes = null;
+        instance.tailArgNames = null;
+        instance.tailLen = 0;
+        if (tailLen > 0 && tailTypes != null && tailNodes != null)
+        {
+            Ty* ttypes = alloc<Ty>((usize)tailLen);
+            NodeId* tnodes = alloc<NodeId>((usize)tailLen);
+            if (ttypes != null && tnodes != null)
+            {
+                u32 k = 0;
+                while (k < tailLen)
+                {
+                    ttypes[k] = tailTypes[k];
+                    tnodes[k] = tailNodes[k];
+                    k++;
+                }
+                instance.tailTypes = ttypes;
+                instance.tailNodes = tnodes;
+                instance.tailLen = tailLen;
+            }
+            else
+            {
+                if (ttypes != null) dealloc<Ty>(ttypes);
+                if (tnodes != null) dealloc<NodeId>(tnodes);
+            }
+        }
+        if (literalsLen > 0)
+        {
+            Str* lnames = alloc<Str>((usize)literalsLen);
+            NodeId* lnodes = alloc<NodeId>((usize)literalsLen);
+            if (lnames != null && lnodes != null)
+            {
+                u32 k = 0;
+                while (k < literalsLen)
+                {
+                    lnames[k] = literalNames[k];
+                    lnodes[k] = literalNodes[k];
+                    k++;
+                }
+                instance.literalNames = lnames;
+                instance.literalNodes = lnodes;
+                instance.literalsLen = literalsLen;
+            }
+            else
+            {
+                if (lnames != null) dealloc<Str>(lnames);
+                if (lnodes != null) dealloc<NodeId>(lnodes);
+            }
+        }
+        if (decl->kind.tag == DeclKind::Func) instance.body = decl->kind.payload.Func.body;
+        else
+        {
+            NodeId none;
+            none.index = 0;
+            instance.body = none;
+        }
+        instance.attributes = decl->attrs;
+        instance.attributesLen = decl->attrsLen;
+        instance.validationAttempted = 0;
+        instance.validated = 0;
+        if (decl->kind.tag == DeclKind::Func)
+        {
+            instance.returnType = self.substituteType(decl->kind.payload.Func.returnType, instance.substitutions, instance.substitutionsLen);
+            /* parallel to the decl's param list, positions kept as-is
+             * (incl. bare-T params) so codegen can match params[i] */
+            instance.paramTypesLen = decl->kind.payload.Func.paramsLen;
+            if (instance.paramTypesLen > 0)
+            {
+                instance.paramTypes = alloc<Ty>((usize)instance.paramTypesLen);
+                if (instance.paramTypes == null)
+                {
+                    self.errors++;
+                    return false;
+                }
+                zero<Ty>(instance.paramTypes, (usize)instance.paramTypesLen);
+                u32 i = 0;
+                while (i < instance.paramTypesLen)
+                {
+                    Node* param = self.nodeAt(decl->kind.payload.Func.params[i]);
+                    if (param != null && param->kind.tag == NodeKind::Param)
+                        instance.paramTypes[i] = self.substituteType(param->kind.payload.Param.value.typeNode, instance.substitutions, instance.substitutionsLen);
+                    i++;
+                }
+            }
+        }
+        else
+        {
+            /* type instances get a Ty naming the concrete shape:
+             * codegen mangles it into the typedef name */
+            TypeKind kind = TypeKind::Named{ .name = name, .genericArgs = instance.arguments, .genericArgsLen = argumentsLen };
+            instance.typeNode = self.sema.allocType(kind);
+        }
+        self.instancesLen++;
+        if (outIndex != null) *outIndex = self.instancesLen - 1;
+        return true;
+    }
+
+    /* lazily checks the substituted signature, once per instance:
+     * `validationAttempted` records the try, `validated` the outcome.
+     * Validity is judged by whether sema's error count moved: checkType
+     * reports its own diagnostics, so no need to duplicate them. */
+    bool validateInstance(MonoInstance* instance)
+    {
+        instance.validationAttempted = 1;
+        u32 errorsBefore = self.sema.errors;
+        if (instance.kind == MonoInstanceKind::FunctionInstance)
+        {
+            if (!self.sema.checkType(instance.returnType)) return false;
+            u32 i = 0;
+            while (i < instance.paramTypesLen)
+            {
+                if (!self.sema.checkType(instance.paramTypes[i])) return false;
+                i++;
+            }
+        }
+        else if (!self.sema.checkType(instance.typeNode)) return false;
+        if (self.sema.errors == errorsBefore) instance.validated = 1;
+        else instance.validated = 0;
+        return instance.validated != 0;
+    }
+
+    /* fixpoint over the work list. Re-collection can append work, and
+     * the loop condition re-reads workLen each pass; instances that fail
+     * validation bump errors but don't stop the drain; the pass as a
+     * whole fails at the end. */
+    bool run()
+    {
+        u32 i = 0;
+        while (i < self.workLen)
+        {
+            u32 instIdx = 0;
+            if (!self.addInstance(self.work[i].declaration, self.work[i].arguments, self.work[i].argumentsLen,
+                                  self.work[i].valueKey, self.work[i].packArity,
+                                  self.work[i].literalNames, self.work[i].literalNodes, self.work[i].literalsLen,
+                                  self.work[i].tailTypes, self.work[i].tailNodes, self.work[i].tailLen,
+                                  &instIdx)) return false;
+            MonoInstance* instance = self.instances + instIdx;
+            if (!self.validateInstance(instance))
+            {
+                self.errors++;
+            }
+            /* re-collect the instance body with its substitutions active so
+             * nested generic calls (`dealloc<T>` inside realloc<cchar>,
+             * `alloc<T>` inside Vec<str>) enqueue concrete instances */
+            self.activeSubs = instance.substitutions;
+            self.activeSubsLen = instance.substitutionsLen;
+            if (instance.kind == MonoInstanceKind::FunctionInstance)
+            {
+                if (instance.body.index != 0)
+                {
+                    self.collectStmt(instance.body);
+                    /* staging: evaluate the body's comptime blocks with the
+                     * instance's type substitutions bound; surviving runtime
+                     * statements replace the original body */
+                    self.evalComptimeBody(instance);
+                }
+            }
+            else if (instance.kind == MonoInstanceKind::TypeInstance)
+            {
+                /* queue the type's methods so generic calls in their
+                 * bodies are collected per instance: only struct,
+                 * union and variant decls carry method lists */
+                Node* tdn = self.nodeAt(instance.declaration);
+                if (tdn != null && tdn.kind.tag == NodeKind::Decl)
+                {
+                    Decl* td = &tdn.kind.payload.Decl.value;
+                    NodeId* methods = null;
+                    u32 methodsLen = 0;
+                    if (td->kind.tag == DeclKind::Struct)
+                    {
+                        methods = td->kind.payload.Struct.methods;
+                        methodsLen = td->kind.payload.Struct.methodsLen;
+                    }
+                    else if (td->kind.tag == DeclKind::Union)
+                    {
+                        methods = td->kind.payload.Union.methods;
+                        methodsLen = td->kind.payload.Union.methodsLen;
+                    }
+                    else if (td->kind.tag == DeclKind::Variant)
+                    {
+                        methods = td->kind.payload.Variant.methods;
+                        methodsLen = td->kind.payload.Variant.methodsLen;
+                    }
+                    u32 mi = 0;
+                    while (mi < methodsLen)
+                    {
+                        self.collectDecl(methods[mi]);
+                        mi++;
+                    }
+                }
+            }
+            self.activeSubs = null;
+            self.activeSubsLen = 0;
+            i++;
+        }
+        return self.errors == 0;
+    }
+
+    /* staging: evaluate comptime blocks in a function instance's body.
+     * binds type params from substitutions, then rewrites the body's
+     * comptime control flow into runtime statements. the original body
+     * is only replaced when the evaluator produced output (i.e. there
+     * was something to fold); otherwise the body passes through and
+     * codegen inlines the comptime blocks as before. */
+    void evalComptimeBody(MonoInstance* instance)
+    {
+        /* only rewire bodies that actually contain a comptime block:
+         * every other instance skips the evaluator entirely */
+        Node* bn = self.nodeAt(instance.body);
+        if (bn == null || bn->kind.tag != NodeKind::Stmt) return;
+        Stmt* bs = &bn->kind.payload.Stmt.value;
+        bool hasCt = false;
+        if (bs->kind.tag == StmtKind::Comptime) hasCt = true;
+        else if (bs->kind.tag == StmtKind::Block)
+        {
+            u32 s = 0;
+            while (s < bs->kind.payload.Block.stmtsLen)
+            {
+                Node* sn = self.nodeAt(bs->kind.payload.Block.stmts[s]);
+                if (sn != null && sn->kind.tag == NodeKind::Stmt &&
+                    sn->kind.payload.Stmt.value.kind.tag == StmtKind::Comptime)
+                    hasCt = true;
+                s++;
+            }
+        }
+        if (!hasCt) return;
+
+        CtEval ct;
+        ct.init(self);
+        /* bind each generic parameter to its concrete type so type
+         * switches (`switch (T)`) fold during evaluation */
+        u32 i = 0;
+        while (i < instance.substitutionsLen)
+        {
+            ct.bind(instance.substitutions[i].parameter,
+                    ct.makeType(instance.substitutions[i].typeNode));
+            i++;
+        }
+        /* bind call-site literal values recorded for this instance
+         * (Zig-style value specialization: `println("hello")` binds fmt
+         * to the literal bytes, so `@isFormatLiteral(fmt)` folds) */
+        u32 li = 0;
+        while (li < instance.literalsLen)
+        {
+            Node* vn = self.nodeAt(instance.literalNodes[li]);
+            if (vn != null && vn->kind.tag == NodeKind::Expr)
+            {
+                Expr* ve = &vn->kind.payload.Expr.value;
+                if (ve->kind.tag == ExprKind::StringLit)
+                    ct.bind(instance.literalNames[li], ct.strLitVal(instance.literalNodes[li]));
+                else if (ve->kind.tag == ExprKind::IntLit)
+                    ct.bind(instance.literalNames[li], ct.makeInt(ve->kind.payload.IntLit.value));
+                else if (ve->kind.tag == ExprKind::CharLit)
+                    ct.bind(instance.literalNames[li], ct.makeInt((u64)ve->kind.payload.CharLit.value));
+                else if (ve->kind.tag == ExprKind::BoolLit)
+                    ct.bind(instance.literalNames[li], ct.makeBool((ve->kind.payload.BoolLit.flags & 1) != 0));
+            }
+            li++;
+        }
+        /* if the instance function is variadic, remember the pack param
+         * name so bare `...` in its body can forward it */
+        Node* fnNode = self.nodeAt(instance.declaration);
+        if (fnNode != null && fnNode->kind.tag == NodeKind::Decl)
+        {
+            Decl* fd = &fnNode->kind.payload.Decl.value;
+            if (fd->kind.tag == DeclKind::Func && fd->kind.payload.Func.paramsLen > 0)
+            {
+                NodeId lastP = fd->kind.payload.Func.params[fd->kind.payload.Func.paramsLen - 1];
+                Node* lpn = self.nodeAt(lastP);
+                if (lpn != null && lpn->kind.tag == NodeKind::Param &&
+                    (lpn->kind.payload.Param.value.flags & 16) != 0)
+                {
+                    ct.variadicPackName = lpn->kind.payload.Param.value.name;
+                    if (instance.packArity == 0)
+                    {
+                        /* this call site passed no trailing args: bind
+                         * the pack to an empty pack so `for (x : args)`
+                         * unrolls to zero iterations instead of falling
+                         * back to a runtime loop over a pack codegen
+                         * cannot lower */
+                        ct.bind(ct.variadicPackName, ct.makePack(null, 0));
+                    }
+                    else
+                    {
+                        /* bind the recorded call-site tail args: literals
+                         * fold to their comptime value; runtime args become
+                         * fresh idents naming this instance's own trailing
+                         * C parameters (`_varg0`, …): the call site passes
+                         * every arg positionally, so the names only need to
+                         * match what cgEmitParams declares */
+                        u32 n = instance.packArity;
+                        CtVal* elems = alloc<CtVal>((usize)n);
+                        Str* names = alloc<Str>((usize)n);
+                        u8* sbuf = alloc<u8>(32);
+                        if (elems != null && names != null && sbuf != null)
+                        {
+                            zero<CtVal>(elems, (usize)n);
+                            u32 k = 0;
+                            while (k < n)
+                            {
+                                NodeId nid;
+                                nid.index = 0;
+                                if (k < instance.tailLen) nid = instance.tailNodes[k];
+                                Ty tt = 0;
+                                if (k < instance.tailLen) tt = instance.tailTypes[k];
+                                bool folded = false;
+                                CtVal ev;
+                                ev.kind = 0;
+                                if (nid.index != 0)
+                                {
+                                    Node* tn = self.nodeAt(nid);
+                                    if (tn != null && tn->kind.tag == NodeKind::Expr)
+                                    {
+                                        Expr* te = &tn->kind.payload.Expr.value;
+                                        if (te->kind.tag == ExprKind::StringLit)
+                                        {
+                                            ev = ct.strLitVal(nid);
+                                            folded = true;
+                                        }
+                                        else if (te->kind.tag == ExprKind::IntLit)
+                                        {
+                                            ev = ct.makeIntTy(te->kind.payload.IntLit.value, tt);
+                                            folded = true;
+                                        }
+                                        else if (te->kind.tag == ExprKind::CharLit)
+                                        {
+                                            ev = ct.makeIntTy((u64)te->kind.payload.CharLit.value, tt);
+                                            folded = true;
+                                        }
+                                        else if (te->kind.tag == ExprKind::BoolLit)
+                                        {
+                                            ev = ct.makeBool((te->kind.payload.BoolLit.flags & 1) != 0);
+                                            folded = true;
+                                        }
+                                    }
+                                }
+                                /* synthesized parameter name: always made
+                                 * so the emitted C signature has one named
+                                 * parameter per tail arg, in call order.
+                                 * digits are written reverse-first into
+                                 * sbuf[20..], then copied back in order */
+                                sbuf[0] = 95; sbuf[1] = 118; sbuf[2] = 97; sbuf[3] = 114; sbuf[4] = 103; // "_varg"
+                                u32 w = 5;
+                                u32 dv = k;
+                                u32 dn = 0;
+                                if (dv == 0) { sbuf[20] = 48; dn = 1; }
+                                while (dv > 0)
+                                {
+                                    sbuf[20 + dn] = (u8)(48 + (dv % 10));
+                                    dn++;
+                                    dv /= 10;
+                                }
+                                while (dn > 0) { dn--; sbuf[w] = sbuf[20 + dn]; w++; }
+                                Str nm = ct.internStr(str { .ptr = sbuf, .len = (usize)w });
+                                names[k] = nm;
+                                if (!folded)
+                                {
+                                    NodeId id = ct.mkExpr(ExprKind::Ident{ .name = nm }, tt);
+                                    ev = ct.makeRt(id, tt);
+                                }
+                                elems[k] = ev;
+                                k++;
+                            }
+                            instance.tailArgNames = names;
+                            ct.bind(ct.variadicPackName, ct.makePack(elems, n));
+                        }
+                        else
+                        {
+                            /* OOM: pack stays unbound: lookup yields
+                             * none-kind, so a bare `...` forward inside
+                             * the body would fold to zero args */
+                            if (elems != null) dealloc<CtVal>(elems);
+                            if (names != null) dealloc<Str>(names);
+                        }
+                        dealloc<u8>(sbuf);
+                    }
+                }
+            }
+        }
+        ct.evalStmt(instance.body);
+        if (ct.failed)
+        {
+            self.errors++;
+            ct.dispose();
+            return;
+        }
+        /* a type switch with no matching arm: only reported when the
+         * author's own @compileError did not already fire (ct.failed) */
+        if (ct.typeSwitchMissed)
+        {
+            self.errors++;
+            ct.dispose();
+            return;
+        }
+        /* replace the body with a Block of the surviving runtime stmts:
+         * length is not a proxy for "unchanged" (one comptime stmt can
+         * fold into one different runtime stmt) */
+        if (ct.emittedLen > 0)
+        {
+            NodeId* out = alloc<NodeId>((usize)ct.emittedLen);
+            if (out != null)
+            {
+                zero<NodeId>(out, (usize)ct.emittedLen);
+                u32 k = 0;
+                while (k < ct.emittedLen) { out[k] = ct.emitted[k]; k++; }
+                AstContext* c = self.ast;
+                NodeId newBody = c.allocNodeSlot();
+                if (newBody.index != 0)
+                {
+                    Node* nn = c.nodes + newBody.index;
+                    nn->loc = bn->loc;
+                    nn->kind = NodeKind::Stmt{ .value = Stmt{ .kind = StmtKind::Block{ .stmts = out, .stmtsLen = ct.emittedLen }, .loc = bn->loc } };
+                    instance.body = newBody;
+                    // arena-tracked so clear() need not free it
+                    c.track((rawptr)out);
+                }
+            }
+        }
+        ct.dispose();
+    }
+}

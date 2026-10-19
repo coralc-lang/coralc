@@ -1,0 +1,356 @@
+#[[no_drop_all]]
+import(lib) wallvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, FunctionAnalysisCache };
+import(lib) wallvm::irOps { IrOpcode };
+import(lib) wallvm::passes::alias_analysis { AliasAnalysis };
+import(lib) wallvm::passes::memory_ssa { MemorySSA };
+
+// Machine-level CSE/DSE pass using MemorySSA.
+//
+// Uses alias analysis and MemorySSA for precise memory optimization:
+// 1. Store-to-load forwarding — if a load reads from a store that definitely
+//    kills all prior stores to the same address, replace the load.
+// 2. Dead store elimination — if a store is overwritten (killed) before any
+//    load reads it, the store is dead and can be removed.
+// 3. Cross-block store-to-load forwarding via dominance.
+//
+// MemorySSA provides precise memory dependency information that replaces
+// the naive back-scan approach, handling aliasing correctly.
+pub struct MachineOptPass
+{
+    IrContext* ctx;
+    u64 forwardingDone;
+    u64 loadsEliminated;
+    u64 storesEliminated;
+    u64 crossBlockOpts;
+
+    MachineOptPass new(IrContext* ctx)
+    {
+        return MachineOptPass {
+            .ctx = ctx,
+            .forwardingDone = 0,
+            .loadsEliminated = 0,
+            .storesEliminated = 0,
+            .crossBlockOpts = 0
+        };
+    }
+
+    bool run(IrFunc* func)
+    {
+        self.forwardingDone = 0;
+        self.loadsEliminated = 0;
+        self.storesEliminated = 0;
+        self.crossBlockOpts = 0;
+
+        // Check for cached AA
+        FunctionAnalysisCache* cache = self.ctx->getOrCreateAnalysisCache(func);
+        AliasAnalysis* aaPtr = (AliasAnalysis*)cache->aliasAnalysis;
+
+        AliasAnalysis aa;
+        MemorySSA mssa;
+        bool ownAA = false;
+
+        if (aaPtr != null && cache->generation == self.ctx->analysisGeneration)
+        {
+            aa = *aaPtr;
+        }
+        else
+        {
+            aa = AliasAnalysis::new(self.ctx);
+            aa.analyze(func);
+            ownAA = true;
+        }
+
+        // I rebuild the MSSA per run rather than reading cache->memorySSA: an
+        // MSSA points at its AliasAnalysis, so a cached one would dangle once
+        // the local AA dies. The local MSSA is torn down before returning.
+        mssa = MemorySSA::new(&aa);
+        mssa.build(func);
+
+        bool changed = false;
+
+        // Pass 1 — intra-block store-to-load forwarding using MemorySSA
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            if (self.processBlockWithMemorySSA(bb, &mssa)) changed = true;
+        }
+
+        // Pass 2 — dead store elimination using MemorySSA
+        if (self.eliminateDeadStores(func, &mssa)) changed = true;
+
+        // Pass 3 — cross-block store-to-load forwarding via dominance
+        if (self.crossBlockLoadForward(func, &mssa)) changed = true;
+
+        mssa.deinit();
+        if (ownAA) aa.deinit();
+        return changed;
+    }
+
+    // Process a single block — forward stores to loads, eliminate dead stores
+    bool processBlockWithMemorySSA(IrBlock* bb, MemorySSA* mssa)
+    {
+        bool changed = false;
+        u32 i = 0;
+        while (i < bb->ninsts)
+        {
+            IrInst* inst = bb->insts[i];
+
+            // Try to forward store value to load
+            if (self.isMemoryRead(inst->opcode) && inst->nops > 0 && inst->ops[0] != null)
+            {
+                IrValue* loadAddr = inst->ops[0];
+                u32 loadWidth = inst->base.type != null ? inst->base.type->width : 0;
+
+                // Use MemorySSA to find the most recent store that may have affected this load
+                u32 storeVer = mssa->findNearestDefForLoad(loadAddr, mssa->getVersionAtInst(inst));
+                if (storeVer > 0 && storeVer < mssa->numMemVersions)
+                {
+                    IrInst* killerDef = mssa->memDefInst[storeVer];
+                    if (killerDef != null && self.isStoreToAddr(killerDef, loadAddr) && killerDef->base.type != null && killerDef->base.type->width == loadWidth)
+                    {
+                        // Check that the store definitely kills all prior stores to this address
+                        if (self.isStoreKilledBy(killerDef, loadAddr, mssa))
+                        {
+                            inst->base.replaceAllUses(killerDef->ops[0]);
+                            inst->erase();
+                            self.forwardingDone++;
+                            changed = true;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // Try to eliminate dead store (store overwritten before read)
+            if (inst->opcode == IrOpcode::Store && inst->nops >= 2 && inst->ops[1] != null)
+            {
+                IrValue* storeAddr = inst->ops[1];
+                u32 storeWidth = inst->base.type != null ? inst->base.type->width : 0;
+
+                // Find if this store is killed by a later store before any load reads it
+                if (self.isStoreDead(inst, storeAddr, storeWidth, mssa))
+                {
+                    inst->erase();
+                    self.storesEliminated++;
+                    changed = true;
+                    continue;
+                }
+            }
+
+            i++;
+        }
+
+        return changed;
+    }
+
+    // Check if a store is killed by a later store before any load reads it
+    bool isStoreDead(IrInst* storeInst, IrValue* addr, u32 width, MemorySSA* mssa)
+    {
+        IrBlock* bb = storeInst->parent;
+        if (bb == null) return false;
+
+        u32 storeIdx = 0;
+        for (u32 i = 0; i < bb->ninsts; i++)
+        {
+            if (bb->insts[i] == storeInst) { storeIdx = i; break; }
+        }
+
+        // Scan forward from the store
+        for (u32 j = storeIdx + 1; j < bb->ninsts; j++)
+        {
+            IrInst* later = bb->insts[j];
+
+            // If a load may alias with the store address, the store is not dead
+            if (self.isMemoryRead(later->opcode) && later->nops > 0 && later->ops[0] != null)
+            {
+                if (!mssa->aliasAnalysis->isNoAlias(later->ops[0], addr))
+                    return false;
+            }
+
+            // If a store definitely kills this store (same address, no intervening load), it's dead
+            if ((later->opcode == IrOpcode::Store || later->opcode == IrOpcode::AtomicStore) &&
+                later->nops >= 2 && later->ops[1] != null)
+            {
+                if (mssa->aliasAnalysis->isMustAlias(later->ops[1], addr) && later->base.type != null && later->base.type->width == width)
+                    return true;
+            }
+
+            // Barriers prevent us from determining death
+            if (self.isBarrier(later->opcode))
+                return false;
+        }
+
+        return false;
+    }
+
+    // Check if a store is killed by a later store (all prior stores are dead)
+    bool isStoreKilledBy(IrInst* storeInst, IrValue* addr, MemorySSA* mssa)
+    {
+        IrBlock* bb = storeInst->parent;
+        if (bb == null) return false;
+
+        u32 storeIdx = 0;
+        for (u32 i = 0; i < bb->ninsts; i++)
+        {
+            if (bb->insts[i] == storeInst) { storeIdx = i; break; }
+        }
+
+        // Check that no aliasing store exists before this one that might be live
+        for (u32 j = 0; j < storeIdx; j++)
+        {
+            IrInst* prev = bb->insts[j];
+            if ((prev->opcode == IrOpcode::Store || prev->opcode == IrOpcode::AtomicStore) &&
+                prev->nops >= 2 && prev->ops[1] != null)
+            {
+                if (!mssa->aliasAnalysis->isNoAlias(prev->ops[1], addr))
+                    return false;
+            }
+        }
+
+        return true;
+    }
+
+    // Cross-block store-to-load forwarding using dominance
+    bool crossBlockLoadForward(IrFunc* func, MemorySSA* mssa)
+    {
+        bool changed = false;
+
+        for (u32 bi = 1; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            if (bb == null || bb->ninsts == 0) continue;
+
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (!self.isMemoryRead(inst->opcode) || inst->nops == 0 || inst->ops[0] == null) continue;
+                if (inst->base.type == null) continue;
+
+                IrValue* loadAddr = inst->ops[0];
+                u32 loadWidth = inst->base.type->width;
+
+                // Use MemorySSA to find the nearest defining store
+                u32 storeVer = mssa->findNearestDefForLoad(loadAddr, mssa->getVersionAtInst(inst));
+                if (storeVer > 0 && storeVer < mssa->numMemVersions)
+                {
+                    IrInst* killerDef = mssa->memDefInst[storeVer];
+                    if (killerDef != null && self.isStoreToAddr(killerDef, loadAddr) && killerDef->base.type != null && killerDef->base.type->width == loadWidth)
+                    {
+                        // Check that the store is not killed by any aliasing store between it and the load
+                        bool safe = true;
+                        for (u32 pi = 0; pi < bi; pi++)
+                        {
+                            IrBlock* pred = func->blocks[pi];
+                            if (pred == null || pred->ninsts == 0) continue;
+
+                            for (u32 si = 0; si < pred->ninsts; si++)
+                            {
+                                IrInst* sinst = pred->insts[si];
+                                if (sinst->opcode == IrOpcode::Store && sinst->nops >= 2 && sinst->ops[1] != null)
+                                {
+                                    if (!mssa->aliasAnalysis->isNoAlias(sinst->ops[1], loadAddr))
+                                    {
+                                        safe = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (!safe) break;
+                        }
+
+                        if (safe)
+                        {
+                            inst->base.replaceAllUses(killerDef->ops[0]);
+                            inst->erase();
+                            self.crossBlockOpts++;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        return changed;
+    }
+
+    // Eliminate dead stores across the function
+    bool eliminateDeadStores(IrFunc* func, MemorySSA* mssa)
+    {
+        bool changed = false;
+
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            u32 ii = 0;
+            while (ii < bb->ninsts)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst->opcode == IrOpcode::Store && inst->nops >= 2 && inst->ops[1] != null)
+                {
+                    IrValue* storeAddr = inst->ops[1];
+                    u32 storeWidth = inst->base.type != null ? inst->base.type->width : 0;
+
+                    // Check if this store is killed by a later store before any load reads it
+                    if (self.isStoreDead(inst, storeAddr, storeWidth, mssa))
+                    {
+                        inst->erase();
+                        self.storesEliminated++;
+                        changed = true;
+                        continue;
+                    }
+                }
+                ii++;
+            }
+        }
+
+        return changed;
+    }
+
+    bool isBarrier(IrOpcode op)
+    {
+        switch (op)
+        {
+            IrOpcode::Call |
+            IrOpcode::AtomicStore |
+            IrOpcode::AtomicRmw |
+            IrOpcode::AtomicCmpXchg |
+            IrOpcode::Fence |
+            IrOpcode::InlineAsm |
+            IrOpcode::GcRoot |
+            IrOpcode::GcWriteBarrier |
+            IrOpcode::GcSafepoint |
+            IrOpcode::LandingPad => { return true; },
+
+            else => { return false; },
+        }
+    }
+
+    bool isMemoryRead(IrOpcode op)
+    {
+        switch (op)
+        {
+            IrOpcode::Load |
+            IrOpcode::AtomicLoad |
+            IrOpcode::Call |
+            IrOpcode::AtomicCmpXchg => { return true; },
+
+            else => { return false; },
+        }
+    }
+
+    bool isStoreToAddr(IrInst* inst, IrValue* addr)
+    {
+        if (inst->opcode != IrOpcode::Store && inst->opcode != IrOpcode::AtomicStore)
+            return false;
+        if (inst->nops < 2 || inst->ops[1] == null) return false;
+        return inst->ops[1]->id == addr->id;
+    }
+}
+
+pub bool irMachineOpt(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (ctx == null || func == null) return false;
+    MachineOptPass pass = MachineOptPass::new(ctx);
+    return pass.run(func);
+}

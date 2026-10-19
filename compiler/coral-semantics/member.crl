@@ -1,0 +1,521 @@
+#[[no_drop_all]]
+
+/* member.crl: field and method resolution on a receiver type: struct/union
+ * fields, variant tag/payload/case fields, builtin str { ptr, len }, and
+ * methods from the type's own decl plus its `extend` blocks. */
+import ast {
+    id { Str, NodeId },
+    types { Ty, TypeEntry, TypeKind },
+    node { Node, NodeKind },
+    decl { Decl, DeclKind }
+};
+import scope { Symbol };
+import sema { Sema };
+import(lib) std::mman { alloc, dealloc };
+
+pub struct MemberInfo
+{
+    Ty typeNode;
+    NodeId declaration;
+    // 0 = not found, 1 = field, 2 = method
+    u8 kind;
+    // interned name of the type that owns the member ("str" for builtin
+    // slice members); 0 when the receiver has no name to show
+    Str owner;
+}
+
+pub extend Sema
+{
+    // peel the wrappers that don't change which fields exist: a pointer
+    // auto-derefs (`x.f` works on `x: T*`), const/comptime qualifiers lift
+    Ty stripType(Ty typeNode)
+    {
+        while (typeNode != 0)
+        {
+            TypeEntry* entry = self.ctx.types + typeNode;
+            if (entry->kind.tag == TypeKind::Pointer)
+                typeNode = entry->kind.payload.Pointer.base;
+            else if (entry->kind.tag == TypeKind::Const)
+                typeNode = entry->kind.payload.Const.base;
+            else if (entry->kind.tag == TypeKind::Comptime)
+                typeNode = entry->kind.payload.Comptime.base;
+            else
+                break;
+        }
+        return typeNode;
+    }
+
+    /* field lookup on the stripped receiver. typeNode == 0 means "no such
+     * member": callers report it; this never errors itself. builtin str
+     * answers ptr/len, variants answer tag/payload plus any case field. */
+    MemberInfo findMember(Ty receiver, Str name)
+    {
+        MemberInfo none;
+        none.typeNode = 0;
+        none.declaration.index = 0;
+        none.kind = 0;
+        none.owner = 0;
+        receiver = self.stripType(receiver);
+        if (receiver == 0) return none;
+        TypeEntry* typeEntry = self.ctx.types + receiver;
+        // str is an immutable slice view: { ptr, len }
+        if (typeEntry->kind.tag == TypeKind::Str)
+        {
+            none.owner = self.ctx.intern("str");
+            if (name == self.ctx.intern("len")) {
+                none.typeNode = self.usizeType();
+                none.kind = 1;
+                return none;
+            }
+            if (name == self.ctx.intern("ptr")) {
+                none.typeNode = self.strPtrType();
+                none.kind = 1;
+                return none;
+            }
+            return none;
+        }
+        if (typeEntry->kind.tag != TypeKind::Named) return none;
+        none.owner = typeEntry->kind.payload.Named.name;
+        Symbol* symbol = self.lookupType(typeEntry->kind.payload.Named.name, typeEntry->loc);
+        if (symbol == null) return none;
+        Node* declNode = self.ctx.nodes + symbol->declaration.index;
+        if (declNode->kind.tag != NodeKind::Decl) return none;
+        Decl* decl = &declNode->kind.payload.Decl.value;
+        if (decl->kind.tag == DeclKind::Struct || decl->kind.tag == DeclKind::Union)
+        {
+            NodeId* fields = decl->kind.payload.Struct.fields;
+            u32 fieldCount = decl->kind.payload.Struct.fieldsLen;
+            if (decl->kind.tag == DeclKind::Union)
+            {
+                fields = decl->kind.payload.Union.fields;
+                fieldCount = decl->kind.payload.Union.fieldsLen;
+            }
+            u32 i = 0;
+            while (i < fieldCount)
+            {
+                Node* fieldNode = self.ctx.nodes + fields[i].index;
+                if (fieldNode->kind.tag == NodeKind::Field && fieldNode->kind.payload.Field.value.name == name)
+                {
+                    none.typeNode = fieldNode->kind.payload.Field.value.typeNode;
+                    none.declaration = fields[i];
+                    none.kind = 1;
+                    return none;
+                }
+                i++;
+            }
+        }
+        if (decl->kind.tag == DeclKind::Variant)
+        {
+            /* implicit members: `tag` is the int32 discriminant the backend
+             * writes; `payload` keeps the variant type so `x.payload.Case`
+             * chains keep resolving (the case level is handled in expr.crl) */
+            if (name == self.ctx.intern("tag"))
+            {
+                none.typeNode = self.i32Type();
+                none.kind = 1;
+                return none;
+            }
+            if (name == self.ctx.intern("payload"))
+            {
+                none.typeNode = receiver;
+                none.kind = 1;
+                return none;
+            }
+            u32 i = 0;
+            while (i < decl->kind.payload.Variant.variantsLen)
+            {
+                u32 p = 0;
+                while (p < decl->kind.payload.Variant.variants[i].fieldsLen)
+                {
+                    if (decl->kind.payload.Variant.variants[i].fieldNames[p] == name)
+                    {
+                        // case fields match across ALL cases (`.value` finds
+                        // any case that has it). declaration stays 0: there
+                        // is no single Field node to point at.
+                        none.typeNode = decl->kind.payload.Variant.variants[i].fieldTypes[p];
+                        none.declaration.index = 0;
+                        none.kind = 1;
+                        return none;
+                    }
+                    p++;
+                }
+                i++;
+            }
+        }
+        return none;
+    }
+
+    /* `x.payload.Case.field`: resolve the case field's type directly
+     * from the variant decl (no payload/case type is materialized) */
+    Ty findVariantCaseFieldTy(Ty variantTy, Str caseName, Str fieldName)
+    {
+        variantTy = self.stripType(variantTy);
+        if (variantTy == 0) return 0;
+        TypeEntry* typeEntry = self.ctx.types + variantTy;
+        if (typeEntry->kind.tag != TypeKind::Named) return 0;
+        Symbol* symbol = self.lookupType(typeEntry->kind.payload.Named.name, typeEntry->loc);
+        if (symbol == null || symbol->declaration.index == 0) return 0;
+        Node* declNode = self.ctx.nodes + symbol->declaration.index;
+        if (declNode->kind.tag != NodeKind::Decl) return 0;
+        Decl* decl = &declNode->kind.payload.Decl.value;
+        if (decl->kind.tag != DeclKind::Variant) return 0;
+        u32 i = 0;
+        while (i < decl->kind.payload.Variant.variantsLen)
+        {
+            if (decl->kind.payload.Variant.variants[i].name == caseName)
+            {
+                u32 p = 0;
+                while (p < decl->kind.payload.Variant.variants[i].fieldsLen)
+                {
+                    if (decl->kind.payload.Variant.variants[i].fieldNames[p] == fieldName)
+                        return decl->kind.payload.Variant.variants[i].fieldTypes[p];
+                    p++;
+                }
+                return 0;
+            }
+            i++;
+        }
+        return 0;
+    }
+
+    // does the variant decl have a case named `caseName`? (payload access guard)
+    bool variantHasCase(Ty variantTy, Str caseName)
+    {
+        variantTy = self.stripType(variantTy);
+        if (variantTy == 0) return false;
+        TypeEntry* typeEntry = self.ctx.types + variantTy;
+        if (typeEntry->kind.tag != TypeKind::Named) return false;
+        Symbol* symbol = self.lookupType(typeEntry->kind.payload.Named.name, typeEntry->loc);
+        if (symbol == null || symbol->declaration.index == 0) return false;
+        Node* declNode = self.ctx.nodes + symbol->declaration.index;
+        if (declNode->kind.tag != NodeKind::Decl) return false;
+        Decl* decl = &declNode->kind.payload.Decl.value;
+        if (decl->kind.tag != DeclKind::Variant) return false;
+        u32 i = 0;
+        while (i < decl->kind.payload.Variant.variantsLen)
+        {
+            if (decl->kind.payload.Variant.variants[i].name == caseName) return true;
+            i++;
+        }
+        return false;
+    }
+
+    /* true when `t` (after stripping) is a named variant decl type:
+     * drives the `v.tag == V::Case` / `kind.tag = V::Case` allowances */
+    bool isVariantNamedTy(Ty t)
+    {
+        t = self.stripType(t);
+        if (t == 0) return false;
+        TypeEntry* typeEntry = self.ctx.types + t;
+        if (typeEntry->kind.tag != TypeKind::Named) return false;
+        Symbol* symbol = self.lookupType(typeEntry->kind.payload.Named.name, typeEntry->loc);
+        if (symbol == null || symbol->declaration.index == 0) return false;
+        Node* declNode = self.ctx.nodes + symbol->declaration.index;
+        return declNode->kind.tag == NodeKind::Decl &&
+               declNode->kind.payload.Decl.value.kind.tag == DeclKind::Variant;
+    }
+
+    /* positional lookup: field at declaration order `index`; mirrors
+     * findMember but without a name (brace literals like `T { v1, v2 }`) */
+    MemberInfo findMemberByIndex(Ty receiver, u32 index)
+    {
+        MemberInfo none;
+        none.typeNode = 0;
+        none.declaration.index = 0;
+        none.kind = 0;
+        none.owner = 0;
+        receiver = self.stripType(receiver);
+        if (receiver == 0) return none;
+        TypeEntry* typeEntry = self.ctx.types + receiver;
+        // str is an immutable slice view: { ptr, len }
+        if (typeEntry->kind.tag == TypeKind::Str)
+        {
+            none.owner = self.ctx.intern("str");
+            if (index == 0) {
+                none.typeNode = self.strPtrType();
+                none.kind = 1;
+                return none;
+            }
+            if (index == 1) {
+                none.typeNode = self.usizeType();
+                none.kind = 1;
+                return none;
+            }
+            return none;
+        }
+        if (typeEntry->kind.tag != TypeKind::Named) return none;
+        none.owner = typeEntry->kind.payload.Named.name;
+        Symbol* symbol = self.lookupType(typeEntry->kind.payload.Named.name, typeEntry->loc);
+        if (symbol == null) return none;
+        Node* declNode = self.ctx.nodes + symbol->declaration.index;
+        if (declNode->kind.tag != NodeKind::Decl) return none;
+        Decl* decl = &declNode->kind.payload.Decl.value;
+        NodeId* fields = null;
+        u32 fieldCount = 0;
+        if (decl->kind.tag == DeclKind::Struct)
+        {
+            fields = decl->kind.payload.Struct.fields;
+            fieldCount = decl->kind.payload.Struct.fieldsLen;
+        }
+        else if (decl->kind.tag == DeclKind::Union)
+        {
+            fields = decl->kind.payload.Union.fields;
+            fieldCount = decl->kind.payload.Union.fieldsLen;
+        }
+        if (fields == null || index >= fieldCount) return none;
+        Node* fieldNode = self.ctx.nodes + fields[index].index;
+        if (fieldNode->kind.tag != NodeKind::Field) return none;
+        none.typeNode = fieldNode->kind.payload.Field.value.typeNode;
+        none.declaration = fields[index];
+        none.kind = 1;
+        return none;
+    }
+
+    /* method lookup: the type's own decl methods win over extends, and
+     * extends are scanned in collection order; first name match returns.
+     * builtin `str` has no decl, so it only ever resolves through extends. */
+    MemberInfo findMethod(Ty receiver, Str name)
+    {
+        MemberInfo none;
+        none.typeNode = 0;
+        none.declaration.index = 0;
+        none.kind = 0;
+        none.owner = 0;
+        receiver = self.stripType(receiver);
+        if (receiver == 0) return none;
+        TypeEntry* typeEntry = self.ctx.types + receiver;
+        /* builtin receivers (`str`) carry no decl, so they resolve through
+         * `extend` blocks only; Named walks its own decl's method list first */
+        if (typeEntry->kind.tag != TypeKind::Named && typeEntry->kind.tag != TypeKind::Str) return none;
+        if (typeEntry->kind.tag == TypeKind::Named) none.owner = typeEntry->kind.payload.Named.name;
+        else none.owner = self.ctx.intern("str");
+        if (typeEntry->kind.tag == TypeKind::Named)
+        {
+            Symbol* symbol = self.lookupType(typeEntry->kind.payload.Named.name, typeEntry->loc);
+            if (symbol == null) return none;
+            Node* declNode = self.ctx.nodes + symbol->declaration.index;
+            if (declNode->kind.tag != NodeKind::Decl) return none;
+            Decl* decl = &declNode->kind.payload.Decl.value;
+            NodeId* methods = null;
+            u32 methodCount = 0;
+
+            switch (decl->kind.tag)
+            {
+                DeclKind::Struct => {
+                    methods = decl->kind.payload.Struct.methods;
+                    methodCount = decl->kind.payload.Struct.methodsLen;
+                },
+
+                DeclKind::Union => {
+                    methods = decl->kind.payload.Union.methods;
+                    methodCount = decl->kind.payload.Union.methodsLen;
+                },
+
+                DeclKind::Trait => {
+                    methods = decl->kind.payload.Trait.methods;
+                    methodCount = decl->kind.payload.Trait.methodsLen;
+                },
+                DeclKind::Variant => {
+                    methods = decl->kind.payload.Variant.methods;
+                    methodCount = decl->kind.payload.Variant.methodsLen;
+                },
+                else => {}
+            }
+            u32 i = 0;
+            while (i < methodCount)
+            {
+                Node* methodNode = self.ctx.nodes + methods[i].index;
+                if (methodNode->kind.tag == NodeKind::Decl)
+                {
+                    Decl* method = &methodNode->kind.payload.Decl.value;
+                    if (method->kind.tag == DeclKind::Func && method->kind.payload.Func.name == name)
+                    {
+                        none.typeNode = method->kind.payload.Func.returnType;
+                        none.declaration = methods[i];
+                        none.kind = 2;
+                        return none;
+                    }
+                }
+                i++;
+            }
+        }
+        u32 e = 0;
+        while (e < self.extendsLen)
+        {
+            Node* extNode = self.ctx.nodes + self.extends[e].index;
+            if (extNode->kind.tag == NodeKind::Decl)
+            {
+                Decl* ext = &extNode->kind.payload.Decl.value;
+                NodeId* extMethods = null;
+                u32 extMethodsLen = 0;
+                bool matches = false;
+                if (ext->kind.tag == DeclKind::Extend)
+                {
+                    extMethods = ext->kind.payload.Extend.methods;
+                    extMethodsLen = ext->kind.payload.Extend.methodsLen;
+                    if (self.sameTypePattern(ext->kind.payload.Extend.selfType, receiver)) matches = true;
+                }
+                else if (ext->kind.tag == DeclKind::ExtendTrait)
+                {
+                    extMethods = ext->kind.payload.ExtendTrait.methods;
+                    extMethodsLen = ext->kind.payload.ExtendTrait.methodsLen;
+                    if (self.sameTypePattern(ext->kind.payload.ExtendTrait.selfType, receiver)) matches = true;
+                }
+                if (matches)
+                {
+                    u32 m = 0;
+                    while (m < extMethodsLen)
+                    {
+                        Node* methodNode = self.ctx.nodes + extMethods[m].index;
+                        if (methodNode->kind.tag == NodeKind::Decl)
+                        {
+                            Decl* method = &methodNode->kind.payload.Decl.value;
+                            if (method->kind.tag == DeclKind::Func && method->kind.payload.Func.name == name)
+                            {
+                                none.typeNode = method->kind.payload.Func.returnType;
+                                none.declaration = extMethods[m];
+                                none.kind = 2;
+                                return none;
+                            }
+                        }
+                        m++;
+                    }
+                }
+            }
+            e++;
+        }
+        return none;
+    }
+
+    /* edit distance between two interned names, classic DP over one row;
+     * names are short, so the windows cap at 40 bytes each. callers use
+     * this only to decide "close enough to suggest", never to sort */
+    u32 nameDistance(Str a, Str b)
+    {
+        if (a == b) return 0;
+        if (a == 0 || b == 0) return 4;
+        str sa = self.nameTextView(a);
+        str sb = self.nameTextView(b);
+        if (sa.len > 40) sa.len = 40;
+        if (sb.len > 40) sb.len = 40;
+        usize* prev = alloc<usize>(41);
+        usize* cur = alloc<usize>(41);
+        if (prev == null || cur == null)
+        {
+            if (prev != null) dealloc<usize>(prev);
+            if (cur != null) dealloc<usize>(cur);
+            return 4;
+        }
+        usize i = 0;
+        while (i <= sb.len) { prev[i] = i; i++; }
+        usize j = 1;
+        while (j <= sa.len)
+        {
+            cur[0] = j;
+            i = 1;
+            while (i <= sb.len)
+            {
+                usize cost = 1;
+                if (sa.ptr[j - 1] == sb.ptr[i - 1]) cost = 0;
+                usize best = prev[i] + 1;
+                if (cur[i - 1] + 1 < best) best = cur[i - 1] + 1;
+                if (prev[i - 1] + cost < best) best = prev[i - 1] + cost;
+                cur[i] = best;
+                i++;
+            }
+            i = 0;
+            while (i <= sb.len) { prev[i] = cur[i]; i++; }
+            j++;
+        }
+        u32 d = (u32)prev[sb.len];
+        dealloc<usize>(prev);
+        dealloc<usize>(cur);
+        return d;
+    }
+
+    /* the field of `receiver` closest to a misspelling of `name`:
+     * distance 1 for short names, 2 from four bytes up; 0 = no guess */
+    Str closestField(Ty receiver, Str name)
+    {
+        receiver = self.stripType(receiver);
+        if (receiver == 0 || name == 0) return 0;
+        TypeEntry* typeEntry = self.ctx.types + receiver;
+        if (typeEntry->kind.tag != TypeKind::Named) return 0;
+        Symbol* symbol = self.lookupType(typeEntry->kind.payload.Named.name, typeEntry->loc);
+        if (symbol == null || symbol->declaration.index == 0) return 0;
+        Node* declNode = self.ctx.nodes + symbol->declaration.index;
+        if (declNode->kind.tag != NodeKind::Decl) return 0;
+        Decl* decl = &declNode->kind.payload.Decl.value;
+        NodeId* fields = null;
+        u32 fieldCount = 0;
+        if (decl->kind.tag == DeclKind::Struct)
+        {
+            fields = decl->kind.payload.Struct.fields;
+            fieldCount = decl->kind.payload.Struct.fieldsLen;
+        }
+        else if (decl->kind.tag == DeclKind::Union)
+        {
+            fields = decl->kind.payload.Union.fields;
+            fieldCount = decl->kind.payload.Union.fieldsLen;
+        }
+        if (fields == null) return 0;
+        u32 limit = 1;
+        if (self.nameTextView(name).len >= 4) limit = 2;
+        Str best = 0;
+        u32 bestD = limit + 1;
+        u32 i = 0;
+        while (i < fieldCount)
+        {
+            Node* fieldNode = self.ctx.nodes + fields[i].index;
+            i++;
+            if (fieldNode->kind.tag != NodeKind::Field) continue;
+            Str fn = fieldNode->kind.payload.Field.value.name;
+            u32 d = self.nameDistance(name, fn);
+            if (d < bestD) { bestD = d; best = fn; }
+        }
+        if (best == 0 || bestD > limit) return 0;
+        return best;
+    }
+
+    /* append "\n\navailable fields: a, b, c" for a struct/union receiver
+     * (up to eight names); receivers with no enumerable fields append
+     * nothing, so callers can always call this after a lookup miss */
+    void pushAvailableFields(String* s, Ty receiver)
+    {
+        receiver = self.stripType(receiver);
+        if (receiver == 0) return;
+        TypeEntry* typeEntry = self.ctx.types + receiver;
+        if (typeEntry->kind.tag != TypeKind::Named) return;
+        Symbol* symbol = self.lookupType(typeEntry->kind.payload.Named.name, typeEntry->loc);
+        if (symbol == null || symbol->declaration.index == 0) return;
+        Node* declNode = self.ctx.nodes + symbol->declaration.index;
+        if (declNode->kind.tag != NodeKind::Decl) return;
+        Decl* decl = &declNode->kind.payload.Decl.value;
+        NodeId* fields = null;
+        u32 fieldCount = 0;
+        if (decl->kind.tag == DeclKind::Struct)
+        {
+            fields = decl->kind.payload.Struct.fields;
+            fieldCount = decl->kind.payload.Struct.fieldsLen;
+        }
+        else if (decl->kind.tag == DeclKind::Union)
+        {
+            fields = decl->kind.payload.Union.fields;
+            fieldCount = decl->kind.payload.Union.fieldsLen;
+        }
+        if (fields == null || fieldCount == 0) return;
+        s->pushView("\n\navailable fields: ");
+        u32 shown = 0;
+        u32 i = 0;
+        while (i < fieldCount)
+        {
+            if (shown >= 8) { s->pushView(", ..."); break; }
+            Node* fieldNode = self.ctx.nodes + fields[i].index;
+            i++;
+            if (fieldNode->kind.tag != NodeKind::Field) continue;
+            if (shown > 0) s->pushView(", ");
+            s->pushView(self.nameTextView(fieldNode->kind.payload.Field.value.name));
+            shown++;
+        }
+    }
+}

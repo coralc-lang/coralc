@@ -1,0 +1,181 @@
+#[[no_drop_all]]
+import(lib) wallvm::irtypes { IrFunc, IrBlock, IrInst, IrValue };
+import(lib) wallvm::irOps { IrOpcode };
+import(lib) wallvm::domtree { IrDomTree, irDomtreeNew, irDomtreeDominates, irDomtreeFree };
+
+// Return Value Optimization (RVO)
+// Replaces alloca→store→load patterns with direct value forwarding.
+
+pub bool irPassSROA(IrFunc* func, rawptr userdata)
+{
+    if (func == null || func->isExtern) return false;
+    if (func->nblocks == 0) return false;
+    bool changed = false;
+
+    IrDomTree* dt = irDomtreeNew(func);
+
+    for (u32 bi = 0; bi < func->nblocks; bi++)
+    {
+        IrBlock* bb = func->blocks[bi];
+        for (u32 ii = 0; ii < bb->ninsts; ii++)
+        {
+            IrInst* inst = bb->insts[ii];
+            if (inst->opcode != IrOpcode::Alloca) continue;
+
+            IrInst* storeInst = null;
+            IrInst* loadInsts[16];
+            u32 nLoads = 0;
+            u32 storeCount = 0;
+            bool safe = true;
+
+            for (u32 bj = 0; bj < func->nblocks; bj++)
+            {
+                IrBlock* b = func->blocks[bj];
+                for (u32 ij = 0; ij < b->ninsts; ij++)
+                {
+                    IrInst* use = b->insts[ij];
+                    if (use->opcode == IrOpcode::Store && use->nops >= 2)
+                    {
+                        if (use->ops[1] == &inst->base)
+                        {
+                            storeInst = use;
+                            storeCount++;
+                        }
+                    }
+                    else if (use->opcode == IrOpcode::Load && use->nops >= 1)
+                    {
+                        if (use->ops[0] == &inst->base)
+                        {
+                            if (nLoads < 16)
+                                loadInsts[nLoads] = use;
+                            nLoads++;
+                        }
+                    }
+                    else if (use->opcode == IrOpcode::Gep ||
+                             use->opcode == IrOpcode::AtomicLoad ||
+                             use->opcode == IrOpcode::AtomicStore)
+                    {
+                        if (use->nops > 0 && use->ops[0] == &inst->base)
+                            safe = false;
+                    }
+                }
+            }
+
+            // Any unhandled opcode that touches this alloca (call, bitcast,
+            // cmp, ret, ...) makes the transform unsafe: we neither count it
+            // nor rewrite it, so leaving the alloca in place would dangle.
+            for (u32 ui = 0; ui < inst->base.nusers; ui++)
+            {
+                IrInst* u = inst->base.users[ui];
+                if (u == null) continue;
+                switch (u->opcode)
+                {
+                    IrOpcode::Load | IrOpcode::Gep | IrOpcode::AtomicLoad | IrOpcode::AtomicStore => { },
+                    IrOpcode::Store =>
+                    {
+                        // Only store-into-alloca is handled; a store of the
+                        // alloca pointer value itself is an escape
+                        if (u->ops[0] == &inst->base) safe = false;
+                    },
+                    else => { safe = false; },
+                }
+            }
+
+            if (!safe || storeCount != 1 || nLoads == 0 || storeInst == null)
+                continue;
+
+            // More loads than the local tracking array can hold: bail,
+            // rewriting them all would read loadInsts out of bounds
+            if (nLoads > 16)
+                continue;
+
+            // Every load must be dominated by the single store, otherwise a
+            // load could observe the pre-store value. Same-block loads must
+            // textually follow the store for the same reason.
+            bool dominated = true;
+            for (u32 li = 0; li < nLoads; li++)
+            {
+                IrBlock* lb = loadInsts[li]->parent;
+                IrBlock* sb = storeInst->parent;
+                if (sb == lb)
+                {
+                    bool storeFirst = false;
+                    for (u32 k = 0; k < sb->ninsts; k++)
+                    {
+                        if (sb->insts[k] == loadInsts[li]) break;
+                        if (sb->insts[k] == storeInst) storeFirst = true;
+                    }
+                    if (!storeFirst) dominated = false;
+                }
+                else if (!irDomtreeDominates(dt, sb, lb))
+                {
+                    dominated = false;
+                }
+                if (!dominated) break;
+            }
+            if (!dominated)
+                continue;
+
+            IrValue* storedVal = storeInst->ops[0];
+
+            for (u32 li = 0; li < nLoads; li++)
+            {
+                IrInst* loadInst = loadInsts[li];
+                for (u32 bj = 0; bj < func->nblocks; bj++)
+                {
+                    IrBlock* b = func->blocks[bj];
+                    for (u32 ij = 0; ij < b->ninsts; ij++)
+                    {
+                        IrInst* use = b->insts[ij];
+                        for (u32 oi = 0; oi < use->nops; oi++)
+                        {
+                            if (use->ops[oi] == &loadInst->base)
+                            {
+                                // keep the user lists in sync, otherwise the
+                                // stale entries corrupt later RAUW/erase walks
+                                loadInst->base.removeUser(use);
+                                use->ops[oi] = storedVal;
+                                storedVal->addUser(use);
+                            }
+                        }
+                    }
+                }
+                // detach from old operands before dropping them
+                for (u32 oi = 0; oi < loadInst->nops; oi++)
+                    if (loadInst->ops[oi]) loadInst->ops[oi]->removeUser(loadInst);
+                loadInst->opcode = IrOpcode::Noret;
+                loadInst->nops = 0;
+            }
+
+            // detach from old operands before dropping them
+            for (u32 oi = 0; oi < inst->nops; oi++)
+                if (inst->ops[oi]) inst->ops[oi]->removeUser(inst);
+            inst->opcode = IrOpcode::Noret;
+            inst->nops = 0;
+            for (u32 oi = 0; oi < storeInst->nops; oi++)
+                if (storeInst->ops[oi]) storeInst->ops[oi]->removeUser(storeInst);
+            storeInst->opcode = IrOpcode::Noret;
+            storeInst->nops = 0;
+            changed = true;
+        }
+    }
+
+    // Compact blocks, remove Noret (dead) instructions
+    if (changed)
+    {
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            u32 writeIdx = 0;
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                if (bb->insts[ii]->opcode != IrOpcode::Noret)
+                    bb->insts[writeIdx++] = bb->insts[ii];
+            }
+            bb->ninsts = writeIdx;
+        }
+    }
+
+    irDomtreeFree(dt);
+    return changed;
+}

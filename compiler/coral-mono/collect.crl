@@ -1,0 +1,751 @@
+#[[no_drop_all]]
+/* mono/collect.crl: the collect pass: walks the analyzed AST and
+ * enqueues every generic instantiation it can name (type refs, calls),
+ * with bindings and comptime-visible call values attached. instantiate
+ * drains the queue later; this file emits nothing. Assumes sema has
+ * already resolved every expr's type. */
+
+import ast::id { Str, NodeId };
+import ast::types { Ty, TypeEntry, TypeKind };
+import ast::node { Node, NodeKind };
+import ast::decl { File, Decl, DeclKind, Param, GenericParam };
+import ast::expr { Expr, ExprKind };
+import ast::stmt { Stmt, StmtKind };
+import mono { MonoContext, MonoDeclKind, MonoWorkItem };
+import sem::sema { Sema };
+import sem::scope { Symbol, ScopeStack };
+import context::context { AstContext, InternEntry };
+
+import(lib) std::mman { alloc, dealloc, zero };
+import(lib) platform::libc { printf };
+
+pub extend MonoContext
+{
+    /* decl lookup for mono's purposes: this file's decls first, then
+     * sema's merged scope. NodeId 0 means nothing found. */
+    NodeId findDeclaration(Str name)
+    {
+        if (self.file != null)
+        {
+            u32 i = 0;
+            while (i < self.file->declsLen)
+            {
+                if (self.declarationName(self.file->decls[i]) == name) return self.file->decls[i];
+                i++;
+            }
+        }
+        /* fallback: sema's merged scope; types like core's `cchar` may be
+         * visible to sema without being merged into this unit's file */
+        if (self.sema != null)
+        {
+            ScopeStack* scopes = self.sema.scopes;
+            if (scopes != null)
+            {
+                Symbol* sym = scopes.lookup(name);
+                if (sym != null && sym->declaration.index != 0) return sym->declaration;
+            }
+        }
+        NodeId none;
+        none.index = 0;
+        return none;
+    }
+
+    /* explicit generic args on a named type: prefer the decl whose generic
+     * arity matches (libc's extern realloc vs mman's realloc<T>) */
+    NodeId findGenericDeclaration(Str name, u32 want)
+    {
+        if (self.file != null)
+        {
+            u32 i = 0;
+            while (i < self.file->declsLen)
+            {
+                if (self.declarationName(self.file->decls[i]) == name &&
+                    self.genericCount(self.file->decls[i]) == want)
+                    return self.file->decls[i];
+                i++;
+            }
+        }
+        if (self.sema != null)
+        {
+            ScopeStack* scopes = self.sema.scopes;
+            if (scopes != null)
+            {
+                Symbol** cands = alloc<Symbol*>(16);
+                if (cands != null)
+                {
+                    u32 n = scopes.lookupAll(name, cands, 16);
+                    u32 m = 0;
+                    while (m < n)
+                    {
+                        if (cands[m]->declaration.index != 0 &&
+                            self.genericCount(cands[m]->declaration) == want)
+                        {
+                            NodeId found = cands[m]->declaration;
+                            dealloc<Symbol*>(cands);
+                            return found;
+                        }
+                        m++;
+                    }
+                    dealloc<Symbol*>(cands);
+                }
+            }
+        }
+        NodeId none;
+        none.index = 0;
+        return none;
+    }
+
+    /* true when a type can name a concrete instance: recursion is the
+     * point: `Vec<T>` is not concrete until every arg bottoms out in a
+     * declared type. Unresolvable names count as non-concrete. */
+    bool isConcreteType(Ty typeNode)
+    {
+        if (typeNode == 0) return false;
+        TypeEntry* entry = self.typeEntryAt(typeNode);
+        if (entry == null) return false;
+        if (entry->kind.tag == TypeKind::TypeParam) return false;
+        /* builtin scalar/string types are always concrete; they have no
+         * file declaration for findDeclaration to resolve */
+        if (entry->kind.tag == TypeKind::Str || entry->kind.tag == TypeKind::Char ||
+            entry->kind.tag == TypeKind::Bool || entry->kind.tag == TypeKind::Void ||
+            entry->kind.tag == TypeKind::U8 || entry->kind.tag == TypeKind::U16 ||
+            entry->kind.tag == TypeKind::U32 || entry->kind.tag == TypeKind::U64 ||
+            entry->kind.tag == TypeKind::U128 || entry->kind.tag == TypeKind::I8 ||
+            entry->kind.tag == TypeKind::I16 || entry->kind.tag == TypeKind::I32 ||
+            entry->kind.tag == TypeKind::I64 || entry->kind.tag == TypeKind::I128 ||
+            entry->kind.tag == TypeKind::F32 || entry->kind.tag == TypeKind::F64 ||
+            entry->kind.tag == TypeKind::Usize || entry->kind.tag == TypeKind::Isize ||
+            entry->kind.tag == TypeKind::Rawptr || entry->kind.tag == TypeKind::Pointer ||
+            entry->kind.tag == TypeKind::Slice || entry->kind.tag == TypeKind::Array ||
+            entry->kind.tag == TypeKind::Const || entry->kind.tag == TypeKind::Comptime)
+            return true;
+        if (entry->kind.tag == TypeKind::Named)
+        {
+            NodeId declId = self.findDeclaration(entry->kind.payload.Named.name);
+            if (declId.index == 0) return false;
+            u32 i = 0;
+            while (i < entry->kind.payload.Named.genericArgsLen)
+            {
+                if (!self.isConcreteType(entry->kind.payload.Named.genericArgs[i])) return false;
+                i++;
+            }
+        }
+        return true;
+    }
+
+    bool areConcreteTypes(Ty* types, u32 len)
+    {
+        u32 i = 0;
+        while (i < len)
+        {
+            if (!self.isConcreteType(types[i])) return false;
+            i++;
+        }
+        return true;
+    }
+
+    bool enqueue(MonoDeclKind kind, NodeId declaration, Ty* arguments, u32 argumentsLen)
+    {
+        return self.enqueueVal(kind, declaration, arguments, argumentsLen, 0, 0, null, null, 0, null, null, 0);
+    }
+
+    /* dedup by (kind, decl, sameType args, valueKey, tail types) before
+     * appending; an enqueue is idempotent. Copies every array into the
+     * work item; the caller keeps ownership of its originals. */
+    bool enqueueVal(MonoDeclKind kind, NodeId declaration, Ty* arguments, u32 argumentsLen,
+                    u64 valueKey, u32 packArity, Str* literalNames, NodeId* literalNodes, u32 literalsLen,
+                    Ty* tailTypes, NodeId* tailNodes, u32 tailLen)
+    {
+        if (self.genericCount(declaration) != argumentsLen)
+        {
+            self.errors++;
+            return false;
+        }
+        /* still contains type params: skip silently; the site gets
+         * re-collected with activeSubs once its enclosing instance is
+         * known (collectType/collectCall substitute before enqueueing) */
+        if (!self.areConcreteTypes(arguments, argumentsLen)) return true;
+        /* head check: same decl, same arg types, same valueKey, same
+         * tail arity + types ⇒ same instance, nothing to do. The tail
+         * compare is what lets `println("a", x)` and `println("a", y)`
+         * with x,y:i32 collapse but x:i32,y:str stay separate. */
+        u32 i = 0;
+        while (i < self.workLen)
+        {
+            if (self.work[i].kind == kind && self.work[i].declaration.index == declaration.index)
+            {
+                u32 j = 0;
+                while (j < argumentsLen)
+                {
+                    if (!self.sema.sameType(self.work[i].arguments[j], arguments[j])) break;
+                    j++;
+                }
+                if (j == argumentsLen && self.work[i].valueKey == valueKey &&
+                    self.work[i].tailLen == tailLen)
+                {
+                    bool sameTail = true;
+                    u32 tt = 0;
+                    while (tt < tailLen)
+                    {
+                        if (!self.sema.sameType(self.work[i].tailTypes[tt], tailTypes[tt])) { sameTail = false; break; }
+                        tt++;
+                    }
+                    if (sameTail) return true;
+                }
+            }
+            i++;
+        }
+        if (!self.reserveWork()) return false;
+        MonoWorkItem* item = self.work + self.workLen;
+        item.kind = kind;
+        item.declaration = declaration;
+        item.arguments = self.copyTypes(arguments, argumentsLen);
+        item.argumentsLen = argumentsLen;
+        item.inherited = null;
+        item.inheritedLen = 0;
+        item.valueKey = valueKey;
+        item.packArity = packArity;
+        item.literalNames = null;
+        item.literalNodes = null;
+        item.literalsLen = 0;
+        item.tailTypes = null;
+        item.tailNodes = null;
+        item.tailLen = 0;
+        if (tailLen > 0 && tailTypes != null && tailNodes != null)
+        {
+            Ty* ttypes = alloc<Ty>((usize)tailLen);
+            NodeId* tnodes = alloc<NodeId>((usize)tailLen);
+            if (ttypes != null && tnodes != null)
+            {
+                u32 k = 0;
+                while (k < tailLen)
+                {
+                    ttypes[k] = tailTypes[k];
+                    tnodes[k] = tailNodes[k];
+                    k++;
+                }
+                item.tailTypes = ttypes;
+                item.tailNodes = tnodes;
+                item.tailLen = tailLen;
+            }
+            else
+            {
+                if (ttypes != null) dealloc<Ty>(ttypes);
+                if (tnodes != null) dealloc<NodeId>(tnodes);
+            }
+        }
+        if (literalsLen > 0)
+        {
+            Str* lnames = alloc<Str>((usize)literalsLen);
+            NodeId* lnodes = alloc<NodeId>((usize)literalsLen);
+            if (lnames != null && lnodes != null)
+            {
+                u32 k = 0;
+                while (k < literalsLen)
+                {
+                    lnames[k] = literalNames[k];
+                    lnodes[k] = literalNodes[k];
+                    k++;
+                }
+                item.literalNames = lnames;
+                item.literalNodes = lnodes;
+                item.literalsLen = literalsLen;
+            }
+            else
+            {
+                if (lnames != null) dealloc<Str>(lnames);
+                if (lnodes != null) dealloc<NodeId>(lnodes);
+            }
+        }
+        self.workLen++;
+        return item.arguments != null || argumentsLen == 0;
+    }
+
+    /* enqueues the Named type itself (when it has generic args) and
+     * recurses into the args: Pointer/Slice/Array wrappers exist here
+     * only to carry the walk inward. */
+    bool collectType(Ty typeNode)
+    {
+        if (typeNode == 0) return true;
+        TypeEntry* entry = self.typeEntryAt(typeNode);
+        if (entry == null) return false;
+        if (entry->kind.tag == TypeKind::Named)
+        {
+            NodeId declId = self.findDeclaration(entry->kind.payload.Named.name);
+            if (entry->kind.payload.Named.genericArgsLen > 0)
+            {
+                NodeId pref = self.findGenericDeclaration(entry->kind.payload.Named.name,
+                                                          entry->kind.payload.Named.genericArgsLen);
+                if (pref.index != 0) declId = pref;
+            }
+            if (declId.index == 0) return true; /* unresolved name: nothing to enqueue */
+            if (entry->kind.payload.Named.genericArgsLen > 0)
+            {
+                u32 gaLen = entry->kind.payload.Named.genericArgsLen;
+                Ty* ga = entry->kind.payload.Named.genericArgs;
+                if (self.activeSubsLen > 0 && self.activeSubs != null)
+                {
+                    // instance-body re-collection: `alloc<T>` becomes alloc<str>
+                    Ty* subst = alloc<Ty>((usize)gaLen);
+                    if (subst != null)
+                    {
+                        u32 q = 0;
+                        while (q < gaLen)
+                        {
+                            subst[q] = self.substituteType(ga[q], self.activeSubs, self.activeSubsLen);
+                            q++;
+                        }
+                        bool okE = self.enqueue(MonoDeclKind::TypeDecl, declId, subst, gaLen);
+                        dealloc<Ty>(subst);
+                        if (!okE) return false;
+                    }
+                }
+                else if (!self.enqueue(MonoDeclKind::TypeDecl, declId, ga, gaLen)) return false;
+            }
+            u32 i = 0;
+            while (i < entry->kind.payload.Named.genericArgsLen)
+            {
+                if (!self.collectType(entry->kind.payload.Named.genericArgs[i])) return false;
+                i++;
+            }
+            return true;
+        }
+        if (entry->kind.tag == TypeKind::Pointer) return self.collectType(entry->kind.payload.Pointer.base);
+        if (entry->kind.tag == TypeKind::Const) return self.collectType(entry->kind.payload.Const.base);
+        if (entry->kind.tag == TypeKind::Comptime) return self.collectType(entry->kind.payload.Comptime.base);
+        if (entry->kind.tag == TypeKind::Slice) return self.collectType(entry->kind.payload.Slice.base);
+        if (entry->kind.tag == TypeKind::Array) return self.collectType(entry->kind.payload.Array.base);
+        if (entry->kind.tag == TypeKind::FnPtr)
+        {
+            if (!self.collectType(entry->kind.payload.FnPtr.returnType)) return false;
+            u32 i = 0;
+            while (i < entry->kind.payload.FnPtr.paramsLen)
+            {
+                if (!self.collectType(entry->kind.payload.FnPtr.params[i])) return false;
+                i++;
+            }
+        }
+        if (entry->kind.tag == TypeKind::Tuple)
+        {
+            u32 i = 0;
+            while (i < entry->kind.payload.Tuple.elemsLen)
+            {
+                if (!self.collectType(entry->kind.payload.Tuple.elems[i])) return false;
+                i++;
+            }
+        }
+        return true;
+    }
+
+    /* generic-call detector: resolves the callee, fills one binding per
+     * generic slot from the call args, and enqueues with value key plus
+     * literal/tail metadata. Non-generic and unresolved callees return
+     * true: there is simply nothing to instantiate. */
+    bool collectCall(NodeId callId)
+    {
+        Node* callNode = self.nodeAt(callId);
+        if (callNode == null || callNode->kind.tag != NodeKind::Expr) return true;
+        Expr* call = &callNode->kind.payload.Expr.value;
+        if (call->kind.tag != ExprKind::Call) return true;
+        Node* calleeNode = self.nodeAt(call->kind.payload.Call.callee);
+        if (calleeNode == null || calleeNode->kind.tag != NodeKind::Expr) return true;
+        Expr* callee = &calleeNode->kind.payload.Expr.value;
+        if (callee->kind.tag != ExprKind::Ident) return true;
+        NodeId declaration = self.findDeclaration(callee->kind.payload.Ident.name);
+        u32 gcount = self.genericCount(declaration);
+        if (declaration.index == 0 || gcount == 0) return true; /* not a generic call */
+        /* one generic argument per type-param POSITION in the decl's param
+         * list: the call arg at that slot supplies the binding. the
+         * variadic tail and non-generic fixed params are excluded, so
+         * `println<comptime T>(T fmt, ...)` binds T from fmt's type alone
+         * and `println("{}", 42, x)` enqueues with argumentsLen=1. */
+        Decl* gdecl = self.declAt(declaration);
+        if (gdecl == null || gdecl->kind.tag != DeclKind::Func) return true;
+        Ty* arguments = alloc<Ty>((usize)gcount);
+        if (arguments == null)
+        {
+            self.errors++;
+            return false;
+        }
+        zero<Ty>(arguments, (usize)gcount);
+        u32 next = 0;
+        u32 namedCount = 0;
+        u32 litCap = call->kind.payload.Call.argsLen;
+        Str* litNames = null;
+        NodeId* litNodes = null;
+        if (litCap > 0)
+        {
+            litNames = alloc<Str>((usize)litCap);
+            litNodes = alloc<NodeId>((usize)litCap);
+        }
+        u32 litsLen = 0;
+        Ty* tailTypes = null;
+        NodeId* tailNodes = null;
+        if (litCap > 0)
+        {
+            tailTypes = alloc<Ty>((usize)litCap);
+            tailNodes = alloc<NodeId>((usize)litCap);
+        }
+        u32 tailLen = 0;
+        u32 p = 0;
+        while (p < gdecl->kind.payload.Func.paramsLen && next < gcount)
+        {
+            NodeId paramId = gdecl->kind.payload.Func.params[p];
+            if (self.isTypeParameter(paramId))
+            {
+                /* bare `T` slot: the arg's own type is the binding */
+                if (p < call->kind.payload.Call.argsLen)
+                {
+                    arguments[next] = self.sema.exprType(call->kind.payload.Call.args[p]);
+                    if (self.activeSubsLen > 0 && self.activeSubs != null)
+                        arguments[next] = self.substituteType(arguments[next], self.activeSubs, self.activeSubsLen);
+                }
+                next++;
+            }
+            else
+            {
+                /* named param whose type is a generic (`T fmt`): the type
+                 * is TypeParam{index} after parser rebind: bind the call
+                 * arg at this position to that generic slot */
+                Node* pn = self.nodeAt(paramId);
+                if (pn != null && pn->kind.tag == NodeKind::Param)
+                {
+                    Ty pt = pn->kind.payload.Param.value.typeNode;
+                    while (pt != 0)
+                    {
+                        TypeEntry* te2 = self.ast.types + pt;
+                        if (te2->kind.tag == TypeKind::Comptime) pt = te2->kind.payload.Comptime.base;
+                        else if (te2->kind.tag == TypeKind::Const) pt = te2->kind.payload.Const.base;
+                        else break;
+                    }
+                    if (pt != 0)
+                    {
+                        TypeEntry* te3 = self.ast.types + pt;
+                        u32 slot = 0;
+                        bool haveSlot = false;
+                        if (te3->kind.tag == TypeKind::TypeParam)
+                        {
+                            slot = te3->kind.payload.TypeParam.index;
+                            haveSlot = true;
+                        }
+                        else if (te3->kind.tag == TypeKind::Named)
+                        {
+                            Str tn = te3->kind.payload.Named.name;
+                            u32 gi = 0;
+                            while (gi < gdecl->kind.payload.Func.genericParamsLen)
+                            {
+                                Node* gpn = self.nodeAt(gdecl->kind.payload.Func.genericParams[gi]);
+                                if (gpn != null && gpn->kind.tag == NodeKind::GenericParam &&
+                                    gpn->kind.payload.GenericParam.value.name == tn)
+                                {
+                                    slot = gi;
+                                    haveSlot = true;
+                                    break;
+                                }
+                                gi++;
+                            }
+                        }
+                        if (haveSlot && slot < gcount &&
+                            arguments[slot] == 0 && p < call->kind.payload.Call.argsLen)
+                        {
+                            arguments[slot] = self.sema.exprType(call->kind.payload.Call.args[p]);
+                            if (self.activeSubsLen > 0 && self.activeSubs != null)
+                                arguments[slot] = self.substituteType(arguments[slot], self.activeSubs, self.activeSubsLen);
+                        }
+                    }
+                    /* fixed named param: count it for the variadic-tail
+                     * arity and record a literal call arg so the instance
+                     * can bind the parameter's comptime value */
+                    if ((pn->kind.payload.Param.value.flags & 16) == 0)
+                    {
+                        namedCount++;
+                        if (p < call->kind.payload.Call.argsLen &&
+                            pn->kind.payload.Param.value.name != 0)
+                        {
+                            NodeId avId = call->kind.payload.Call.args[p];
+                            Node* avn = self.nodeAt(avId);
+                            bool isLit = false;
+                            if (avn != null && avn->kind.tag == NodeKind::Expr)
+                            {
+                                Expr* ave = &avn->kind.payload.Expr.value;
+                                if (ave->kind.tag == ExprKind::StringLit ||
+                                    ave->kind.tag == ExprKind::IntLit ||
+                                    ave->kind.tag == ExprKind::CharLit ||
+                                    ave->kind.tag == ExprKind::BoolLit) isLit = true;
+                            }
+                            if (isLit && litNames != null && litNodes != null && litsLen < litCap)
+                            {
+                                litNames[litsLen] = pn->kind.payload.Param.value.name;
+                                litNodes[litsLen] = avId;
+                                litsLen++;
+                            }
+                        }
+                    }
+                }
+            }
+            p++;
+        }
+        /* trailing args past the fixed params are the variadic tail: record
+         * each one's concrete type + node so the instance can fold literal
+         * tails and give runtime tails named C parameters. A bare `...`
+         * forwards the caller's pack: it is not a concrete tail arg and
+         * must not count toward the arity (`_printEmit(&out, fmt, ...)`
+         * forwarded through `println("hello")` stays an arity-0 site). */
+        u32 ti = namedCount;
+        while (ti < call->kind.payload.Call.argsLen)
+        {
+            NodeId avId = call->kind.payload.Call.args[ti];
+            Node* avn = self.nodeAt(avId);
+            bool isSpread = false;
+            if (avn != null && avn->kind.tag == NodeKind::Expr &&
+                avn->kind.payload.Expr.value.kind.tag == ExprKind::Spread) isSpread = true;
+            if (!isSpread && tailTypes != null && tailNodes != null && tailLen < litCap)
+            {
+                Ty tt = 0;
+                if (avn != null && avn->kind.tag == NodeKind::Expr)
+                    tt = self.sema.exprType(avId);
+                if (self.activeSubsLen > 0 && self.activeSubs != null)
+                    tt = self.substituteType(tt, self.activeSubs, self.activeSubsLen);
+                tailTypes[tailLen] = tt;
+                tailNodes[tailLen] = avId;
+                tailLen++;
+            }
+            ti++;
+        }
+        u32 arity = tailLen; /* pack arity: how many `_vargN` params the instance gets */
+        u64 key = self.callValueKeyTyped(call->kind.payload.Call.args, call->kind.payload.Call.argsLen,
+                                         self.activeSubs, self.activeSubsLen);
+        bool ok = self.enqueueVal(MonoDeclKind::FunctionDecl, declaration, arguments, gcount,
+                                  key, arity, litNames, litNodes, litsLen,
+                                  tailTypes, tailNodes, tailLen);
+        if (litNames != null) dealloc<Str>(litNames);
+        if (litNodes != null) dealloc<NodeId>(litNodes);
+        if (tailTypes != null) dealloc<Ty>(tailTypes);
+        if (tailNodes != null) dealloc<NodeId>(tailNodes);
+        dealloc<Ty>(arguments);
+        return ok;
+    }
+
+    /* expression walk. Only TypeRef (via collectType) and Call can
+     * enqueue; the rest recurse because a type ref may sit deeper in
+     * the tree. Unlisted variants can't carry Named types, so they
+     * fall through. */
+    bool collectExpr(NodeId id)
+    {
+        Node* node = self.nodeAt(id);
+        if (node == null) return true;
+        if (node->kind.tag != NodeKind::Expr) return true;
+        Expr* expr = &node->kind.payload.Expr.value;
+        switch (expr->kind.tag)
+        {
+            ExprKind::TypeRef => { return self.collectType(expr->kind.payload.TypeRef.typeNode); },
+            ExprKind::Field => { return self.collectExpr(expr->kind.payload.Field.obj); },
+            ExprKind::Cast => { return self.collectExpr(expr->kind.payload.Cast.expr); },
+            ExprKind::Spread => { return self.collectExpr(expr->kind.payload.Spread.expr); },
+            
+            ExprKind::StructLiteral => {
+                if (!self.collectType(expr->kind.payload.StructLiteral.typeNode)) return false;
+                u32 i = 0;
+                while (i < expr->kind.payload.StructLiteral.fieldValuesLen)
+                {
+                    if (!self.collectExpr(expr->kind.payload.StructLiteral.fieldValues[i])) return false;
+                    i++;
+                }
+                return true;
+            },
+            
+            ExprKind::Call => {
+                if (!self.collectExpr(expr->kind.payload.Call.callee)) return false;
+                u32 i = 0;
+                while (i < expr->kind.payload.Call.argsLen)
+                {
+                    if (!self.collectExpr(expr->kind.payload.Call.args[i])) return false;
+                    i++;
+                }
+                return self.collectCall(id);
+            },
+
+            ExprKind::Path => {
+                /* segment types must be collected too: `Foo<i32>::new(...)`
+                 * carries the instance in a TypeRef segment of the callee */
+                u32 i = 0;
+                while (i < expr->kind.payload.Path.segmentsLen)
+                {
+                    if (!self.collectExpr(expr->kind.payload.Path.segments[i])) return false;
+                    i++;
+                }
+                return true;
+            },
+
+            ExprKind::MethodCall => {
+                if (!self.collectExpr(expr->kind.payload.MethodCall.receiver)) return false;
+                u32 i = 0;
+                while (i < expr->kind.payload.MethodCall.argsLen)
+                {
+                    if (!self.collectExpr(expr->kind.payload.MethodCall.args[i])) return false;
+                    i++;
+                }
+                return true;
+            },
+
+            ExprKind::Index => {
+                if (!self.collectExpr(expr->kind.payload.Index.obj)) return false;
+                return self.collectExpr(expr->kind.payload.Index.index);
+            },
+
+            ExprKind::Add => {
+                if (!self.collectExpr(expr->kind.payload.Add.left)) return false;
+                return self.collectExpr(expr->kind.payload.Add.right);
+            },
+            ExprKind::Assign => {
+                if (!self.collectExpr(expr->kind.payload.Assign.target)) return false;
+                return self.collectExpr(expr->kind.payload.Assign.value);
+            },
+            else => { return true; }
+        }
+    }
+
+    /* statement walk, shallow by design: type refs only appear inside
+     * expressions, so each arm just reaches the exprs a stmt owns. */
+    bool collectStmt(NodeId id)
+    {
+        Node* node = self.nodeAt(id);
+        if (node == null) return true;
+        if (node->kind.tag != NodeKind::Stmt) return true;
+        Stmt* stmt = &node->kind.payload.Stmt.value;
+        switch (stmt->kind.tag)
+        {
+            StmtKind::ExprStmt => { return self.collectExpr(stmt->kind.payload.ExprStmt.expr); },
+            StmtKind::VarDecl => {
+                /* the declared type may be a generic instantiation of its
+                 * own (`Arr<i32, 4> a;` with no init): enqueue it so the
+                 * struct and its methods get emitted for this shape */
+                if (!self.collectType(stmt->kind.payload.VarDecl.typeNode)) return false;
+                return self.collectExpr(stmt->kind.payload.VarDecl.init);
+            },
+            StmtKind::Return => { return self.collectExpr(stmt->kind.payload.Return.value); },
+
+            StmtKind::Block => {
+                u32 i = 0;
+                while (i < stmt->kind.payload.Block.stmtsLen)
+                {
+                    if (!self.collectStmt(stmt->kind.payload.Block.stmts[i])) return false;
+                    i++;
+                }
+                return true;
+            },
+
+            StmtKind::If => {
+                if (!self.collectExpr(stmt->kind.payload.If.cond)) return false;
+                if (!self.collectStmt(stmt->kind.payload.If.thenBody)) return false;
+                return self.collectStmt(stmt->kind.payload.If.elseBody);
+            },
+
+            StmtKind::While => {
+                if (!self.collectExpr(stmt->kind.payload.While.cond)) return false;
+                return self.collectStmt(stmt->kind.payload.While.body);
+            },
+            else => { return true; }
+        }
+    }
+
+    /* decl surface walk: struct fields, variant case types, func
+     * signatures + bodies. Generic decls contribute little here; their
+     * bodies carry unbound type params and only enqueue once activeSubs
+     * re-collects them per instance. */
+    bool collectDecl(NodeId id)
+    {
+        Decl* decl = self.declAt(id);
+        if (decl == null) return true;
+        switch (decl->kind.tag)
+        {
+            DeclKind::Struct => {
+                u32 i = 0;
+                while (i < decl->kind.payload.Struct.fieldsLen)
+                {
+                    Node* field = self.nodeAt(decl->kind.payload.Struct.fields[i]);
+                    if (field != null && field->kind.tag == NodeKind::Field && !self.collectType(field->kind.payload.Field.value.typeNode)) return false;
+                    i++;
+                }
+                i = 0;
+                while (i < decl->kind.payload.Struct.methodsLen)
+                {
+                    if (!self.collectDecl(decl->kind.payload.Struct.methods[i])) return false;
+                    i++;
+                }
+                return true;
+            },
+            DeclKind::Variant => {
+                u32 i = 0;
+                while (i < decl->kind.payload.Variant.variantsLen)
+                {
+                    u32 j = 0;
+                    while (j < decl->kind.payload.Variant.variants[i].fieldsLen)
+                    {
+                        if (!self.collectType(decl->kind.payload.Variant.variants[i].fieldTypes[j])) return false;
+                        j++;
+                    }
+                    i++;
+                }
+                return true;
+            },
+            DeclKind::Func => {
+                if (!self.collectType(decl->kind.payload.Func.returnType)) return false;
+                u32 i = 0;
+                while (i < decl->kind.payload.Func.paramsLen)
+                {
+                    Node* param = self.nodeAt(decl->kind.payload.Func.params[i]);
+                    if (param != null && param->kind.tag == NodeKind::Param && !self.collectType(param->kind.payload.Param.value.typeNode)) return false;
+                    i++;
+                }
+                return self.collectStmt(decl->kind.payload.Func.body);
+            },
+            DeclKind::Constant => { return self.collectExpr(decl->kind.payload.Constant.value); },
+            DeclKind::TypeAlias => { return self.collectType(decl->kind.payload.TypeAlias.target); },
+            DeclKind::Distinct => { return self.collectType(decl->kind.payload.Distinct.baseType); },
+            /* extend-block methods are ordinary functions once merged:
+             * walk them like struct methods so generic calls inside a
+             * non-generic `extend T` body still enqueue their instances
+             * (longhand self-refinement blocks, e.g. `extend ScopeStack`) */
+            DeclKind::Extend => {
+                u32 i = 0;
+                while (i < decl->kind.payload.Extend.methodsLen)
+                {
+                    if (!self.collectDecl(decl->kind.payload.Extend.methods[i])) return false;
+                    i++;
+                }
+                return true;
+            },
+            DeclKind::ExtendTrait => {
+                u32 i = 0;
+                while (i < decl->kind.payload.ExtendTrait.methodsLen)
+                {
+                    if (!self.collectDecl(decl->kind.payload.ExtendTrait.methods[i])) return false;
+                    i++;
+                }
+                return true;
+            },
+            else => { return true; }
+        }
+    }
+
+    /* entry point, called per merged file: rebinding self.file makes
+     * findDeclaration see the right decl list. Any error anywhere fails
+     * the whole pass. */
+    bool collectFile(File* file)
+    {
+        self.file = file;
+        if (file == null)
+        {
+            self.errors++;
+            return false;
+        }
+        u32 i = 0;
+        while (i < file->declsLen)
+        {
+            if (!self.collectDecl(file->decls[i])) return false;
+            i++;
+        }
+        return self.errors == 0;
+    }
+}

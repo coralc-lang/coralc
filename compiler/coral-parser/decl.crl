@@ -1,0 +1,1717 @@
+#[[no_drop_all]]
+// parser/decl.crl: declaration parsing
+//
+// one entry point (parseDecl) dispatches on the leading keyword, with
+// save/restore peeks where the keyword alone is ambiguous:
+// `struct(...)` is a tuple-returning fn, `const T* name(` is a fn,
+// `var T name` vs `var name`.
+import(lib) std::mman { realloc };
+import(lib) std::text::string { String };
+
+import parser;
+import common::token { Token, TokenKind };
+import diag::code { ErrorCode };
+import base { Parser, ParserMark };
+import context::context { AstContext, InternEntry, NodeListBuilder, StrListBuilder, TyListBuilder, VariantListBuilder };
+import ast {
+    id { NodeId, Str, SourceLoc, locLine },
+    decl { Decl, DeclKind, Param, Field, GenericParam, EnumVariant, VariantVariant, ImportSymbol, Attribute },
+    node { Node, NodeKind },
+    types { Ty, TypeEntry, TypeKind }
+};
+
+struct ImportSymList
+{
+    ImportSymbol* items;
+    u32 len;
+    u32 cap;
+}
+
+pub extend Parser
+{
+    /* ── node constructors ── */
+
+    /* the contiguous `///` block immediately above the token the parser is
+     * looking at: leading `///` (and one optional space) stripped, lines
+     * joined with \n. `//` and `////` are plain comments and stop the walk;
+     * a blank line breaks the block. Returns an interned string (0 when
+     * there is no block). */
+    Str scanDocsAbove()
+    {
+        if (self.current.kind == TokenKind::Eof) return 0;
+        u8* bufStart = self.lexer.getBufStart();
+        u8* p = self.current.data.ptr;
+        if (p == null || p < bufStart) return 0;
+        /* start of the line the decl head sits on */
+        while (p > bufStart && p[-1] != 10) p--;
+        u8* starts[64];
+        u8* ends[64];
+        u32 n = 0;
+        i64 endLine = (i64)self.current.line - 1;
+        i64 lineNo = endLine;
+        while (n < 64 && p > bufStart && lineNo > 0)
+        {
+            u8* lineEnd = p - 1;
+            u8* s = lineEnd;
+            while (s > bufStart && s[-1] != 10) s--;
+            u8* q = s;
+            while (q < lineEnd && (q[0] == 32 || q[0] == 9)) q++;
+            if (q + 2 >= lineEnd) break;
+            bool isDoc = q[0] == 47 && q[1] == 47 && q[2] == 47;
+            if (isDoc && q + 3 < lineEnd && q[3] == 47) isDoc = false;
+            /* an attribute on its own line between the docs and the
+             * declaration still documents the declaration (temp.crl) */
+            bool isAttr = q[0] == 35 && q[1] == 91 && q[2] == 91;
+            if (!isDoc && !isAttr) break;
+            if (isDoc)
+            {
+                starts[n] = q + 3;
+                ends[n] = lineEnd;
+                n++;
+            }
+            p = s;
+            lineNo = lineNo - 1;
+        }
+        if (n == 0) return 0;
+        String out = String::new();
+        u32 k = n;
+        while (k > 0)
+        {
+            k--;
+            u8* s = starts[k];
+            u8* e = ends[k];
+            if (s < e && (s[0] == 32 || s[0] == 9)) s++;
+            while (e > s && e[-1] == 13) e--;
+            if (out.len > 0) out.pushByte(10);
+            out.pushView(str { .ptr = s, .len = (usize)(e - s) });
+        }
+        return self.ctx.intern(out.asView());
+    }
+
+    /* remember a `///` block against the declaration's name line so the
+     * server can render it in hover (see scanDocsAbove) */
+    void attachDoc(NodeId id, Str doc)
+    {
+        if (doc == 0 || id.index == 0) return;
+        Node* n = self.ctx.nodes + id.index;
+        if (n->kind.tag != NodeKind::Decl) return;
+        self.ctx.addDocBlock(self.fileId, locLine(n->kind.payload.Decl.value.nameLoc), doc);
+    }
+
+    // loc comes from the last consumed token. attrs are never materialized:
+    // parseAttrList only surfaces the const bit
+    NodeId storeDecl(DeclKind kind, SourceLoc nameLoc)
+    {
+        return self.storeNode(NodeKind::Decl{
+            .value = Decl { 
+                .kind = kind,
+                .loc = self.tokenLoc(self.previous),
+                .nameLoc = nameLoc,
+                .attrs = null,
+                .attrsLen = 0
+            }
+        });
+    }
+
+    NodeId storeParam(Param value)
+    {
+        value.loc = self.tokenLoc(self.previous);
+        return self.storeNode(NodeKind::Param{ .value = value });
+    }
+
+    NodeId storeField(Field value)
+    {
+        value.loc = self.tokenLoc(self.previous);
+        return self.storeNode(NodeKind::Field{ .value = value });
+    }
+
+    /* attribute names this compiler recognizes; keep in sync with the LSP
+     * attribute cards (server.crl lspAttributeCard) and mono's planned set
+     * (`inline_always`, `hot`, `cold`, `vectorise` are accepted ahead of
+     * implementation) */
+    bool isKnownAttr(Str name)
+    {
+        if (name == self.ctx.intern("const")) return true;
+        if (name == self.ctx.intern("condassign")) return true;
+        if (name == self.ctx.intern("no_drop")) return true;
+        if (name == self.ctx.intern("no_drop_all")) return true;
+        if (name == self.ctx.intern("fallthrough")) return true;
+        if (name == self.ctx.intern("inline")) return true;
+        if (name == self.ctx.intern("inline_always")) return true;
+        if (name == self.ctx.intern("hot")) return true;
+        if (name == self.ctx.intern("cold")) return true;
+        if (name == self.ctx.intern("vectorise")) return true;
+        if (name == self.ctx.intern("deprecated")) return true;
+        if (name == self.ctx.intern("packed")) return true;
+        if (name == self.ctx.intern("noreturn")) return true;
+        if (name == self.ctx.intern("reorder")) return true;
+        if (name == self.ctx.intern("generate")) return true;
+        if (name == self.ctx.intern("generated")) return true;
+        if (name == self.ctx.intern("generator")) return true;
+        return false;
+    }
+
+    /* edit distance for attribute misspellings; mirrors the semantics
+     * helper nameDistance (member.crl) but over the parser's intern
+     * table. names are short; the windows cap at 40 bytes */
+    u32 attrNameDistance(Str a, Str b)
+    {
+        if (a == b) return 0;
+        if (a == 0 || b == 0) return 4;
+        str sa = str { .ptr = self.ctx.interns[a].ptr, .len = self.ctx.interns[a].len };
+        str sb = str { .ptr = self.ctx.interns[b].ptr, .len = self.ctx.interns[b].len };
+        if (sa.len > 40) sa.len = 40;
+        if (sb.len > 40) sb.len = 40;
+        usize* prev = alloc<usize>(41);
+        usize* cur = alloc<usize>(41);
+        if (prev == null || cur == null)
+        {
+            if (prev != null) dealloc<usize>(prev);
+            if (cur != null) dealloc<usize>(cur);
+            return 4;
+        }
+        usize i = 0;
+        while (i <= sb.len) { prev[i] = i; i++; }
+        usize j = 1;
+        while (j <= sa.len)
+        {
+            cur[0] = j;
+            i = 1;
+            while (i <= sb.len)
+            {
+                usize cost = 1;
+                if (sa.ptr[j - 1] == sb.ptr[i - 1]) cost = 0;
+                usize best = prev[i] + 1;
+                if (cur[i - 1] + 1 < best) best = cur[i - 1] + 1;
+                if (prev[i - 1] + cost < best) best = prev[i - 1] + cost;
+                cur[i] = best;
+                i++;
+            }
+            i = 0;
+            while (i <= sb.len) { prev[i] = cur[i]; i++; }
+            j++;
+        }
+        u32 d = (u32)prev[sb.len];
+        dealloc<usize>(prev);
+        dealloc<usize>(cur);
+        return d > 40 ? 40 : d;
+    }
+
+    /* closest known attribute for a misspelled one, 0 when none is close */
+    Str closestAttrName(Str name)
+    {
+        Str best = 0;
+        u32 bestD = 3;
+        Str cands[24];
+        u32 n = 0;
+        cands[n] = self.ctx.intern("const"); n++;
+        cands[n] = self.ctx.intern("condassign"); n++;
+        cands[n] = self.ctx.intern("no_drop"); n++;
+        cands[n] = self.ctx.intern("no_drop_all"); n++;
+        cands[n] = self.ctx.intern("fallthrough"); n++;
+        cands[n] = self.ctx.intern("inline"); n++;
+        cands[n] = self.ctx.intern("inline_always"); n++;
+        cands[n] = self.ctx.intern("hot"); n++;
+        cands[n] = self.ctx.intern("cold"); n++;
+        cands[n] = self.ctx.intern("vectorise"); n++;
+        cands[n] = self.ctx.intern("deprecated"); n++;
+        cands[n] = self.ctx.intern("packed"); n++;
+        cands[n] = self.ctx.intern("noreturn"); n++;
+        cands[n] = self.ctx.intern("reorder"); n++;
+        cands[n] = self.ctx.intern("generate"); n++;
+        cands[n] = self.ctx.intern("generated"); n++;
+        cands[n] = self.ctx.intern("generator"); n++;
+        u32 i = 0;
+        while (i < n)
+        {
+            u32 d = self.attrNameDistance(name, cands[i]);
+            if (d < bestD) { bestD = d; best = cands[i]; }
+            i++;
+        }
+        return best;
+    }
+
+    /* `#[[name(args), …]]*`: one or more attribute lists.
+     * Returns flags: bit0 = carries `const`. When `outAttrs` is non-null
+     * every attribute's name is materialized (args are skipped for now);
+     * the caller owns the realloc'd array (process-lifetime arena is also
+     * fine — this parser never frees decls). Shared by decl, statement,
+     * method and struct/union member parsing so every position accepts
+     * attributes. */
+    u8 parseAttrListTo(Attribute** outAttrs, u32* outLen)
+    {
+        u8 flags = 0;
+        Attribute* list = null;
+        u32 len = 0;
+        u32 cap = 0;
+        while (self.match(TokenKind::Hash))
+        {
+            self.expect(TokenKind::LBracket);
+            self.expect(TokenKind::LBracket);
+            bool first = true;
+            while (!self.atEnd() && self.current.kind != TokenKind::RBracket)
+            {
+                if (!first)
+                {
+                    if (!self.match(TokenKind::Comma)) break;
+                    if (self.current.kind == TokenKind::RBracket) break;
+                }
+                first = false;
+                Str name = 0;
+                SourceLoc loc = self.tokenLoc(self.current);
+                if (self.current.kind == TokenKind::Const)
+                {
+                    flags |= 1;
+                    name = self.ctx.intern("const");
+                    self.advance();
+                }
+                else if (self.current.kind == TokenKind::Ident)
+                {
+                    name = self.ctx.intern(self.current.data.asStr());
+                    self.advance();
+                    /* P0012: misspelled attribute names get a did-you-mean
+                     * like `.member` typos do (closestField) */
+                    if (!self.isKnownAttr(name))
+                    {
+                        String msg = String::new();
+                        msg.pushView("unknown attribute '");
+                        msg.pushView(str { .ptr = self.ctx.interns[name].ptr, .len = self.ctx.interns[name].len });
+                        msg.pushView("'");
+                        Str cand = self.closestAttrName(name);
+                        if (cand != 0)
+                        {
+                            String hint = String::new();
+                            hint.pushView("did you mean '");
+                            hint.pushView(str { .ptr = self.ctx.interns[cand].ptr, .len = self.ctx.interns[cand].len });
+                            hint.pushView("'?");
+                            self.reportErrorAtHelp(ErrorCode::ParseUnknownAttr, loc, msg.asView(), hint.asView());
+                        }
+                        else self.reportErrorAtHelp(ErrorCode::ParseUnknownAttr, loc, msg.asView(), null);
+                    }
+                }
+                else
+                {
+                    self.advance();
+                    continue;
+                }
+                /* `name(arg, …)`: kept for later passes; skipped here */
+                if (self.current.kind == TokenKind::LParen)
+                {
+                    self.advance();
+                    while (self.current.kind != TokenKind::RParen && !self.atEnd())
+                        self.advance();
+                    self.expect(TokenKind::RParen);
+                }
+                if (outAttrs != null && name != 0)
+                {
+                    if (len == cap)
+                    {
+                        u32 newCap = cap == 0 ? 4 : cap * 2;
+                        Attribute* raw = realloc<Attribute>(list, (usize)newCap);
+                        if (raw == null) { self.reportAllocFailed(); break; }
+                        list = raw;
+                        cap = newCap;
+                    }
+                    Attribute a;
+                    a.name = name;
+                    a.args = null;
+                    a.argsLen = 0;
+                    a.loc = loc;
+                    list[len] = a;
+                    len++;
+                }
+            }
+            self.expect(TokenKind::RBracket);
+            self.expect(TokenKind::RBracket);
+        }
+        if (outAttrs != null) *outAttrs = list;
+        if (outLen != null) *outLen = len;
+        return flags;
+    }
+
+    // wrapper for call sites that only want the const bit
+    u8 parseAttrList()
+    {
+        return self.parseAttrListTo(null, null);
+    }
+
+    /* attach parsed attributes to a Decl or Stmt node (both carry
+     * attrs/attrsLen slots); used by parseDecl/parseStmt after the node
+     * exists. no-op for zero ids and unknown node kinds */
+    void attachAttrs(NodeId id, Attribute* attrs, u32 attrsLen)
+    {
+        if (attrsLen == 0 || id.index == 0) return;
+        Node* n = self.ctx.nodes + id.index;
+        if (n->kind.tag == NodeKind::Decl)
+        {
+            n->kind.payload.Decl.value.attrs = attrs;
+            n->kind.payload.Decl.value.attrsLen = attrsLen;
+        }
+        else if (n->kind.tag == NodeKind::Stmt)
+        {
+            n->kind.payload.Stmt.value.attrs = attrs;
+            n->kind.payload.Stmt.value.attrsLen = attrsLen;
+        }
+    }
+
+    /* ── top-level dispatch ── */
+
+    /* attrs/pub/extern/static lead; then the keyword decides. two shapes
+     * need a peek because the keyword alone can't tell: `struct` could be
+     * `struct(...)` (tuple-returning fn), and `const` could be a
+     * const-returning fn. both peek via save()/restore(), which drops
+     * diagnostics from the discarded pass */
+    NodeId parseDecl()
+    {
+        Str doc = self.scanDocsAbove();
+        Attribute* attrs = null;
+        u32 attrsLen = 0;
+        u8 attrFlags = self.parseAttrListTo(&attrs, &attrsLen);
+        NodeId id = self.parseDeclBody(attrFlags);
+        self.attachAttrs(id, attrs, attrsLen);
+        self.attachDoc(id, doc);
+        return id;
+    }
+
+    /* the body of parseDecl, after the leading attribute lists were
+     * consumed and the const bit extracted */
+    NodeId parseDeclBody(u8 attrFlags)
+    {
+        bool isConst = (attrFlags & 1) != 0;
+        bool isPub = self.match(TokenKind::Pub);
+        bool isExtern = self.match(TokenKind::Extern);
+        if (isExtern && self.current.kind == TokenKind::LParen)
+        {
+            self.advance();
+            self.expect(TokenKind::String);
+            self.expect(TokenKind::RParen);
+        }
+        bool isStatic = self.match(TokenKind::Static);
+
+        switch (self.current.kind)
+        {
+            /* `struct(...) fn name(...)` is a function returning a tuple;
+             * only a bare `struct` starts a struct declaration */
+            TokenKind::Struct => {
+                ParserMark m = self.save();
+                self.advance();
+                bool tupleRet = self.current.kind == TokenKind::LParen;
+                self.restore(m);
+                if (!tupleRet) return self.parseStructDecl(isPub);
+            },
+            
+            TokenKind::Enum => { return self.parseEnumDecl(isPub); },
+            TokenKind::Variant => { return self.parseVariantDecl(isPub); },
+            TokenKind::Union => { return self.parseUnionDecl(isPub); },
+            TokenKind::Trait => { return self.parseTraitDecl(isPub); },
+            TokenKind::Extend => { return self.parseExtendDecl(isPub); },
+            TokenKind::Const => {
+                /* `const T* name(...)` declares a function with a const
+                 * return type; only a non-fn shape is a constant */
+                ParserMark m = self.save();
+                self.advance();
+                self.parseType();
+                bool fnAfterConst = false;
+                if (self.current.kind == TokenKind::Ident)
+                {
+                    self.advance();
+                    fnAfterConst = self.current.kind == TokenKind::LParen;
+                }
+                self.restore(m);
+                if (fnAfterConst) return self.parseFuncOrVarDecl(isPub, isExtern, isStatic, true);
+                return self.parseConstDecl(isPub);
+            },
+            
+            TokenKind::Var => { return self.parseVarDecl(isPub); },
+            TokenKind::Typedef => { return self.parseTypedefDecl(); },
+            TokenKind::Distinct => { return self.parseDistinctDecl(); },
+            TokenKind::Flag => { return self.parseFlagDecl(); },
+            TokenKind::Import => { return self.parseImportDecl(); },
+            TokenKind::Mod => { return self.parseModReexport(isPub); },
+            TokenKind::Comptime => { return self.parseComptimeDecl(); },
+            else => {}
+        }
+
+        if (isExtern || isStatic || self.isTypeStart())
+            return self.parseFuncOrVarDecl(isPub, isExtern, isStatic, isConst);
+
+        self.reportCurrentError(ErrorCode::ParseExpectedDecl, "expected a declaration: a function, var, const, struct or a type here");
+        if (!self.atEnd()) self.advance();
+        return self.noneNode();
+    }
+
+    // can this start a type in decl position? Ident does; user types look
+    // exactly like values here, hence all the speculating in parseDecl
+    bool isTypeStart()
+    {
+        TokenKind k = self.current.kind;
+        switch (k)
+        {
+            TokenKind::Void => { return true; },
+            TokenKind::Bool => { return true; },
+            TokenKind::Char => { return true; },
+            TokenKind::U8 => { return true; },
+            TokenKind::I8 => { return true; },
+            TokenKind::U16 => { return true; },
+            TokenKind::I16 => { return true; },
+            TokenKind::U32 => { return true; },
+            TokenKind::I32 => { return true; },
+            TokenKind::U64 => { return true; },
+            TokenKind::I64 => { return true; },
+            TokenKind::U128 => { return true; },
+            TokenKind::I128 => { return true; },
+            TokenKind::F32 => { return true; },
+            TokenKind::F64 => { return true; },
+            TokenKind::Usize => { return true; },
+            TokenKind::Isize => { return true; },
+            TokenKind::Rawptr => { return true; },
+            TokenKind::Str => { return true; },
+            TokenKind::Ident => { return true; },
+            TokenKind::Const => { return true; },
+            TokenKind::Comptime => { return true; },
+            TokenKind::Flag => { return true; },
+            TokenKind::LParen => { return true; },
+            TokenKind::Struct => { return true; },
+            else => { return false; }
+        }
+    }
+
+    /* rewrite Named type refs that actually name one of genericValues
+     * into TypeKind::TypeParam carrying the param's index. runs in place
+     * on freshly parsed entries (nothing shared yet), recursing through
+     * every composite kind, nested generic args included */
+    void rebindTypeParams(Ty ty, NodeId* genericValues, u32 genericCount)
+    {
+        if (ty == 0 || genericCount == 0) return;
+        TypeEntry* entry = self.ctx.types + ty;
+        switch (entry->kind.tag)
+        {
+            TypeKind::Named => {
+                Str nm = entry->kind.payload.Named.name;
+                u32 g = 0;
+                while (g < genericCount)
+                {
+                    Node* gn = self.ctx.nodes + genericValues[g].index;
+                    if (gn->kind.tag == NodeKind::GenericParam)
+                    {
+                        if (gn->kind.payload.GenericParam.value.name == nm)
+                        {
+                            entry->kind = TypeKind::TypeParam { .name = nm, .index = g };
+                            return;
+                        }
+                    }
+                    g++;
+                }
+                u32 i = 0;
+                while (i < entry->kind.payload.Named.genericArgsLen)
+                {
+                    self.rebindTypeParams(entry->kind.payload.Named.genericArgs[i], genericValues, genericCount);
+                    i++;
+                }
+                return;
+            },
+        
+            TypeKind::Pointer => {
+                self.rebindTypeParams(entry->kind.payload.Pointer.base, genericValues, genericCount);
+                return;
+            },
+            
+            TypeKind::Const => {
+                self.rebindTypeParams(entry->kind.payload.Const.base, genericValues, genericCount);
+                return;
+            },
+            
+            TypeKind::Comptime => {
+                self.rebindTypeParams(entry->kind.payload.Comptime.base, genericValues, genericCount);
+                return;
+            },
+            
+            TypeKind::Slice => {
+                self.rebindTypeParams(entry->kind.payload.Slice.base, genericValues, genericCount);
+                return;
+            },
+            
+            TypeKind::Array => {
+                self.rebindTypeParams(entry->kind.payload.Array.base, genericValues, genericCount);
+                Str sn = entry->kind.payload.Array.sizeName;
+                if (sn != 0)
+                {
+                    u32 g2 = 0;
+                    while (g2 < genericCount)
+                    {
+                        Node* gn2 = self.ctx.nodes + genericValues[g2].index;
+                        if (gn2->kind.tag == NodeKind::GenericParam)
+                        {
+                            if (gn2->kind.payload.GenericParam.value.name == sn)
+                            {
+                                entry->kind.payload.Array.sizeParam = g2;
+                                break;
+                            }
+                        }
+                        g2++;
+                    }
+                }
+                return;
+            },
+            
+            TypeKind::FnPtr => {
+                self.rebindTypeParams(entry->kind.payload.FnPtr.returnType, genericValues, genericCount);
+                u32 p = 0;
+                while (p < entry->kind.payload.FnPtr.paramsLen)
+                {
+                    self.rebindTypeParams(entry->kind.payload.FnPtr.params[p], genericValues, genericCount);
+                    p++;
+                }
+                return;
+            },
+            
+            TypeKind::Tuple => {
+                u32 e = 0;
+                while (e < entry->kind.payload.Tuple.elemsLen)
+                {
+                    self.rebindTypeParams(entry->kind.payload.Tuple.elems[e], genericValues, genericCount);
+                    e++;
+                }
+                return;
+            }
+        }
+    }
+
+    /* RET NAME<gens>(params) body  |  TYPE NAME = init;
+     * decl flags: 1 pub, 2 extern, 4 static, 8 hasBody, 16 const.
+     * generics rebind the return type and every param type; outerGenerics
+     * (the enclosing struct/variant's params) are layered on top so a
+     * method can spell its owner's type params */
+    NodeId parseFuncOrVarDecl(bool isPub, bool isExtern, bool isStatic, bool isConst)
+    {
+        Ty retType = self.parseType();
+        /* `u8 const NAME = …`: type-first constant; `const u8 NAME` is
+         * routed to parseConstDecl before we ever get here */
+        if (self.match(TokenKind::Const)) isConst = true;
+        Token nameTok = self.expectName();
+        Str name = self.ctx.intern(nameTok.data.asStr());
+        NodeListBuilder genericParams;
+        self.ctx.nodeListInit(&genericParams);
+        
+        if (self.current.kind == TokenKind::Less)
+            self.parseGenericParams(&genericParams);
+        u32 genericCount = genericParams.len;
+        NodeId* genericValues = self.ctx.nodeListFinish(&genericParams);
+        self.rebindTypeParams(retType, genericValues, genericCount);
+        self.rebindTypeParams(retType, self.outerGenerics, self.outerGenericsLen);
+        u8 flags = 0;
+        
+        if (isPub) flags |= 1;
+        if (isExtern) flags |= 2;
+        if (isStatic) flags |= 4;
+        if (isConst) flags |= 16;
+        
+        // `NAME(`: a function; no parens means a file-scope constant
+        if (self.current.kind == TokenKind::LParen) {
+            self.advance();
+            NodeListBuilder params;
+            self.ctx.nodeListInit(&params);
+            if (self.current.kind == TokenKind::LBrace || self.current.kind == TokenKind::Eof)
+            {
+                /* `main(` running straight into the body: name the
+                 * function and the missing ')' instead of cascading
+                 * through "expected a type" */
+                String msg = String::new();
+                msg.pushView("expected ')' to close the parameter list of '");
+                if (name != 0 && name < self.ctx.internsLen)
+                    msg.pushView(str { .ptr = self.ctx.interns[name].ptr, .len = self.ctx.interns[name].len });
+                msg.pushView("', found '");
+                if (self.current.kind == TokenKind::LBrace) msg.pushView("{");
+                else msg.pushView("<eof>");
+                msg.pushView("'");
+                self.reportError(ErrorCode::ParseExpectedToken, self.current, msg.asView());
+            }
+            else
+            {
+                if (self.current.kind != TokenKind::RParen)
+                {
+                    NodeId param = self.parseParam();
+                    if (!self.ctx.nodeListAppend(&params, param)) self.reportAllocFailed();
+                    while (self.match(TokenKind::Comma))
+                    {
+                        param = self.parseParam();
+                        if (!self.ctx.nodeListAppend(&params, param)) self.reportAllocFailed();
+                    }
+                }
+                self.expect(TokenKind::RParen);
+            }
+            // `const` qualifier after the parameter list: const method
+            if (self.match(TokenKind::Const)) flags |= 16;
+            u32 paramCount = params.len;
+            NodeId* paramValues = self.ctx.nodeListFinish(&params);
+            u32 pi = 0;
+            while (pi < paramCount)
+            {
+                Node* pn = self.ctx.nodes + paramValues[pi].index;
+                if (pn->kind.tag == NodeKind::Param)
+                {
+                    self.rebindTypeParams(pn->kind.payload.Param.value.typeNode, genericValues, genericCount);
+                    self.rebindTypeParams(pn->kind.payload.Param.value.typeNode, self.outerGenerics, self.outerGenericsLen);
+                }
+                pi++;
+            }
+            NodeId body = self.noneNode();
+            if (!self.match(TokenKind::Semicolon)) {
+                body = self.parseBlock();
+                flags |= 8;
+            }
+            return self.storeDecl(DeclKind::Func{
+                .name = name, .genericParams = genericValues,
+                .genericParamsLen = genericCount, .params = paramValues,
+                .paramsLen = paramCount, .returnType = retType,
+                .body = body, .flags = flags
+            }, self.tokenLoc(nameTok));
+        }
+        
+        NodeId value = self.noneNode();
+        Ty varType = self.parseDeclaratorArray(retType);
+        
+        if (self.match(TokenKind::Equal)) {
+            value = self.parseInitExpr();
+            self.expect(TokenKind::Semicolon);
+        } else {
+            self.expect(TokenKind::Semicolon);
+        }
+        
+        varType = self.inferArrayFromInit(varType, value);
+        return self.storeDecl(DeclKind::Constant{ .name = name, .typeNode = varType, .value = value, .flags = flags }, self.tokenLoc(nameTok));
+    }
+
+    // only the `comptime` flag is parsed; bounds are never spelled yet
+    // (the ast has room for them, no syntax reaches it)
+    NodeId parseGenericParam()
+    {
+        GenericParam param;
+        param.bounds = null;
+        param.boundsLen = 0;
+        param.flags = 0;
+        if (self.match(TokenKind::Comptime)) param.flags |= 1;
+        Token nameTok = self.expectName();
+        param.name = self.ctx.intern(nameTok.data.asStr());
+        return self.storeNode(NodeKind::GenericParam{ .value = param });
+    }
+
+    // `<T, U, comptime N>`: empty `<>` and trailing comma are legal
+    void parseGenericParams(NodeListBuilder* params)
+    {
+        self.expect(TokenKind::Less);
+        if (self.consumeGreater()) return;
+        while (true)
+        {
+            NodeId param = self.parseGenericParam();
+            if (!self.ctx.nodeListAppend(params, param)) self.reportAllocFailed();
+            if (!self.match(TokenKind::Comma)) break;
+        }
+        if (!self.consumeGreater()) self.reportCurrentError(ErrorCode::ParseExpectedToken, "expected '>' to close generic parameters");
+    }
+
+    NodeId parseFuncDecl()
+    {
+        return self.parseFuncDeclFlags(0);
+    }
+
+    // attrs already consumed by a member loop get folded in here
+    NodeId parseFuncDeclFlags(u8 attrFlags)
+    {
+        Str doc = self.scanDocsAbove();
+        attrFlags |= self.parseAttrList();
+        bool isConst = (attrFlags & 1) != 0;
+        NodeId id = self.parseFuncOrVarDecl(false, false, false, isConst);
+        self.attachDoc(id, doc);
+        return id;
+    }
+
+    /* one parameter. flags: 1 = isSelf, 8 = unnamed/type-only,
+     * 16 = variadic `...` (optionally named). `self`, `self*` and
+     * `const self*` all mark the receiver; the pointer/const wrappers
+     * are peeled off below to recognise it */
+    NodeId parseParam()
+    {
+        Param param;
+        param.loc.data = 0;
+        param.flags = 0;
+        if (self.current.kind == TokenKind::Self)
+        {
+            self.advance();
+            param.name = self.ctx.intern("self");
+            param.typeNode = 0;
+            param.flags = 1;
+            return self.storeParam(param);
+        }
+        if (self.current.kind == TokenKind::Ellipsis)
+        {
+            self.advance();
+            param.name = 0;
+            param.typeNode = 0;
+            param.flags = 16;
+            // `... args`: named variadic package
+            if (self.current.kind == TokenKind::Ident)
+            {
+                Token varTok = self.advance();
+                param.name = self.ctx.intern(varTok.data.asStr());
+            }
+            return self.storeParam(param);
+        }
+        param.typeNode = self.parseType();
+        /* `self`, `self*`, `const self*`: explicit self parameter (the
+         * receiver is a pointer in the C implementation) */
+        {
+            Ty resolved = param.typeNode;
+            TypeEntry* typeEntry = (resolved != 0) ? self.ctx.types + resolved : null;
+            while (typeEntry != null && (typeEntry->kind.tag == TypeKind::Const || typeEntry->kind.tag == TypeKind::Pointer))
+            {
+                if (typeEntry->kind.tag == TypeKind::Const) resolved = typeEntry->kind.payload.Const.base;
+                else resolved = typeEntry->kind.payload.Pointer.base;
+                if (resolved == 0) break;
+                typeEntry = self.ctx.types + resolved;
+            }
+            if (typeEntry != null && typeEntry->kind.tag == TypeKind::Named &&
+                typeEntry->kind.payload.Named.name == self.ctx.intern("self"))
+            {
+                param.name = self.ctx.intern("self");
+                param.flags = 1;
+                return self.storeParam(param);
+            }
+        }
+        // no name after the type (`f(i32, str)`), or a `comptime T`
+        // auto-param. flags 8 = type-only; a bare Named type donates its
+        // name so sema still has something to bind
+        if (self.current.kind == TokenKind::Comma || self.current.kind == TokenKind::RParen)
+        {
+            param.name = 0;
+            param.flags = 8;
+            if (param.typeNode != 0)
+            {
+                Ty resolved = param.typeNode;
+                TypeEntry* typeEntry = self.ctx.types + resolved;
+                while (typeEntry != null && typeEntry->kind.tag == TypeKind::Const)
+                {
+                    resolved = typeEntry->kind.payload.Const.base;
+                    if (resolved == 0) break;
+                    typeEntry = self.ctx.types + resolved;
+                }
+                if (typeEntry != null && typeEntry->kind.tag == TypeKind::Comptime)
+                {
+                    Ty base = typeEntry->kind.payload.Comptime.base;
+                    typeEntry = base != 0 ? self.ctx.types + base : null;
+                }
+                if (typeEntry != null && typeEntry->kind.tag == TypeKind::Named)
+                    param.name = typeEntry->kind.payload.Named.name;
+            }
+            return self.storeParam(param);
+        }
+        Token name = self.expectName();
+        param.name = self.ctx.intern(name.data.asStr());
+        // `T name[]` / `T name[N]`: C-style declarator array suffix
+        if (param.typeNode != 0) param.typeNode = self.parseDeclaratorArray(param.typeNode);
+        return self.storeParam(param);
+    }
+
+    /* members are fields or methods; with no marker to tell them apart
+     * the parser peeks `type ident` and calls it a method only when
+     * `(` or `<` follows. outerGenerics is set for the member loop so
+     * method sigs can reference the struct's params, then cleared */
+    NodeId parseStructDecl(bool isPub)
+    {
+        self.expect(TokenKind::Struct);
+        Token nameTok = self.expect(TokenKind::Ident);
+        Str name = self.ctx.intern(nameTok.data.asStr());
+        NodeListBuilder genericParams;
+        self.ctx.nodeListInit(&genericParams);
+        if (self.current.kind == TokenKind::Less)
+            self.parseGenericParams(&genericParams);
+        u32 genericCount = genericParams.len;
+        NodeId* genericValues = self.ctx.nodeListFinish(&genericParams);
+        self.outerGenerics = genericValues;
+        self.outerGenericsLen = genericCount;
+        NodeListBuilder fields;
+        NodeListBuilder methods;
+        self.ctx.nodeListInit(&fields);
+        self.ctx.nodeListInit(&methods);
+        self.expect(TokenKind::LBrace);
+        while (self.current.kind != TokenKind::RBrace && !self.atEnd())
+        {
+            u8 memberAttrs = self.parseAttrList();
+            u8 fieldFlags = 0;
+            if (self.match(TokenKind::Pub)) fieldFlags = 1;
+            if (self.current.kind == TokenKind::Extern || self.current.kind == TokenKind::Static)
+            {
+                bool mIsExtern = self.match(TokenKind::Extern);
+                if (mIsExtern && self.current.kind == TokenKind::LParen)
+                {
+                    self.advance();
+                    self.expect(TokenKind::String);
+                    self.expect(TokenKind::RParen);
+                }
+                bool mIsStatic = self.match(TokenKind::Static);
+                Str methodDoc = self.scanDocsAbove();
+                NodeId method = self.parseFuncOrVarDecl(fieldFlags == 1, mIsExtern, mIsStatic, (memberAttrs & 1) != 0);
+                self.attachDoc(method, methodDoc);
+                if (!self.ctx.nodeListAppend(&methods, method)) self.reportAllocFailed();
+                self.match(TokenKind::Semicolon);
+                continue;
+            }
+
+            ParserMark mark = self.save();
+            self.parseType();
+            self.expect(TokenKind::Ident);
+            bool isMethod = self.current.kind == TokenKind::LParen ||
+                            self.current.kind == TokenKind::Less;
+            self.restore(mark);
+
+            if (isMethod)
+            {
+                NodeId method = self.parseFuncDeclFlags(memberAttrs);
+                if (!self.ctx.nodeListAppend(&methods, method)) self.reportAllocFailed();
+                self.match(TokenKind::Semicolon);
+                continue;
+            }
+
+            Ty fieldType = self.parseType();
+            /* C-style multi-declarator fields: `i32 goo, moo;`; repeat
+             * the parsed type per declarator (own array suffix/default) */
+            while (true)
+            {
+                Token fieldNameTok = self.expect(TokenKind::Ident);
+                Ty declType = self.parseDeclaratorArray(fieldType);
+                Field field;
+                field.name = self.ctx.intern(fieldNameTok.data.asStr());
+                field.typeNode = declType;
+                field.defaultValue = self.noneNode();
+                field.loc.data = 0;
+                field.flags = fieldFlags;
+                if (self.match(TokenKind::Equal))
+                {
+                    field.defaultValue = self.parseExpr();
+                    field.flags |= 2;
+                }
+                NodeId fieldNode = self.storeField(field);
+                if (!self.ctx.nodeListAppend(&fields, fieldNode)) self.reportAllocFailed();
+                if (!self.match(TokenKind::Comma)) break;
+            }
+            self.match(TokenKind::Semicolon);
+        }
+        self.expect(TokenKind::RBrace);
+        self.outerGenerics = null;
+        self.outerGenericsLen = 0;
+        u32 fieldCount = fields.len;
+        NodeId* fieldValues = self.ctx.nodeListFinish(&fields);
+        u32 methodCount = methods.len;
+        NodeId* methodValues = self.ctx.nodeListFinish(&methods);
+        u8 flags = 0;
+        if (isPub) flags = 1;
+        return self.storeDecl(DeclKind::Struct{
+            .name = name, .genericParams = genericValues,
+            .genericParamsLen = genericCount, .fields = fieldValues,
+            .fieldsLen = fieldCount, .methods = methodValues,
+            .methodsLen = methodCount, .flags = flags
+        }, self.tokenLoc(nameTok));
+    }
+
+    // `enum Name : Backing { A, B = 3 }`; flags: 1 hasBacking, 2 isPub
+    NodeId parseEnumDecl(bool isPub)
+    {
+        self.expect(TokenKind::Enum);
+        Token nameTok = self.expect(TokenKind::Ident);
+        Str name = self.ctx.intern(nameTok.data.asStr());
+        Ty backingType = 0;
+        u8 flags = 0;
+        if (self.match(TokenKind::Colon))
+        {
+            backingType = self.parseType();
+            flags = 1;
+        }
+        if (isPub) flags |= 2;
+        NodeListBuilder variants;
+        self.ctx.nodeListInit(&variants);
+        self.expect(TokenKind::LBrace);
+        if (self.current.kind != TokenKind::RBrace)
+        {
+            while (true)
+            {
+                EnumVariant enumValue;
+                Token variantTok = self.expect(TokenKind::Ident);
+                enumValue.name = self.ctx.intern(variantTok.data.asStr());
+                enumValue.value = self.noneNode();
+                enumValue.loc = self.tokenLoc(variantTok);
+                enumValue.flags = 0;
+                if (self.match(TokenKind::Equal))
+                {
+                    enumValue.value = self.parseExpr();
+                    enumValue.flags = 1;
+                }
+                NodeId variantNode = self.storeNode(NodeKind::EnumVariant{ .value = enumValue });
+                if (!self.ctx.nodeListAppend(&variants, variantNode)) self.reportAllocFailed();
+                if (!self.match(TokenKind::Comma)) break;
+                if (self.current.kind == TokenKind::RBrace) break;
+            }
+        }
+        self.expect(TokenKind::RBrace);
+        u32 variantCount = variants.len;
+        NodeId* variantValues = self.ctx.nodeListFinish(&variants);
+        return self.storeDecl(DeclKind::Enum{ .name = name, .backingType = backingType, .variants = variantValues, .variantsLen = variantCount, .flags = flags }, self.tokenLoc(nameTok));
+    }
+
+    /* `variant V { Case { T a, U b }, ... }`; cases carry parallel
+     * name/type lists. methods need a leading `pub` (no other marker
+     * distinguishes a method name from a case name). pushes
+     * outerGenerics like struct parsing does */
+    NodeId parseVariantDecl(bool isPub)
+    {
+        self.expect(TokenKind::Variant);
+        Token nameTok = self.expect(TokenKind::Ident);
+        Str name = self.ctx.intern(nameTok.data.asStr());
+        NodeListBuilder genericParams;
+        self.ctx.nodeListInit(&genericParams);
+        if (self.current.kind == TokenKind::Less)
+            self.parseGenericParams(&genericParams);
+        u32 genericCount = genericParams.len;
+        NodeId* genericValues = self.ctx.nodeListFinish(&genericParams);
+        self.outerGenerics = genericValues;
+        self.outerGenericsLen = genericCount;
+        VariantListBuilder variants;
+        NodeListBuilder methods;
+        self.ctx.variantListInit(&variants);
+        self.ctx.nodeListInit(&methods);
+        self.expect(TokenKind::LBrace);
+        while (self.current.kind != TokenKind::RBrace && !self.atEnd())
+        {
+            if (self.current.kind == TokenKind::Pub)
+            {
+                self.advance();
+                NodeId method = self.parseFuncDecl();
+                if (!self.ctx.nodeListAppend(&methods, method)) self.reportAllocFailed();
+                continue;
+            }
+            Token variantTok = self.expect(TokenKind::Ident);
+            VariantVariant variantValue;
+            variantValue.name = self.ctx.intern(variantTok.data.asStr());
+            variantValue.fieldNames = null;
+            variantValue.fieldTypes = null;
+            variantValue.fieldsLen = 0;
+            variantValue.loc = self.tokenLoc(variantTok);
+            if (self.current.kind == TokenKind::LBrace)
+            {
+                self.advance();
+                StrListBuilder fieldNames;
+                TyListBuilder fieldTypes;
+                self.ctx.strListInit(&fieldNames);
+                self.ctx.tyListInit(&fieldTypes);
+                while (self.current.kind != TokenKind::RBrace && !self.atEnd())
+                {
+                    Ty fieldType = self.parseType();
+                    Token fieldTok = self.expect(TokenKind::Ident);
+                    Str fieldName = self.ctx.intern(fieldTok.data.asStr());
+                    if (!self.ctx.tyListAppend(&fieldTypes, fieldType)) self.reportAllocFailed();
+                    if (!self.ctx.strListAppend(&fieldNames, fieldName)) self.reportAllocFailed();
+                    if (!self.match(TokenKind::Comma) && !self.match(TokenKind::Semicolon)) break;
+                }
+                self.expect(TokenKind::RBrace);
+                // both lists are parallel: names drive field lookup, types
+                // drive layout. fieldsLen is the shared length
+                variantValue.fieldsLen = fieldNames.len;
+                variantValue.fieldNames = self.ctx.strListFinish(&fieldNames);
+                variantValue.fieldTypes = self.ctx.tyListFinish(&fieldTypes);
+            }
+            if (!self.ctx.variantListAppend(&variants, variantValue)) self.reportAllocFailed();
+            self.match(TokenKind::Comma);
+        }
+        self.expect(TokenKind::RBrace);
+        self.outerGenerics = null;
+        self.outerGenericsLen = 0;
+        u32 variantCount = variants.len;
+        VariantVariant* variantValues = self.ctx.variantListFinish(&variants);
+        u32 methodCount = methods.len;
+        NodeId* methodValues = self.ctx.nodeListFinish(&methods);
+        u8 flags = 0;
+        if (isPub) flags = 1;
+        return self.storeDecl(DeclKind::Variant{
+            .name = name, .genericParams = genericValues,
+            .genericParamsLen = genericCount, .variants = variantValues,
+            .variantsLen = variantCount, .methods = methodValues,
+            .methodsLen = methodCount, .flags = flags
+        }, self.tokenLoc(nameTok));
+    }
+
+    // same shape as a struct body minus defaults and declarator arrays:
+    // union arms are `type name[, name...];`
+    NodeId parseUnionDecl(bool isPub)
+    {
+        self.expect(TokenKind::Union);
+        Token nameTok = self.expect(TokenKind::Ident);
+        Str name = self.ctx.intern(nameTok.data.asStr());
+        NodeListBuilder genericParams;
+        self.ctx.nodeListInit(&genericParams);
+        if (self.current.kind == TokenKind::Less)
+            self.parseGenericParams(&genericParams);
+        u32 genericCount = genericParams.len;
+        NodeId* genericValues = self.ctx.nodeListFinish(&genericParams);
+        self.outerGenerics = genericValues;
+        self.outerGenericsLen = genericCount;
+        NodeListBuilder fields;
+        NodeListBuilder methods;
+        self.ctx.nodeListInit(&fields);
+        self.ctx.nodeListInit(&methods);
+        self.expect(TokenKind::LBrace);
+        while (self.current.kind != TokenKind::RBrace && !self.atEnd())
+        {
+            u8 memberAttrs = self.parseAttrList();
+            u8 fieldFlags = 0;
+            if (self.match(TokenKind::Pub)) fieldFlags = 1;
+            if (self.current.kind == TokenKind::Extern || self.current.kind == TokenKind::Static)
+            {
+                bool mIsExtern = self.match(TokenKind::Extern);
+                if (mIsExtern && self.current.kind == TokenKind::LParen)
+                {
+                    self.advance();
+                    self.expect(TokenKind::String);
+                    self.expect(TokenKind::RParen);
+                }
+                bool mIsStatic = self.match(TokenKind::Static);
+                Str methodDoc = self.scanDocsAbove();
+                NodeId method = self.parseFuncOrVarDecl(fieldFlags == 1, mIsExtern, mIsStatic, (memberAttrs & 1) != 0);
+                self.attachDoc(method, methodDoc);
+                if (!self.ctx.nodeListAppend(&methods, method)) self.reportAllocFailed();
+                self.match(TokenKind::Semicolon);
+                continue;
+            }
+            ParserMark mark = self.save();
+            self.parseType();
+            self.expect(TokenKind::Ident);
+            bool isMethod = self.current.kind == TokenKind::LParen ||
+                            self.current.kind == TokenKind::Less;
+            self.restore(mark);
+            if (isMethod)
+            {
+                NodeId method = self.parseFuncDeclFlags(memberAttrs);
+                if (!self.ctx.nodeListAppend(&methods, method)) self.reportAllocFailed();
+                self.match(TokenKind::Semicolon);
+                continue;
+            }
+            Ty fieldType = self.parseType();
+            // C-style multi-declarator union arms: `i32 a, b;`
+            while (true)
+            {
+                Token fieldTok = self.expect(TokenKind::Ident);
+                Field field;
+                field.name = self.ctx.intern(fieldTok.data.asStr());
+                field.typeNode = fieldType;
+                field.defaultValue = self.noneNode();
+                field.loc.data = 0;
+                field.flags = fieldFlags;
+                NodeId fieldNode = self.storeField(field);
+                if (!self.ctx.nodeListAppend(&fields, fieldNode)) self.reportAllocFailed();
+                if (!self.match(TokenKind::Comma)) break;
+            }
+            self.match(TokenKind::Semicolon);
+        }
+        self.expect(TokenKind::RBrace);
+        self.outerGenerics = null;
+        self.outerGenericsLen = 0;
+        u32 fieldCount = fields.len;
+        NodeId* fieldValues = self.ctx.nodeListFinish(&fields);
+        u32 methodCount = methods.len;
+        NodeId* methodValues = self.ctx.nodeListFinish(&methods);
+        u8 flags = 0;
+        if (isPub) flags = 1;
+        return self.storeDecl(DeclKind::Union{
+            .name = name, .genericParams = genericValues,
+            .genericParamsLen = genericCount, .fields = fieldValues,
+            .fieldsLen = fieldCount, .methods = methodValues,
+            .methodsLen = methodCount, .flags = flags
+        }, self.tokenLoc(nameTok));
+    }
+
+    // no fields: every member is a method signature (body optional) or an
+    // extern/static fn
+    NodeId parseTraitDecl(bool isPub)
+    {
+        self.expect(TokenKind::Trait);
+        Token nameTok = self.expect(TokenKind::Ident);
+        Str name = self.ctx.intern(nameTok.data.asStr());
+        NodeListBuilder genericParams;
+        self.ctx.nodeListInit(&genericParams);
+        if (self.current.kind == TokenKind::Less)
+            self.parseGenericParams(&genericParams);
+        u32 genericCount = genericParams.len;
+        NodeId* genericValues = self.ctx.nodeListFinish(&genericParams);
+        self.outerGenerics = genericValues;
+        self.outerGenericsLen = genericCount;
+        NodeListBuilder methods;
+        self.ctx.nodeListInit(&methods);
+        self.expect(TokenKind::LBrace);
+        while (self.current.kind != TokenKind::RBrace && !self.atEnd())
+        {
+            NodeId method;
+            if (self.current.kind == TokenKind::Extern || self.current.kind == TokenKind::Static)
+            {
+                bool mIsExtern = self.match(TokenKind::Extern);
+                if (mIsExtern && self.current.kind == TokenKind::LParen)
+                {
+                    self.advance();
+                    self.expect(TokenKind::String);
+                    self.expect(TokenKind::RParen);
+                }
+                bool mIsStatic = self.match(TokenKind::Static);
+                Str methodDoc = self.scanDocsAbove();
+                method = self.parseFuncOrVarDecl(false, mIsExtern, mIsStatic, false);
+                self.attachDoc(method, methodDoc);
+            }
+            else {
+                method = self.parseFuncDecl();
+            }
+            if (!self.ctx.nodeListAppend(&methods, method)) self.reportAllocFailed();
+        }
+        self.expect(TokenKind::RBrace);
+        self.outerGenerics = null;
+        self.outerGenericsLen = 0;
+        u32 methodCount = methods.len;
+        
+        NodeId* methodValues = self.ctx.nodeListFinish(&methods);
+        u8 flags = 0;
+        if (isPub) flags = 1;
+        
+        return self.storeDecl(DeclKind::Trait{
+            .name = name, .genericParams = genericValues,
+            .genericParamsLen = genericCount,
+            .methods = methodValues, .methodsLen = methodCount,
+            .flags = flags
+        }, self.tokenLoc(nameTok));
+    }
+
+    /* `extend<gens> Type` or `extend<gens> Type : Trait { methods }`.
+     * a trait after `:` is either a user name or `@name` for a builtin
+     * (`@drop`, `@toStr`); the `@` is folded into the interned name so
+     * builtin and user traits can't collide. gens are rebound in the
+     * self type before the body is parsed */
+    NodeId parseExtendDecl(bool isPub)
+    {
+        self.expect(TokenKind::Extend);
+        NodeListBuilder genParams;
+        self.ctx.nodeListInit(&genParams);
+        if (self.current.kind == TokenKind::Less)
+            self.parseGenericParams(&genParams);
+        u32 genericCount = genParams.len;
+        NodeId* genericValues = self.ctx.nodeListFinish(&genParams);
+        self.outerGenerics = genericValues;
+        self.outerGenericsLen = genericCount;
+        Ty selfType = self.parseType();
+        self.rebindTypeParams(selfType, genericValues, genericCount);
+        Str traitName = 0;
+        if (self.match(TokenKind::Colon))
+        {
+            /* builtin traits are spelled `@name` (`@drop`, `@toStr`, …);
+             * keep the `@` so they stay distinct from user traits */
+            bool atMark = self.match(TokenKind::At);
+            Token traitTok = self.expect(TokenKind::Ident);
+            if (atMark)
+            {
+                String atName = String::withCap(traitTok.data.len + 1);
+                atName.pushByte('@');
+                atName.pushView(traitTok.data.asStr());
+                traitName = self.ctx.intern(atName.asView());
+                atName.free();
+            }
+            else {
+                traitName = self.ctx.intern(traitTok.data.asStr());
+            }
+        }
+        NodeListBuilder methods;
+        self.ctx.nodeListInit(&methods);
+        self.expect(TokenKind::LBrace);
+        while (self.current.kind != TokenKind::RBrace && !self.atEnd())
+        {
+            NodeId method;
+            if (self.current.kind == TokenKind::Extern || self.current.kind == TokenKind::Static)
+            {
+                bool mIsExtern = self.match(TokenKind::Extern);
+                if (mIsExtern && self.current.kind == TokenKind::LParen)
+                {
+                    self.advance();
+                    self.expect(TokenKind::String);
+                    self.expect(TokenKind::RParen);
+                }
+                bool mIsStatic = self.match(TokenKind::Static);
+                Str methodDoc = self.scanDocsAbove();
+                method = self.parseFuncOrVarDecl(false, mIsExtern, mIsStatic, false);
+                self.attachDoc(method, methodDoc);
+            }
+            else
+            {
+                method = self.parseFuncDecl();
+            }
+            if (!self.ctx.nodeListAppend(&methods, method)) self.reportAllocFailed();
+        }
+        self.expect(TokenKind::RBrace);
+        self.outerGenerics = null;
+        self.outerGenericsLen = 0;
+        u32 methodCount = methods.len;
+        NodeId* methodValues = self.ctx.nodeListFinish(&methods);
+        if (traitName != 0)
+            return self.storeDecl(DeclKind::ExtendTrait{ .selfType = selfType, .traitName = traitName, .genericParams = genericValues, .genericParamsLen = genericCount, .methods = methodValues, .methodsLen = methodCount }, SourceLoc { .data = 0 });
+        return self.storeDecl(DeclKind::Extend{ .selfType = selfType, .genericParams = genericValues, .genericParamsLen = genericCount, .methods = methodValues, .methodsLen = methodCount }, SourceLoc { .data = 0 });
+    }
+
+    /* `const T NAME = v` / `const NAME = v` / `const T NAME[N] = v`.
+     * the untyped form is detected after the fact: parseType() has
+     * already eaten the name, so a Named type with no args becomes the
+     * name and the type resets to 0 (sema infers it) */
+    NodeId parseConstDecl(bool isPub)
+    {
+        self.expect(TokenKind::Const);
+        Ty typeNode = self.parseType();
+        Str nameId = 0;
+        SourceLoc nameLoc;
+        nameLoc.data = 0;
+        if (self.current.kind == TokenKind::Equal)
+        {
+            /* untyped constant: `const NAME = value;`; what parseType
+             * consumed was actually the constant's name */
+            if (typeNode != 0)
+            {
+                TypeEntry* te = self.ctx.types + typeNode;
+                if (te->kind.tag == TypeKind::Named && te->kind.payload.Named.genericArgsLen == 0)
+                {
+                    nameId = te->kind.payload.Named.name;
+                    nameLoc = te->loc;
+                }
+            }
+            typeNode = 0;
+        }
+        else
+        {
+            Token name = self.expectName();
+            if (typeNode != 0) typeNode = self.parseDeclaratorArray(typeNode);
+            nameId = self.ctx.intern(name.data.asStr());
+            nameLoc = self.tokenLoc(name);
+        }
+        if (nameId == 0) self.reportCurrentError(ErrorCode::ParseExpectedToken, "expected a constant name");
+        self.expect(TokenKind::Equal);
+        NodeId value = self.parseInitExpr();
+        self.expect(TokenKind::Semicolon);
+        // flags: 1 = pub, 16 = const (see parseFuncOrVarDecl)
+        u8 cflags = 16;
+        if (isPub) cflags |= 1;
+        typeNode = self.inferArrayFromInit(typeNode, value);
+        return self.storeDecl(DeclKind::Constant{ .name = nameId, .typeNode = typeNode, .value = value, .flags = cflags }, nameLoc);
+    }
+
+    /* `var NAME = expr;` (inferred storage) and `var T NAME [N] [= expr];`
+     * (typed storage) at file scope. `var name` and `var Type name` share
+     * a prefix, so the type is parsed speculatively and committed only if
+     * an ident follows it (`var name = ...` must not eat `name` as a type) */
+    NodeId parseVarDecl(bool isPub)
+    {
+        self.expect(TokenKind::Var);
+        Ty ty = 0;
+        bool typed = false;
+        if (self.isTypeStart())
+        {
+            ParserMark m = self.save();
+            Ty parsed = self.parseType();
+            if (self.current.kind == TokenKind::Ident)
+            {
+                // a name follows the type: `var i32 x = …`
+                // committed: the speculation was real
+                typed = true;
+                ty = parsed;
+                self.endSpeculation();
+            }
+            else self.restore(m);
+        }
+        Token nameTok = self.expectName();
+        Str name = self.ctx.intern(nameTok.data.asStr());
+        if (typed) ty = self.parseDeclaratorArray(ty);
+        NodeId value = self.noneNode();
+        if (self.match(TokenKind::Equal)) value = self.parseInitExpr();
+        self.expect(TokenKind::Semicolon);
+        ty = self.inferArrayFromInit(ty, value);
+        u8 flags = isPub ? 1 : 0;
+        return self.storeDecl(DeclKind::Constant{ .name = name, .typeNode = ty, .value = value, .flags = flags }, self.tokenLoc(nameTok));
+    }
+
+    // `typedef Name = Type;`: pure alias, no distinct identity
+    NodeId parseTypedefDecl()
+    {
+        self.expect(TokenKind::Typedef);
+        Token nameTok = self.expect(TokenKind::Ident);
+        Str name = self.ctx.intern(nameTok.data.asStr());
+        self.expect(TokenKind::Equal);
+        Ty target = self.parseType();
+        self.expect(TokenKind::Semicolon);
+        return self.storeDecl(DeclKind::TypeAlias{ .name = name, .target = target, .flags = 0 }, self.tokenLoc(nameTok));
+    }
+
+    // `distinct Name = Type;`: nominal wrapper; a `flag(...)` base picks
+    // the arm per build flags
+    NodeId parseDistinctDecl()
+    {
+        self.expect(TokenKind::Distinct);
+        Token nameTok = self.expect(TokenKind::Ident);
+        Str name = self.ctx.intern(nameTok.data.asStr());
+        self.expect(TokenKind::Equal);
+        Ty base = 0;
+        if (self.current.kind == TokenKind::Flag) base = self.parseFlagType();
+        else base = self.parseType();
+        self.expect(TokenKind::Semicolon);
+        return self.storeDecl(DeclKind::Distinct{ .name = name, .baseType = base, .flags = 0 }, self.tokenLoc(nameTok));
+    }
+
+    /* `flag (NAME) { key => { T }, ..., else => { T } }` in type position,
+     * e.g. `distinct Ptr = flag (target) { aarch64 => {...}, ... };`.
+     * arms are selected by comparing NAME's value in ctx.flags (the same
+     * build-flag table the expression form uses; not targetArch, that's
+     * for @arch). every arm type is parsed so its syntax gets checked,
+     * and `else` covers the no-match case. */
+    Ty parseFlagType()
+    {
+        self.advance(); // flag
+        self.expect(TokenKind::LParen);
+        Token nameTokStmt = self.expect(TokenKind::Ident);
+        Str nameStrFor = self.ctx.intern(nameTokStmt.data.asStr());
+        self.expect(TokenKind::RParen);
+        self.expect(TokenKind::LBrace);
+
+        Ty selected = 0;
+        Ty selectedArmElse = 0;
+        while (!self.atEnd() && self.current.kind != TokenKind::RBrace)
+        {
+            bool isElse = false;
+            bool isHost = false;
+            if (self.match(TokenKind::Else))
+            {
+                isElse = true;
+            }
+            else
+            {
+                Token keyTok = self.expect(TokenKind::Ident);
+                /* arm selected when the build-time flag (flag name is
+                 * the param of `flag (NAME)`)'s value equals this key; the
+                 * 'else' arm is the fallback when no match is found. */
+                bool isMatch = false;
+                if (self.ctx != null)
+                {
+                    Str keyStr = self.ctx.intern(keyTok.data.asStr());
+                    Str anm = nameStrFor; // lookup by the planted flag name
+                    u32 f1 = 0;
+                    while (f1 < self.ctx->flagsLen)
+                    {
+                        if (self.ctx->flagNames[f1] == anm &&
+                            self.ctx->flagValues[f1] == keyStr) isMatch = true;
+                        f1++;
+                    }
+                }
+                if (isMatch) isHost = true;
+            }
+            self.expect(TokenKind::FatArrow);
+            Ty armTy = 0;
+            if (self.match(TokenKind::LBrace))
+            {
+                armTy = self.parseType();
+                self.expect(TokenKind::RBrace);
+            }
+            else armTy = self.parseType();
+            if (isHost) selected = armTy;
+            else if (isElse) selectedArmElse = armTy;
+            if (!self.match(TokenKind::Comma)) break;
+        }
+        self.expect(TokenKind::RBrace);
+        Ty r = selected != 0 ? selected : selectedArmElse;
+        return r;
+    }
+
+    /* file-scope `flag (NAME) { key => { stmts } }`. arm bodies are
+     * parsed then dropped; nothing consumes this form (the flag forms
+     * that matter are driven by ctx.flags in stmt.crl and expr.crl).
+     * returns the invalid node, like parseComptimeDecl */
+    NodeId parseFlagDecl()
+    {
+        self.expect(TokenKind::Flag);
+        self.expect(TokenKind::LParen);
+        self.expect(TokenKind::Ident);
+        self.expect(TokenKind::RParen);
+        self.expect(TokenKind::LBrace);
+        while (self.current.kind != TokenKind::RBrace && !self.atEnd())
+        {
+            if (!self.match(TokenKind::Else))
+                self.expect(TokenKind::Ident);
+            self.expect(TokenKind::FatArrow);
+            self.expect(TokenKind::LBrace);
+            while (self.current.kind != TokenKind::RBrace && !self.atEnd())
+                self.parseStmt();
+            self.expect(TokenKind::RBrace);
+            self.match(TokenKind::Comma);
+        }
+        self.expect(TokenKind::RBrace);
+        return self.allocNode();
+    }
+
+    // joins interned names with `::` and interns the result. parts is
+    // consumed (finished); the result is ctx-owned, the String buffer is
+    // freed here
+    Str strListJoin(StrListBuilder* parts)
+    {
+        u32 count = parts->len;
+        Str* values = self.ctx.strListFinish(parts);
+        if (count == 0 || values == null) return 0;
+        if (count == 1) return values[0];
+        String text = String::new();
+        u32 i = 0;
+        while (i < count)
+        {
+            if (i > 0) text.pushView("::");
+            InternEntry* entry = self.ctx.interns + values[i];
+            text.pushView(str { .ptr = entry->ptr, .len = entry->len });
+            i++;
+        }
+        Str result = self.ctx.intern(text.asView());
+        text.free();
+        return result;
+    }
+
+    /* `a::b::c`, stopping before a `:: {`; that brace opens the import
+     * symbol list, not a path segment (peek + restore so a wrong guess
+     * never emits a diagnostic) */
+    Str parseNamespacePath()
+    {
+        StrListBuilder parts;
+        self.ctx.strListInit(&parts);
+        while (true)
+        {
+            Token tok = self.expectName();
+            Str part = self.ctx.intern(tok.data.asStr());
+            if (!self.ctx.strListAppend(&parts, part))
+            {
+                self.reportAllocFailed();
+                break;
+            }
+            if (self.current.kind != TokenKind::ColonColon) break;
+            ParserMark m = self.save();
+            self.advance();
+            if (self.current.kind == TokenKind::LBrace)
+            {
+                self.restore(m);
+                break;
+            }
+            self.endSpeculation();
+        }
+        return self.strListJoin(&parts);
+    }
+
+    /* `a, b as c, pkg::{d}, *`: recursive over nested groups. `prefix`
+     * is the parent path for `::{...}` symbols, 0 at top level. `*` gets
+     * flags 2 (the ast docs only mention bit 0, but sema reads bit 1),
+     * `as` sets bit 0 and the alias. returns false only on OOM */
+    bool parseSymbolList(Str prefix, ImportSymList* list)
+    {
+        while (self.current.kind != TokenKind::RBrace && !self.atEnd())
+        {
+            ImportSymbol value;
+            value.name = 0;
+            value.alias = 0;
+            value.flags = 0;
+            if (self.match(TokenKind::Star))
+            {
+                value.flags = 2;
+                if (list->len >= list->cap)
+                {
+                    u32 newCap = list->cap * 2;
+                    if (newCap == 0) newCap = 4;
+                    ImportSymbol* raw = realloc<ImportSymbol>(list->items, (usize)newCap);
+                    if (raw == null)
+                    {
+                        self.reportAllocFailed();
+                        return false;
+                    }
+                    list->items = raw;
+                    list->cap = newCap;
+                }
+                list->items[list->len] = value;
+                list->len++;
+            }
+            else
+            {
+                Token nameTok = self.expectName();
+                Str name = self.ctx.intern(nameTok.data.asStr());
+                if (prefix != 0)
+                {
+                    StrListBuilder parts;
+                    self.ctx.strListInit(&parts);
+                    self.ctx.strListAppend(&parts, prefix);
+                    self.ctx.strListAppend(&parts, name);
+                    name = self.strListJoin(&parts);
+                }
+                if (self.current.kind == TokenKind::ColonColon)
+                {
+                    ParserMark m = self.save();
+                    self.advance();
+                    if (self.current.kind == TokenKind::LBrace)
+                    {
+                        self.advance();
+                        if (!self.parseSymbolList(name, list)) return false;
+                        self.expect(TokenKind::RBrace);
+                        self.endSpeculation();
+                        if (!self.match(TokenKind::Comma)) break;
+                        continue;
+                    }
+                    if (self.current.kind == TokenKind::Ident)
+                    {
+                        StrListBuilder pathParts;
+                        self.ctx.strListInit(&pathParts);
+                        self.ctx.strListAppend(&pathParts, name);
+                        while (self.current.kind == TokenKind::Ident)
+                        {
+                            Token partTok = self.current;
+                            Str part = self.ctx.intern(partTok.data.asStr());
+                            self.ctx.strListAppend(&pathParts, part);
+                            self.advance();
+                            if (self.current.kind != TokenKind::ColonColon) break;
+                            self.advance();
+                        }
+                        name = self.strListJoin(&pathParts);
+                        self.endSpeculation();
+                    }
+                    else
+                    {
+                        self.restore(m);
+                    }
+                }
+                if (self.current.kind == TokenKind::LBrace)
+                {
+                    self.advance();
+                    if (!self.parseSymbolList(name, list)) return false;
+                    self.expect(TokenKind::RBrace);
+                }
+                else
+                {
+                    value.name = name;
+                    if (self.match(TokenKind::As))
+                    {
+                        Token aliasTok = self.expectName();
+                        value.alias = self.ctx.intern(aliasTok.data.asStr());
+                        value.flags |= 1;
+                    }
+                    if (list->len >= list->cap)
+                    {
+                        u32 newCap = list->cap * 2;
+                        if (newCap == 0) newCap = 4;
+                        ImportSymbol* raw = realloc<ImportSymbol>(list->items, (usize)newCap);
+                        if (raw == null)
+                        {
+                            self.reportAllocFailed();
+                            return false;
+                        }
+                        list->items = raw;
+                        list->cap = newCap;
+                    }
+                    list->items[list->len] = value;
+                    list->len++;
+                }
+            }
+            if (!self.match(TokenKind::Comma)) break;
+        }
+        return true;
+    }
+
+    /* `path::{...}` (path becomes the prefix) or a bare `{...}`; no list
+     * is not an error, just zero symbols. the list buffer is handed to
+     * the ctx; freed at deinit, not by the caller */
+    void parseImportSymbols(rawptr* outSymbols, u32* outLen, Str path)
+    {
+        *outSymbols = null;
+        *outLen = 0;
+        Str prefix = 0;
+        if (self.current.kind == TokenKind::ColonColon)
+        {
+            self.advance();
+            prefix = path;
+            self.expect(TokenKind::LBrace);
+        }
+        else if (!self.match(TokenKind::LBrace)) return;
+        ImportSymList list;
+        list.items = null;
+        list.len = 0;
+        list.cap = 0;
+        self.parseSymbolList(prefix, &list);
+        self.expect(TokenKind::RBrace);
+        if (list.items != null && !self.ctx.track((rawptr)list.items)) self.reportAllocFailed();
+        *outSymbols = (rawptr)list.items;
+        *outLen = list.len;
+    }
+
+    // `import(lib) path::{...};`: flags bit 0 = the `(pkg)` qualifier.
+    // a string-literal path is rejected with a pointer at the real shape
+    NodeId parseImportDecl()
+    {
+        self.expect(TokenKind::Import);
+        u8 flags = 0;
+        if (self.match(TokenKind::LParen))
+        {
+            self.expect(TokenKind::Ident);
+            self.expect(TokenKind::RParen);
+            flags |= 1;
+        }
+        Str path = 0;
+        if (self.current.kind == TokenKind::String)
+        {
+            self.reportCurrentError(ErrorCode::ParseInvalidImportPath, "expected an import path: a bare name or a module path");
+            self.advance();
+        }
+        else path = self.parseNamespacePath();
+        ImportSymbol* symbols = null;
+        u32 symbolsLen = 0;
+        self.parseImportSymbols((rawptr*)&symbols, &symbolsLen, path);
+        self.expect(TokenKind::Semicolon);
+        return self.storeDecl(DeclKind::Import{ .path = path, .symbols = symbols, .symbolsLen = symbolsLen, .flags = flags }, SourceLoc { .data = 0 });
+    }
+
+    // `mod alias = import[(pkg)] path;`: flags: bit 0 = (pkg), bit 1 = pub
+    NodeId parseModReexport(bool isPub)
+    {
+        self.expect(TokenKind::Mod);
+        Token aliasToken = self.expectName();
+        Str alias = self.ctx.intern(aliasToken.data.asStr());
+        self.expect(TokenKind::Equal);
+        self.expect(TokenKind::Import);
+        u8 flags = 0;
+        if (self.match(TokenKind::LParen))
+        {
+            self.expect(TokenKind::Ident);
+            self.expect(TokenKind::RParen);
+            flags |= 1;
+        }
+        Str path = 0;
+        if (self.current.kind == TokenKind::String)
+        {
+            self.reportCurrentError(ErrorCode::ParseInvalidImportPath, "expected an import path: a bare name or a module path");
+            self.advance();
+        }
+        else path = self.parseNamespacePath();
+        ImportSymbol* symbols = null;
+        u32 symbolsLen = 0;
+        self.parseImportSymbols((rawptr*)&symbols, &symbolsLen, path);
+        self.expect(TokenKind::Semicolon);
+        if (isPub) flags |= 2;
+        return self.storeDecl(DeclKind::ModReexport{ .alias = alias, .path = path, .symbols = symbols, .symbolsLen = symbolsLen, .flags = flags }, self.tokenLoc(aliasToken));
+    }
+
+    /* `comptime { decls }` at file scope: a stub. the decls get parsed
+     * (their nodes land in the arena) but the DeclKind::Comptime payload
+     * is never built and nothing consumes it; the invalid node below is
+     * all the caller gets. also note the indentation lies: only
+     * parseDecl() is the loop body, the RBrace expect runs once */
+    NodeId parseComptimeDecl()
+    {
+        self.expect(TokenKind::Comptime);
+        self.expect(TokenKind::LBrace);
+        while (self.current.kind != TokenKind::RBrace && !self.atEnd())
+            self.parseDecl();
+            self.expect(TokenKind::RBrace);
+        return self.allocNode();
+    }
+}

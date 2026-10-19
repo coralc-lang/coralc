@@ -1,0 +1,726 @@
+#[[no_drop_all]]
+// async — library-level async/await runtime for coral (stackful fibers).
+//
+// The language has no `async fn` yet, so this is a runtime you drive by hand —
+// spawn() puts a task on its own fiber stack, await(future) suspends the
+// calling fiber and resumes it later, run() is the scheduler driver.
+// Sequential code therefore reads top-to-bottom across suspension points.
+//
+// v1 shape:
+//  - glibc ucontext (getcontext/makecontext/swapcontext) does the stackful
+//    switch; the glibc x86_64 ucontext_t layout was validated by a gcc offset
+//    probe and is mirrored by UContext below (getcontext writes all 968 bytes,
+//    so the mirror has to be byte-exact).
+//  - one driver thread (whoever calls run()/runOnce()) and one scheduler
+//    lock+condvar; only the driver swaps contexts. Futures resolved from other
+//    threads (ThreadPool workers, channel senders) do it under the lock and
+//    signal the condvar, so a parked run() wakes up.
+//  - futures are NOT individually cancellable in v1 — the owner just drops a
+//    future it no longer wants and the runtime never resumes or frees it.
+//    dealloc<Future>(f) is the owner's job once nothing can resolve or await
+//    it (note the corollary, a dropped pending recv future can stall run()).
+//  - fiber stacks are heap blocks (std::mman), 128 KiB by default via
+//    defaultFiberStackSize, recycled together with the finished fiber.
+//    No guard pages in v1 — a runaway fiber smashes its neighbours instead of
+//    faulting.
+//  - timers are wall-clock (gettimeofday); run() idles in
+//    pthread_cond_timedwait on that same clock. My judgment call, one wait
+//    mechanism serves both timers and cross-thread wakes instead of the
+//    poll(...,timeout) alternative (a condvar signal would not wake a poll).
+//
+// Call init() before first use when several threads touch this module;
+// single-threaded setups initialize lazily on the first call that locks.
+
+import mutex { Mutex };
+import thread { ConditionVar };
+import threadpool { ThreadPool };
+import(lib) std::mman { alloc, dealloc };
+import(lib) std::result { Result };
+import(lib) platform::libc {
+    getcontext, makecontext, swapcontext, gettimeofday, pthread_cond_timedwait, printf
+};
+import(lib) core::cchar { cchar };
+
+/// Errors reported by the async runtime.
+pub variant AsyncError
+{
+    OutsideFiber { str msg; },
+    NullFuture { str msg; },
+    SpawnFailed { str msg; }
+}
+
+// glibc x86_64 stack_t, probe numbers: ss_sp 0, ss_flags 8, ss_size 16,
+// sizeof 24.
+struct UStack
+{
+    rawptr ss_sp;
+    i32 ss_flags;
+    u64 ss_size;
+}
+
+// glibc x86_64 ucontext_t, probe numbers: uc_flags 0, uc_link 8, uc_stack 16
+// (24 bytes), uc_mcontext 40 (256 bytes, gregs at 0 / fpregs at 184),
+// uc_sigmask 296 (128 bytes), trailing fpstate+ssp 424..968,
+// sizeof(ucontext_t) == 968. The coral field sequence must match it exactly.
+struct UContext
+{
+    u64 uc_flags;
+    rawptr uc_link;
+    UStack uc_stack;
+    u8 uc_mcontext[256];
+    u8 uc_sigmask[128];
+    u8 uc_tail[544];
+}
+
+const u8 FUTURE_PENDING = 0;
+const u8 FUTURE_READY = 1;
+
+const u8 FIBER_READY = 0;
+const u8 FIBER_RUNNING = 1;
+const u8 FIBER_PARKED = 2;
+const u8 FIBER_DONE = 3;
+
+const i32 STEP_RAN = 1;
+const i32 STEP_WAITED = 2;
+const i32 STEP_DONE = 3;
+const i32 STEP_IDLE = 4;
+const i32 STEP_STUCK = 5;
+
+// A one-shot result cell. await(f) suspends the calling fiber until it turns
+// ready and then returns its result. v1 futures are not individually
+// cancellable — the owner drops a future it no longer wants to wait on, and
+// the runtime never resumes or frees one; see the module comment.
+/// One-shot result cell awaited by fibers.
+pub struct Future
+{
+    u8 state;
+    rawptr result;
+    Fiber* waiters;   // fibers parked inside await(), chain via Fiber.waitNext
+    Future* chanNext; // link while queued on an AsyncChannel's recv waiters
+    bool counted;     // in-flight pool job, keeps run() from declaring a stall
+}
+
+struct Fiber
+{
+    UContext ctx;
+    u8* stack;
+    usize stackSize;
+    void(rawptr) fn;
+    rawptr arg;
+    Future* done; // spawn()'s join future, resolved when fn returns
+    Fiber* waitNext; // next fiber on a future's waiter list
+    Fiber* next; // ready queue / free list / reap list link
+    u8 state;
+    bool started; // makecontext entry has been entered once
+}
+
+struct TimerEntry
+{
+    u64 deadlineMs;
+    Future* fut;
+    TimerEntry* next;
+}
+
+struct PoolJob
+{
+    void(rawptr) fn;
+    rawptr arg;
+    Future* fut;
+}
+
+struct Scheduler
+{
+    Mutex mutex;
+    ConditionVar cond;
+    Fiber* readyHead;
+    Fiber* readyTail;
+    Fiber* freeHead; // finished fibers kept for stack reuse
+    Fiber* reapHead; // fibers that finished but still run on their own stack
+    TimerEntry* timerHead; // deadlines ascending
+    u32 live; // spawned fibers that have not finished
+    u32 pendingPool; // poolRun jobs the thread pool has not finished yet
+    bool inited;
+}
+
+Scheduler _sched;
+UContext _schedCtx; // driver context, saved/restored by swapcontext
+Fiber* _activeFiber; // fiber currently executing on the driver thread
+Fiber* _startingFiber; // fresh fiber whose makecontext entry has not run yet
+bool _busy; // a driver owns the scheduler (run/runOnce guard)
+
+// Heap stack size for new fibers. Set it before the first spawn; a recycled
+// fiber keeps whatever stack size it was born with.
+/// Stack size, in bytes, for newly spawned fibers.
+pub usize defaultFiberStackSize = 131072;
+
+struct TimeVal
+{
+    i64 sec;
+    i64 usec;
+}
+
+struct TimeSpec
+{
+    i64 sec;
+    i64 nsec;
+}
+
+u64 _nowMs()
+{
+    TimeVal tv;
+    gettimeofday((rawptr)&tv, null);
+    return (u64)tv.sec * 1000u + (u64)tv.usec / 1000u;
+}
+
+void _initScheduler()
+{
+    if (_sched.inited) return;
+    _sched.mutex.init();
+    _sched.cond.init();
+    _sched.readyHead = null;
+    _sched.readyTail = null;
+    _sched.freeHead = null;
+    _sched.reapHead = null;
+    _sched.timerHead = null;
+    _sched.live = 0;
+    _sched.pendingPool = 0;
+    _sched.inited = true;
+}
+
+// Set up the module from the calling thread before any other thread touches
+// it — the lazy path inside _lock() is not itself synchronized.
+/// Initialize the scheduler; true on success.
+pub bool init()
+{
+    _initScheduler();
+    return _sched.inited;
+}
+
+void _lock()
+{
+    if (!_sched.inited) _initScheduler();
+    _sched.mutex.lock();
+}
+
+void _unlock()
+{
+    _sched.mutex.unlock();
+}
+
+// Lock must be held. Hands result out to every parked waiter and wakes run().
+void _resolveLocked(Future* f, rawptr result)
+{
+    if (f == null || f->state == FUTURE_READY) return;
+    f->state = FUTURE_READY;
+    f->result = result;
+    Fiber* w = f->waiters;
+    f->waiters = null;
+    while (w != null)
+    {
+        Fiber* nx = w->waitNext;
+        w->waitNext = null;
+        w->state = FIBER_READY;
+        _pushReady(w);
+        w = nx;
+    }
+    _sched.cond.signal();
+}
+
+// Lock must be held. Single funnel for every completion, so the pool-in-flight
+// counter stays honest.
+void _completeLocked(Future* f, rawptr result)
+{
+    if (f != null && f->counted)
+    {
+        f->counted = false;
+        _sched.pendingPool = _sched.pendingPool - 1u;
+    }
+    _resolveLocked(f, result);
+}
+
+// Lock must be held.
+void _pushReady(Fiber* f)
+{
+    f->next = null;
+    if (_sched.readyTail != null) _sched.readyTail->next = f;
+    else _sched.readyHead = f;
+    _sched.readyTail = f;
+}
+
+// Lock must be held.
+Fiber* _popReady()
+{
+    Fiber* f = _sched.readyHead;
+    if (f == null) return null;
+    _sched.readyHead = f->next;
+    if (_sched.readyHead == null) _sched.readyTail = null;
+    f->next = null;
+    return f;
+}
+
+// Lock must be held. Expired timers resolve their futures (wakes parked
+// waiters) and free their entries.
+void _expireTimersLocked()
+{
+    u64 now = _nowMs();
+    while (_sched.timerHead != null && _sched.timerHead->deadlineMs <= now)
+    {
+        TimerEntry* t = _sched.timerHead;
+        _sched.timerHead = t->next;
+        _completeLocked(t->fut, null);
+        dealloc<TimerEntry>(t);
+    }
+}
+
+// Lock must be held. Finished fibers no longer execute on their stacks, so
+// they may go back on the free list for reuse.
+void _drainReapLocked()
+{
+    while (_sched.reapHead != null)
+    {
+        Fiber* f = _sched.reapHead;
+        _sched.reapHead = f->next;
+        f->next = _sched.freeHead;
+        _sched.freeHead = f;
+    }
+}
+
+// Lock must be held (pthread_cond_timedwait drops and re-takes it).
+void _condTimedWait(u64 deadlineMs)
+{
+    TimeSpec ts;
+    ts.sec = (i64)(deadlineMs / 1000u);
+    ts.nsec = (i64)(deadlineMs % 1000u) * 1000000;
+    pthread_cond_timedwait(_sched.cond.impl, _sched.mutex.impl, (rawptr)&ts);
+}
+
+void _prepareContext(Fiber* f)
+{
+    getcontext((rawptr)&f->ctx);
+    f->ctx.uc_link = null;
+    f->ctx.uc_stack.ss_sp = (rawptr)f->stack;
+    f->ctx.uc_stack.ss_flags = 0;
+    f->ctx.uc_stack.ss_size = (u64)f->stackSize;
+    makecontext((rawptr)&f->ctx, _fiberEntry, 0);
+}
+
+Fiber* _popFree()
+{
+    _lock();
+    Fiber* f = _sched.freeHead;
+    if (f != null)
+    {
+        _sched.freeHead = f->next;
+        f->next = null;
+    }
+    _unlock();
+    return f;
+}
+
+Fiber* _acquireFiber()
+{
+    Fiber* f = _popFree();
+    if (f != null)
+    {
+        _prepareContext(f);
+        return f;
+    }
+    f = alloc<Fiber>(1);
+    if (f == null) return null;
+    u8* stk = alloc<u8>(defaultFiberStackSize);
+    if (stk == null)
+    {
+        dealloc<Fiber>(f);
+        return null;
+    }
+    f->stack = stk;
+    f->stackSize = defaultFiberStackSize;
+    _prepareContext(f);
+    return f;
+}
+
+Future* _newFuture()
+{
+    Future* f = alloc<Future>(1);
+    if (f == null) return null;
+    f->state = FUTURE_PENDING;
+    f->result = null;
+    f->waiters = null;
+    f->chanNext = null;
+    f->counted = false;
+    return f;
+}
+
+// makecontext entry for every fiber. _startingFiber is stashed by the driver
+// immediately before the first switch in, since makecontext is called with
+// argc 0 and cannot carry the pointer itself.
+void _fiberEntry()
+{
+    Fiber* f = _startingFiber;
+    _startingFiber = null;
+    f->fn(f->arg);
+    // finished — resolve the join future, park self on the reap list, and
+    // swap back to the driver holding the lock, the invariant the driver side
+    // of every swap relies on.
+    _lock();
+    f->state = FIBER_DONE;
+    _completeLocked(f->done, null);
+    f->next = _sched.reapHead;
+    _sched.reapHead = f;
+    _sched.live = _sched.live - 1u;
+    swapcontext((rawptr)&f->ctx, (rawptr)&_schedCtx);
+}
+
+void _poolEntry(rawptr p)
+{
+    PoolJob* job = (PoolJob*)p;
+    Future* fut = job->fut;
+    job->fn(job->arg);
+    dealloc<PoolJob>(job);
+    _lock();
+    _completeLocked(fut, null);
+    _unlock();
+}
+
+// One scheduler slice. Lock is taken inside and released on every exit path.
+// A fiber swap-out leaves the lock held for the driver to pick up, a fiber
+// swap-in happens with the lock dropped.
+i32 _step(bool allowWait)
+{
+    _lock();
+    _expireTimersLocked();
+    _drainReapLocked();
+    Fiber* f = _popReady();
+    if (f != null)
+    {
+        _unlock();
+        _activeFiber = f;
+        f->state = FIBER_RUNNING;
+        if (!f->started)
+        {
+            f->started = true;
+            _startingFiber = f;
+        }
+        swapcontext((rawptr)&_schedCtx, (rawptr)&f->ctx);
+        _activeFiber = null;
+        _unlock();
+        return STEP_RAN;
+    }
+    if (_sched.live == 0u)
+    {
+        _unlock();
+        return STEP_DONE;
+    }
+    if (!allowWait)
+    {
+        _unlock();
+        return STEP_IDLE;
+    }
+    if (_sched.timerHead != null)
+    {
+        _condTimedWait(_sched.timerHead->deadlineMs);
+        _unlock();
+        return STEP_WAITED;
+    }
+    if (_sched.pendingPool > 0u)
+    {
+        // in-flight pool work resolves a future and signals; that wake-up is
+        // the whole reason this can wait without a timeout
+        _sched.cond.wait(&_sched.mutex);
+        _unlock();
+        return STEP_WAITED;
+    }
+    // live fibers parked with nothing left that could ever wake them
+    _unlock();
+    return STEP_STUCK;
+}
+
+// Spawn fn+arg on a fresh (or recycled) fiber. The returned future is a join
+// handle — await(spawn(...)) waits for fn to return; since fn is void it
+// carries no payload (my judgment call, null is the result).
+// Err(SpawnFailed) — null fn, or the fiber/future could not be allocated;
+// the message says which.
+/// Spawn fn(arg) on its own fiber, returning a join future or Err.
+pub Result<Future*, AsyncError> spawn(void(rawptr) fn, rawptr arg)
+{
+    if (fn == null)
+        return Result<Future*, AsyncError>::Err { .error = AsyncError::SpawnFailed { .msg = "spawn() called with a null fn" } };
+    Future* join = _newFuture();
+    if (join == null)
+        return Result<Future*, AsyncError>::Err { .error = AsyncError::SpawnFailed { .msg = "spawn() join future allocation failed" } };
+    Fiber* f = _acquireFiber();
+    if (f == null)
+    {
+        dealloc<Future>(join);
+        return Result<Future*, AsyncError>::Err { .error = AsyncError::SpawnFailed { .msg = "spawn() fiber stack allocation failed" } };
+    }
+    f->fn = fn;
+    f->arg = arg;
+    f->done = join;
+    f->waitNext = null;
+    f->state = FIBER_READY;
+    f->started = false;
+    _lock();
+    _sched.live = _sched.live + 1u;
+    _pushReady(f);
+    _sched.cond.signal(); // a driver parked with an empty queue must see it
+    _unlock();
+    return Result<Future*, AsyncError>::Ok { .value = join };
+}
+
+// Suspend the calling fiber until f is ready, then return its result.
+// There is nowhere to suspend to outside a fiber, so that diagnoses itself
+// (message on stdout) and returns Err; await on a null future is Err too.
+// Ok(null) is a legitimate result — join futures resolve with a null payload.
+/// Suspend the calling fiber until f resolves; Err outside a fiber.
+pub Result<rawptr, AsyncError> await(Future* f)
+{
+    Fiber* cur = _activeFiber;
+    if (cur == null)
+    {
+        printf((const cchar*)C"coral async: await() called outside a fiber\n");
+        return Result<rawptr, AsyncError>::Err { .error = AsyncError::OutsideFiber { .msg = "await() called outside a fiber" } };
+    }
+    if (f == null) return Result<rawptr, AsyncError>::Err { .error = AsyncError::NullFuture { .msg = "await() called with a null future" } };
+    _lock();
+    while (f->state == FUTURE_PENDING)
+    {
+        cur->waitNext = f->waiters;
+        f->waiters = cur;
+        cur->state = FIBER_PARKED;
+        // park, leaving the lock held for the driver; run() drops the lock
+        // before switching back in, so re-take it to re-read the state
+        swapcontext((rawptr)&cur->ctx, (rawptr)&_schedCtx);
+        _lock();
+    }
+    rawptr r = f->result;
+    _unlock();
+    return Result<rawptr, AsyncError>::Ok { .value = r };
+}
+
+// Timer awaitable — await(sleep(ms)) suspends the fiber for at least ms.
+// null — the future or timer entry could not be allocated; awaiting a null
+// future reports Err(NullFuture).
+/// Awaitable that resolves after at least ms milliseconds.
+pub Future* sleep(u64 ms)
+{
+    Future* f = _newFuture();
+    if (f == null) return null;
+    TimerEntry* t = alloc<TimerEntry>(1);
+    if (t == null)
+    {
+        dealloc<Future>(f);
+        return null;
+    }
+    t->fut = f;
+    t->deadlineMs = _nowMs() + ms;
+    _lock();
+    TimerEntry* prev = null;
+    TimerEntry* cur = _sched.timerHead;
+    while (cur != null && cur->deadlineMs <= t->deadlineMs)
+    {
+        prev = cur;
+        cur = cur->next;
+    }
+    t->next = cur;
+    if (prev == null) _sched.timerHead = t;
+    else prev->next = t;
+    _sched.cond.signal(); // a driver already waiting must re-measure its timeout
+    _unlock();
+    return f;
+}
+
+// Drive fibers until every spawned fiber has finished, true, or until the
+// scheduler stalls with fibers still parked, false. A stall means no ready
+// fiber, no timer, no pool job in flight — e.g. fibers parked on channel
+// receives nobody will ever send; after an external completion (or spawn)
+// makes progress, run() may simply be called again. Not re-entrant, a nested
+// or concurrent driver call returns false without driving anything.
+/// Drive fibers until all finish; false if the scheduler stalls.
+pub bool run()
+{
+    if (_busy) return false;
+    _busy = true;
+    bool ok = true;
+    loop
+    {
+        i32 step = _step(true);
+        if (step == STEP_DONE) break;
+        if (step == STEP_STUCK)
+        {
+            ok = false;
+            break;
+        }
+    }
+    _busy = false;
+    return ok;
+}
+
+// One scheduler slice that never blocks — expire due timers, then run at most
+// one ready fiber, then return (nothing to do just returns).
+/// Run at most one scheduler slice without blocking.
+pub void runOnce()
+{
+    if (_busy) return;
+    _busy = true;
+    _step(false);
+    _busy = false;
+}
+
+// Offload fn+arg to an existing thread pool; the future resolves when the
+// pool finishes and an awaiting fiber always resumes on the driver thread
+// (the pool thread only completes the future under the scheduler lock).
+// null — the job could not be queued (bad args, OOM, or a stopped pool)
+// instead of an early-resolved future.
+/// Offload fn(arg) to pool, returning a future that resolves on completion.
+pub Future* poolRun(ThreadPool* pool, void(rawptr) fn, rawptr arg)
+{
+    if (pool == null || fn == null) return null;
+    Future* f = _newFuture();
+    if (f == null) return null;
+    PoolJob* job = alloc<PoolJob>(1);
+    if (job == null)
+    {
+        dealloc<Future>(f);
+        return null;
+    }
+    job->fn = fn;
+    job->arg = arg;
+    job->fut = f;
+    _lock();
+    f->counted = true;
+    _sched.pendingPool = _sched.pendingPool + 1u;
+    _unlock();
+    if (!pool->enqueue(_poolEntry, (rawptr)job))
+    {
+        _lock();
+        f->counted = false;
+        _sched.pendingPool = _sched.pendingPool - 1u;
+        _sched.cond.signal(); // a driver waiting on the stale count must re-check
+        _unlock();
+        dealloc<PoolJob>(job);
+        dealloc<Future>(f);
+        return null;
+    }
+    return f;
+}
+
+// Channel of rawptr values, buffered (capacity > 0) or rendezvous
+// (capacity 0). send() is synchronous — it hands the value to a parked recv
+// future if one exists, else buffers it, else returns false; it never parks
+// the sender (my reading of the spec, v1 has no back-pressure on send, and an
+// unbuffered send succeeds only against an already-parked receiver).
+// recv() returns a future that is already resolved when a value is waiting,
+// or resolves when some later send delivers one; awaiting it parks the fiber.
+// A pending recv future that is never awaited and never matched stays pending
+// forever (the module-level no-cancellation rule) — its value, if a send did
+// match it, goes nowhere.
+/// Buffered or rendezvous channel of rawptr values.
+pub struct AsyncChannel
+{
+    rawptr* buf;
+    usize cap;
+    usize count;
+    usize head;
+    Future* recvHead;
+    Future* recvTail;
+
+    /// Initialize a channel with the given capacity (0 for rendezvous).
+    bool init(usize capacity)
+    {
+        self.buf = null;
+        self.cap = 0;
+        self.count = 0;
+        self.head = 0;
+        self.recvHead = null;
+        self.recvTail = null;
+        if (capacity == 0u) return true;
+        self.buf = alloc<rawptr>(capacity);
+        if (self.buf == null) return false;
+        self.cap = capacity;
+        return true;
+    }
+
+    /// Release the channel's buffer; parked receives stay pending.
+    void deinit()
+    {
+        if (self.buf != null) dealloc<rawptr>(self.buf);
+        self.buf = null;
+        self.cap = 0;
+        self.count = 0;
+        self.head = 0;
+        // parked recv futures are left pending, per the no-cancellation rule
+        self.recvHead = null;
+        self.recvTail = null;
+    }
+
+    /// Deliver value to a receiver or a buffer slot; true on success.
+    bool send(rawptr value)
+    {
+        _lock();
+        if (self.recvHead != null)
+        {
+            Future* f = self.recvHead;
+            self.recvHead = f->chanNext;
+            if (self.recvHead == null) self.recvTail = null;
+            f->chanNext = null;
+            _completeLocked(f, value);
+            _unlock();
+            return true;
+        }
+        if (self.cap != 0u && self.count < self.cap)
+        {
+            usize idx = (self.head + self.count) % self.cap;
+            self.buf[idx] = value;
+            self.count = self.count + 1u;
+            _unlock();
+            return true;
+        }
+        _unlock();
+        return false;
+    }
+
+    // null — the receive future could not be allocated.
+    /// Return a future resolving to the next received value, or null on OOM.
+    Future* recv()
+    {
+        _lock();
+        Future* f = _newFuture();
+        if (f == null)
+        {
+            _unlock();
+            return null;
+        }
+        if (self.count > 0u)
+        {
+            rawptr v = self.buf[self.head];
+            self.head = (self.head + 1u) % self.cap;
+            self.count = self.count - 1u;
+            _completeLocked(f, v);
+            _unlock();
+            return f;
+        }
+        if (self.recvTail != null)
+        {
+            self.recvTail->chanNext = f;
+            self.recvTail = f;
+        }
+        else
+        {
+            self.recvHead = f;
+            self.recvTail = f;
+        }
+        _unlock();
+        return f;
+    }
+}
+
+// @drop is the inbuilt drop trait — mirrors threadpool.crl's deinit hookup.
+/// Drops the channel by releasing its buffer.
+pub extend AsyncChannel : @drop
+{
+    void drop()
+    {
+        self.deinit();
+    }
+}

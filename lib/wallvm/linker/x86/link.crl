@@ -1,0 +1,352 @@
+#[[no_drop_all]]
+/* link.crl for linker
+ * Public surface: Config, Buffer, Linker, and the one-shot
+ * linkBuffers. Inputs are buffers passed live in memory - addObject
+ * copies for lifetime safety, addBuffer borrows (zero-copy, caller
+ * keeps the buffer alive until produce/write), addObjectFile reads
+ * from disk. M1: static non-PIE ET_EXEC, x86_64 and i386.
+ */
+
+import(lib) std::vec { Vec };
+import(lib) std::text::string { String };
+import(lib) std::result { Result };
+import(lib) std::mman { alloc, dealloc };
+import(lib) std::io::fs { fileOpen, fileClose, fileRead, fileWrite, fileSeek, File, IoError, SEEK_SET, SEEK_END };
+import elf { EM_X86_64, EM_386 };
+import object { ObjFile, parseObject };
+import resolve { GlobalDef, resolveSyms };
+import layout { Layout, computeLayout };
+import reloc { applyRels };
+import emit { emitImage };
+
+pub enum Arch
+{
+    X86_64,
+    I386
+}
+
+pub struct Config
+{
+    Arch arch;
+    str entry;
+    u64 imageBase;
+    bool emitSymtab;
+}
+
+pub struct Buffer
+{
+    str name;
+    const u8* data;
+    usize len;
+}
+
+pub Config configFor(Arch arch)
+{
+    Config c;
+    c.arch = arch;
+    c.entry = "_start";
+    c.imageBase = 0;
+    c.emitSymtab = true;
+    return c;
+}
+
+struct Pending
+{
+    str name;
+    bool owned;
+    Vec<u8> bytes;
+    const u8* view;
+    usize viewLen;
+}
+
+pub struct Linker
+{
+    Config cfg;
+    Vec<Pending> inputs;
+
+    static Linker new(Config cfg)
+    {
+        Linker l;
+        l.cfg = cfg;
+        l.inputs = Vec<Pending>::new();
+        return l;
+    }
+
+    void addObject(str name, const u8* data, usize len)
+    {
+        Pending p;
+        p.name = name;
+        p.owned = true;
+        p.bytes = Vec<u8>::withCap(len > 0 ? len : 1);
+        p.view = null;
+        p.viewLen = 0;
+        for (usize i = 0; i < len; i++) p.bytes.push(data[i]);
+        self.inputs.push(p);
+    }
+
+    void addObjectOwned(str name, Vec<u8> raw)
+    {
+        Pending p;
+        p.name = name;
+        p.owned = true;
+        p.bytes = raw;
+        p.view = null;
+        p.viewLen = 0;
+        self.inputs.push(p);
+    }
+
+    void addBuffer(Buffer b)
+    {
+        Pending p;
+        p.name = b.name;
+        p.owned = false;
+        p.bytes = Vec<u8>::new();
+        p.view = b.data;
+        p.viewLen = b.len;
+        self.inputs.push(p);
+    }
+
+    bool addObjectFile(str path, String* err)
+    {
+        Vec<u8> raw = Vec<u8>::new();
+        if (!_readFile(path, &raw, err)) return false;
+        addObjectOwned(path, raw);
+        return true;
+    }
+
+    Result<Vec<u8>, String> produce()
+    {
+        String err = String::new();
+        Vec<u8> out = Vec<u8>::new();
+        if (!_run(self.cfg, &self.inputs, &out, &err))
+        {
+            out.dispose();
+            return Result<Vec<u8>, String>::Err { .error = err };
+        }
+        return Result<Vec<u8>, String>::Ok { .value = out };
+    }
+
+    bool write(str path, String* err)
+    {
+        Result<Vec<u8>, String> r = self.produce();
+        if (r.isErr())
+        {
+            String* e = r.errPtr();
+            err->pushView(e->asView());
+            e->free();
+            return false;
+        }
+        Vec<u8>* bytes = r.okPtr();
+        bool wok = _writeFile(path, bytes->ptr(), bytes->count(), err);
+        bytes->dispose();
+        return wok;
+    }
+
+    void dispose()
+    {
+        for (usize i = 0; i < self.inputs.count(); i++)
+        {
+            Pending* p = self.inputs.atPtr(i);
+            if (p->owned) p->bytes.dispose();
+        }
+        self.inputs.dispose();
+    }
+}
+
+bool _readFile(str path, Vec<u8>* out, String* err)
+{
+    Result<File, IoError> fo = fileOpen(path, "rb");
+    if (fo.isErr())
+    {
+        err->pushView("linker: cannot open ");
+        err->pushView(path);
+        return false;
+    }
+    File f = fo.unwrap();
+    Result<isize, IoError> sized = fileSeek(f, 0, SEEK_END);
+    fileSeek(f, 0, SEEK_SET);
+    if (sized.isErr())
+    {
+        fileClose(f);
+        err->pushView("linker: cannot size ");
+        err->pushView(path);
+        return false;
+    }
+    i64 sz = (i64)sized.unwrap();
+    usize n = (usize)sz;
+    u8* tmp = alloc<u8>(n > 0 ? n : 1);
+    usize got = 0;
+    while (got < n)
+    {
+        Result<isize, IoError> rr = fileRead(f, tmp + got, n - got);
+        if (rr.isErr()) break;
+        isize r = rr.unwrap();
+        if (r <= 0) break;
+        got += (usize)r;
+    }
+    fileClose(f);
+    if (got != n)
+    {
+        dealloc<u8>(tmp);
+        err->pushView("linker: short read on ");
+        err->pushView(path);
+        return false;
+    }
+    Vec<u8> buf = Vec<u8>::withCap(n > 0 ? n : 1);
+    for (usize i = 0; i < n; i++) buf.push(tmp[i]);
+    dealloc<u8>(tmp);
+    *out = buf;
+    return true;
+}
+
+bool _writeFile(str path, const u8* data, usize len, String* err)
+{
+    Result<File, IoError> fo = fileOpen(path, "wb");
+    if (fo.isErr())
+    {
+        err->pushView("linker: cannot create ");
+        err->pushView(path);
+        return false;
+    }
+    File f = fo.unwrap();
+    usize off = 0;
+    while (off < len)
+    {
+        Result<isize, IoError> wr = fileWrite(f, data + off, len - off);
+        if (wr.isErr())
+        {
+            fileClose(f);
+            err->pushView("linker: write failed on ");
+            err->pushView(path);
+            return false;
+        }
+        isize r = wr.unwrap();
+        if (r <= 0)
+        {
+            fileClose(f);
+            err->pushView("linker: write failed on ");
+            err->pushView(path);
+            return false;
+        }
+        off += (usize)r;
+    }
+    fileClose(f);
+    return true;
+}
+
+void _cleanup(Vec<ObjFile>* objs, Vec<GlobalDef>* defs, Layout* L)
+{
+    for (usize k = 0; k < objs->count(); k++) objs->atPtr(k)->dispose();
+    objs->dispose();
+    defs->dispose();
+    L->dispose();
+}
+
+bool _run(Config cfg, Vec<Pending>* inputs, Vec<u8>* out, String* err)
+{
+    u16 machine = 0;
+    bool want64 = false;
+    switch (cfg.arch)
+    {
+        Arch::X86_64 => { machine = EM_X86_64; want64 = true; },
+        else => { machine = EM_386; want64 = false; }
+    }
+
+    Vec<ObjFile> objs = Vec<ObjFile>::new();
+    Vec<GlobalDef> defs = Vec<GlobalDef>::new();
+    Layout L = Layout::empty();
+
+    for (usize i = 0; i < inputs->count(); i++)
+    {
+        Pending* p = inputs->atPtr(i);
+        const u8* bytes;
+        usize len;
+        if (p->owned)
+        {
+            bytes = p->bytes.ptr();
+            len = p->bytes.count();
+        }
+        else
+        {
+            bytes = p->view;
+            len = p->viewLen;
+        }
+        Result<ObjFile, String> r = parseObject(p->name, bytes, len);
+        if (r.isErr())
+        {
+            String* e = r.errPtr();
+            err->pushView(e->asView());
+            e->free();
+            _cleanup(&objs, &defs, &L);
+            return false;
+        }
+        objs.push(*r.okPtr());
+    }
+
+    for (usize i = 0; i < objs.count(); i++)
+    {
+        ObjFile* obj = objs.atPtr(i);
+        u8 wantCls = want64 ? 2 : 1;
+        if (obj->machine != machine)
+        {
+            err->pushView("linker: ");
+            err->pushView(obj->name);
+            err->pushView(": machine does not match target arch");
+            _cleanup(&objs, &defs, &L);
+            return false;
+        }
+        if (obj->cls != wantCls)
+        {
+            err->pushView("linker: ");
+            err->pushView(obj->name);
+            err->pushView(": ELF class does not match target arch");
+            _cleanup(&objs, &defs, &L);
+            return false;
+        }
+    }
+
+    if (!resolveSyms(&objs, &defs, err))
+    {
+        _cleanup(&objs, &defs, &L);
+        return false;
+    }
+
+    if (!computeLayout(machine, cfg.imageBase, cfg.entry, &objs, &defs, &L, err))
+    {
+        _cleanup(&objs, &defs, &L);
+        return false;
+    }
+
+    u8* img = null;
+    usize len = 0;
+    if (!emitImage(machine, cfg.emitSymtab, &objs, &defs, &L, &img, &len, err))
+    {
+        _cleanup(&objs, &defs, &L);
+        return false;
+    }
+
+    if (!applyRels(machine, &objs, &defs, &L, img, len, err))
+    {
+        dealloc<u8>(img);
+        _cleanup(&objs, &defs, &L);
+        return false;
+    }
+
+    Vec<u8> v = Vec<u8>::withCap(len > 0 ? len : 1);
+    for (usize i = 0; i < len; i++) v.push(img[i]);
+    dealloc<u8>(img);
+    *out = v;
+
+    _cleanup(&objs, &defs, &L);
+    return true;
+}
+
+pub Result<Vec<u8>, String> linkBuffers(Config cfg, Vec<Buffer> inputs)
+{
+    Linker lk = Linker::new(cfg);
+    for (usize i = 0; i < inputs.count(); i++)
+        lk.addBuffer(inputs.at(i));
+    Result<Vec<u8>, String> r = lk.produce();
+    lk.dispose();
+    return r;
+}

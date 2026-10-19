@@ -1,0 +1,381 @@
+#[[no_drop_all]]
+/* imports.crl for linker
+ * COFF import records built from .lib short import members and from
+ * PE image export tables. One record serves both the plain name
+ * (generated jump thunk) and the __imp_name (IAT slot) references.
+ * The .idata geometry helper sizes the PE import section and lays
+ * out per-record IAT slot offsets; layout and emit both call it.
+ */
+
+import(lib) std::vec { Vec };
+import elf { putU16, putU32, putU64, fits };
+
+pub struct ImportRec
+{
+    str dll;
+    str name;
+    bool byOrdinal;
+    u16 ordinal;
+    u64 iatAddr;
+    u64 thunkAddr;
+
+    static ImportRec empty()
+    {
+        return ImportRec {
+            .dll = str::empty(),
+            .name = str::empty(),
+            .byOrdinal = false,
+            .ordinal = 0,
+            .iatAddr = 0,
+            .thunkAddr = 0
+        };
+    }
+}
+
+pub struct Imports
+{
+    Vec<ImportRec> recs;
+
+    static Imports new()
+    {
+        return Imports { .recs = Vec<ImportRec>::new() };
+    }
+
+    usize count() { return self.recs.count(); }
+
+    i64 find(str name)
+    {
+        for (usize i = 0; i < self.recs.count(); i++)
+        {
+            if (self.recs.at(i).name.equals(name)) return (i64)i;
+        }
+        if (name.startsWith("__imp_"))
+        {
+            str core = name.slice(6, name.len);
+            for (usize i = 0; i < self.recs.count(); i++)
+            {
+                ImportRec* r = self.recs.atPtr(i);
+                if (r->name.equals(core)) return (i64)i;
+            }
+        }
+        else
+        {
+            for (usize i = 0; i < self.recs.count(); i++)
+            {
+                ImportRec* r = self.recs.atPtr(i);
+                if (r->name.startsWith("__imp_") &&
+                    r->name.slice(6, r->name.len).equals(name))
+                    return (i64)i;
+            }
+        }
+        return -1;
+    }
+
+    i64 add(str dll, str name, bool byOrdinal, u16 ordinal)
+    {
+        for (usize i = 0; i < self.recs.count(); i++)
+        {
+            ImportRec* r = self.recs.atPtr(i);
+            if (r->name.equals(name) && r->dll.equals(dll) &&
+                r->byOrdinal == byOrdinal && r->ordinal == ordinal)
+                return (i64)i;
+        }
+        ImportRec r = ImportRec::empty();
+        r.dll = dll;
+        r.name = name;
+        r.byOrdinal = byOrdinal;
+        r.ordinal = ordinal;
+        self.recs.push(r);
+        return (i64)(self.recs.count() - 1);
+    }
+
+    void dispose() { self.recs.dispose(); }
+}
+
+/* Unique DLL groups in first-seen order. Returns the group index for
+ * recIdx, and counts each group's records.
+ */
+i64 _groupOf(Imports* imps, usize recIdx, Vec<i64>* groups)
+{
+    str dll = imps->recs.at(recIdx).dll;
+    for (usize g = 0; g < groups->count(); g++)
+    {
+        usize first = (usize)groups->at(g);
+        if (imps->recs.at(first).dll.equals(dll)) return (i64)g;
+    }
+    groups->push((i64)recIdx);
+    return (i64)(groups->count() - 1);
+}
+
+/* Sizes the PE import section and fills every record's iatOff (byte
+ * offset of its IAT slot inside .idata). Layout: descriptors, per-DLL
+ * ILT, per-DLL IAT, hint/name entries, DLL name strings. Pure and
+ * idempotent so layout and emit can both call it.
+ */
+pub u32 sizeIdata(bool is64, Imports* imps)
+{
+    usize n = imps->recs.count();
+    if (n == 0) return 0;
+    usize entry = is64 ? 8 : 4;
+
+    Vec<i64> groups = Vec<i64>::new();
+    Vec<u32> groupCount = Vec<u32>::new();
+    for (usize i = 0; i < n; i++)
+    {
+        i64 g = _groupOf(imps, i, &groups);
+        if ((usize)g >= groupCount.count())
+        {
+            u32 z = 0;
+            groupCount.push(z);
+        }
+        u32* c = groupCount.atPtr((usize)g);
+        *c = *c + 1;
+    }
+    u32 nD = (u32)groups.count();
+
+    u32 descSz = (nD + 1) * 20; /* plus the null terminator descriptor */
+    u32 iltSz = 0;
+    u32 iatSz = 0;
+    for (usize g = 0; g < groups.count(); g++)
+    {
+        u32 c = groupCount.at(g);
+        iltSz = iltSz + (c + 1) * (u32)entry;
+        iatSz = iatSz + (c + 1) * (u32)entry;
+    }
+
+    /* hint/name region */
+    u32 hnSz = 0;
+    for (usize i = 0; i < n; i++)
+    {
+        ImportRec* r = imps->recs.atPtr(i);
+        if (r->byOrdinal) continue;
+        if ((hnSz & 1) != 0) hnSz++;
+        hnSz = hnSz + 2 + (u32)r->name.len + 1;
+    }
+
+    /* dll name strings (one per unique dll) */
+    u32 strSz = 0;
+    for (usize g = 0; g < groups.count(); g++)
+    {
+        ImportRec* r = imps->recs.atPtr((usize)groups.at(g));
+        strSz = strSz + (u32)r.dll.len + 1;
+    }
+
+    u32 offDesc = 0;
+    u32 offILT = descSz;
+    u32 offIAT = offILT + iltSz;
+    u32 offHN = offIAT + iatSz;
+    u32 offStr = offHN + hnSz;
+
+    /* second pass: per-group offsets, per-rec IAT slots, hn/str cursors */
+    Vec<u32> gStartILT = Vec<u32>::new();
+    Vec<u32> gStartIAT = Vec<u32>::new();
+    for (usize g = 0; g < groups.count(); g++)
+    {
+        gStartILT.push(offILT + 0); /* placeholder, fixed below */
+        gStartIAT.push(offIAT + 0);
+    }
+    u32 curILT = offILT;
+    u32 curIAT = offIAT;
+    for (usize g = 0; g < groups.count(); g++)
+    {
+        u32 c = groupCount.at(g);
+        *gStartILT.atPtr(g) = curILT;
+        *gStartIAT.atPtr(g) = curIAT;
+        curILT = curILT + (c + 1) * (u32)entry;
+        curIAT = curIAT + (c + 1) * (u32)entry;
+    }
+
+    Vec<u32> nextInGroup = Vec<u32>::new();
+    for (usize g = 0; g < groups.count(); g++)
+    {
+        u32 z = 0;
+        nextInGroup.push(z);
+    }
+    u32 hnCur = offHN;
+    for (usize i = 0; i < n; i++)
+    {
+        ImportRec* r = imps->recs.atPtr(i);
+        i64 g = _groupOf(imps, i, &groups);
+        u32 slot = gStartIAT.at((usize)g) + nextInGroup.at((usize)g) * (u32)entry;
+        r->iatAddr = (u64)slot; /* relative to .idata start; layout adds base */
+        *nextInGroup.atPtr((usize)g) = nextInGroup.at((usize)g) + 1;
+        if (!r->byOrdinal)
+        {
+            if ((hnCur & 1) != 0) hnCur++;
+            hnCur = hnCur + 2 + (u32)r->name.len + 1;
+        }
+    }
+
+    u32 total = offStr + strSz;
+    if (total % 4 != 0) total = total + (4 - total % 4);
+
+    groups.dispose();
+    groupCount.dispose();
+    gStartILT.dispose();
+    gStartIAT.dispose();
+    nextInGroup.dispose();
+    return total;
+}
+
+/* Writes the .idata content: descriptors, per-DLL ILT and IAT,
+ * hint/name entries, DLL name strings. rawOff is the file offset of
+ * the section inside img; rvaBase is the section's RVA. Re-runs the
+ * same geometry as sizeIdata so the two cannot drift.
+ */
+pub bool writeIdata(u8* img, usize rawOff, u64 rvaBase, bool is64, Imports* imps, String* err)
+{
+    usize n = imps->recs.count();
+    if (n == 0) return true;
+    u32 total = sizeIdata(is64, imps);
+    if (total == 0) return true;
+    usize entry = is64 ? 8 : 4;
+
+    /* rebuild groups exactly like sizeIdata */
+    Vec<i64> groups = Vec<i64>::new();
+    Vec<u32> groupCount = Vec<u32>::new();
+    for (usize i = 0; i < n; i++)
+    {
+        i64 g = -1;
+        str dll = imps->recs.at(i).dll;
+        for (usize gg = 0; gg < groups.count(); gg++)
+        {
+            if (imps->recs.at((usize)groups.at(gg)).dll.equals(dll)) { g = (i64)gg; break; }
+        }
+        if (g < 0)
+        {
+            groups.push((i64)i);
+            g = (i64)(groups.count() - 1);
+            u32 z = 0;
+            groupCount.push(z);
+        }
+        u32* c = groupCount.atPtr((usize)g);
+        *c = *c + 1;
+    }
+    u32 nD = (u32)groups.count();
+    u32 offDesc = 0;
+    u32 offILT = (nD + 1) * 20;
+    u32 iltSz = 0;
+    for (usize g = 0; g < groups.count(); g++)
+        iltSz = iltSz + (groupCount.at(g) + 1) * (u32)entry;
+    u32 offIAT = offILT + iltSz;
+    u32 iatSz = 0;
+    for (usize g = 0; g < groups.count(); g++)
+        iatSz = iatSz + (groupCount.at(g) + 1) * (u32)entry;
+    u32 offHN = offIAT + iatSz;
+    u32 hnSz = 0;
+    for (usize i = 0; i < n; i++)
+    {
+        ImportRec* r = imps->recs.atPtr(i);
+        if (r->byOrdinal) continue;
+        if (hnSz % 2 != 0) hnSz++;
+        hnSz = hnSz + 2 + (u32)r->name.len + 1;
+    }
+    u32 offStr = offHN + hnSz;
+
+    u8* base = img + rawOff;
+
+    /* group starts */
+    Vec<u32> gILT = Vec<u32>::new();
+    Vec<u32> gIAT = Vec<u32>::new();
+    u32 curILT = offILT;
+    u32 curIAT = offIAT;
+    for (usize g = 0; g < groups.count(); g++)
+    {
+        gILT.push(curILT);
+        gIAT.push(curIAT);
+        u32 c = groupCount.at(g);
+        curILT = curILT + (c + 1) * (u32)entry;
+        curIAT = curIAT + (c + 1) * (u32)entry;
+    }
+
+    /* per-rec: hint/name offsets and per-group slots */
+    Vec<u32> recHN = Vec<u32>::new();
+    u32 hnCur = offHN;
+    for (usize i = 0; i < n; i++)
+    {
+        ImportRec* r = imps->recs.atPtr(i);
+        if (!r->byOrdinal)
+        {
+            if (hnCur % 2 != 0) hnCur++;
+            recHN.push(hnCur);
+            hnCur = hnCur + 2 + (u32)r->name.len + 1;
+        }
+        else
+        {
+            recHN.push(0xffffffffu);
+        }
+    }
+
+    /* hint/name content */
+    hnCur = offHN;
+    for (usize i = 0; i < n; i++)
+    {
+        ImportRec* r = imps->recs.atPtr(i);
+        if (r->byOrdinal) continue;
+        if (hnCur % 2 != 0) hnCur++;
+        putU16(base + hnCur, 0);
+        for (usize b = 0; b < r->name.len; b++) base[hnCur + 2 + b] = r->name.ptr[b];
+        base[hnCur + 2 + r->name.len] = 0;
+        hnCur = hnCur + 2 + (u32)r->name.len + 1;
+    }
+
+    /* dll strings per group */
+    Vec<u32> gStr = Vec<u32>::new();
+    u32 strCur = offStr;
+    for (usize g = 0; g < groups.count(); g++)
+    {
+        ImportRec* r = imps->recs.atPtr((usize)groups.at(g));
+        gStr.push(strCur);
+        for (usize b = 0; b < r->dll.len; b++) base[strCur + b] = r->dll.ptr[b];
+        base[strCur + r->dll.len] = 0;
+        strCur = strCur + (u32)r->dll.len + 1;
+    }
+
+    /* ILT and IAT entry values, then descriptors */
+    Vec<u32> slotCur = Vec<u32>::new();
+    for (usize g = 0; g < groups.count(); g++)
+    {
+        u32 z = gILT.at(g);
+        slotCur.push(z);
+    }
+    for (usize i = 0; i < n; i++)
+    {
+        ImportRec* r = imps->recs.atPtr(i);
+        i64 g = -1;
+        for (usize gg = 0; gg < groups.count(); gg++)
+        {
+            if (imps->recs.at((usize)groups.at(gg)).dll.equals(r->dll)) { g = (i64)gg; break; }
+        }
+        u32 val;
+        if (r->byOrdinal) val = 0x80000000u | (u32)r->ordinal;
+        else val = (u32)(rvaBase + (u64)recHN.at(i));
+        u32 s = *slotCur.atPtr((usize)g);
+        if (is64) { putU64(base + s, (u64)val); putU64(base + gIAT.at((usize)g) + (s - gILT.at((usize)g)), (u64)val); }
+        else { putU32(base + s, val); putU32(base + gIAT.at((usize)g) + (s - gILT.at((usize)g)), val); }
+        *slotCur.atPtr((usize)g) = s + (u32)entry;
+    }
+    /* group terminators are already zero (buffer pre-zeroed) */
+
+    /* descriptors */
+    u32 d = offDesc;
+    for (usize g = 0; g < groups.count(); g++)
+    {
+        putU32(base + d + 0, (u32)(rvaBase + (u64)gILT.at(g)));      /* OriginalFirstThunk */
+        putU32(base + d + 4, 0);                                       /* TimeDateStamp */
+        putU32(base + d + 8, 0);                                       /* ForwarderChain */
+        putU32(base + d + 12, (u32)(rvaBase + (u64)gStr.at(g)));      /* Name */
+        putU32(base + d + 16, (u32)(rvaBase + (u64)gIAT.at(g)));      /* FirstThunk */
+        d = d + 20;
+    }
+    /* terminator descriptor left zero */
+
+    groups.dispose();
+    groupCount.dispose();
+    gILT.dispose();
+    gIAT.dispose();
+    recHN.dispose();
+    gStr.dispose();
+    slotCur.dispose();
+    return true;
+}

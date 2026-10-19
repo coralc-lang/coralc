@@ -1,0 +1,473 @@
+#[[no_drop_all]]
+import(lib) wallvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind };
+import(lib) wallvm::irOps { IrOpcode };
+import(lib) std::mman { copy };
+import(lib) core::limits { INT64_MIN };
+
+// Sign-extend the low `bits` of val to the full signed width.
+i64 _signExt(u64 val, u32 bits)
+{
+    if (bits >= 64) return (i64)val;
+    u64 m = (1ULL << bits) - 1;
+    u64 v = val & m;
+    // I test the mask against zero, the new dialect wants bool conditions.
+    if ((v & (1ULL << (bits - 1))) != 0)
+        return (i64)(v | ~m);
+    return (i64)v;
+}
+
+pub struct ConstFoldPass
+{
+    IrContext* ctx;
+    u64 folds;
+
+    ConstFoldPass new(IrContext* ctx)
+    {
+        return ConstFoldPass {
+            .ctx = ctx,
+            .folds = 0
+        };
+    }
+
+    // Run constant folding on a function
+    bool run(IrFunc* func)
+    {
+        self.folds = 0;
+
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            u32 ii = 0;
+            while (ii < bb->ninsts)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (self.tryFold(inst))
+                {
+                    self.folds++;
+                }
+                else
+                {
+                    ii++;
+                }
+            }
+        }
+
+        return self.folds > 0;
+    }
+
+    u64 foldCount()
+    {
+        return self.folds;
+    }
+
+    // Try to fold a single instruction
+    bool tryFold(IrInst* inst)
+    {
+        if (inst->nops == 2)
+        {
+            IrValue* a = inst->ops[0];
+            IrValue* b = inst->ops[1];
+            if (a == null || b == null) return false;
+            // Rotl(x, 0) -> x and Rotr(x, 0) -> x (short-circuit zero shifts)
+            if (b->kind == IrValueKind::ConstInt && b->valData == 0 &&
+                (inst->opcode == IrOpcode::Rotl || inst->opcode == IrOpcode::Rotr))
+            {
+                inst->base.replaceAllUses(a);
+                inst->erase();
+                return true;
+            }
+            if (a->kind == IrValueKind::ConstInt && b->kind == IrValueKind::ConstInt)
+                return self.foldBinary(inst, a, b);
+            if (a->kind == IrValueKind::ConstFloat && b->kind == IrValueKind::ConstFloat)
+                return self.foldBinaryFloat(inst, a, b);
+        }
+        else if (inst->nops == 1)
+        {
+            IrValue* a = inst->ops[0];
+            if (a == null) return false;
+            // SiToFp(FpToSi(x)) -> x when widths match (identity fold)
+            if (inst->opcode == IrOpcode::SiToFp && a->kind == IrValueKind::Inst)
+            {
+                IrInst* aInst = (IrInst*)a;
+                if (aInst->opcode == IrOpcode::FpToSi)
+                {
+                    u32 outW = inst->base.type != null ? inst->base.type->width : 64;
+                    u32 inW = aInst->ops[0]->type != null ? aInst->ops[0]->type->width : 64;
+                    if (outW == inW)
+                    {
+                        inst->base.replaceAllUses(aInst->ops[0]);
+                        inst->erase();
+                        return true;
+                    }
+                }
+            }
+            // FpTrunc(FpExt(x)) -> x when widths match (identity fold)
+            if (inst->opcode == IrOpcode::FpTrunc && a->kind == IrValueKind::Inst)
+            {
+                IrInst* aInst = (IrInst*)a;
+                if (aInst->opcode == IrOpcode::FpExt)
+                {
+                    u32 outW = inst->base.type != null ? inst->base.type->width : 64;
+                    u32 inW = aInst->ops[0]->type != null ? aInst->ops[0]->type->width : 64;
+                    if (outW == inW)
+                    {
+                        inst->base.replaceAllUses(aInst->ops[0]);
+                        inst->erase();
+                        return true;
+                    }
+                }
+            }
+            if (inst->opcode == IrOpcode::SiToFp || inst->opcode == IrOpcode::UiToFp)
+            {
+                if (a->kind == IrValueKind::ConstInt)
+                    return self.foldUnaryFloat(inst, a);
+                return false;
+            }
+            if (a->kind == IrValueKind::ConstInt)
+                return self.foldUnary(inst, a);
+            if (a->kind == IrValueKind::ConstFloat)
+                return self.foldUnaryFloat(inst, a);
+        }
+        else if (inst->nops == 3)
+        {
+            IrValue* a = inst->ops[0];
+            IrValue* b = inst->ops[1];
+            IrValue* c = inst->ops[2];
+            if (a == null || b == null || c == null) return false;
+            // FMA, all three operands must be constant floats
+            if (inst->opcode == IrOpcode::Fma)
+            {
+                if (a->kind == IrValueKind::ConstFloat &&
+                    b->kind == IrValueKind::ConstFloat &&
+                    c->kind == IrValueKind::ConstFloat)
+                    return self.foldFma(inst, a, b, c);
+            }
+            // Select, condition is ConstInt
+            if (inst->opcode == IrOpcode::Select)
+            {
+                if (a->kind == IrValueKind::ConstInt)
+                {
+                    IrValue* result = (a->valData != 0) ? b : c;
+                    inst->base.replaceAllUses(result);
+                    inst->erase();
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    // Fold binary operations with two constant int operands
+    bool foldBinary(IrInst* inst, IrValue* a, IrValue* b)
+    {
+        u64 av = a->valData;
+        u64 bv = b->valData;
+        u32 bits = a->type != null ? a->type->width : 64;
+        u64 mask = bits >= 64 ? ~0ULL : (1ULL << bits) - 1;
+        u64 result = 0;
+
+        switch (inst->opcode)
+        {
+            IrOpcode::Add => { result = mask & (av + bv); },
+            IrOpcode::Sub => { result = mask & (av - bv); },
+            IrOpcode::Mul => { result = mask & (av * bv); },
+            IrOpcode::And => { result = mask & (av & bv); },
+            IrOpcode::Or => { result = mask & (av | bv); },
+            IrOpcode::Xor => { result = mask & (av ^ bv); },
+            IrOpcode::Shl => { result = mask & (av << (bv & (bits > 0 ? (bits - 1) : 0x3F))); },
+            IrOpcode::Lshr => { result = mask & (av >> (bv & (bits > 0 ? (bits - 1) : 0x3F))); },
+            IrOpcode::Ashr =>
+            {
+                u32 shift = (u32)(bv & (bits > 0 ? (bits - 1) : 0x3F));
+                if (shift >= bits)
+                {
+                    // All bits become the sign bit; sign-extend produces correct value
+                    i64 s = _signExt(av, bits);
+                    result = (s < 0) ? mask : 0;
+                }
+                else
+                {
+                    // sign-extend then shift; result is already in-bounds
+                    result = (u64)(_signExt(av, bits) >> shift);
+                }
+            },
+            IrOpcode::SDiv =>
+            {
+                if (bv == 0) return false;
+                if ((i64)av == INT64_MIN && (i64)bv == -1) return false;
+                result = (u64)(_signExt(av, bits) / _signExt(bv, bits));
+            },
+            IrOpcode::UDiv =>
+            {
+                if (bv == 0) return false;
+                result = av / bv;
+            },
+            IrOpcode::SRem =>
+            {
+                if (bv == 0) return false;
+                // I use else here, the old case jumped past the second write with break.
+                if ((i64)av == INT64_MIN && (i64)bv == -1) result = 0;
+                else result = (u64)(_signExt(av, bits) % _signExt(bv, bits));
+            },
+            IrOpcode::URem =>
+            {
+                if (bv == 0) return false;
+                result = av % bv;
+            },
+            IrOpcode::Rotl =>
+            {
+                u32 shift = (u32)(bv & (bits > 0 ? (bits - 1) : 0x3F));
+                if (bits > 0 && bits < 64)
+                {
+                    u64 low = (av << shift) & mask;
+                    u64 high = (av >> (bits - shift)) & mask;
+                    result = low | high;
+                }
+                else
+                {
+                    result = (av << shift) | (av >> (64 - shift));
+                }
+            },
+            IrOpcode::Rotr =>
+            {
+                u32 shift = (u32)(bv & (bits > 0 ? (bits - 1) : 0x3F));
+                if (bits > 0 && bits < 64)
+                {
+                    u64 low = (av >> shift) & mask;
+                    u64 high = (av << (bits - shift)) & mask;
+                    result = low | high;
+                }
+                else
+                {
+                    result = (av >> shift) | (av << (64 - shift));
+                }
+            },
+            IrOpcode::SMin => { result = _signExt(av, bits) < _signExt(bv, bits) ? av : bv; },
+            IrOpcode::SMax => { result = _signExt(av, bits) > _signExt(bv, bits) ? av : bv; },
+            IrOpcode::UMin => { result = av < bv ? av : bv; },
+            IrOpcode::UMax => { result = av > bv ? av : bv; },
+            else => { return false; },
+        }
+
+        IrValue* c = self.ctx->constInt(inst->base.type, result);
+        inst->base.replaceAllUses(c);
+        inst->erase();
+        return true;
+    }
+
+    // folds binary operations with two constant float operands
+    bool foldBinaryFloat(IrInst* inst, IrValue* a, IrValue* b)
+    {
+        f64 av, bv, result;
+        copy<f64>(&av, (f64*)&a->valData, 1);
+        copy<f64>(&bv, (f64*)&b->valData, 1);
+
+        switch (inst->opcode)
+        {
+            IrOpcode::FAdd => { result = av + bv; },
+            IrOpcode::FSub => { result = av - bv; },
+            IrOpcode::FMul => { result = av * bv; },
+            IrOpcode::FDiv => { result = av / bv; },
+            IrOpcode::Add => { result = av + bv; },
+            IrOpcode::Sub => { result = av - bv; },
+            IrOpcode::Mul => { result = av * bv; },
+            else => { return false; },
+        }
+
+        IrValue* c = self.ctx->constFloat(inst->base.type, result);
+        inst->base.replaceAllUses(c);
+        inst->erase();
+        return true;
+    }
+
+    // Fold FMA with three constant float operands
+    bool foldFma(IrInst* inst,
+        IrValue* a,
+        IrValue* b,
+        IrValue* c)
+    {
+        f64 av, bv, cv, result;
+        copy<f64>(&av, (f64*)&a->valData, 1);
+        copy<f64>(&bv, (f64*)&b->valData, 1);
+        copy<f64>(&cv, (f64*)&c->valData, 1);
+        result = av * bv + cv;
+        IrValue* r = self.ctx->constFloat(inst->base.type, result);
+        inst->base.replaceAllUses(r);
+        inst->erase();
+        return true;
+    }
+
+    // Folds unary operations with constant float operand
+    bool foldUnaryFloat(IrInst* inst, IrValue* a)
+    {
+        f64 av, result;
+        u64 rawResult;
+
+        switch (inst->opcode)
+        {
+            IrOpcode::Neg =>
+            {
+                copy<f64>(&av, (f64*)&a->valData, 1);
+                result = -av;
+                rawResult = 0;
+                copy<f64>((f64*)&rawResult, &result, 1);
+            },
+            IrOpcode::FAbs =>
+            {
+                copy<f64>(&av, (f64*)&a->valData, 1);
+                if (av < 0) av = -av;
+                rawResult = 0;
+                copy<f64>((f64*)&rawResult, &av, 1);
+            },
+            IrOpcode::FSqrt =>
+            {
+                // I keep the old builtin name, it is plain C the backend passes through.
+                copy<f64>(&av, (f64*)&a->valData, 1);
+                result = __builtin_sqrt(av);
+                rawResult = 0;
+                copy<f64>((f64*)&rawResult, &result, 1);
+            },
+            IrOpcode::FpTrunc =>
+            {
+                copy<f64>(&av, (f64*)&a->valData, 1);
+                // The old file spelled this float, I use f32, the dialect's spelling.
+                f32 fv = (f32)av;
+                result = (f64)fv;
+                rawResult = 0;
+                copy<f64>((f64*)&rawResult, &result, 1);
+            },
+            IrOpcode::FpExt =>
+            {
+                copy<f64>(&av, (f64*)&a->valData, 1);
+                rawResult = a->valData;
+            },
+            IrOpcode::FpToSi =>
+            {
+                copy<f64>(&av, (f64*)&a->valData, 1);
+                u32 bits = inst->base.type != null ? inst->base.type->width : 32;
+                if (bits <= 32)
+                    rawResult = (i64)av;
+                else
+                    rawResult = (i64)av;
+                IrValue* c = self.ctx->constInt(inst->base.type, rawResult);
+                inst->base.replaceAllUses(c);
+                inst->erase();
+                return true;
+            },
+            IrOpcode::FpToUi =>
+            {
+                copy<f64>(&av, (f64*)&a->valData, 1);
+                u32 bits = inst->base.type != null ? inst->base.type->width : 32;
+                if (bits <= 32)
+                    rawResult = (u64)av;
+                else
+                    rawResult = (u64)av;
+                IrValue* c = self.ctx->constInt(inst->base.type, rawResult);
+                inst->base.replaceAllUses(c);
+                inst->erase();
+                return true;
+            },
+            IrOpcode::SiToFp =>
+            {
+                u32 bits = a->type != null ? a->type->width : 32;
+                i64 sv;
+                if (bits == 32)
+                    sv = (u32)a->valData;
+                else
+                    sv = (i64)a->valData;
+                result = (f64)sv;
+                rawResult = 0;
+                copy<f64>((f64*)&rawResult, &result, 1);
+            },
+            IrOpcode::UiToFp =>
+            {
+                u64 uv = a->valData;
+                result = (f64)uv;
+                rawResult = 0;
+                copy<f64>((f64*)&rawResult, &result, 1);
+            },
+            else => { return false; },
+        }
+        IrValue* c = self.ctx->constFloat(inst->base.type, *(f64*)&rawResult);
+        inst->base.replaceAllUses(c);
+        inst->erase();
+        return true;
+    }
+
+    // Fold unary operations with constant int operand
+    bool foldUnary(IrInst* inst, IrValue* a)
+    {
+        u64 av = a->valData;
+        u32 bits = a->type != null ? a->type->width : 64;
+        u64 mask = bits >= 64 ? ~0ULL : ((1ULL << bits) - 1);
+        u64 result = 0;
+
+        switch (inst->opcode)
+        {
+            IrOpcode::Neg => { result = mask & (~av + 1); },
+            IrOpcode::Not => { result = mask & (~av); },
+            IrOpcode::Abs =>
+            {
+                i64 s = _signExt(av, bits);
+                if (s < 0) result = mask & (u64)(-s);
+                else result = av & mask;
+            },
+            IrOpcode::Bswap =>
+            {
+                u64 v = av;
+                if (bits == 16)
+                {
+                    result = ((v >> 8) & 0xFF) | ((v & 0xFF) << 8);
+                }
+                else if (bits == 32)
+                {
+                    result = ((v >> 24) & 0xFF) | ((v >> 8) & 0xFF00) |
+                             ((v & 0xFF00) << 8) | ((v & 0xFF) << 24);
+                }
+                else
+                {
+                    result = ((v >> 56) & 0xFF) | ((v >> 40) & 0xFF00) |
+                             ((v >> 24) & 0xFF0000) | ((v >> 8) & 0xFF000000) |
+                             ((v & 0xFF000000) << 8) | ((v & 0xFF0000) << 24) |
+                             ((v & 0xFF00) << 40) | ((v & 0xFF) << 56);
+                }
+            },
+            IrOpcode::CtPop =>
+            {
+                u64 v = av;
+                result = 0;
+                while (v != 0) { result += v & 1; v >>= 1; }
+            },
+            IrOpcode::CtLz =>
+            {
+                // I use else here, the old case jumped past the count with break.
+                if (av == 0) result = bits;
+                else result = __builtin_clzll(av) - (64 - bits);
+            },
+            IrOpcode::CtTz =>
+            {
+                if (av == 0) result = bits;
+                else
+                {
+                    result = __builtin_ctzll(av);
+                    if (result > bits) result = bits;
+                }
+            },
+            else => { return false; },
+        }
+
+        IrValue* c = self.ctx->constInt(inst->base.type, result);
+        inst->base.replaceAllUses(c);
+        inst->erase();
+        return true;
+    }
+}
+
+pub bool irPassConstfold(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (ctx == null || func == null) return false;
+    ConstFoldPass pass = ConstFoldPass::new(ctx);
+    return pass.run(func);
+}

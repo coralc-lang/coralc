@@ -1,0 +1,804 @@
+#[[no_drop_all]]
+import(lib) wallvm::irtypes { IrContext, IrModule, IrType, IrFunc, IrBlock, IrInst, IrValue, IrTypeKind, IrValueKind };
+import(lib) wallvm::irOps { IrOpcode };
+import(lib) std::mman { alloc, dealloc };
+import(lib) wallvm::irMetadata { attachFuncMetadata, addString, find, MetadataSet };
+
+// ABI Lowering Pass for the Windows x64 (Microsoft) ABI.
+// Rules implemented here, per the Microsoft x64 calling convention:
+// 1. Integer and pointer arguments go in RCX, RDX, R8, R9
+// 2. Float arguments go in XMM0 through XMM3
+// 3. 1, 2, 4 and 8-byte POD arguments are passed by value in an integer
+//    register (so an aggregate today never lands in an SSE register)
+// 4. Larger aggregates, and aggregates whose size is not a power of two,
+//    are passed via a hidden pointer to caller-allocated storage; the
+//    callee may copy or write through that pointer
+// 5. Aggregate returns follow the same split: 1/2/4/8-byte PODs come
+//    back in rax as a single integer word, everything else returns
+//    through a hidden sret pointer supplied by the caller
+// 6. The 32-byte shadow space is a codegen concern, not a pass concern
+// 7. Vectors of 8 or 16 bytes ride SSE registers like scalar floats;
+//    a vector wider than 16 bytes is passed in memory
+//
+// Contract for the entry point: `irABILower` reads the owning
+// `IrModule*` from `func->parent` first — the optimizer pipeline hands
+// every pass its `IrContext*` as userdata, which is not a module — and
+// only consults userdata as a module hint when parent is null. The
+// module is needed to find and rewrite every direct call of the target
+// function; `ABILowering.run` alone only transforms the one function.
+//
+// Every function this pass processes gets a `abi.lower` metadata string
+// entry, and already-marked functions are skipped — so running the pass
+// twice is a no-op (idempotent).
+//
+// Only direct calls are rewritten (operand 0 of a Call is the Func
+// value); indirect calls keep the old convention and are an IR gap.
+//
+// Extern functions are never transformed themselves (their body is
+// signature-only), but their call sites still get ABI-correct
+// argument marshalling. The extern keeps its declared IrFunc signature;
+// call sites are rewritten to the ABI convention, which is deliberately
+// inconsistent with the extern's declared struct params — an IR gap we
+// document rather than resolve.
+
+str dupStrVal(str s)
+{
+    u8* b = alloc<u8>(s.len + 1);
+    for (usize i = 0; i < s.len; i++) b[i] = s.ptr[i];
+    b[s.len] = 0;
+    return str::fromParts((const u8*)b, s.len);
+}
+
+pub struct ABILowering
+{
+    IrContext* ctx;
+    IrModule* modd;
+
+    ABILowering new(IrContext* ctx)
+    {
+        return ABILowering { .ctx = ctx, .modd = null };
+    }
+
+    // Classify a single field type
+    // Returns 0 = MEMORY, 1 = INTEGER, 2 = SSE
+    u32 classifyField(IrType* ty)
+    {
+        if (ty == null) return 0;
+        switch (ty->kind)
+        {
+            IrTypeKind::Int => { return 1; },  // INTEGER
+            IrTypeKind::Ptr => { return 1; },  // INTEGER (pointer)
+
+            IrTypeKind::Float => {
+                if (ty->width == 32 || ty->width == 64)
+                    return 2;  // SSE — scalar floats ride XMM0-3
+                return 0;  // MEMORY for anything else
+            },
+
+            IrTypeKind::Array => {
+                if (ty->elem == null) return 0;
+                u32 elemClass = classifyField(ty->elem);
+                if (elemClass == 0) return 0;
+                u32 totalSize = ty->count * ctx->irTypeSizeOf(ty->elem);
+                // PODs of 1/2/4/8 bytes can go by value in an integer
+                // register; the 8-byte ceiling matches that POD limit
+                if (totalSize > 8) return 0;
+                // An aggregate is never SSE under MS x64, so an array of
+                // floats passed by value still reports INTEGER
+                if (elemClass == 2) return 1;
+                return elemClass;
+            },
+
+            IrTypeKind::Vector => {
+                u32 sz = ctx->irTypeSizeOf(ty);
+                // 8- and 16-byte vectors ride an SSE register like a
+                // scalar float; anything wider is MEMORY like a large
+                // aggregate
+                if (sz == 8 || sz == 16) return 2;
+                if (sz > 16) return 0;
+                return 1;  // narrow vectors pass like any small POD
+            },
+
+            IrTypeKind::Struct => { return classifyStructType(ty); },
+            else => { return 0; },
+        }
+    }
+
+    // Natural alignment of a field type; scalars at their size (capped
+    // at 8), pointers at 8, aggregates at their largest member's
+    u32 fieldAlign(IrType* ty)
+    {
+        if (ty == null) return 1;
+        switch (ty->kind)
+        {
+            IrTypeKind::Int | IrTypeKind::Float => {
+                u32 a = ty->width / 8;
+                if (a == 0) a = 1;
+                if (a > 8) a = 8;
+                return a;
+            },
+
+            IrTypeKind::Ptr => { return 8; },
+            IrTypeKind::Array | IrTypeKind::Vector => { return fieldAlign(ty->elem); },
+
+            IrTypeKind::Struct => {
+                u32 a = 1;
+                for (u32 i = 0; i < ty->nparams; i++)
+                {
+                    u32 fa = fieldAlign(ty->params[i]);
+                    if (fa > a) a = fa;
+                }
+                if (a > 8) a = 8;
+                return a;
+            },
+
+            else => { return 1; },
+        }
+    }
+
+    // Byte size of a field type; used for offset math where the
+    // interned struct width alone cannot tell fields apart
+    u32 fieldSize(IrType* ty)
+    {
+        if (ty == null) return 0;
+        if (ty->kind == IrTypeKind::Int || ty->kind == IrTypeKind::Float)
+            return ty->width / 8;
+        if (ty->kind == IrTypeKind::Ptr) return 8;
+        if (ty->kind == IrTypeKind::Struct) return ty->width;
+        // a Vector carries width 0 like an Array, so size it from its
+        // element — same bytes irTypeSizeOf reports
+        if (ty->kind == IrTypeKind::Array || ty->kind == IrTypeKind::Vector)
+            return fieldSize(ty->elem) * (ty->count > 0 ? ty->count : 1);
+        return 0;
+    }
+
+    // Get field byte offsets for a struct
+    // For packed structs, no alignment padding
+    // For normal structs, fields are aligned to their natural alignment
+    u32 getFieldOffset(IrType* ty, u32 fieldIdx, bool isPacked)
+    {
+        if (ty == null) return 0;
+
+        if (ty->kind == IrTypeKind::Struct)
+        {
+            u32 off = 0;
+            for (u32 i = 0; i < fieldIdx && i < ty->nparams; i++)
+            {
+                if (!isPacked) {
+                    u32 align = fieldAlign(ty->params[i]);
+                    off = (off + align - 1) / align * align;
+                }
+                off += fieldSize(ty->params[i]);
+            }
+            // off is the end of field fieldIdx-1; placing field
+            // fieldIdx needs one more alignment step by its own
+            // alignment — without this {i32,i64} reported b at 4 not 8
+            if (!isPacked && fieldIdx < ty->nparams)
+            {
+                u32 align = fieldAlign(ty->params[fieldIdx]);
+                off = (off + align - 1) / align * align;
+            }
+            return off;
+        }
+
+        if (ty->kind == IrTypeKind::Array && ty->elem != null)
+        {
+            u32 elemSize = fieldSize(ty->elem);
+            if (!isPacked) {
+                u32 align = fieldAlign(ty->elem);
+                return fieldIdx * ((elemSize + align - 1) / align * align);
+            }
+            return fieldIdx * elemSize;
+        }
+
+        return 0;
+    }
+
+    // Classify a struct type for ABI purposes
+    // Returns 0 = MEMORY, 1 = INTEGER, 2 = SSE, 3 = MIXED
+    // MS x64 has no per-eightbyte split and no MIXED class: a POD of
+    // 1/2/4/8 bytes is INTEGER, everything else is MEMORY. Structs
+    // never classify SSE, and the MIXED result is unreachable here.
+    u32 classifyStructType(IrType* ty)
+    {
+        if (ty == null || ty->kind != IrTypeKind::Struct) return 0;
+
+        u32 sz = ty->width;
+        if (sz == 0) return 0;
+
+        // Only exact 1/2/4/8-byte power-of-two PODs travel by value in
+        // a register; a 12-byte struct is already a hidden pointer.
+        if (sz == 1 || sz == 2 || sz == 4 || sz == 8) return 1;
+        return 0;
+    }
+
+    // Count register fields for a struct
+    u32 structRegCount(IrType* ty)
+    {
+        if (ty == null || ty->kind != IrTypeKind::Struct) return 0;
+        // By-value PODs take exactly one integer register; anything
+        // bigger goes through the hidden pointer, so zero registers
+        u32 sz = ty->width;
+        if (sz == 1 || sz == 2 || sz == 4 || sz == 8) return 1;
+        return 0;
+    }
+
+    // Check if struct fits in integer registers
+    bool isIntegerStruct(IrType* ty)
+    {
+        u32 cls = classifyStructType(ty);
+        return cls == 1;
+    }
+
+    // Check if struct fits in SSE registers
+    // Under MS x64 a whole struct never qualifies — only scalar floats
+    // do — so this only ever reports true for degenerate cases where
+    // classifyStructType would have said INTEGER anyway
+    bool isSSEStruct(IrType* ty)
+    {
+        u32 cls = classifyStructType(ty);
+        return cls == 2;
+    }
+
+    // Check if struct must go in memory
+    bool isMemoryStruct(IrType* ty)
+    {
+        u32 cls = classifyStructType(ty);
+        return cls == 0;
+    }
+
+    // Check if struct has mixed integer/SSE fields (per-eightbyte classification)
+    // MS x64 has no MIXED class, this stays false
+    bool isMixedStruct(IrType* ty)
+    {
+        u32 cls = classifyStructType(ty);
+        return cls == 3;
+    }
+
+    // Flatten compound structs (recursive)
+    // Returns the total number of leaf fields
+    u32 flattenStruct(IrType* ty, IrType** outFields, u32 maxFields)
+    {
+        if (ty == null || maxFields == 0) return 0;
+
+        if (ty->kind == IrTypeKind::Struct)
+        {
+            // struct field types ride on the interned IrType itself
+            // (params/nparams), not elem — elem is null for structs
+            u32 count = 0;
+            for (u32 i = 0; i < ty->nparams && count < maxFields; i++)
+                count += flattenStruct(ty->params[i], outFields + count, maxFields - count);
+            return count;
+        }
+
+        if (ty->kind == IrTypeKind::Array && ty->elem != null)
+        {
+            u32 count = 0;
+            for (u32 i = 0; i < ty->count && count < maxFields; i++)
+            {
+                if (ty->elem->kind == IrTypeKind::Struct)
+                    count += flattenStruct(ty->elem, outFields + count, maxFields - count);
+                else if (count < maxFields)
+                {
+                    outFields[count] = ty->elem;
+                    count++;
+                }
+            }
+            return count;
+        }
+
+        if (outFields != null)
+            outFields[0] = ty;
+        return 1;
+    }
+
+    // scalar word carrying a POD aggregate of `ty->width` bytes, packed
+    // exactly into the matching integer width (i8/i16/i32/i64)
+    IrType* podWordTy(IrType* ty)
+    {
+        return ctx->tyInt(ty->width * 8);
+    }
+
+    u32 splitWordCount(IrType* sTy)
+    {
+        u32 cls = classifyStructType(sTy);
+        if (cls != 1) return 0;
+        return 1;
+    }
+
+    IrType* splitWord(IrType* sTy)
+    {
+        return podWordTy(sTy);
+    }
+
+    // param lowering kind: 0 keep the struct value (never on MS x64 for
+    // structs), 1 pointer, 2 split into a single POD word
+    u32 paramKind(IrType* ty)
+    {
+        if (ty == null || ty->kind != IrTypeKind::Struct) return 0;
+        return classifyStructType(ty) == 0 ? 1 : 2;
+    }
+
+    // return lowering kind: 0 keep, 1 sret, 2 single POD word
+    u32 retModel(IrType* sTy)
+    {
+        u32 cls = classifyStructType(sTy);
+        if (cls == 0) return 1;
+        return 2;
+    }
+
+    IrType* retScalar(IrType* sTy)
+    {
+        return podWordTy(sTy);
+    }
+
+    IrValue* newArgValue(IrType* ty)
+    {
+        IrValue* a = alloc<IrValue>(1);
+        *a = IrValue { IrValueKind::Arg, ty, ctx->nextValueId(), 0, null, null, 0, 0 };
+        return a;
+    }
+
+    IrInst* emit(IrOpcode op, IrType* ty, IrValue** ops, u32 nops, IrBlock* bb, IrInst* before)
+    {
+        IrInst* inst = ctx->createInst(op, ty, ops, nops, 0, 0);
+        for (u32 i = 0; i < nops; i++)
+            if (ops != null && ops[i] != null) ops[i]->addUser(inst);
+        if (before != null) bb->insertBefore(inst, before);
+        else bb->addInst(inst);
+        if (ops != null) dealloc<IrValue*>(ops);
+        return inst;
+    }
+
+    // scratch alloca of `nbytes` raw bytes sitting in block bb
+    IrInst* emitRawAlloca(IrBlock* bb, IrInst* before, u32 nbytes)
+    {
+        IrType* arrTy = ctx->tyArray(ctx->tyInt(8), nbytes);
+        return emit(IrOpcode::Alloca, ctx->tyPtr(arrTy), null, 0, bb, before);
+    }
+
+    // word value: bitcast scratch to the word's ptr type, index it by
+    // its byte offset, load the word
+    IrValue* emitWordLoad(IrInst* scratch, IrType* wTy, u32 byteOff, IrBlock* bb, IrInst* before)
+    {
+        IrValue** o1 = alloc<IrValue*>(1);
+        o1[0] = &scratch->base;
+        IrInst* pw = emit(IrOpcode::Bitcast, ctx->tyPtr(wTy), o1, 1, bb, before);
+        IrValue** o2 = alloc<IrValue*>(2);
+        o2[0] = &pw->base;
+        o2[1] = ctx->constInt(ctx->tyInt(64), byteOff / ctx->irTypeSizeOf(wTy));
+        IrInst* pk = emit(IrOpcode::Gep, ctx->tyPtr(wTy), o2, 2, bb, before);
+        IrValue** o3 = alloc<IrValue*>(1);
+        o3[0] = &pk->base;
+        return &emit(IrOpcode::Load, wTy, o3, 1, bb, before)->base;
+    }
+
+    void emitWordStore(IrInst* scratch, IrType* wTy, u32 byteOff, IrValue* val, IrBlock* bb, IrInst* before)
+    {
+        IrValue** o1 = alloc<IrValue*>(1);
+        o1[0] = &scratch->base;
+        IrInst* pw = emit(IrOpcode::Bitcast, ctx->tyPtr(wTy), o1, 1, bb, before);
+        IrValue** o2 = alloc<IrValue*>(2);
+        o2[0] = &pw->base;
+        o2[1] = ctx->constInt(ctx->tyInt(64), byteOff / ctx->irTypeSizeOf(wTy));
+        IrInst* pk = emit(IrOpcode::Gep, ctx->tyPtr(wTy), o2, 2, bb, before);
+        IrValue** o3 = alloc<IrValue*>(2);
+        o3[0] = val;
+        o3[1] = &pk->base;
+        emit(IrOpcode::Store, ctx->tyVoid(), o3, 2, bb, before);
+    }
+
+    // rebuild the full struct value: alloca bytes, store the scalar
+    // words at their offsets, load the struct back out
+    IrValue* rebuildStruct(IrBlock* bb, IrInst* before, IrType* sTy, IrType** words, IrValue** vals, u32 nwords)
+    {
+        u32 nb = (sTy->width + 7) / 8 * 8;
+        IrInst* scratch = emitRawAlloca(bb, before, nb);
+        for (u32 k = 0; k < nwords; k++)
+            emitWordStore(scratch, words[k], k * 8, vals[k], bb, before);
+        IrValue** o1 = alloc<IrValue*>(1);
+        o1[0] = &scratch->base;
+        IrInst* pS = emit(IrOpcode::Bitcast, ctx->tyPtr(sTy), o1, 1, bb, before);
+        IrValue** o2 = alloc<IrValue*>(1);
+        o2[0] = &pS->base;
+        return &emit(IrOpcode::Load, sTy, o2, 1, bb, before)->base;
+    }
+
+    bool isLowered(IrFunc* func)
+    {
+        if (func == null || func->metadata == null) return false;
+        MetadataSet* md = (MetadataSet*)func->metadata;
+        return find(md, "abi.lower") != null;
+    }
+
+    void markLowered(IrFunc* func)
+    {
+        MetadataSet* md = attachFuncMetadata(func);
+        addString(md, "abi.lower", dupStrVal("ms_x64"));
+    }
+
+    bool run(IrFunc* func)
+    {
+        if (func == null || func->isExtern) return false;
+        if (isLowered(func)) return false;
+
+        IrType* oldRet = func->retType;
+        u32 rmode = (oldRet != null && oldRet->kind == IrTypeKind::Struct) ? retModel(oldRet) : 0;
+
+        u32* modes = alloc<u32>(func->nparams > 0 ? func->nparams : 1);
+        u32* argBase = alloc<u32>(func->nparams > 0 ? func->nparams : 1);
+        u32 nslots = 0;
+        if (rmode == 1) nslots++;
+        for (u32 i = 0; i < func->nparams; i++)
+        {
+            IrType* pt = func->paramTypes[i];
+            modes[i] = paramKind(pt);
+            if (modes[i] == 2) nslots += splitWordCount(pt);
+            else nslots++;
+        }
+
+        IrType** npt = alloc<IrType*>(nslots > 0 ? nslots : 1);
+        IrValue** nargs = alloc<IrValue*>(nslots > 0 ? nslots : 1);
+        u32 m = 0;
+        IrValue* sretArg = null;
+        if (rmode == 1)
+        {
+            npt[m] = ctx->tyPtr(oldRet);
+            nargs[m] = newArgValue(ctx->tyPtr(oldRet));
+            sretArg = nargs[m];
+            m++;
+        }
+        for (u32 i = 0; i < func->nparams; i++)
+        {
+            argBase[i] = m;
+            IrType* pt = func->paramTypes[i];
+            if (modes[i] == 2)
+            {
+                u32 nw = splitWordCount(pt);
+                for (u32 k = 0; k < nw; k++)
+                {
+                    npt[m] = splitWord(pt);
+                    nargs[m] = newArgValue(npt[m]);
+                    m++;
+                }
+            }
+            else if (modes[i] == 1)
+            {
+                npt[m] = ctx->tyPtr(pt);
+                nargs[m] = newArgValue(npt[m]);
+                m++;
+            }
+            else
+            {
+                npt[m] = pt;
+                nargs[m] = func->args[i];
+                m++;
+            }
+        }
+
+        IrType* newRet = oldRet;
+        if (rmode == 1) newRet = ctx->tyVoid();
+        else if (rmode == 2) newRet = retScalar(oldRet);
+
+        IrValue** oldArgs = func->args;
+        u32 nOld = func->nargs;
+
+        func->paramTypes = npt;
+        func->nparams = m;
+        func->args = nargs;
+        func->nargs = m;
+        func->capArgs = m;
+        func->retType = newRet;
+        func->base.type = ctx->tyFunc(newRet, npt, m, false);
+
+        if (func->nblocks > 0)
+        {
+            IrBlock* entry = func->blocks[0];
+            IrInst* anchor = entry->ninsts > 0 ? entry->insts[0] : null;
+
+            for (u32 i = 0; i < nOld; i++)
+            {
+                IrValue* old = oldArgs[i];
+                if (old->type != null && old->type->kind == IrTypeKind::Struct)
+                {
+                    if (modes[i] == 2)
+                    {
+                        u32 nw = splitWordCount(old->type);
+                        IrType** ws = alloc<IrType*>(nw);
+                        IrValue** vs = alloc<IrValue*>(nw);
+                        for (u32 k = 0; k < nw; k++)
+                        {
+                            ws[k] = splitWord(old->type);
+                            vs[k] = nargs[argBase[i] + k];
+                        }
+                        IrValue* rb = rebuildStruct(entry, anchor, old->type, ws, vs, nw);
+                        old->replaceAllUses(rb);
+                        dealloc<IrType*>(ws);
+                        dealloc<IrValue*>(vs);
+                    }
+                    else if (modes[i] == 1)
+                    {
+                        IrValue** oo = alloc<IrValue*>(1);
+                        oo[0] = nargs[argBase[i]];
+                        IrValue* rb = &emit(IrOpcode::Load, old->type, oo, 1, entry, anchor)->base;
+                        old->replaceAllUses(rb);
+                    }
+                }
+            }
+
+            for (u32 bi = 0; bi < func->nblocks; bi++)
+            {
+                IrBlock* bb = func->blocks[bi];
+                for (u32 ii = 0; ii < bb->ninsts; ii++)
+                {
+                    IrInst* inst = &bb->insts[ii];
+                    if (inst->opcode != IrOpcode::Ret || inst->nops < 1) continue;
+                    IrValue* v = inst->ops[0];
+                    if (v == null || v->type == null || v->type->kind != IrTypeKind::Struct) continue;
+
+                    if (rmode == 1)
+                    {
+                        IrValue** so = alloc<IrValue*>(2);
+                        so[0] = v;
+                        so[1] = sretArg;
+                        emit(IrOpcode::Store, ctx->tyVoid(), so, 2, bb, inst);
+                        v->removeUser(inst);
+                        dealloc<IrValue*>(inst->ops);
+                        inst->ops = null;
+                        inst->nops = 0;
+                        inst->capOps = 0;
+                        inst->base.type = ctx->tyVoid();
+                    }
+                    else if (rmode == 2)
+                    {
+                        u32 nb = (v->type->width + 7) / 8 * 8;
+                        IrInst* scratch = emitRawAlloca(bb, inst, nb);
+                        IrValue** o1 = alloc<IrValue*>(1);
+                        o1[0] = &scratch->base;
+                        IrInst* pS = emit(IrOpcode::Bitcast, ctx->tyPtr(v->type), o1, 1, bb, inst);
+                        IrValue** o2 = alloc<IrValue*>(2);
+                        o2[0] = v;
+                        o2[1] = &pS->base;
+                        emit(IrOpcode::Store, ctx->tyVoid(), o2, 2, bb, inst);
+                        IrType* wt = retScalar(v->type);
+                        IrValue* w = emitWordLoad(scratch, wt, 0, bb, inst);
+                        v->removeUser(inst);
+                        inst->ops[0] = w;
+                        w->addUser(inst);
+                        inst->base.type = wt;
+                    }
+                }
+            }
+        }
+
+        markLowered(func);
+        return true;
+    }
+
+    // Rebuild one call site of `callee` so the operands match the
+    // lowered signature; results are rebuilt back into the original
+    // struct type before any uses see them.
+    bool rewriteCall(IrInst* call, IrFunc* callee)
+    {
+        IrBlock* bb = call->parent;
+        IrType* oldRet = call->base.type;
+        u32 rmode = (oldRet != null && oldRet->kind == IrTypeKind::Struct) ? siteRetModel(callee, oldRet) : 0;
+
+        IrValue* sretCallArg = null;
+        IrValue** nargs = alloc<IrValue*>(call->nops + 2);
+        u32 na = 0;
+        if (rmode == 1)
+        {
+            IrInst* sretSlot = emit(IrOpcode::Alloca, ctx->tyPtr(oldRet), null, 0, bb, call);
+            sretCallArg = &sretSlot->base;
+            nargs[na++] = sretCallArg;
+        }
+
+        for (u32 i = 1; i < call->nops; i++)
+        {
+            IrValue* arg = call->ops[i];
+            if (arg != null && arg->type != null && arg->type->kind == IrTypeKind::Struct)
+            {
+                u32 pk = paramKind(arg->type);
+                if (pk == 2)
+                {
+                    u32 nw = splitWordCount(arg->type);
+                    IrType** ws = alloc<IrType*>(nw);
+                    IrValue** vs = alloc<IrValue*>(1);
+                    u32 nb = (arg->type->width + 7) / 8 * 8;
+                    IrInst* scratch = emitRawAlloca(bb, call, nb);
+                    IrValue** o1 = alloc<IrValue*>(1);
+                    o1[0] = &scratch->base;
+                    IrInst* pS = emit(IrOpcode::Bitcast, ctx->tyPtr(arg->type), o1, 1, bb, call);
+                    IrValue** o2 = alloc<IrValue*>(2);
+                    o2[0] = arg;
+                    o2[1] = &pS->base;
+                    emit(IrOpcode::Store, ctx->tyVoid(), o2, 2, bb, call);
+                    for (u32 k = 0; k < nw; k++)
+                    {
+                        ws[k] = splitWord(arg->type);
+                        vs[0] = emitWordLoad(scratch, ws[k], k * 8, bb, call);
+                        nargs[na++] = vs[0];
+                    }
+                    dealloc<IrType*>(ws);
+                    dealloc<IrValue*>(vs);
+                }
+                else if (pk == 1)
+                {
+                    IrInst* slot = emit(IrOpcode::Alloca, ctx->tyPtr(arg->type), null, 0, bb, call);
+                    IrValue** oo = alloc<IrValue*>(2);
+                    oo[0] = arg;
+                    oo[1] = &slot->base;
+                    emit(IrOpcode::Store, ctx->tyVoid(), oo, 2, bb, call);
+                    nargs[na++] = &slot->base;
+                }
+                else
+                {
+                    nargs[na++] = arg;
+                }
+            }
+            else
+            {
+                nargs[na++] = arg;
+            }
+        }
+
+        IrType* newRet = rmode == 1 ? ctx->tyVoid() : rmode == 2 ? siteRetScalar(callee, oldRet) : oldRet;
+        IrValue** ops = alloc<IrValue*>(na + 1);
+        ops[0] = &callee->base;
+        for (u32 i = 0; i < na; i++) ops[i + 1] = nargs[i];
+        IrInst* nc = emit(IrOpcode::Call, newRet, ops, na + 1, bb, call);
+
+        if (rmode == 1)
+        {
+            IrValue** oo = alloc<IrValue*>(1);
+            oo[0] = sretCallArg;
+            IrValue* res = &emit(IrOpcode::Load, oldRet, oo, 1, bb, call)->base;
+            oldCallResultFix(call, res);
+        }
+        else if (rmode == 2)
+        {
+            IrType* wt = siteRetScalar(callee, oldRet);
+            u32 nb = (oldRet->width + 7) / 8 * 8;
+            IrInst* scratch = emitRawAlloca(bb, call, nb);
+            IrValue** o1 = alloc<IrValue*>(1);
+            o1[0] = &scratch->base;
+            IrInst* pW = emit(IrOpcode::Bitcast, ctx->tyPtr(wt), o1, 1, bb, call);
+            IrValue** o2 = alloc<IrValue*>(2);
+            o2[0] = &nc->base;
+            o2[1] = &pW->base;
+            emit(IrOpcode::Store, ctx->tyVoid(), o2, 2, bb, call);
+            IrValue** o3 = alloc<IrValue*>(1);
+            o3[0] = &scratch->base;
+            IrInst* pS = emit(IrOpcode::Bitcast, ctx->tyPtr(oldRet), o3, 1, bb, call);
+            IrValue** o4 = alloc<IrValue*>(1);
+            o4[0] = &pS->base;
+            IrValue* res = &emit(IrOpcode::Load, oldRet, o4, 1, bb, call)->base;
+            oldCallResultFix(call, res);
+        }
+        else
+        {
+            // unchanged return: rewire to the new call's result
+            IrValue* res = &nc->base;
+            oldCallResultFix(call, res);
+        }
+
+        dealloc<IrValue*>(nargs);
+        return true;
+    }
+
+    void oldCallResultFix(IrInst* call, IrValue* res)
+    {
+        call->base.replaceAllUses(res);
+        IrBlock* bb = call->parent;
+        for (u32 i = 0; i < call->nops; i++)
+            if (call->ops[i] != null) call->ops[i]->removeUser(call);
+        if (call->capOps > 0) dealloc<IrValue*>(call->ops);
+        call->ops = null;
+        call->capOps = 0;
+        call->nops = 0;
+        u32 idx = 0;
+        for (u32 i = 0; i < bb->ninsts; i++)
+            if (bb->insts[i] == call) { idx = i; break; }
+        for (u32 j = idx; j < bb->ninsts - 1; j++)
+            bb->insts[j] = bb->insts[j + 1];
+        bb->ninsts--;
+        if (call->base.capUsers > 0) dealloc<IrInst*>(call->base.users);
+        dealloc<IrInst>(call);
+    }
+
+    // figure out what happened to the return of the callee that this
+    // call site used: 1 sret, 2 single POD word, 0 kept
+    u32 siteRetModel(IrFunc* callee, IrType* oldRet)
+    {
+        if (oldRet == null || oldRet->kind != IrTypeKind::Struct) return 0;
+        IrType* nt = callee != null ? callee->retType : null;
+        if (nt == null) return 0;
+        if (nt->kind == IrTypeKind::Void) return 1;
+        if (nt->kind == IrTypeKind::Struct)
+        {
+            // only unchanged (extern, not-yet-lowered, or non-aggregate)
+            // callees still return a matching struct
+            if (nt == oldRet) return 0;
+            return 1;
+        }
+        return 2;
+    }
+
+    IrType* siteRetScalar(IrFunc* callee, IrType* oldRet)
+    {
+        // the new return word must be the scalar the callee now returns
+        IrType* nt = callee->retType;
+        return nt;
+    }
+
+    // Every direct call of `func` anywhere in the module gets its
+    // argument list rebuilt for the lowered signature; results are
+    // rewrapped into their original struct type.
+    bool lowerCallSites(IrFunc* func)
+    {
+        if (modd == null) return false;
+        u32 ncalls = 0;
+        for (u32 fi = 0; fi < modd->nfuncs; fi++)
+        {
+            IrFunc* f = modd->funcs[fi];
+            for (u32 bi = 0; bi < f->nblocks; bi++)
+            {
+                IrBlock* bb = f->blocks[bi];
+                for (u32 ii = 0; ii < bb->ninsts; ii++)
+                {
+                    IrInst* inst = &bb->insts[ii];
+                    if (inst->opcode == IrOpcode::Call && inst->nops >= 1 && inst->ops[0] == &func->base)
+                        ncalls++;
+                }
+            }
+        }
+
+        bool changed = ncalls > 0;
+        IrInst** calls = alloc<IrInst*>(ncalls > 0 ? ncalls : 1);
+        u32 nc = 0;
+        for (u32 fi = 0; fi < modd->nfuncs; fi++)
+        {
+            IrFunc* f = modd->funcs[fi];
+            for (u32 bi = 0; bi < f->nblocks; bi++)
+            {
+                IrBlock* bb = f->blocks[bi];
+                for (u32 ii = 0; ii < bb->ninsts; ii++)
+                {
+                    IrInst* inst = &bb->insts[ii];
+                    if (inst->opcode == IrOpcode::Call && inst->nops >= 1 && inst->ops[0] == &func->base)
+                        calls[nc++] = inst;
+                }
+            }
+        }
+        for (u32 k = 0; k < nc; k++)
+            rewriteCall(calls[k], func);
+
+        dealloc<IrInst*>(calls);
+        return changed;
+    }
+}
+
+pub bool irABILower(IrFunc* func, rawptr userdata)
+{
+    if (func == null) return false;
+    // func->parent is the module of record (every module function gets
+    // one in IrModule.addFunc); userdata only serves a caller that
+    // hands us the module itself, never the pipeline's IrContext*.
+    IrModule* modd = func->parent;
+    if (modd == null && userdata != null) modd = (IrModule*)userdata;
+    if (modd == null) return false;
+    if (func->parent == null) func->parent = modd;
+    ABILowering lower = ABILowering::new(modd->ctx);
+    lower.modd = modd;
+    if (lower.isLowered(func)) return false;
+
+    bool changed = false;
+    if (!func->isExtern)
+        changed = lower.run(func);
+    else
+        lower.markLowered(func);
+
+    changed = lower.lowerCallSites(func) || changed;
+    return changed;
+}

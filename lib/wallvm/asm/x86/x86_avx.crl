@@ -1,0 +1,668 @@
+#[[no_drop_all]]
+// AVX/AVX2/AVX-512 vector encoder: the vector form table and the VEX/
+// EVEX emitter. Rows carry full mnemonic names (vaddpd never collides
+// with a hypothetical vadd+pd), the VEX escape (0F / 0F38 / 0F3A), the
+// pp prefix field, and a width policy. EncAuto rows take EVEX when the
+// operands are zmm or a {k} mask is present, VEX otherwise — the AVX-512
+// subset rides the same opcodes. Also home of EncodeCtx, the shared
+// encode state the legacy and unit assemblers pass around.
+import(lib) wallvm::asm::common { AsmLine, AsmOperand, AsmOpKind, AsmParseError };
+import(lib) wallvm::asm::x86::common { X86Reg, X86RegClass, lookupReg, isVectorReg, AsmBytes, X86Rex, X86Vex, X86Evex, encodeMem, encodeRegReg };
+import(lib) wallvm::asm::x86::obj { AsmObject, AsmRelocKind, asmAddReloc };
+
+// encode context: byte sink plus the optional object the line is being
+// assembled into (null for one-shot encodeLine; carries reloc records)
+pub struct EncodeCtx
+{
+    AsmBytes* out;
+    X86Rex rex;
+    AsmObject* obj;
+    i32 sec;
+}
+
+pub EncodeCtx ctxNew(AsmBytes* out, AsmObject* obj, i32 sec)
+{
+    return EncodeCtx { .out = out, .rex = X86Rex::new(), .obj = obj, .sec = sec };
+}
+
+// form signatures shared with the legacy table
+pub enum VecFormSig
+{
+    VFS_NONE,    // no operands (vzeroupper)
+    VFS_R_RM,    // rm, dst — 2-op moves/converts
+    VFS_RM_R,    // dst, rm — store form
+    VFS_RRM,     // rm, vvvv, dst — 3-op arith
+    VFS_RRM_I,   // imm, rm, vvvv, dst — 4-op with imm8
+    VFS_XRM_I,   // imm, rm, dst — extract form, vvvv unused
+    VFS_XRM_V    // imm, rm, dst — shift-imm group; dst feeds vvvv,
+                 // ModRM.reg carries row.ext as the /digit
+}
+
+pub enum VecEnc
+{
+    VEncVex,     // VEX only (xmm/ymm)
+    VEncEvex,    // EVEX only
+    VEncAuto,    // EVEX when zmm or mask present
+    VEncLegacy   // legacy SSE: mandatory prefix + 0F escape; EVEX when
+                 // a mask is requested (AVX-512VL gives SSE ops masking)
+}
+
+// vector row: opcode byte + VEX escape + prefix + width policy
+// op2esc: 0 = plain 0F, 0x38 = 0F38, 0x3A = 0F3A
+// wMode: 0 W0, 1 W1, 2 W from the GPR operand size
+// llFix: 0 from dst size, 1 force L=1 (vzeroall)
+// vvvvUse: ops[1] feeds vvvv (arith); false = vvvv unused (moves)
+// rmCls: 0 vector/mem, 1 gpr/mem (vmovd, cvt-from-gpr)
+// dstCls: 0 vector, 1 gpr (cvt-to-gpr)
+pub struct VecRow
+{
+    str base;
+    u8 sizeMask;   // SZ16|SZ32|SZ64 from x86_64's mask constants
+    VecFormSig sig;
+    u8 op;
+    u8 op2esc;
+    u8 immW;
+    u8 enc;        // VecEnc
+    u8 vexPp;
+    u8 wMode;
+    u8 llFix;
+    bool vvvvUse;
+    u8 rmCls;
+    u8 dstCls;
+    u8 ext;        // ModRM.reg /digit for group opcodes; 255 = none
+}
+
+const u8 VSZ16 = 16, VSZ32 = 32, VSZ64 = 64;
+
+// ------------------------------------------------------------------
+// vector table. AVX + AVX2 core; AVX-512 coverage is the EncAuto rows
+// (same opcode, EVEX prefix, {k} masks on the destination operand).
+// ------------------------------------------------------------------
+static VecRow _vforms[] = {
+    // packed float arith
+    {"vaddps", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x58, 0, 0, VecEnc::VEncAuto, 0, 0, 0, true, 0, 0, 255 },
+    {"vaddpd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x58, 0, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vsubps", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x5C, 0, 0, VecEnc::VEncAuto, 0, 0, 0, true, 0, 0, 255 },
+    {"vsubpd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x5C, 0, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vmulps", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x59, 0, 0, VecEnc::VEncAuto, 0, 0, 0, true, 0, 0, 255 },
+    {"vmulpd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x59, 0, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vdivps", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x5E, 0, 0, VecEnc::VEncAuto, 0, 0, 0, true, 0, 0, 255 },
+    {"vdivpd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x5E, 0, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vminps", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x5D, 0, 0, VecEnc::VEncAuto, 0, 0, 0, true, 0, 0, 255 },
+    {"vminpd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x5D, 0, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vmaxps", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x5F, 0, 0, VecEnc::VEncAuto, 0, 0, 0, true, 0, 0, 255 },
+    {"vmaxpd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x5F, 0, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vsqrtps", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_R_RM, 0x51, 0, 0, VecEnc::VEncAuto, 0, 0, 0, false, 0, 0, 255 },
+    {"vsqrtpd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_R_RM, 0x51, 0, 0, VecEnc::VEncAuto, 1, 0, 0, false, 0, 0, 255 },
+
+    // packed logic / unpack / shuffle / blend / compare
+    {"vandps", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x54, 0, 0, VecEnc::VEncAuto, 0, 0, 0, true, 0, 0, 255 },
+    {"vandpd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x54, 0, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vandnps", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x55, 0, 0, VecEnc::VEncAuto, 0, 0, 0, true, 0, 0, 255 },
+    {"vandnpd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x55, 0, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vorps", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x56, 0, 0, VecEnc::VEncAuto, 0, 0, 0, true, 0, 0, 255 },
+    {"vorpd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x56, 0, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vxorps", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x57, 0, 0, VecEnc::VEncAuto, 0, 0, 0, true, 0, 0, 255 },
+    {"vxorpd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x57, 0, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vunpcklps", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x14, 0, 0, VecEnc::VEncAuto, 0, 0, 0, true, 0, 0, 255 },
+    {"vunpckhps", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x15, 0, 0, VecEnc::VEncAuto, 0, 0, 0, true, 0, 0, 255 },
+    {"vunpcklpd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x14, 0, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vunpckhpd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x15, 0, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vshufps", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM_I, 0xC6, 0, 1, VecEnc::VEncAuto, 0, 0, 0, true, 0, 0, 255 },
+    {"vshufpd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM_I, 0xC6, 0, 1, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vblendps", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM_I, 0x0C, 0, 1, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vblendpd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM_I, 0x0D, 0, 1, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vcmpps", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM_I, 0xC2, 0, 1, VecEnc::VEncAuto, 0, 0, 0, true, 0, 0, 255 },
+    {"vcmppd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM_I, 0xC2, 0, 1, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+
+    // scalar float
+    {"vaddss", VSZ16, VecFormSig::VFS_RRM, 0x58, 0, 0, VecEnc::VEncAuto, 2, 0, 0, true, 0, 0, 255 },
+    {"vaddsd", VSZ16, VecFormSig::VFS_RRM, 0x58, 0, 0, VecEnc::VEncAuto, 3, 0, 0, true, 0, 0, 255 },
+    {"vsubss", VSZ16, VecFormSig::VFS_RRM, 0x5C, 0, 0, VecEnc::VEncAuto, 2, 0, 0, true, 0, 0, 255 },
+    {"vsubsd", VSZ16, VecFormSig::VFS_RRM, 0x5C, 0, 0, VecEnc::VEncAuto, 3, 0, 0, true, 0, 0, 255 },
+    {"vmulss", VSZ16, VecFormSig::VFS_RRM, 0x59, 0, 0, VecEnc::VEncAuto, 2, 0, 0, true, 0, 0, 255 },
+    {"vmulsd", VSZ16, VecFormSig::VFS_RRM, 0x59, 0, 0, VecEnc::VEncAuto, 3, 0, 0, true, 0, 0, 255 },
+    {"vdivss", VSZ16, VecFormSig::VFS_RRM, 0x5E, 0, 0, VecEnc::VEncAuto, 2, 0, 0, true, 0, 0, 255 },
+    {"vdivsd", VSZ16, VecFormSig::VFS_RRM, 0x5E, 0, 0, VecEnc::VEncAuto, 3, 0, 0, true, 0, 0, 255 },
+    {"vminss", VSZ16, VecFormSig::VFS_RRM, 0x5D, 0, 0, VecEnc::VEncAuto, 2, 0, 0, true, 0, 0, 255 },
+    {"vminsd", VSZ16, VecFormSig::VFS_RRM, 0x5D, 0, 0, VecEnc::VEncAuto, 3, 0, 0, true, 0, 0, 255 },
+    {"vmaxss", VSZ16, VecFormSig::VFS_RRM, 0x5F, 0, 0, VecEnc::VEncAuto, 2, 0, 0, true, 0, 0, 255 },
+    {"vmaxsd", VSZ16, VecFormSig::VFS_RRM, 0x5F, 0, 0, VecEnc::VEncAuto, 3, 0, 0, true, 0, 0, 255 },
+    {"vsqrtss", VSZ16, VecFormSig::VFS_R_RM, 0x51, 0, 0, VecEnc::VEncAuto, 2, 0, 0, false, 0, 0, 255 },
+    {"vsqrtsd", VSZ16, VecFormSig::VFS_R_RM, 0x51, 0, 0, VecEnc::VEncAuto, 3, 0, 0, false, 0, 0, 255 },
+    {"vcmpss", VSZ16, VecFormSig::VFS_RRM_I, 0xC2, 0, 1, VecEnc::VEncAuto, 2, 0, 0, true, 0, 0, 255 },
+    {"vcmpsd", VSZ16, VecFormSig::VFS_RRM_I, 0xC2, 0, 1, VecEnc::VEncAuto, 3, 0, 0, true, 0, 0, 255 },
+
+    // moves — vvvv unused
+    {"vmovaps", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_R_RM, 0x28, 0, 0, VecEnc::VEncAuto, 0, 0, 0, false, 0, 0, 255 },
+    {"vmovaps", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RM_R, 0x29, 0, 0, VecEnc::VEncAuto, 0, 0, 0, false, 0, 0, 255 },
+    {"vmovups", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_R_RM, 0x10, 0, 0, VecEnc::VEncAuto, 0, 0, 0, false, 0, 0, 255 },
+    {"vmovups", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RM_R, 0x11, 0, 0, VecEnc::VEncAuto, 0, 0, 0, false, 0, 0, 255 },
+    {"vmovapd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_R_RM, 0x28, 0, 0, VecEnc::VEncAuto, 1, 0, 0, false, 0, 0, 255 },
+    {"vmovapd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RM_R, 0x29, 0, 0, VecEnc::VEncAuto, 1, 0, 0, false, 0, 0, 255 },
+    {"vmovupd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_R_RM, 0x10, 0, 0, VecEnc::VEncAuto, 1, 0, 0, false, 0, 0, 255 },
+    {"vmovupd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RM_R, 0x11, 0, 0, VecEnc::VEncAuto, 1, 0, 0, false, 0, 0, 255 },
+    {"vmovss", VSZ16, VecFormSig::VFS_R_RM, 0x10, 0, 0, VecEnc::VEncAuto, 2, 0, 0, false, 0, 0, 255 },
+    {"vmovss", VSZ16, VecFormSig::VFS_RM_R, 0x11, 0, 0, VecEnc::VEncAuto, 2, 0, 0, false, 0, 0, 255 },
+    {"vmovsd", VSZ16, VecFormSig::VFS_R_RM, 0x10, 0, 0, VecEnc::VEncAuto, 3, 0, 0, false, 0, 0, 255 },
+    {"vmovsd", VSZ16, VecFormSig::VFS_RM_R, 0x11, 0, 0, VecEnc::VEncAuto, 3, 0, 0, false, 0, 0, 255 },
+    {"vmovd", VSZ16, VecFormSig::VFS_R_RM, 0x6E, 0, 0, VecEnc::VEncVex, 1, 0, 0, false, 1, 0, 255 },
+    {"vmovd", VSZ16, VecFormSig::VFS_RM_R, 0x7E, 0, 0, VecEnc::VEncVex, 1, 0, 0, false, 1, 0, 255 },
+    {"vmovq", VSZ16, VecFormSig::VFS_R_RM, 0x6E, 0, 0, VecEnc::VEncVex, 1, 1, 0, false, 1, 0, 255 },
+    {"vmovq", VSZ16, VecFormSig::VFS_RM_R, 0x7E, 0, 0, VecEnc::VEncVex, 1, 1, 0, false, 1, 0, 255 },
+
+    // converts
+    {"vcvtdq2ps", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_R_RM, 0x5B, 0, 0, VecEnc::VEncAuto, 0, 0, 0, false, 0, 0, 255 },
+    {"vcvtps2dq", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_R_RM, 0x5B, 0, 0, VecEnc::VEncAuto, 1, 0, 0, false, 0, 0, 255 },
+    {"vcvttps2dq", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_R_RM, 0x5B, 0, 0, VecEnc::VEncAuto, 2, 0, 0, false, 0, 0, 255 },
+    {"vcvtsi2ss", VSZ16, VecFormSig::VFS_RRM, 0x2A, 0, 0, VecEnc::VEncVex, 2, 2, 0, true, 1, 0, 255 },
+    {"vcvtsi2sd", VSZ16, VecFormSig::VFS_RRM, 0x2A, 0, 0, VecEnc::VEncVex, 3, 2, 0, true, 1, 0, 255 },
+    {"vcvttss2si", VSZ16, VecFormSig::VFS_R_RM, 0x2C, 0, 0, VecEnc::VEncVex, 2, 2, 0, false, 0, 1, 255 },
+    {"vcvttsd2si", VSZ16, VecFormSig::VFS_R_RM, 0x2C, 0, 0, VecEnc::VEncVex, 3, 2, 0, false, 0, 1, 255 },
+
+    // integer AVX — EncAuto so zmm forms ride EVEX
+    {"vpxor", VSZ16|VSZ32, VecFormSig::VFS_RRM, 0xEF, 0, 0, VecEnc::VEncVex, 1, 0, 0, true, 0, 0, 255 },
+    {"vpand", VSZ16|VSZ32, VecFormSig::VFS_RRM, 0xDB, 0, 0, VecEnc::VEncVex, 1, 0, 0, true, 0, 0, 255 },
+    {"vpor", VSZ16|VSZ32, VecFormSig::VFS_RRM, 0xEB, 0, 0, VecEnc::VEncVex, 1, 0, 0, true, 0, 0, 255 },
+    {"vpandn", VSZ16|VSZ32, VecFormSig::VFS_RRM, 0xDF, 0, 0, VecEnc::VEncVex, 1, 0, 0, true, 0, 0, 255 },
+    {"vpaddb", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0xFC, 0, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vpaddw", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0xFD, 0, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vpaddd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0xFE, 0, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vpaddq", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0xFF, 0, 0, VecEnc::VEncAuto, 1, 1, 0, true, 0, 0, 255 },
+    {"vpsubb", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0xF8, 0, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vpsubw", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0xF9, 0, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vpsubd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0xFA, 0, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vpsubq", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0xFB, 0, 0, VecEnc::VEncAuto, 1, 1, 0, true, 0, 0, 255 },
+    {"vpcmpeqb", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x74, 0, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vpcmpeqw", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x75, 0, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vpcmpeqd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x76, 0, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vpcmpgtb", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x64, 0, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vpcmpgtw", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x65, 0, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vpcmpgtd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x66, 0, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vpmullw", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0xD5, 0, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vpmulld", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x40, 0x38, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vpsllw", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0xF1, 0, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vpsllw", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_XRM_V, 0x71, 0, 1, VecEnc::VEncAuto, 1, 0, 0, false, 0, 0, 6 },
+    {"vpslld", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0xF2, 0, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vpslld", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_XRM_V, 0x72, 0, 1, VecEnc::VEncAuto, 1, 0, 0, false, 0, 0, 6 },
+    {"vpsllq", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0xF3, 0, 0, VecEnc::VEncAuto, 1, 1, 0, true, 0, 0, 255 },
+    {"vpsllq", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_XRM_V, 0x73, 0, 1, VecEnc::VEncAuto, 1, 0, 0, false, 0, 0, 6 },
+    {"vpsrlw", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0xD1, 0, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vpsrlw", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_XRM_V, 0x71, 0, 1, VecEnc::VEncAuto, 1, 0, 0, false, 0, 0, 2 },
+    {"vpsrld", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0xD2, 0, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vpsrld", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_XRM_V, 0x72, 0, 1, VecEnc::VEncAuto, 1, 0, 0, false, 0, 0, 2 },
+    {"vpsrlq", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0xD3, 0, 0, VecEnc::VEncAuto, 1, 1, 0, true, 0, 0, 255 },
+    {"vpsrlq", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_XRM_V, 0x73, 0, 1, VecEnc::VEncAuto, 1, 0, 0, false, 0, 0, 2 },
+    {"vpsraw", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0xE1, 0, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vpsraw", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_XRM_V, 0x71, 0, 1, VecEnc::VEncAuto, 1, 0, 0, false, 0, 0, 4 },
+    {"vpsrad", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0xE2, 0, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vpsrad", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_XRM_V, 0x72, 0, 1, VecEnc::VEncAuto, 1, 0, 0, false, 0, 0, 4 },
+
+    // AVX2 variable shifts + permutes + broadcasts
+    {"vpsllvd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x47, 0x38, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vpsllvq", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x47, 0x38, 0, VecEnc::VEncAuto, 1, 1, 0, true, 0, 0, 255 },
+    {"vpsrlvd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x45, 0x38, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vpsrlvq", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x45, 0x38, 0, VecEnc::VEncAuto, 1, 1, 0, true, 0, 0, 255 },
+    {"vpsravd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x46, 0x38, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vpermq", VSZ32|VSZ64, VecFormSig::VFS_XRM_I, 0x00, 0x3A, 1, VecEnc::VEncAuto, 1, 1, 0, false, 0, 0, 255 },
+    {"vpermpd", VSZ32|VSZ64, VecFormSig::VFS_XRM_I, 0x01, 0x3A, 1, VecEnc::VEncAuto, 1, 1, 0, false, 0, 0, 255 },
+    {"vpermd", VSZ32, VecFormSig::VFS_RRM, 0x36, 0x38, 0, VecEnc::VEncVex, 1, 0, 0, true, 0, 0, 255 },
+    {"vperm2f128", VSZ32, VecFormSig::VFS_RRM_I, 0x06, 0x3A, 1, VecEnc::VEncVex, 0, 0, 0, true, 0, 0, 255 },
+    {"vperm2i128", VSZ32, VecFormSig::VFS_RRM_I, 0x06, 0x3A, 1, VecEnc::VEncVex, 1, 0, 0, true, 0, 0, 255 },
+    {"vextractf128", VSZ32, VecFormSig::VFS_XRM_I, 0x19, 0x3A, 1, VecEnc::VEncVex, 0, 0, 0, false, 0, 0, 255 },
+    {"vinsertf128", VSZ32, VecFormSig::VFS_RRM_I, 0x18, 0x3A, 1, VecEnc::VEncVex, 0, 0, 0, true, 0, 0, 255 },
+    {"vextracti128", VSZ32, VecFormSig::VFS_XRM_I, 0x39, 0x3A, 1, VecEnc::VEncVex, 1, 0, 0, false, 0, 0, 255 },
+    {"vinserti128", VSZ32, VecFormSig::VFS_RRM_I, 0x18, 0x3A, 1, VecEnc::VEncVex, 1, 0, 0, true, 0, 0, 255 },
+    {"vbroadcastss", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_R_RM, 0x18, 0x3A, 0, VecEnc::VEncAuto, 0, 0, 0, false, 0, 0, 255 },
+    {"vbroadcastsd", VSZ32|VSZ64, VecFormSig::VFS_R_RM, 0x19, 0x3A, 0, VecEnc::VEncAuto, 0, 0, 0, false, 0, 0, 255 },
+    {"vbroadcastf128", VSZ32, VecFormSig::VFS_R_RM, 0x1A, 0x3A, 0, VecEnc::VEncVex, 0, 0, 0, false, 0, 0, 255 },
+    {"vbroadcasti128", VSZ32, VecFormSig::VFS_R_RM, 0x1A, 0x3A, 0, VecEnc::VEncVex, 1, 0, 0, false, 0, 0, 255 },
+    {"vpbroadcastb", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_R_RM, 0x78, 0x38, 0, VecEnc::VEncAuto, 1, 0, 0, false, 0, 0, 255 },
+    {"vpbroadcastw", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_R_RM, 0x79, 0x38, 0, VecEnc::VEncAuto, 1, 0, 0, false, 0, 0, 255 },
+    {"vpbroadcastd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_R_RM, 0x58, 0x38, 0, VecEnc::VEncAuto, 1, 0, 0, false, 0, 0, 255 },
+    {"vpbroadcastq", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_R_RM, 0x59, 0x38, 0, VecEnc::VEncAuto, 1, 1, 0, false, 0, 0, 255 },
+
+    // misc
+    {"vzeroupper", 0, VecFormSig::VFS_NONE, 0x77, 0, 0, VecEnc::VEncVex, 0, 0, 0, false, 0, 0, 255 },
+    {"vzeroall", 0, VecFormSig::VFS_NONE, 0x77, 0, 0, VecEnc::VEncVex, 0, 0, 1, false, 0, 0, 255 },
+    {"vmovmskps", VSZ16, VecFormSig::VFS_R_RM, 0x50, 0, 0, VecEnc::VEncVex, 0, 0, 0, false, 0, 1, 255 },
+    {"vmovmskpd", VSZ16, VecFormSig::VFS_R_RM, 0x50, 0, 0, VecEnc::VEncVex, 1, 0, 0, false, 0, 1, 255 },
+    {"vpmovmskb", VSZ16, VecFormSig::VFS_R_RM, 0xD7, 0, 0, VecEnc::VEncVex, 1, 0, 0, false, 0, 1, 255 },
+
+    // FMA3: 66 0F 38 op, vvvv = ops[1], reg = dst. 132 base 98/9A/9C/9E
+    // (+10h for 213, +20h for 231; +1 for the ss/sd scalar pair). W=1 for
+    // pd/sd. Verified against gas output.
+    {"vfmadd132ps", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x98, 0x38, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vfmadd213ps", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0xA8, 0x38, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vfmadd231ps", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0xB8, 0x38, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vfmadd132pd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x98, 0x38, 0, VecEnc::VEncAuto, 1, 1, 0, true, 0, 0, 255 },
+    {"vfmadd213pd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0xA8, 0x38, 0, VecEnc::VEncAuto, 1, 1, 0, true, 0, 0, 255 },
+    {"vfmadd231pd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0xB8, 0x38, 0, VecEnc::VEncAuto, 1, 1, 0, true, 0, 0, 255 },
+    {"vfmadd132ss", VSZ16, VecFormSig::VFS_RRM, 0x99, 0x38, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vfmadd213ss", VSZ16, VecFormSig::VFS_RRM, 0xA9, 0x38, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vfmadd231ss", VSZ16, VecFormSig::VFS_RRM, 0xB9, 0x38, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vfmadd132sd", VSZ16, VecFormSig::VFS_RRM, 0x99, 0x38, 0, VecEnc::VEncAuto, 1, 1, 0, true, 0, 0, 255 },
+    {"vfmadd213sd", VSZ16, VecFormSig::VFS_RRM, 0xA9, 0x38, 0, VecEnc::VEncAuto, 1, 1, 0, true, 0, 0, 255 },
+    {"vfmadd231sd", VSZ16, VecFormSig::VFS_RRM, 0xB9, 0x38, 0, VecEnc::VEncAuto, 1, 1, 0, true, 0, 0, 255 },
+    {"vfmsub132ps", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x9A, 0x38, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vfmsub213ps", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0xAA, 0x38, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vfmsub231ps", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0xBA, 0x38, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vfmsub132pd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x9A, 0x38, 0, VecEnc::VEncAuto, 1, 1, 0, true, 0, 0, 255 },
+    {"vfmsub213pd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0xAA, 0x38, 0, VecEnc::VEncAuto, 1, 1, 0, true, 0, 0, 255 },
+    {"vfmsub231pd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0xBA, 0x38, 0, VecEnc::VEncAuto, 1, 1, 0, true, 0, 0, 255 },
+    {"vfmsub132ss", VSZ16, VecFormSig::VFS_RRM, 0x9B, 0x38, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vfmsub213ss", VSZ16, VecFormSig::VFS_RRM, 0xAB, 0x38, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vfmsub231ss", VSZ16, VecFormSig::VFS_RRM, 0xBB, 0x38, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vfmsub132sd", VSZ16, VecFormSig::VFS_RRM, 0x9B, 0x38, 0, VecEnc::VEncAuto, 1, 1, 0, true, 0, 0, 255 },
+    {"vfmsub213sd", VSZ16, VecFormSig::VFS_RRM, 0xAB, 0x38, 0, VecEnc::VEncAuto, 1, 1, 0, true, 0, 0, 255 },
+    {"vfmsub231sd", VSZ16, VecFormSig::VFS_RRM, 0xBB, 0x38, 0, VecEnc::VEncAuto, 1, 1, 0, true, 0, 0, 255 },
+    {"vfnmadd132ps", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x9C, 0x38, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vfnmadd213ps", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0xAC, 0x38, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vfnmadd231ps", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0xBC, 0x38, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vfnmadd132pd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x9C, 0x38, 0, VecEnc::VEncAuto, 1, 1, 0, true, 0, 0, 255 },
+    {"vfnmadd213pd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0xAC, 0x38, 0, VecEnc::VEncAuto, 1, 1, 0, true, 0, 0, 255 },
+    {"vfnmadd231pd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0xBC, 0x38, 0, VecEnc::VEncAuto, 1, 1, 0, true, 0, 0, 255 },
+    {"vfnmadd132ss", VSZ16, VecFormSig::VFS_RRM, 0x9D, 0x38, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vfnmadd213ss", VSZ16, VecFormSig::VFS_RRM, 0xAD, 0x38, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vfnmadd231ss", VSZ16, VecFormSig::VFS_RRM, 0xBD, 0x38, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vfnmadd132sd", VSZ16, VecFormSig::VFS_RRM, 0x9D, 0x38, 0, VecEnc::VEncAuto, 1, 1, 0, true, 0, 0, 255 },
+    {"vfnmadd213sd", VSZ16, VecFormSig::VFS_RRM, 0xAD, 0x38, 0, VecEnc::VEncAuto, 1, 1, 0, true, 0, 0, 255 },
+    {"vfnmadd231sd", VSZ16, VecFormSig::VFS_RRM, 0xBD, 0x38, 0, VecEnc::VEncAuto, 1, 1, 0, true, 0, 0, 255 },
+    {"vfnmsub132ps", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x9E, 0x38, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vfnmsub213ps", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0xAE, 0x38, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vfnmsub231ps", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0xBE, 0x38, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vfnmsub132pd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0x9E, 0x38, 0, VecEnc::VEncAuto, 1, 1, 0, true, 0, 0, 255 },
+    {"vfnmsub213pd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0xAE, 0x38, 0, VecEnc::VEncAuto, 1, 1, 0, true, 0, 0, 255 },
+    {"vfnmsub231pd", VSZ16|VSZ32|VSZ64, VecFormSig::VFS_RRM, 0xBE, 0x38, 0, VecEnc::VEncAuto, 1, 1, 0, true, 0, 0, 255 },
+    {"vfnmsub132ss", VSZ16, VecFormSig::VFS_RRM, 0x9F, 0x38, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vfnmsub213ss", VSZ16, VecFormSig::VFS_RRM, 0xAF, 0x38, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vfnmsub231ss", VSZ16, VecFormSig::VFS_RRM, 0xBF, 0x38, 0, VecEnc::VEncAuto, 1, 0, 0, true, 0, 0, 255 },
+    {"vfnmsub132sd", VSZ16, VecFormSig::VFS_RRM, 0x9F, 0x38, 0, VecEnc::VEncAuto, 1, 1, 0, true, 0, 0, 255 },
+    {"vfnmsub213sd", VSZ16, VecFormSig::VFS_RRM, 0xAF, 0x38, 0, VecEnc::VEncAuto, 1, 1, 0, true, 0, 0, 255 },
+    {"vfnmsub231sd", VSZ16, VecFormSig::VFS_RRM, 0xBF, 0x38, 0, VecEnc::VEncAuto, 1, 1, 0, true, 0, 0, 255 }
+};
+
+// W-bit helper for wMode=2 rows: true when a GPR operand is 64-bit
+bool gprIs64(AsmLine* line)
+{
+    for (u32 i = 0; i < line.nops; i++)
+    {
+        if (line.ops[i].kind == AsmOpKind::Reg)
+        {
+            X86Reg* r = lookupReg(line.ops[i].text);
+            if (r != null && r.cls == X86RegClass::RcGpr) return r.size == 8;
+        }
+    }
+    return false;
+}
+
+bool vecSizeOk(u8 mask, u8 vsize)
+{
+    if (mask == 0) return true;
+    if (vsize == 16) return (mask & VSZ16) != 0;
+    if (vsize == 32) return (mask & VSZ32) != 0;
+    if (vsize == 64) return (mask & VSZ64) != 0;
+    return false;
+}
+
+// signature match: operand count, kinds, register classes
+bool vecSigOk(AsmLine* line, VecRow* row)
+{
+    switch (row.sig)
+    {
+        VecFormSig::VFS_NONE => { return line.nops == 0; },
+        VecFormSig::VFS_R_RM => {
+            if (line.nops != 2 || line.ops[1].kind != AsmOpKind::Reg) return false;
+            if (line.ops[0].kind != AsmOpKind::Reg && line.ops[0].kind != AsmOpKind::Mem) return false;
+            X86Reg* d = lookupReg(line.ops[1].text);
+            if (d == null) return false;
+            if (row.dstCls == 1) { if (d.cls != X86RegClass::RcGpr) return false; }
+            else { if (!isVectorReg(d)) return false; }
+            if (line.ops[0].kind == AsmOpKind::Reg)
+            {
+                X86Reg* s = lookupReg(line.ops[0].text);
+                if (s == null) return false;
+                if (row.rmCls == 0) { if (!isVectorReg(s)) return false; }
+                else { if (s.cls != X86RegClass::RcGpr) return false; }
+            }
+            return true;
+        },
+        VecFormSig::VFS_RM_R => {
+            if (line.nops != 2 || line.ops[0].kind != AsmOpKind::Reg) return false;
+            if (line.ops[1].kind != AsmOpKind::Reg && line.ops[1].kind != AsmOpKind::Mem) return false;
+            X86Reg* d = lookupReg(line.ops[0].text);
+            return d != null && isVectorReg(d);
+        },
+        VecFormSig::VFS_RRM => {
+            if (line.nops != 3 || line.ops[2].kind != AsmOpKind::Reg) return false;
+            X86Reg* d = lookupReg(line.ops[2].text);
+            if (d == null) return false;
+            if (row.dstCls == 1) { if (d.cls != X86RegClass::RcGpr) return false; }
+            else { if (!isVectorReg(d)) return false; }
+            if (row.vvvvUse)
+            {
+                if (line.ops[1].kind != AsmOpKind::Reg) return false;
+                X86Reg* v = lookupReg(line.ops[1].text);
+                if (v == null || !isVectorReg(v)) return false;
+            }
+            if (line.ops[0].kind != AsmOpKind::Reg && line.ops[0].kind != AsmOpKind::Mem) return false;
+            if (line.ops[0].kind == AsmOpKind::Reg)
+            {
+                X86Reg* s = lookupReg(line.ops[0].text);
+                if (s == null) return false;
+                if (row.rmCls == 0) { if (!isVectorReg(s)) return false; }
+                else { if (s.cls != X86RegClass::RcGpr) return false; }
+            }
+            return true;
+        },
+        VecFormSig::VFS_RRM_I => {
+            if (line.nops != 4 || line.ops[0].kind != AsmOpKind::Imm) return false;
+            if (line.ops[3].kind != AsmOpKind::Reg) return false;
+            X86Reg* d = lookupReg(line.ops[3].text);
+            if (d == null || !isVectorReg(d)) return false;
+            if (row.vvvvUse)
+            {
+                if (line.ops[2].kind != AsmOpKind::Reg) return false;
+                X86Reg* v = lookupReg(line.ops[2].text);
+                if (v == null || !isVectorReg(v)) return false;
+            }
+            if (line.ops[1].kind != AsmOpKind::Reg && line.ops[1].kind != AsmOpKind::Mem) return false;
+            return true;
+        },
+        VecFormSig::VFS_XRM_I => {
+            if (line.nops != 3 || line.ops[0].kind != AsmOpKind::Imm) return false;
+            if (line.ops[2].kind != AsmOpKind::Reg) return false;
+            X86Reg* d = lookupReg(line.ops[2].text);
+            if (d == null) return false;
+            if (row.dstCls == 1) { if (d.cls != X86RegClass::RcGpr) return false; }
+            else { if (!isVectorReg(d)) return false; }
+            if (line.ops[1].kind != AsmOpKind::Reg && line.ops[1].kind != AsmOpKind::Mem) return false;
+            if (line.ops[1].kind == AsmOpKind::Reg)
+            {
+                X86Reg* s = lookupReg(line.ops[1].text);
+                if (s == null) return false;
+                if (row.rmCls == 0) { if (!isVectorReg(s)) return false; }
+                else { if (s.cls != X86RegClass::RcGpr) return false; }
+            }
+            return true;
+        },
+        VecFormSig::VFS_XRM_V => {
+            // imm8, rm, dst — dst feeds vvvv, ModRM.reg = ext /digit
+            if (line.nops != 3 || line.ops[0].kind != AsmOpKind::Imm) return false;
+            if (line.ops[2].kind != AsmOpKind::Reg) return false;
+            X86Reg* d = lookupReg(line.ops[2].text);
+            if (d == null || !isVectorReg(d)) return false;
+            if (line.ops[1].kind != AsmOpKind::Reg && line.ops[1].kind != AsmOpKind::Mem) return false;
+            if (line.ops[1].kind == AsmOpKind::Reg)
+            {
+                X86Reg* s = lookupReg(line.ops[1].text);
+                if (s == null || !isVectorReg(s)) return false;
+            }
+            return true;
+        },
+        else => { return false; },
+    }
+}
+
+// vector encode: build VEX or EVEX, emit prefix, opcode, ModRM tail,
+// imm. The ModRM tail goes through a scratch buffer first so the R/X/B
+// extension bits are known before the prefix is written.
+bool encodeVector(AsmLine* line, VecRow* row, EncodeCtx* ctx, AsmParseError* err)
+{
+    AsmBytes* out = ctx.out;
+
+    AsmOperand* rmOp = null;
+    AsmOperand* vvvvOp = null;
+    AsmOperand* dstOp = null;
+    AsmOperand* immOp = null;
+    switch (row.sig)
+    {
+        VecFormSig::VFS_RRM => {
+            rmOp = &line.ops[0];
+            if (row.vvvvUse) vvvvOp = &line.ops[1];
+            dstOp = &line.ops[2];
+        },
+        VecFormSig::VFS_RRM_I => {
+            immOp = &line.ops[0];
+            rmOp = &line.ops[1];
+            if (row.vvvvUse) vvvvOp = &line.ops[2];
+            dstOp = &line.ops[3];
+        },
+        VecFormSig::VFS_XRM_I => {
+            immOp = &line.ops[0];
+            rmOp = &line.ops[1];
+            dstOp = &line.ops[2];
+        },
+        VecFormSig::VFS_XRM_V => {
+            // imm8, rm, dst — dst feeds vvvv, ModRM.reg = ext /digit
+            immOp = &line.ops[0];
+            rmOp = &line.ops[1];
+            vvvvOp = &line.ops[2];
+            dstOp = null;
+        },
+        VecFormSig::VFS_R_RM => {
+            rmOp = &line.ops[0];
+            dstOp = &line.ops[1];
+        },
+        VecFormSig::VFS_RM_R => {
+            rmOp = &line.ops[1];
+            dstOp = &line.ops[0];
+        },
+        VecFormSig::VFS_NONE => { /* no operands */ },
+        else => { err.msg = "bad vector signature"; return false; },
+    }
+
+    X86Reg* dstReg = null;
+    X86Reg* rmReg = null;
+    X86Reg* vvvvReg = null;
+    if (dstOp != null && dstOp.kind == AsmOpKind::Reg) dstReg = lookupReg(dstOp.text);
+    if (rmOp != null && rmOp.kind == AsmOpKind::Reg) rmReg = lookupReg(rmOp.text);
+    if (vvvvOp != null && vvvvOp.kind == AsmOpKind::Reg) vvvvReg = lookupReg(vvvvOp.text);
+
+    if (dstReg != null)
+    {
+        bool ok = row.dstCls == 1 ? dstReg.cls == X86RegClass::RcGpr : isVectorReg(dstReg);
+        if (!ok) { err.msg = "wrong destination register class"; return false; }
+    }
+    if (rmReg != null)
+    {
+        bool ok = row.rmCls == 0 ? isVectorReg(rmReg) : rmReg.cls == X86RegClass::RcGpr;
+        if (!ok) { err.msg = "wrong source register class"; return false; }
+    }
+    if (vvvvReg != null && !isVectorReg(vvvvReg))
+    {
+        err.msg = "vvvv operand must be a vector register";
+        return false;
+    }
+
+    // vector length rides the destination register (gpr destinations in
+    // cvt-to-gpr forms use the source xmm's width for W only; extract
+    // forms take it from the wider source, since the dst is the other
+    // half of the pair)
+    u8 vsize = dstReg != null && isVectorReg(dstReg) ? dstReg->size : 0;
+    if (rmReg != null && isVectorReg(rmReg) && rmReg->size > vsize) vsize = rmReg->size;
+    if (vvvvReg != null && isVectorReg(vvvvReg) && vvvvReg->size > vsize) vsize = vvvvReg->size;
+    if (!vecSizeOk(row.sizeMask, vsize))
+    {
+        err.msg = "operand width not valid for this form";
+        return false;
+    }
+
+    // EVEX when the row allows it and the operands demand it. Legacy rows
+    // stay legacy unless a mask asks for the AVX-512VL EVEX form.
+    bool evex = row.enc == VecEnc::VEncEvex;
+    if (row.enc == VecEnc::VEncAuto)
+    {
+        if (vsize == 64) evex = true;
+        if (dstOp != null && !dstOp.mask.isEmpty()) evex = true;
+    }
+    if (row.enc == VecEnc::VEncLegacy && dstOp != null && !dstOp.mask.isEmpty()) evex = true;
+    if (row.enc == VecEnc::VEncVex && (vsize == 64 || (dstOp != null && !dstOp.mask.isEmpty())))
+    {
+        err.msg = "form is VEX-only; zmm/mask needs an EVEX form";
+        return false;
+    }
+
+    AsmBytes tail = AsmBytes::new();
+    u8 highB = 0;
+    u8 highX = 0;
+    // group forms put the /digit in ModRM.reg instead of a register
+    u8 regField = row.ext != 255 ? row.ext : (dstReg != null ? (dstReg.num & 7) : 0);
+    bool regExt = dstReg != null && (dstReg.num & 8) != 0;
+    bool regExt2 = dstReg != null && (dstReg.num & 16) != 0;
+
+    if (rmOp != null && row.sig != VecFormSig::VFS_NONE)
+    {
+        if (rmOp.kind == AsmOpKind::Mem)
+        {
+            X86Reg* base = null;
+            X86Reg* index = null;
+            if (!rmOp.rip)
+            {
+                if (rmOp.hasSym) { tail.deinit(); err.msg = "symbolic displacement needs %rip"; return false; }
+                if (!rmOp.base.isEmpty())
+                {
+                    base = lookupReg(rmOp.base);
+                    if (base == null) { tail.deinit(); err.msg = "bad base register"; return false; }
+                }
+                if (!rmOp.index.isEmpty())
+                {
+                    index = lookupReg(rmOp.index);
+                    if (index == null) { tail.deinit(); err.msg = "bad index register"; return false; }
+                }
+            }
+            u8 xb = 0;
+            u8 xx = 0;
+            // imm bytes that follow the displacement feed the PC32 addend
+            u32 immTail = 0;
+            if (immOp != null && row.immW != 0)
+            {
+                if (row.immW == 1) immTail = 1;
+                else immTail = row.immW;
+            }
+            // rip+sym: the in-place disp holds the addend (disp-4-immTail);
+            // the ELF writer zeroes the field, COFF keeps it
+            i64 wdisp = rmOp.disp;
+            if (rmOp.hasSym && rmOp.rip) wdisp = rmOp.disp - 4 - (i64)immTail;
+            if (!encodeMem(&tail, base, index, rmOp.scale, rmOp.hasDisp || rmOp.hasSym,
+                           wdisp, rmOp.rip, regField, &xb, &xx))
+            {
+                tail.deinit();
+                return false;
+            }
+            highB = xb;
+            highX = xx;
+        }
+        else
+        {
+            if (rmReg == null) { tail.deinit(); err.msg = "missing rm operand"; return false; }
+            if (!tail.u8b(encodeRegReg(regField, rmReg.num))) { tail.deinit(); return false; }
+            highB = (rmReg.num & 8) != 0 ? 1 : 0;
+            if (evex) highX = (rmReg.num & 16) != 0 ? 1 : 0;
+        }
+    }
+
+    // compose and emit the prefix
+    u8 mmmmm = row.op2esc == 0x38 ? 2 : (row.op2esc == 0x3A ? 3 : 1);
+    bool w = row.wMode == 1 || (row.wMode == 2 && gprIs64(line));
+    if (evex)
+    {
+        X86Evex ev = X86Evex::new();
+        ev.r = regExt;
+        ev.rp = regExt2;
+        ev.x = highX != 0;
+        ev.b = highB != 0;
+        ev.mmmmm = mmmmm;
+        ev.pp = row.vexPp;
+        ev.w = w;
+        u8 ll = 0;
+        if (vsize == 32) ll = 1;
+        else if (vsize == 64) ll = 2;
+        if (row.llFix == 1) ll = 1;
+        ev.ll = ll;
+        if (vvvvReg != null) { ev.vvvv = vvvvReg.num & 15; ev.v2 = (vvvvReg.num & 16) != 0; }
+        if (dstOp != null && !dstOp.mask.isEmpty())
+        {
+            X86Reg* m = lookupReg(dstOp.mask);
+            if (m == null || m.cls != X86RegClass::RcK) { tail.deinit(); err.msg = "bad opmask"; return false; }
+            ev.aaa = m.num & 7;
+            ev.z = dstOp.maskZero;
+        }
+        if (!ev.emit(out)) { tail.deinit(); return false; }
+    }
+    else if (row.enc == VecEnc::VEncLegacy && !evex)
+    {
+        // legacy SSE: [mandatory prefix] [REX] 0F [escape] opcode, no VEX
+        u8 pfx = row.vexPp == 1 ? 0x66 : (row.vexPp == 2 ? 0xF3 : (row.vexPp == 3 ? 0xF2 : 0));
+        if (pfx != 0) { if (!out.u8b(pfx)) { tail.deinit(); return false; } }
+        // REX only when the reg/rm needs it (xmm8-15, gpr src/dst)
+        if (regExt || highB != 0 || highX != 0 || w)
+        {
+            X86Rex rex = X86Rex::new();
+            rex.r = regExt;
+            rex.b = highB != 0;
+            rex.x = highX != 0;
+            rex.w = w;
+            if (!out.u8b(rex.byte())) { tail.deinit(); return false; }
+        }
+        if (!out.u8b(0x0F)) { tail.deinit(); return false; }
+        if (row.op2esc != 0)
+        {
+            if (!out.u8b(row.op2esc)) { tail.deinit(); return false; }
+        }
+    }
+    else
+    {
+        X86Vex vx = X86Vex::new();
+        vx.r = regExt;
+        vx.x = highX != 0;
+        vx.b = highB != 0;
+        vx.mmmmm = mmmmm;
+        vx.pp = row.vexPp;
+        vx.w = w;
+        u8 ll = 0;
+        if (vsize == 32) ll = 1;
+        if (row.llFix == 1) ll = 1;
+        vx.ll = ll;
+        if (vvvvReg != null) vx.vvvv = vvvvReg.num & 15;
+        if (!vx.emit(out)) { tail.deinit(); return false; }
+    }
+
+    // opcode, then the parked ModRM tail
+    if (!out.u8b(row.op)) { tail.deinit(); return false; }
+    for (u32 i = 0; i < tail.len; i++)
+    {
+        if (!out.u8b(tail.data[i])) { tail.deinit(); return false; }
+    }
+    tail.deinit();
+
+    // rip-relative symbol displacement: the disp is the last 4 bytes
+    if (rmOp != null && rmOp.kind == AsmOpKind::Mem && rmOp.hasSym && rmOp.rip && ctx.obj != null)
+    {
+        u64 at = out.len >= 4 ? out.len - 4 : 0;
+        i64 addend = rmOp.disp - 4;
+        if (immOp != null && row.immW != 0) addend -= (row.immW == 1 ? 1 : row.immW);
+        if (!asmAddReloc(ctx.obj, at, rmOp.sym, AsmRelocKind::RelPc32, addend, ctx.sec)) return false;
+    }
+
+    if (immOp != null && row.immW != 0)
+    {
+        return out.immv(immOp.imm, row.immW);
+    }
+    return true;
+}
+
+// walk the vector table; 1 encoded, 0 no match, -1 hard error
+pub i32 tryVecTable(AsmLine* line, str base, EncodeCtx* ctx, AsmParseError* err)
+{
+    u32 n = sizeof(_vforms) / sizeof(_vforms[0]);
+    for (u32 i = 0; i < n; i++)
+    {
+        VecRow* row = &_vforms[i];
+        if (!row.base.equals(base)) continue;
+        if (!vecSigOk(line, row)) continue;
+        if (!encodeVector(line, row, ctx, err)) return -1;
+        return 1;
+    }
+    return 0;
+}
