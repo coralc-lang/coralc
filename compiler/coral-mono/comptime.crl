@@ -25,10 +25,11 @@ import context::context { AstContext };
 import sem::sema { Sema };
 import sem::scope { Symbol };
 import sem::member;
+import member { MemberInfo };
+import lexer { escape { EscapeResult } };
 import mono { MonoContext, MonoSubstitution };
 
 import(lib) std::mman { alloc, dealloc, realloc, zero };
-
 /* CtVal.kind tags: the bootstrap does not emit file-scope scalar consts
  * (only array consts) or forward-declare non-variant enums before extend
  * bodies, so the tags are inlined as numeric literals at use sites.
@@ -63,6 +64,7 @@ pub struct CtEval
     u32 emittedCap;
     bool failed;
     str errMsg;
+    SourceLoc errLoc;
     u32 depth;
     SourceLoc loc;
     Str variadicPackName;
@@ -106,6 +108,7 @@ pub extend CtEval
         self.emittedCap = 0;
         self.failed = false;
         self.errMsg = str::empty();
+        self.errLoc.data = 0;
         self.depth = 0;
         self.loc.data = 0;
         self.variadicPackName = 0;
@@ -376,6 +379,7 @@ pub extend CtEval
         if (self.failed) return;
         self.failed = true;
         self.errMsg = msg;
+        self.errLoc = self.loc;
     }
 
     Node* nodeAt(NodeId n) { return self.mono.nodeAt(n); }
@@ -848,8 +852,10 @@ pub extend CtEval
     }
 
     /* comptime str VALUE of a source string literal: intern text keeps
-     * the surrounding quotes (codegen strips them when re-emitting); the
-     * value bytes are what sits inside the quotes */
+     * the surrounding quotes and raw escapes (codegen strips/re-escapes
+     * them when re-emitting), so the value is the decoded content —
+     * `"a\nb"` yields a real newline byte, matching what the C literal
+     * ends up holding at runtime */
     CtVal strLitVal(NodeId id)
     {
         u8* p = null;
@@ -860,7 +866,33 @@ pub extend CtEval
         else if (pl >= 2 && p[0] == 34) begin = 1;
         usize end = pl;
         if (end > begin && p[end - 1] == 34) end--;
-        return self.makeStrCopy(p + begin, end - begin);
+        usize rawLen = end - begin;
+        if (rawLen == 0) return self.makeStrCopy(p, 0);
+        u8* out = alloc<u8>(rawLen);
+        if (out == null) { self.mono.errors++; return self.makeNone(); }
+        usize w = 0;
+        u8* q = p + begin;
+        u8* qe = p + end;
+        while (q < qe)
+        {
+            if (q[0] == 92 && qe - q >= 2)
+            {
+                EscapeResult esc = EscapeResult::decodeEscapeSequence(q, qe);
+                if (esc.isValid && esc.bytesConsumed > 0)
+                {
+                    out[w] = (u8)esc.codepoint;
+                    w++;
+                    q += esc.bytesConsumed;
+                    continue;
+                }
+            }
+            out[w] = q[0];
+            w++;
+            q++;
+        }
+        CtVal v = self.makeStrCopy(out, w);
+        dealloc<u8>(out);
+        return v;
     }
 
     // evaluate a builtin call (@compileError / @isFormatLiteral / @typeof)
@@ -874,17 +906,16 @@ pub extend CtEval
             str msg = "@compileError tripped";
             if (n > 0)
             {
-                u8* p = null;
-                usize pl = 0;
-                if (self.litStringBytes(e->kind.payload.BuiltinCall.args[0], &p, &pl))
+                CtVal m = self.strLitVal(e->kind.payload.BuiltinCall.args[0]);
+                if (m.kind == 3)
                 {
-                    u8* copy = alloc<u8>(pl + 1);
+                    u8* copy = alloc<u8>(m.slen + 1);
                     if (copy != null)
                     {
                         usize i = 0;
-                        while (i < pl) { copy[i] = p[i]; i++; }
-                        copy[pl] = 0;
-                        msg = str { .ptr = copy, .len = pl };
+                        while (i < m.slen) { copy[i] = m.sptr[i]; i++; }
+                        copy[m.slen] = 0;
+                        msg = str { .ptr = copy, .len = m.slen };
                     }
                 }
             }
@@ -2130,6 +2161,8 @@ pub extend CtEval
                     .bindName = st->kind.payload.ForIn.bindName,
                     .extraBindNames = st->kind.payload.ForIn.extraBindNames,
                     .extraBindNamesLen = st->kind.payload.ForIn.extraBindNamesLen,
+                    .bindTypes = st->kind.payload.ForIn.bindTypes,
+                    .bindTypesLen = st->kind.payload.ForIn.bindTypesLen,
                     .iterExpr = ni,
                     .rangeStart = nrs,
                     .rangeEnd = nre,
@@ -2404,6 +2437,7 @@ pub extend CtEval
              * element type, so `@typeof(elem)` in the body folds right. */
             u32 savedRt = self.bindingsLen;
             Str bindNm = s->kind.payload.ForIn.bindName;
+            Ty rwElemTy = 0;
             if (self.depth > 0 && bindNm != 0)
             {
                 Ty et = it.ty;
@@ -2411,19 +2445,37 @@ pub extend CtEval
                 {
                     TypeEntry* te = self.mono.ast.types + et;
                     while (te->kind.tag == TypeKind::Const || te->kind.tag == TypeKind::Comptime)
-                        te = self.mono.ast.types + te->kind.payload.Const.base;
+                    {
+                        Ty base = te->kind.tag == TypeKind::Const ? te->kind.payload.Const.base
+                                                                  : te->kind.payload.Comptime.base;
+                        if (base == et) break;
+                        et = base;
+                        te = self.mono.ast.types + et;
+                    }
                     if (te->kind.tag == TypeKind::Array) et = te->kind.payload.Array.base;
                     else if (te->kind.tag == TypeKind::Slice) et = te->kind.payload.Slice.base;
+                    else if (self.mono.sema.implementsIter(et))
+                    {
+                        MemberInfo atInfo = self.mono.sema.findMethod(et, self.internStr("at"));
+                        if (atInfo.declaration.index != 0)
+                            et = self.mono.sema.substituteFieldTy(atInfo.typeNode, et);
+                        else et = 0;
+                    }
                     else et = 0;
                 }
+                rwElemTy = et;
                 if (et != 0)
                 {
                     NodeId ev2 = self.mkExpr(ExprKind::Ident{ .name = bindNm }, et);
                     if (ev2.index != 0) self.bind(bindNm, self.makeRt(ev2, et));
                 }
             }
-            if (self.depth > 0) self.emit(self.rwStmt(id));
-            else self.emit(id);
+            NodeId nf = self.depth > 0 ? self.rwStmt(id) : id;
+            Node* nfn = self.nodeAt(nf);
+            if (rwElemTy != 0 && nfn != null && nfn->kind.tag == NodeKind::Stmt &&
+                nfn->kind.payload.Stmt.value.kind.tag == StmtKind::ForIn)
+                nfn->kind.payload.Stmt.value.kind.payload.ForIn.bindType = rwElemTy;
+            self.emit(nf);
             self.bindingsLen = savedRt;
             return;
         }
