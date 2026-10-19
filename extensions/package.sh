@@ -55,7 +55,7 @@ for f in extension.wasm grammars/coral.wasm; do
     cp "$ZED_DIR/$f" "$STAGE/$f"
 done
 cp -R "$ZED_DIR/languages/coral" "$STAGE/languages/coral"
-for d in icons icon_themes; do
+for d in icons; do
     [ -d "$ZED_DIR/$d" ] && cp -R "$ZED_DIR/$d" "$STAGE/$d"
 done
 for f in README.md LANGUAGE-SERVER.md PROTOCOL.md; do
@@ -123,8 +123,7 @@ manifest = {
     'authors': data.get('authors', []),
     'lib': {'kind': 'Rust', 'version': data['version']},
     'themes': data.get('themes', []),
-    'icon_themes': data.get('icon_themes', []),
-    'languages': data.get('languages', []),
+        'languages': data.get('languages', []),
     'grammars': {'coral': grammar},
     'language_servers': {},
     'context_servers': {},
@@ -156,11 +155,6 @@ index_entry = {
             'grammar': 'coral',
             'query_files': query_lines,
         }
-    },
-    'icon_theme': {
-        name: {'extension': data['id'], 'path': path}
-        for name, path in {'Coral': 'icon_themes/coral.json'}.items()
-        if (pathlib.Path(stage) / path).is_file()
     },
 }
 

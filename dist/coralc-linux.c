@@ -3077,6 +3077,7 @@ crl__loc__coral_ast__id__NodeId crl__loc__coral_parser__stmt__Parser_parseReturn
 void crl__loc__coral_parser__stmt__Parser_checkCondAssign(crl__loc__coral_parser__base__Parser* self, crl__loc__coral_ast__id__NodeId cond);
 crl__loc__coral_ast__id__NodeId crl__loc__coral_parser__stmt__Parser_parseIfStmt(crl__loc__coral_parser__base__Parser* self);
 crl__loc__coral_ast__id__NodeId crl__loc__coral_parser__stmt__Parser_parseWhileStmt(crl__loc__coral_parser__base__Parser* self);
+void crl__loc__coral_parser__stmt__Parser_parseForIterExpr(crl__loc__coral_parser__base__Parser* self, crl__loc__coral_ast__id__NodeId* iterExpr);
 crl__loc__coral_ast__id__NodeId crl__loc__coral_parser__stmt__Parser_parseForStmt(crl__loc__coral_parser__base__Parser* self);
 crl__loc__coral_ast__id__NodeId crl__loc__coral_parser__stmt__Parser_parseLoopStmt(crl__loc__coral_parser__base__Parser* self);
 crl__loc__coral_ast__id__NodeId crl__loc__coral_parser__stmt__Parser_parseSwitchStmt(crl__loc__coral_parser__base__Parser* self);
@@ -3271,6 +3272,7 @@ _Bool crl__loc__coral_mono__collect__MonoContext_collectStmt(crl__loc__coral_mon
 _Bool crl__loc__coral_mono__collect__MonoContext_collectDecl(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_ast__id__NodeId id);
 _Bool crl__loc__coral_mono__collect__MonoContext_collectFile(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_ast__decl__File* file);
 uint32_t crl__loc__coral_semantics__member__Sema_stripType(crl__loc__coral_semantics__sema__Sema* self, uint32_t typeNode);
+_Bool crl__loc__coral_semantics__member__Sema_implementsIter(crl__loc__coral_semantics__sema__Sema* self, uint32_t receiver);
 crl__loc__coral_semantics__member__MemberInfo crl__loc__coral_semantics__member__Sema_findMember(crl__loc__coral_semantics__sema__Sema* self, uint32_t receiver, uint32_t name);
 uint32_t crl__loc__coral_semantics__member__Sema_findVariantCaseFieldTy(crl__loc__coral_semantics__sema__Sema* self, uint32_t variantTy, uint32_t caseName, uint32_t fieldName);
 _Bool crl__loc__coral_semantics__member__Sema_variantHasCase(crl__loc__coral_semantics__sema__Sema* self, uint32_t variantTy, uint32_t caseName);
@@ -3749,10 +3751,8 @@ Vec__coral_str crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_wi
 void crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_reserve(Vec__coral_str* self, size_t newCap);
 void crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_push(Vec__coral_str* self, _coral_str val);
 _coral_str crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_pop(Vec__coral_str* self);
-size_t crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_count(Vec__coral_str* self);
 _coral_str* crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_atPtr(Vec__coral_str* self, size_t i);
 _coral_str* const crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_atConst(Vec__coral_str* self, size_t i);
-_coral_str crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_at(Vec__coral_str* self, size_t i);
 _coral_str* crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_ptr(Vec__coral_str* self);
 _Bool crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_isEmpty(Vec__coral_str* self);
 _coral_str* const crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_constPtr(Vec__coral_str* self);
@@ -3775,6 +3775,9 @@ size_t crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str__partition
 int64_t crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_binarySearchBy(Vec__coral_str* self, _coral_str key, FnP_int32_t__coral_str__coral_str cmp);
 void crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_dispose(Vec__coral_str* self);
 void crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_drop(Vec__coral_str* self);
+size_t crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_count(Vec__coral_str* self);
+_coral_str crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_at(Vec__coral_str* self, size_t i);
+Vec__coral_str crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_range(Vec__coral_str* self, size_t start, size_t end);
 void crl__lib__std__x86_64__linux__memory__mman__copy_uint8_t(uint8_t* dst, uint8_t* src, size_t count);
 crl__loc__coral_build__arena__ArenaBlock* crl__lib__std__x86_64__linux__memory__mman__alloc_crl__loc__coral_build__arena__ArenaBlock(size_t count);
 void crl__lib__std__x86_64__linux__memory__mman__dealloc_crl__loc__coral_build__arena__ArenaBlock(crl__loc__coral_build__arena__ArenaBlock* ptr);
@@ -3872,10 +3875,8 @@ Vec_uint8_tp crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_withCa
 void crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_reserve(Vec_uint8_tp* self, size_t newCap);
 void crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_push(Vec_uint8_tp* self, uint8_t* val);
 uint8_t* crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_pop(Vec_uint8_tp* self);
-size_t crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_count(Vec_uint8_tp* self);
 uint8_t** crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_atPtr(Vec_uint8_tp* self, size_t i);
 uint8_t** const crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_atConst(Vec_uint8_tp* self, size_t i);
-uint8_t* crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_at(Vec_uint8_tp* self, size_t i);
 uint8_t** crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_ptr(Vec_uint8_tp* self);
 _Bool crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_isEmpty(Vec_uint8_tp* self);
 uint8_t** const crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_constPtr(Vec_uint8_tp* self);
@@ -3898,6 +3899,9 @@ size_t crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp__partitionBy
 int64_t crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_binarySearchBy(Vec_uint8_tp* self, uint8_t* key, FnP_int32_t_uint8_tp_uint8_tp cmp);
 void crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_dispose(Vec_uint8_tp* self);
 void crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_drop(Vec_uint8_tp* self);
+size_t crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_count(Vec_uint8_tp* self);
+uint8_t* crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_at(Vec_uint8_tp* self, size_t i);
+Vec_uint8_tp crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_range(Vec_uint8_tp* self, size_t start, size_t end);
 void crl__lib__std__x86_64__linux__memory__mman__zero_uint8_t(uint8_t* ptr, size_t count);
 void crl__lib__std__x86_64__linux__memory__mman__dealloc_voidp(void** ptr);
 void crl__lib__std__x86_64__linux__memory__mman__dealloc_crl__loc__coral_context__context__InternEntry(crl__loc__coral_context__context__InternEntry* ptr);
@@ -3973,10 +3977,8 @@ Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue crl__lib__std__x86_64_
 void crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_reserve(Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue* self, size_t newCap);
 void crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_push(Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue* self, crl__lib__std__x86_64__linux__parser__json__JsonValue val);
 crl__lib__std__x86_64__linux__parser__json__JsonValue crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_pop(Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue* self);
-size_t crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_count(Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue* self);
 crl__lib__std__x86_64__linux__parser__json__JsonValue* crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_atPtr(Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue* self, size_t i);
 crl__lib__std__x86_64__linux__parser__json__JsonValue* const crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_atConst(Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue* self, size_t i);
-crl__lib__std__x86_64__linux__parser__json__JsonValue crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_at(Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue* self, size_t i);
 crl__lib__std__x86_64__linux__parser__json__JsonValue* crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_ptr(Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue* self);
 _Bool crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_isEmpty(Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue* self);
 crl__lib__std__x86_64__linux__parser__json__JsonValue* const crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_constPtr(Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue* self);
@@ -3999,15 +4001,16 @@ size_t crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64
 int64_t crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_binarySearchBy(Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue* self, crl__lib__std__x86_64__linux__parser__json__JsonValue key, FnP_int32_t_crl__lib__std__x86_64__linux__parser__json__JsonValue_crl__lib__std__x86_64__linux__parser__json__JsonValue cmp);
 void crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_dispose(Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue* self);
 void crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_drop(Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue* self);
+size_t crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_count(Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue* self);
+crl__lib__std__x86_64__linux__parser__json__JsonValue crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_at(Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue* self, size_t i);
+Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_range(Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue* self, size_t start, size_t end);
 Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_new(void);
 Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_withCap(size_t capacity);
 void crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_reserve(Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair* self, size_t newCap);
 void crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_push(Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair* self, crl__lib__std__x86_64__linux__parser__json__JsonPair val);
 crl__lib__std__x86_64__linux__parser__json__JsonPair crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_pop(Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair* self);
-size_t crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_count(Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair* self);
 crl__lib__std__x86_64__linux__parser__json__JsonPair* crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_atPtr(Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair* self, size_t i);
 crl__lib__std__x86_64__linux__parser__json__JsonPair* const crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_atConst(Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair* self, size_t i);
-crl__lib__std__x86_64__linux__parser__json__JsonPair crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_at(Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair* self, size_t i);
 crl__lib__std__x86_64__linux__parser__json__JsonPair* crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_ptr(Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair* self);
 _Bool crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_isEmpty(Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair* self);
 crl__lib__std__x86_64__linux__parser__json__JsonPair* const crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_constPtr(Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair* self);
@@ -4030,6 +4033,9 @@ size_t crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64
 int64_t crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_binarySearchBy(Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair* self, crl__lib__std__x86_64__linux__parser__json__JsonPair key, FnP_int32_t_crl__lib__std__x86_64__linux__parser__json__JsonPair_crl__lib__std__x86_64__linux__parser__json__JsonPair cmp);
 void crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_dispose(Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair* self);
 void crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_drop(Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair* self);
+size_t crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_count(Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair* self);
+crl__lib__std__x86_64__linux__parser__json__JsonPair crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_at(Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair* self, size_t i);
+Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_range(Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair* self, size_t start, size_t end);
 _Bool crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__parser__json__JsonValue_crl__lib__std__x86_64__linux__parser__json__ParseError_isOk(Result_crl__lib__std__x86_64__linux__parser__json__JsonValue_crl__lib__std__x86_64__linux__parser__json__ParseError* self);
 _Bool crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__parser__json__JsonValue_crl__lib__std__x86_64__linux__parser__json__ParseError_isErr(Result_crl__lib__std__x86_64__linux__parser__json__JsonValue_crl__lib__std__x86_64__linux__parser__json__ParseError* self);
 crl__lib__std__x86_64__linux__parser__json__JsonValue crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__parser__json__JsonValue_crl__lib__std__x86_64__linux__parser__json__ParseError_unwrap(Result_crl__lib__std__x86_64__linux__parser__json__JsonValue_crl__lib__std__x86_64__linux__parser__json__ParseError* self);
@@ -4049,10 +4055,8 @@ Vec_crl__lib__std__x86_64__linux__text__string__String crl__lib__std__x86_64__li
 void crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_reserve(Vec_crl__lib__std__x86_64__linux__text__string__String* self, size_t newCap);
 void crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_push(Vec_crl__lib__std__x86_64__linux__text__string__String* self, crl__lib__std__x86_64__linux__text__string__String val);
 crl__lib__std__x86_64__linux__text__string__String crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_pop(Vec_crl__lib__std__x86_64__linux__text__string__String* self);
-size_t crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_count(Vec_crl__lib__std__x86_64__linux__text__string__String* self);
 crl__lib__std__x86_64__linux__text__string__String* crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_atPtr(Vec_crl__lib__std__x86_64__linux__text__string__String* self, size_t i);
 crl__lib__std__x86_64__linux__text__string__String* const crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_atConst(Vec_crl__lib__std__x86_64__linux__text__string__String* self, size_t i);
-crl__lib__std__x86_64__linux__text__string__String crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_at(Vec_crl__lib__std__x86_64__linux__text__string__String* self, size_t i);
 crl__lib__std__x86_64__linux__text__string__String* crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_ptr(Vec_crl__lib__std__x86_64__linux__text__string__String* self);
 _Bool crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_isEmpty(Vec_crl__lib__std__x86_64__linux__text__string__String* self);
 crl__lib__std__x86_64__linux__text__string__String* const crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_constPtr(Vec_crl__lib__std__x86_64__linux__text__string__String* self);
@@ -4075,6 +4079,9 @@ size_t crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64
 int64_t crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_binarySearchBy(Vec_crl__lib__std__x86_64__linux__text__string__String* self, crl__lib__std__x86_64__linux__text__string__String key, FnP_int32_t_crl__lib__std__x86_64__linux__text__string__String_crl__lib__std__x86_64__linux__text__string__String cmp);
 void crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_dispose(Vec_crl__lib__std__x86_64__linux__text__string__String* self);
 void crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_drop(Vec_crl__lib__std__x86_64__linux__text__string__String* self);
+size_t crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_count(Vec_crl__lib__std__x86_64__linux__text__string__String* self);
+crl__lib__std__x86_64__linux__text__string__String crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_at(Vec_crl__lib__std__x86_64__linux__text__string__String* self, size_t i);
+Vec_crl__lib__std__x86_64__linux__text__string__String crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_range(Vec_crl__lib__std__x86_64__linux__text__string__String* self, size_t start, size_t end);
 _Bool crl__lib__std__x86_64__linux__data__option__Option__coral_str_isSome(Option__coral_str* self);
 _Bool crl__lib__std__x86_64__linux__data__option__Option__coral_str_isNone(Option__coral_str* self);
 _coral_str crl__lib__std__x86_64__linux__data__option__Option__coral_str_unwrap(Option__coral_str* self);
@@ -4091,10 +4098,8 @@ Vec_uint32_t crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_withCa
 void crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_reserve(Vec_uint32_t* self, size_t newCap);
 void crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_push(Vec_uint32_t* self, uint32_t val);
 uint32_t crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_pop(Vec_uint32_t* self);
-size_t crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_count(Vec_uint32_t* self);
 uint32_t* crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_atPtr(Vec_uint32_t* self, size_t i);
 uint32_t* const crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_atConst(Vec_uint32_t* self, size_t i);
-uint32_t crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_at(Vec_uint32_t* self, size_t i);
 uint32_t* crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_ptr(Vec_uint32_t* self);
 _Bool crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_isEmpty(Vec_uint32_t* self);
 uint32_t* const crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_constPtr(Vec_uint32_t* self);
@@ -4117,6 +4122,9 @@ size_t crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t__partitionBy
 int64_t crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_binarySearchBy(Vec_uint32_t* self, uint32_t key, FnP_int32_t_uint32_t_uint32_t cmp);
 void crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_dispose(Vec_uint32_t* self);
 void crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_drop(Vec_uint32_t* self);
+size_t crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_count(Vec_uint32_t* self);
+uint32_t crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_at(Vec_uint32_t* self, size_t i);
+Vec_uint32_t crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_range(Vec_uint32_t* self, size_t start, size_t end);
 crl__loc__coral_hir__hir__HirModule* crl__lib__std__x86_64__linux__memory__mman__alloc_crl__loc__coral_hir__hir__HirModule(size_t count);
 _Bool crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__io__process__Process_crl__lib__std__x86_64__linux__io__fs__IoError_isOk(Result_crl__lib__std__x86_64__linux__io__process__Process_crl__lib__std__x86_64__linux__io__fs__IoError* self);
 _Bool crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__io__process__Process_crl__lib__std__x86_64__linux__io__fs__IoError_isErr(Result_crl__lib__std__x86_64__linux__io__process__Process_crl__lib__std__x86_64__linux__io__fs__IoError* self);
@@ -11906,7 +11914,7 @@ _Bool crl__loc__coral_diagnostics__explain__exOne(crl__lib__std__x86_64__linux__
     {
         crl__loc__coral_diagnostics__explain__exTitle(b, code, (_coral_str){ (const uint8_t*)"unused variable", 15 });
         crl__loc__coral_diagnostics__explain__exWhy(b, (_coral_str){ (const uint8_t*)"a local variable is declared and never read; this is a warning enabled by --warn-unused.", 88 });
-        crl__loc__coral_diagnostics__explain__exFix(b, (_coral_str){ (const uint8_t*)"remove it, or prefix the name with `_` if it is deliberately unused.", 68 });
+        crl__loc__coral_diagnostics__explain__exFix(b, (_coral_str){ (const uint8_t*)"remove it, or prefix the name with `#[[maybe_unused]]` if it is deliberately unused.", 84 });
         return 1;
     }
     if (crl__loc__coral_diagnostics__explain__exEq(code, (_coral_str){ (const uint8_t*)"T0013", 5 }))
@@ -12508,7 +12516,7 @@ _coral_str crl__loc__coral_diagnostics__error__helpFor(_coral_str code) {
     }
     if (crl__lib__core__str___coral_str_equals((&(code)), (_coral_str){ (const uint8_t*)"T0012", 5 }))
     {
-        return (_coral_str){ (const uint8_t*)"remove the local, use it, or name it `_name` to mark it intentionally unused", 76 };
+        return (_coral_str){ (const uint8_t*)"remove the local, use it, or name it `#[[maybe_unused]]` to mark it intentionally unused", 88 };
     }
     if (crl__lib__core__str___coral_str_equals((&(code)), (_coral_str){ (const uint8_t*)"T0013", 5 }))
     {
@@ -17934,6 +17942,25 @@ crl__loc__coral_ast__id__NodeId crl__loc__coral_parser__stmt__Parser_parseWhileS
     crl__loc__coral_ast__id__NodeId body = crl__loc__coral_parser__stmt__Parser_parseStmt(self);
     return crl__loc__coral_parser__stmt__Parser_storeStmt(self, ((crl__loc__coral_ast__stmt__StmtKind){ .tag = 8, .u.v8 = {.cond = cond, .body = body}}));
 }
+void crl__loc__coral_parser__stmt__Parser_parseForIterExpr(crl__loc__coral_parser__base__Parser* self, crl__loc__coral_ast__id__NodeId* iterExpr) {
+    crl__loc__coral_ast__node__Node* n = ((self->ctx->nodes + iterExpr->index));
+    if (((n->kind.tag != 1)))
+    {
+        return;
+    }
+    crl__loc__coral_ast__expr__Expr* e = (&(n->kind.u.v1.value));
+    if (((((e->kind.tag != 9))) || (((e->kind.u.v9.argsLen != 2)))))
+    {
+        return;
+    }
+    crl__loc__coral_ast__id__NodeId calleeId = e->kind.u.v9.callee;
+    crl__loc__coral_ast__node__Node* callee = ((self->ctx->nodes + calleeId.index));
+    if (((((callee->kind.tag != 1))) || (((callee->kind.u.v1.value.kind.tag != 6)))))
+    {
+        return;
+    }
+    (((*(iterExpr)) = crl__loc__coral_parser__expr__Parser_storeExpr(self, ((crl__loc__coral_ast__expr__ExprKind){ .tag = 10, .u.v10 = {.receiver = calleeId, .method = crl__loc__coral_context__context__AstContext_intern(self->ctx, (_coral_str){ (const uint8_t*)"range", 5 }), .args = e->kind.u.v9.args, .argsLen = e->kind.u.v9.argsLen}}))));
+}
 crl__loc__coral_ast__id__NodeId crl__loc__coral_parser__stmt__Parser_parseForStmt(crl__loc__coral_parser__base__Parser* self) {
     crl__loc__coral_ast__id__SourceLoc forLoc = crl__loc__coral_parser__parser__Parser_tokenLoc(self, self->current);
     crl__loc__coral_parser__parser__Parser_advance(self);
@@ -17954,6 +17981,7 @@ crl__loc__coral_ast__id__NodeId crl__loc__coral_parser__stmt__Parser_parseForStm
         if (crl__loc__coral_parser__parser__Parser_match(self, crl__loc__coral_common__token__TokenKind_Colon))
         {
             crl__loc__coral_ast__id__NodeId iterExpr = crl__loc__coral_parser__expr__Parser_parseExpr(self);
+            crl__loc__coral_parser__stmt__Parser_parseForIterExpr(self, (&(iterExpr)));
             crl__loc__coral_parser__parser__Parser_expect(self, crl__loc__coral_common__token__TokenKind_RParen);
             crl__loc__coral_ast__id__NodeId body = crl__loc__coral_parser__stmt__Parser_parseStmt(self);
             uint8_t forInFlags = 0;
@@ -17979,6 +18007,7 @@ crl__loc__coral_ast__id__NodeId crl__loc__coral_parser__stmt__Parser_parseForStm
             if (crl__loc__coral_parser__parser__Parser_match(self, crl__loc__coral_common__token__TokenKind_Colon))
             {
                 crl__loc__coral_ast__id__NodeId iterExpr = crl__loc__coral_parser__expr__Parser_parseExpr(self);
+                crl__loc__coral_parser__stmt__Parser_parseForIterExpr(self, (&(iterExpr)));
                 crl__loc__coral_parser__parser__Parser_expect(self, crl__loc__coral_common__token__TokenKind_RParen);
                 crl__loc__coral_ast__id__NodeId body = crl__loc__coral_parser__stmt__Parser_parseStmt(self);
                 crl__loc__coral_parser__recovery__Parser_endSpeculation(self);
@@ -25877,6 +25906,29 @@ uint32_t crl__loc__coral_semantics__member__Sema_stripType(crl__loc__coral_seman
     }
     return typeNode;
 }
+_Bool crl__loc__coral_semantics__member__Sema_implementsIter(crl__loc__coral_semantics__sema__Sema* self, uint32_t receiver) {
+    uint32_t base = crl__loc__coral_semantics__member__Sema_stripType(self, receiver);
+    if (((base == 0)))
+    {
+        return 0;
+    }
+    uint32_t marker = crl__loc__coral_context__context__AstContext_intern(self->ctx, (_coral_str){ (const uint8_t*)"@iter", 5 });
+    uint32_t i = 0;
+    while (((i < self->extendsLen)))
+    {
+        crl__loc__coral_ast__node__Node* node = ((self->ctx->nodes + self->extends[i].index));
+        if (((node->kind.tag == 3)))
+        {
+            crl__loc__coral_ast__decl__Decl* decl = (&(node->kind.u.v3.value));
+            if (((((((decl->kind.tag == 8))) && (((decl->kind.u.v8.traitName == marker))))) && (crl__loc__coral_semantics__typecheck__Sema_sameTypePattern(self, decl->kind.u.v8.selfType, base))))
+            {
+                return 1;
+            }
+        }
+        ((i)++);
+    }
+    return 0;
+}
 crl__loc__coral_semantics__member__MemberInfo crl__loc__coral_semantics__member__Sema_findMember(crl__loc__coral_semantics__sema__Sema* self, uint32_t receiver, uint32_t name) {
     crl__loc__coral_semantics__member__MemberInfo none;
     ((none.typeNode = 0));
@@ -33333,6 +33385,7 @@ _Bool crl__loc__coral_semantics__expr__Sema_checkExpr(crl__loc__coral_semantics_
                         return crl__loc__coral_semantics__expr__Sema_checkFnPtrCall(self, id, fnField.typeNode, expr->kind.u.v10.args, expr->kind.u.v10.argsLen);
                     }
                 }
+                uint32_t recvTy = crl__loc__coral_semantics__member__Sema_stripType(self, crl__loc__coral_semantics__typecheck__Sema_exprType(self, expr->kind.u.v10.receiver));
                 uint8_t* tb = crl__lib__std__x86_64__linux__memory__mman__alloc_uint8_t(256);
                 crl__lib__std__x86_64__linux__text__string__String msg = crl__lib__std__x86_64__linux__text__string__String_new();
                 crl__lib__std__x86_64__linux__text__string__String_pushView((&(msg)), (_coral_str){ (const uint8_t*)"method '", 8 });
@@ -33340,7 +33393,7 @@ _Bool crl__loc__coral_semantics__expr__Sema_checkExpr(crl__loc__coral_semantics_
                 crl__lib__std__x86_64__linux__text__string__String_pushView((&(msg)), (_coral_str){ (const uint8_t*)"' not found on type '", 21 });
                 if (((tb != 0)))
                 {
-                    crl__lib__std__x86_64__linux__text__string__String_pushView((&(msg)), crl__loc__coral_semantics__expr__Sema_typeTextView(self, crl__loc__coral_semantics__member__Sema_stripType(self, crl__loc__coral_semantics__typecheck__Sema_exprType(self, expr->kind.u.v10.receiver)), tb, 256));
+                    crl__lib__std__x86_64__linux__text__string__String_pushView((&(msg)), crl__loc__coral_semantics__expr__Sema_typeTextView(self, recvTy, tb, 256));
                     crl__lib__std__x86_64__linux__memory__mman__dealloc_uint8_t(tb);
                 }
                 else
@@ -33348,7 +33401,21 @@ _Bool crl__loc__coral_semantics__expr__Sema_checkExpr(crl__loc__coral_semantics_
                     crl__lib__std__x86_64__linux__text__string__String_pushView((&(msg)), (_coral_str){ (const uint8_t*)"?", 1 });
                 }
                 crl__lib__std__x86_64__linux__text__string__String_pushView((&(msg)), (_coral_str){ (const uint8_t*)"'", 1 });
-                crl__loc__coral_semantics__sema__Sema_semaErrorNode(self, crl__loc__coral_diagnostics__code__ErrorCode_SemaUnknownMember, id, crl__lib__std__x86_64__linux__text__string__String_asView((&(msg))));
+                if (crl__loc__coral_semantics__member__Sema_implementsIter(self, recvTy))
+                {
+                    if (((expr->kind.u.v10.method == crl__loc__coral_context__context__AstContext_intern(self->ctx, (_coral_str){ (const uint8_t*)"range", 5 }))))
+                    {
+                        crl__loc__coral_semantics__sema__Sema_semaErrorNodeHelp(self, crl__loc__coral_diagnostics__code__ErrorCode_SemaUnknownMember, id, crl__lib__std__x86_64__linux__text__string__String_asView((&(msg))), (_coral_str){ (const uint8_t*)"the receiver implements @iter; ranged for-in requires `range(usize start, usize end)` returning an iterable, in addition to `usize count()` and `T at(usize)`", 157 });
+                    }
+                    else
+                    {
+                        crl__loc__coral_semantics__sema__Sema_semaErrorNodeHelp(self, crl__loc__coral_diagnostics__code__ErrorCode_SemaUnknownMember, id, crl__lib__std__x86_64__linux__text__string__String_asView((&(msg))), (_coral_str){ (const uint8_t*)"the receiver implements @iter, whose indexed protocol requires `usize count()` and `T at(usize)`; ranged for-in also requires `range(usize, usize)`", 147 });
+                    }
+                }
+                else
+                {
+                    crl__loc__coral_semantics__sema__Sema_semaErrorNode(self, crl__loc__coral_diagnostics__code__ErrorCode_SemaUnknownMember, id, crl__lib__std__x86_64__linux__text__string__String_asView((&(msg))));
+                }
                 __t6 = 0;
                 crl__lib__std__x86_64__linux__text__string__String_drop(&msg);
                 return __t6;
@@ -35162,26 +35229,78 @@ _Bool crl__loc__coral_semantics__stmt__Sema_checkStmt(crl__loc__coral_semantics_
             {
                 crl__loc__coral_ast__types__TypeEntry* ie = ((self->ctx->types + iterTy));
                 _Bool isIterable = ((((ie->kind.tag == 23))) || (((ie->kind.tag == 25))));
-                if ((((!(isIterable))) && (((self->comptimeDepth == 0)))))
+                uint32_t elemTy = 0;
+                if (isIterable)
                 {
-                    crl__loc__coral_semantics__sema__Sema_semaErrorNode(self, crl__loc__coral_diagnostics__code__ErrorCode_SemaTypeMismatch, id, (_coral_str){ (const uint8_t*)"for-in iterator must be an array or slice", 41 });
+                    ((elemTy = ((((ie->kind.tag == 23))) ? (ie->kind.u.v23.base) : (ie->kind.u.v25.base))));
                 }
                 else
                 {
-                    if (isIterable)
+                    if (((self->comptimeDepth == 0)))
                     {
-                        uint32_t elemTy = ((((ie->kind.tag == 23))) ? (ie->kind.u.v23.base) : (ie->kind.u.v25.base));
-                        if (((stmt->kind.u.v11.bindType != 0)))
+                        if ((!(crl__loc__coral_semantics__member__Sema_implementsIter(self, iterTy))))
                         {
-                            if ((!(crl__loc__coral_semantics__typecheck__Sema_compatible(self, elemTy, stmt->kind.u.v11.bindType))))
+                            crl__loc__coral_semantics__sema__Sema_semaErrorNodeHelp(self, crl__loc__coral_diagnostics__code__ErrorCode_SemaTypeMismatch, id, (_coral_str){ (const uint8_t*)"for-in iterator must be an array, slice, or @iter collection", 60 }, (_coral_str){ (const uint8_t*)"implement `extend Type : @iter {}` with `usize count()` and `T at(usize i)`", 75 });
+                        }
+                        else
+                        {
+                            crl__loc__coral_semantics__member__MemberInfo atInfo = crl__loc__coral_semantics__member__Sema_findMethod(self, iterTy, crl__loc__coral_context__context__AstContext_intern(self->ctx, (_coral_str){ (const uint8_t*)"at", 2 }));
+                            crl__loc__coral_semantics__member__MemberInfo countInfo = crl__loc__coral_semantics__member__Sema_findMethod(self, iterTy, crl__loc__coral_context__context__AstContext_intern(self->ctx, (_coral_str){ (const uint8_t*)"count", 5 }));
+                            if (((countInfo.declaration.index == 0)))
                             {
-                                crl__loc__coral_semantics__sema__Sema_semaErrorNode(self, crl__loc__coral_diagnostics__code__ErrorCode_SemaTypeMismatch, id, (_coral_str){ (const uint8_t*)"for-in bind type does not match the iterator's element type", 59 });
+                                uint8_t* tb = crl__lib__std__x86_64__linux__memory__mman__alloc_uint8_t(256);
+                                crl__lib__std__x86_64__linux__text__string__String msg = crl__lib__std__x86_64__linux__text__string__String_new();
+                                crl__lib__std__x86_64__linux__text__string__String_pushView((&(msg)), (_coral_str){ (const uint8_t*)"method 'count' not found on type '", 34 });
+                                if (((tb != 0)))
+                                {
+                                    crl__lib__std__x86_64__linux__text__string__String_pushView((&(msg)), crl__loc__coral_semantics__expr__Sema_typeTextView(self, crl__loc__coral_semantics__member__Sema_stripType(self, iterTy), tb, 256));
+                                    crl__lib__std__x86_64__linux__memory__mman__dealloc_uint8_t(tb);
+                                }
+                                else
+                                {
+                                    crl__lib__std__x86_64__linux__text__string__String_pushView((&(msg)), (_coral_str){ (const uint8_t*)"?", 1 });
+                                }
+                                crl__lib__std__x86_64__linux__text__string__String_pushView((&(msg)), (_coral_str){ (const uint8_t*)"'", 1 });
+                                crl__loc__coral_semantics__sema__Sema_semaErrorNodeHelp(self, crl__loc__coral_diagnostics__code__ErrorCode_SemaUnknownMember, id, crl__lib__std__x86_64__linux__text__string__String_asView((&(msg))), (_coral_str){ (const uint8_t*)"the type implements @iter, whose indexed protocol requires `usize count()` and `T at(usize)`; add count() to the type's `extend Type : @iter` block", 147 });
+                                crl__lib__std__x86_64__linux__text__string__String_drop(&msg);
+                            }
+                            if (((atInfo.declaration.index == 0)))
+                            {
+                                uint8_t* tb = crl__lib__std__x86_64__linux__memory__mman__alloc_uint8_t(256);
+                                crl__lib__std__x86_64__linux__text__string__String msg = crl__lib__std__x86_64__linux__text__string__String_new();
+                                crl__lib__std__x86_64__linux__text__string__String_pushView((&(msg)), (_coral_str){ (const uint8_t*)"method 'at' not found on type '", 31 });
+                                if (((tb != 0)))
+                                {
+                                    crl__lib__std__x86_64__linux__text__string__String_pushView((&(msg)), crl__loc__coral_semantics__expr__Sema_typeTextView(self, crl__loc__coral_semantics__member__Sema_stripType(self, iterTy), tb, 256));
+                                    crl__lib__std__x86_64__linux__memory__mman__dealloc_uint8_t(tb);
+                                }
+                                else
+                                {
+                                    crl__lib__std__x86_64__linux__text__string__String_pushView((&(msg)), (_coral_str){ (const uint8_t*)"?", 1 });
+                                }
+                                crl__lib__std__x86_64__linux__text__string__String_pushView((&(msg)), (_coral_str){ (const uint8_t*)"'", 1 });
+                                crl__loc__coral_semantics__sema__Sema_semaErrorNodeHelp(self, crl__loc__coral_diagnostics__code__ErrorCode_SemaUnknownMember, id, crl__lib__std__x86_64__linux__text__string__String_asView((&(msg))), (_coral_str){ (const uint8_t*)"the type implements @iter, whose indexed protocol requires `usize count()` and `T at(usize)`; add at(usize) to the type's `extend Type : @iter` block", 149 });
+                                crl__lib__std__x86_64__linux__text__string__String_drop(&msg);
+                            }
+                            if (((((atInfo.declaration.index != 0))) && (((countInfo.declaration.index != 0)))))
+                            {
+                                ((elemTy = crl__loc__coral_semantics__typecheck__Sema_substituteFieldTy(self, atInfo.typeNode, iterTy)));
                             }
                         }
-                        if (((stmt->kind.u.v11.bindType == 0)))
+                    }
+                }
+                if (((elemTy != 0)))
+                {
+                    if (((stmt->kind.u.v11.bindType != 0)))
+                    {
+                        if ((!(crl__loc__coral_semantics__typecheck__Sema_compatible(self, elemTy, stmt->kind.u.v11.bindType))))
                         {
-                            ((stmt->kind.u.v11.bindType = elemTy));
+                            crl__loc__coral_semantics__sema__Sema_semaErrorNode(self, crl__loc__coral_diagnostics__code__ErrorCode_SemaTypeMismatch, id, (_coral_str){ (const uint8_t*)"for-in bind type does not match the iterator's element type", 59 });
                         }
+                    }
+                    if (((stmt->kind.u.v11.bindType == 0)))
+                    {
+                        ((stmt->kind.u.v11.bindType = elemTy));
                     }
                 }
             }
@@ -49666,15 +49785,84 @@ void cgStmt(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_ast__
             {
                 ((te = ((cg->ctx->types + iterTy))));
             }
-            if (((((te == 0))) || (((((te->kind.tag != 23))) && (((te->kind.tag != 25)))))))
+            _Bool indexed = ((((te != 0))) && (((((te->kind.tag == 23))) || (((te->kind.tag == 25))))));
+            _Bool useAt = 0;
+            crl__loc__coral_common__slice__Slice elemTy;
+            crl__loc__coral_common__slice__Slice iterRecv;
+            crl__loc__coral_common__slice__Slice atCallee;
+            uint32_t countLabel = 0;
+            if (indexed)
             {
-                crl__loc__coral_backend__codegen__cgError(cg, (_coral_str){ (const uint8_t*)"for-in over non-slice/array", 27 });
-                return;
+                ((elemTy = tyStr(cg, ((((te->kind.tag == 23))) ? (te->kind.u.v23.base) : (te->kind.u.v25.base)))));
             }
-            crl__loc__coral_common__slice__Slice elemTy = tyStr(cg, te->kind.u.v23.base);
+            else
+            {
+                crl__loc__coral_ast__id__NodeId countDecl = crl__loc__coral_backend__codegen__cgFindMethodDecl(cg, iterTy, crl__loc__coral_context__context__AstContext_intern(cg->ctx, (_coral_str){ (const uint8_t*)"count", 5 }));
+                crl__loc__coral_ast__id__NodeId atDecl = crl__loc__coral_backend__codegen__cgFindMethodDecl(cg, iterTy, crl__loc__coral_context__context__AstContext_intern(cg->ctx, (_coral_str){ (const uint8_t*)"at", 2 }));
+                if (((((countDecl.index == 0))) || (((atDecl.index == 0)))))
+                {
+                    crl__loc__coral_backend__codegen__cgError(cg, (_coral_str){ (const uint8_t*)"for-in over non-slice/array without @iter count()/at()", 54 });
+                    return;
+                }
+                uint32_t baseTy = crl__loc__coral_backend__codegen__cgTyUnwrap(cg, iterTy);
+                _Bool iterIsPtr = ((((baseTy != 0))) && (((((cg->ctx->types + baseTy))->kind.tag == 20))));
+                if (iterIsPtr)
+                {
+                    ((baseTy = crl__loc__coral_backend__codegen__cgTyUnwrap(cg, ((cg->ctx->types + baseTy))->kind.u.v20.base)));
+                }
+                if (((baseTy == 0)))
+                {
+                    crl__loc__coral_backend__codegen__cgError(cg, (_coral_str){ (const uint8_t*)"for-in over unknown iterator type", 33 });
+                    return;
+                }
+                size_t ps = cg->tybuf.len;
+                tyStr(cg, baseTy);
+                crl__loc__coral_backend__codegen__stCh((&(cg->tybuf)), '*');
+                crl__loc__coral_common__slice__Slice ptrTy = crl__loc__coral_backend__codegen__stTail((&(cg->tybuf)), ps);
+                uint32_t rt = crl__loc__coral_backend__codegen__cgNewTemp(cg, ptrTy, 0);
+                crl__loc__coral_backend__codegen__stNL((&(cg->body)), cg->ind);
+                crl__loc__coral_backend__codegen__stPS((&(cg->body)), crl__loc__coral_backend__codegen__cgTempName(cg, rt));
+                crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)" = ", 3 });
+                if (iterIsPtr)
+                {
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)"(", 1 });
+                    crl__loc__coral_backend__codegen__stPS((&(cg->body)), ptrTy);
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)")", 1 });
+                    crl__loc__coral_backend__codegen__stPS((&(cg->body)), it);
+                }
+                else
+                {
+                    crl__loc__coral_backend__codegen__stPS((&(cg->body)), cgAddrOfValue(cg, iter, it));
+                }
+                crl__loc__coral_backend__codegen__stCh((&(cg->body)), ';');
+                crl__loc__coral_common__slice__Slice owner = crl__loc__coral_backend__codegen__cgOwnerName(cg, baseTy);
+                size_t cs = cg->ebuf.len;
+                crl__loc__coral_backend__codegen__stPS((&(cg->ebuf)), owner);
+                crl__loc__coral_backend__codegen__stCh((&(cg->ebuf)), '_');
+                crl__loc__coral_backend__codegen__stPS((&(cg->ebuf)), crl__loc__coral_backend__codegen__cgIntern(cg, crl__loc__coral_context__context__AstContext_intern(cg->ctx, (_coral_str){ (const uint8_t*)"count", 5 })));
+                crl__loc__coral_common__slice__Slice countCallee = crl__loc__coral_backend__codegen__cgMangleS(cg, countDecl, crl__loc__coral_backend__codegen__stTail((&(cg->ebuf)), cs), 0);
+                ((countLabel = crl__loc__coral_backend__codegen__cgLabel(cg)));
+                crl__loc__coral_backend__codegen__stNL((&(cg->body)), cg->ind);
+                crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)"size_t coral_n", 14 });
+                crl__loc__coral_backend__codegen__stU64((&(cg->body)), ((uint64_t)(countLabel)));
+                crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)" = ", 3 });
+                crl__loc__coral_backend__codegen__stPS((&(cg->body)), countCallee);
+                crl__loc__coral_backend__codegen__stCh((&(cg->body)), '(');
+                crl__loc__coral_backend__codegen__stPS((&(cg->body)), crl__loc__coral_backend__codegen__cgTempName(cg, rt));
+                crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)");", 2 });
+                ((owner = crl__loc__coral_backend__codegen__cgOwnerName(cg, baseTy)));
+                ((cs = cg->ebuf.len));
+                crl__loc__coral_backend__codegen__stPS((&(cg->ebuf)), owner);
+                crl__loc__coral_backend__codegen__stCh((&(cg->ebuf)), '_');
+                crl__loc__coral_backend__codegen__stPS((&(cg->ebuf)), crl__loc__coral_backend__codegen__cgIntern(cg, crl__loc__coral_context__context__AstContext_intern(cg->ctx, (_coral_str){ (const uint8_t*)"at", 2 })));
+                ((atCallee = crl__loc__coral_backend__codegen__cgMangleS(cg, atDecl, crl__loc__coral_backend__codegen__stTail((&(cg->ebuf)), cs), 0)));
+                ((elemTy = tyStr(cg, crl__loc__coral_backend__codegen__cgSubstTy(cg, s->kind.u.v11.bindType))));
+                ((iterRecv = crl__loc__coral_backend__codegen__cgTempName(cg, rt)));
+                ((useAt = 1));
+            }
             uint32_t k = crl__loc__coral_backend__codegen__cgLabel(cg);
             size_t kxs = cg->tybuf.len;
-            crl__loc__coral_backend__codegen__stP((&(cg->tybuf)), (_coral_str){ (const uint8_t*)"__k", 3 });
+            crl__loc__coral_backend__codegen__stP((&(cg->tybuf)), (_coral_str){ (const uint8_t*)"coral_k", 7 });
             crl__loc__coral_backend__codegen__stU64((&(cg->tybuf)), ((uint64_t)(k)));
             crl__loc__coral_common__slice__Slice ix = crl__loc__coral_backend__codegen__stTail((&(cg->tybuf)), kxs);
             crl__loc__coral_backend__codegen__stNL((&(cg->body)), cg->ind);
@@ -49683,14 +49871,22 @@ void cgStmt(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_ast__
             crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)" = 0; ", 6 });
             crl__loc__coral_backend__codegen__stPS((&(cg->body)), ix);
             crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)" < ", 3 });
-            if (((te->kind.tag == 25)))
+            if (((indexed) && (((te->kind.tag == 25)))))
             {
                 crl__loc__coral_backend__codegen__stU64((&(cg->body)), ((uint64_t)(te->kind.u.v25.len)));
             }
             else
             {
-                crl__loc__coral_backend__codegen__stPS((&(cg->body)), it);
-                crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)".len", 4 });
+                if (indexed)
+                {
+                    crl__loc__coral_backend__codegen__stPS((&(cg->body)), it);
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)".len", 4 });
+                }
+                else
+                {
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)"coral_n", 7 });
+                    crl__loc__coral_backend__codegen__stU64((&(cg->body)), ((uint64_t)(countLabel)));
+                }
             }
             crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)"; ", 2 });
             crl__loc__coral_backend__codegen__stPS((&(cg->body)), ix);
@@ -49706,18 +49902,30 @@ void cgStmt(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_ast__
             crl__loc__coral_backend__codegen__stCh((&(cg->body)), ' ');
             crl__loc__coral_backend__codegen__stPS((&(cg->body)), crl__loc__coral_backend__codegen__cgIntern(cg, s->kind.u.v11.bindName));
             crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)" = ", 3 });
-            crl__loc__coral_backend__codegen__stPS((&(cg->body)), it);
-            if (((te->kind.tag == 25)))
+            if (useAt)
             {
-                crl__loc__coral_backend__codegen__stCh((&(cg->body)), '[');
+                crl__loc__coral_backend__codegen__stPS((&(cg->body)), atCallee);
+                crl__loc__coral_backend__codegen__stCh((&(cg->body)), '(');
+                crl__loc__coral_backend__codegen__stPS((&(cg->body)), iterRecv);
+                crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)", ", 2 });
                 crl__loc__coral_backend__codegen__stPS((&(cg->body)), ix);
-                crl__loc__coral_backend__codegen__stCh((&(cg->body)), ']');
+                crl__loc__coral_backend__codegen__stCh((&(cg->body)), ')');
             }
             else
             {
-                crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)".ptr[", 5 });
-                crl__loc__coral_backend__codegen__stPS((&(cg->body)), ix);
-                crl__loc__coral_backend__codegen__stCh((&(cg->body)), ']');
+                crl__loc__coral_backend__codegen__stPS((&(cg->body)), it);
+                if (((te->kind.tag == 25)))
+                {
+                    crl__loc__coral_backend__codegen__stCh((&(cg->body)), '[');
+                    crl__loc__coral_backend__codegen__stPS((&(cg->body)), ix);
+                    crl__loc__coral_backend__codegen__stCh((&(cg->body)), ']');
+                }
+                else
+                {
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)".ptr[", 5 });
+                    crl__loc__coral_backend__codegen__stPS((&(cg->body)), ix);
+                    crl__loc__coral_backend__codegen__stCh((&(cg->body)), ']');
+                }
             }
             crl__loc__coral_backend__codegen__stCh((&(cg->body)), ';');
             crl__loc__coral_backend__codegen__cgPushLoop(cg, loopMark);
@@ -53251,9 +53459,6 @@ _coral_str crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_pop(Ve
     ((self->len)--);
     return self->data[self->len];
 }
-size_t crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_count(Vec__coral_str* self) {
-    return self->len;
-}
 _coral_str* crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_atPtr(Vec__coral_str* self, size_t i) {
     assert((((i < self->len))) && _coral_strtruth((_coral_str){ (const uint8_t*)"Index Out of bounds", 19 }));
     0;
@@ -53263,11 +53468,6 @@ _coral_str* const crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str
     assert((((i < self->len))) && _coral_strtruth((_coral_str){ (const uint8_t*)"Index Out of bounds", 19 }));
     0;
     return ((_coral_str* const)((&(self->data[i]))));
-}
-_coral_str crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_at(Vec__coral_str* self, size_t i) {
-    assert((((i < self->len))) && _coral_strtruth((_coral_str){ (const uint8_t*)"Index Out of bounds", 19 }));
-    0;
-    return self->data[i];
 }
 _coral_str* crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_ptr(Vec__coral_str* self) {
     return self->data;
@@ -53460,6 +53660,37 @@ void crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_dispose(Vec_
 }
 void crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_drop(Vec__coral_str* self) {
     crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_dispose(self);
+}
+size_t crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_count(Vec__coral_str* self) {
+    return self->len;
+}
+_coral_str crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_at(Vec__coral_str* self, size_t i) {
+    assert((((i < self->len))) && _coral_strtruth((_coral_str){ (const uint8_t*)"Index Out of bounds", 19 }));
+    0;
+    return self->data[i];
+}
+Vec__coral_str crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_range(Vec__coral_str* self, size_t start, size_t end) {
+    size_t n = self->len;
+    if (((start > n)))
+    {
+        ((start = n));
+    }
+    if (((end > n)))
+    {
+        ((end = n));
+    }
+    if (((end < start)))
+    {
+        ((end = start));
+    }
+    Vec__coral_str out = crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_withCap(((end - start)));
+    for (
+    size_t i = start;((i < end));((i)++))
+    {
+        crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_push((&(out)), self->data[i]);
+    }
+    return out;
+    crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_drop(&out);
 }
 void crl__lib__std__x86_64__linux__memory__mman__copy_uint8_t(uint8_t* dst, uint8_t* src, size_t count) {
     if (((((dst) && (src))) && (((count > 0)))))
@@ -54760,9 +54991,6 @@ uint8_t* crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_pop(Vec_ui
     ((self->len)--);
     return self->data[self->len];
 }
-size_t crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_count(Vec_uint8_tp* self) {
-    return self->len;
-}
 uint8_t** crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_atPtr(Vec_uint8_tp* self, size_t i) {
     assert((((i < self->len))) && _coral_strtruth((_coral_str){ (const uint8_t*)"Index Out of bounds", 19 }));
     0;
@@ -54772,11 +55000,6 @@ uint8_t** const crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_atC
     assert((((i < self->len))) && _coral_strtruth((_coral_str){ (const uint8_t*)"Index Out of bounds", 19 }));
     0;
     return ((uint8_t** const)((&(self->data[i]))));
-}
-uint8_t* crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_at(Vec_uint8_tp* self, size_t i) {
-    assert((((i < self->len))) && _coral_strtruth((_coral_str){ (const uint8_t*)"Index Out of bounds", 19 }));
-    0;
-    return self->data[i];
 }
 uint8_t** crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_ptr(Vec_uint8_tp* self) {
     return self->data;
@@ -54969,6 +55192,37 @@ void crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_dispose(Vec_ui
 }
 void crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_drop(Vec_uint8_tp* self) {
     crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_dispose(self);
+}
+size_t crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_count(Vec_uint8_tp* self) {
+    return self->len;
+}
+uint8_t* crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_at(Vec_uint8_tp* self, size_t i) {
+    assert((((i < self->len))) && _coral_strtruth((_coral_str){ (const uint8_t*)"Index Out of bounds", 19 }));
+    0;
+    return self->data[i];
+}
+Vec_uint8_tp crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_range(Vec_uint8_tp* self, size_t start, size_t end) {
+    size_t n = self->len;
+    if (((start > n)))
+    {
+        ((start = n));
+    }
+    if (((end > n)))
+    {
+        ((end = n));
+    }
+    if (((end < start)))
+    {
+        ((end = start));
+    }
+    Vec_uint8_tp out = crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_withCap(((end - start)));
+    for (
+    size_t i = start;((i < end));((i)++))
+    {
+        crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_push((&(out)), self->data[i]);
+    }
+    return out;
+    crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_drop(&out);
 }
 void crl__lib__std__x86_64__linux__memory__mman__zero_uint8_t(uint8_t* ptr, size_t count) {
     memset(((void*)(ptr)), 0, ((sizeof(uint8_t) * count)));
@@ -55781,9 +56035,6 @@ crl__lib__std__x86_64__linux__parser__json__JsonValue crl__lib__std__x86_64__lin
     ((self->len)--);
     return self->data[self->len];
 }
-size_t crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_count(Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue* self) {
-    return self->len;
-}
 crl__lib__std__x86_64__linux__parser__json__JsonValue* crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_atPtr(Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue* self, size_t i) {
     assert((((i < self->len))) && _coral_strtruth((_coral_str){ (const uint8_t*)"Index Out of bounds", 19 }));
     0;
@@ -55793,11 +56044,6 @@ crl__lib__std__x86_64__linux__parser__json__JsonValue* const crl__lib__std__x86_
     assert((((i < self->len))) && _coral_strtruth((_coral_str){ (const uint8_t*)"Index Out of bounds", 19 }));
     0;
     return ((crl__lib__std__x86_64__linux__parser__json__JsonValue* const)((&(self->data[i]))));
-}
-crl__lib__std__x86_64__linux__parser__json__JsonValue crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_at(Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue* self, size_t i) {
-    assert((((i < self->len))) && _coral_strtruth((_coral_str){ (const uint8_t*)"Index Out of bounds", 19 }));
-    0;
-    return self->data[i];
 }
 crl__lib__std__x86_64__linux__parser__json__JsonValue* crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_ptr(Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue* self) {
     return self->data;
@@ -55991,6 +56237,37 @@ void crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__
 void crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_drop(Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue* self) {
     crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_dispose(self);
 }
+size_t crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_count(Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue* self) {
+    return self->len;
+}
+crl__lib__std__x86_64__linux__parser__json__JsonValue crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_at(Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue* self, size_t i) {
+    assert((((i < self->len))) && _coral_strtruth((_coral_str){ (const uint8_t*)"Index Out of bounds", 19 }));
+    0;
+    return self->data[i];
+}
+Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_range(Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue* self, size_t start, size_t end) {
+    size_t n = self->len;
+    if (((start > n)))
+    {
+        ((start = n));
+    }
+    if (((end > n)))
+    {
+        ((end = n));
+    }
+    if (((end < start)))
+    {
+        ((end = start));
+    }
+    Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue out = crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_withCap(((end - start)));
+    for (
+    size_t i = start;((i < end));((i)++))
+    {
+        crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_push((&(out)), self->data[i]);
+    }
+    return out;
+    crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_drop(&out);
+}
 Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_new(void) {
     return ((Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair){.data = 0, .len = 0, .cap = 0});
 }
@@ -56020,9 +56297,6 @@ crl__lib__std__x86_64__linux__parser__json__JsonPair crl__lib__std__x86_64__linu
     ((self->len)--);
     return self->data[self->len];
 }
-size_t crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_count(Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair* self) {
-    return self->len;
-}
 crl__lib__std__x86_64__linux__parser__json__JsonPair* crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_atPtr(Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair* self, size_t i) {
     assert((((i < self->len))) && _coral_strtruth((_coral_str){ (const uint8_t*)"Index Out of bounds", 19 }));
     0;
@@ -56032,11 +56306,6 @@ crl__lib__std__x86_64__linux__parser__json__JsonPair* const crl__lib__std__x86_6
     assert((((i < self->len))) && _coral_strtruth((_coral_str){ (const uint8_t*)"Index Out of bounds", 19 }));
     0;
     return ((crl__lib__std__x86_64__linux__parser__json__JsonPair* const)((&(self->data[i]))));
-}
-crl__lib__std__x86_64__linux__parser__json__JsonPair crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_at(Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair* self, size_t i) {
-    assert((((i < self->len))) && _coral_strtruth((_coral_str){ (const uint8_t*)"Index Out of bounds", 19 }));
-    0;
-    return self->data[i];
 }
 crl__lib__std__x86_64__linux__parser__json__JsonPair* crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_ptr(Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair* self) {
     return self->data;
@@ -56229,6 +56498,37 @@ void crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__
 }
 void crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_drop(Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair* self) {
     crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_dispose(self);
+}
+size_t crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_count(Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair* self) {
+    return self->len;
+}
+crl__lib__std__x86_64__linux__parser__json__JsonPair crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_at(Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair* self, size_t i) {
+    assert((((i < self->len))) && _coral_strtruth((_coral_str){ (const uint8_t*)"Index Out of bounds", 19 }));
+    0;
+    return self->data[i];
+}
+Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_range(Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair* self, size_t start, size_t end) {
+    size_t n = self->len;
+    if (((start > n)))
+    {
+        ((start = n));
+    }
+    if (((end > n)))
+    {
+        ((end = n));
+    }
+    if (((end < start)))
+    {
+        ((end = start));
+    }
+    Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair out = crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_withCap(((end - start)));
+    for (
+    size_t i = start;((i < end));((i)++))
+    {
+        crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_push((&(out)), self->data[i]);
+    }
+    return out;
+    crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_drop(&out);
 }
 _Bool crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__parser__json__JsonValue_crl__lib__std__x86_64__linux__parser__json__ParseError_isOk(Result_crl__lib__std__x86_64__linux__parser__json__JsonValue_crl__lib__std__x86_64__linux__parser__json__ParseError* self) {
     crl__lib__std__x86_64__linux__parser__json__JsonValue value;
@@ -56440,9 +56740,6 @@ crl__lib__std__x86_64__linux__text__string__String crl__lib__std__x86_64__linux_
     ((self->len)--);
     return self->data[self->len];
 }
-size_t crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_count(Vec_crl__lib__std__x86_64__linux__text__string__String* self) {
-    return self->len;
-}
 crl__lib__std__x86_64__linux__text__string__String* crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_atPtr(Vec_crl__lib__std__x86_64__linux__text__string__String* self, size_t i) {
     assert((((i < self->len))) && _coral_strtruth((_coral_str){ (const uint8_t*)"Index Out of bounds", 19 }));
     0;
@@ -56452,11 +56749,6 @@ crl__lib__std__x86_64__linux__text__string__String* const crl__lib__std__x86_64_
     assert((((i < self->len))) && _coral_strtruth((_coral_str){ (const uint8_t*)"Index Out of bounds", 19 }));
     0;
     return ((crl__lib__std__x86_64__linux__text__string__String* const)((&(self->data[i]))));
-}
-crl__lib__std__x86_64__linux__text__string__String crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_at(Vec_crl__lib__std__x86_64__linux__text__string__String* self, size_t i) {
-    assert((((i < self->len))) && _coral_strtruth((_coral_str){ (const uint8_t*)"Index Out of bounds", 19 }));
-    0;
-    return self->data[i];
 }
 crl__lib__std__x86_64__linux__text__string__String* crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_ptr(Vec_crl__lib__std__x86_64__linux__text__string__String* self) {
     return self->data;
@@ -56649,6 +56941,37 @@ void crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__
 }
 void crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_drop(Vec_crl__lib__std__x86_64__linux__text__string__String* self) {
     crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_dispose(self);
+}
+size_t crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_count(Vec_crl__lib__std__x86_64__linux__text__string__String* self) {
+    return self->len;
+}
+crl__lib__std__x86_64__linux__text__string__String crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_at(Vec_crl__lib__std__x86_64__linux__text__string__String* self, size_t i) {
+    assert((((i < self->len))) && _coral_strtruth((_coral_str){ (const uint8_t*)"Index Out of bounds", 19 }));
+    0;
+    return self->data[i];
+}
+Vec_crl__lib__std__x86_64__linux__text__string__String crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_range(Vec_crl__lib__std__x86_64__linux__text__string__String* self, size_t start, size_t end) {
+    size_t n = self->len;
+    if (((start > n)))
+    {
+        ((start = n));
+    }
+    if (((end > n)))
+    {
+        ((end = n));
+    }
+    if (((end < start)))
+    {
+        ((end = start));
+    }
+    Vec_crl__lib__std__x86_64__linux__text__string__String out = crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_withCap(((end - start)));
+    for (
+    size_t i = start;((i < end));((i)++))
+    {
+        crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_push((&(out)), self->data[i]);
+    }
+    return out;
+    crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_drop(&out);
 }
 _Bool crl__lib__std__x86_64__linux__data__option__Option__coral_str_isSome(Option__coral_str* self) {
     _coral_str value;
@@ -56849,9 +57172,6 @@ uint32_t crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_pop(Vec_ui
     ((self->len)--);
     return self->data[self->len];
 }
-size_t crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_count(Vec_uint32_t* self) {
-    return self->len;
-}
 uint32_t* crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_atPtr(Vec_uint32_t* self, size_t i) {
     assert((((i < self->len))) && _coral_strtruth((_coral_str){ (const uint8_t*)"Index Out of bounds", 19 }));
     0;
@@ -56861,11 +57181,6 @@ uint32_t* const crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_atC
     assert((((i < self->len))) && _coral_strtruth((_coral_str){ (const uint8_t*)"Index Out of bounds", 19 }));
     0;
     return ((uint32_t* const)((&(self->data[i]))));
-}
-uint32_t crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_at(Vec_uint32_t* self, size_t i) {
-    assert((((i < self->len))) && _coral_strtruth((_coral_str){ (const uint8_t*)"Index Out of bounds", 19 }));
-    0;
-    return self->data[i];
 }
 uint32_t* crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_ptr(Vec_uint32_t* self) {
     return self->data;
@@ -57058,6 +57373,37 @@ void crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_dispose(Vec_ui
 }
 void crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_drop(Vec_uint32_t* self) {
     crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_dispose(self);
+}
+size_t crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_count(Vec_uint32_t* self) {
+    return self->len;
+}
+uint32_t crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_at(Vec_uint32_t* self, size_t i) {
+    assert((((i < self->len))) && _coral_strtruth((_coral_str){ (const uint8_t*)"Index Out of bounds", 19 }));
+    0;
+    return self->data[i];
+}
+Vec_uint32_t crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_range(Vec_uint32_t* self, size_t start, size_t end) {
+    size_t n = self->len;
+    if (((start > n)))
+    {
+        ((start = n));
+    }
+    if (((end > n)))
+    {
+        ((end = n));
+    }
+    if (((end < start)))
+    {
+        ((end = start));
+    }
+    Vec_uint32_t out = crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_withCap(((end - start)));
+    for (
+    size_t i = start;((i < end));((i)++))
+    {
+        crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_push((&(out)), self->data[i]);
+    }
+    return out;
+    crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_drop(&out);
 }
 crl__loc__coral_hir__hir__HirModule* crl__lib__std__x86_64__linux__memory__mman__alloc_crl__loc__coral_hir__hir__HirModule(size_t count) {
     if (((count == 0)))

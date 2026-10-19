@@ -42,12 +42,12 @@ dist/coralc-windows.c:
 	@exit 1
 
 dist/coralc-linux-x86_64: dist/coralc-linux.c
-	$(CC) -std=gnu11 -O0 -o $@ $< -lm
+	$(CC) -std=gnu11 -O3 -march=native -o $@ $< -lm
 
 dist/coralc-windows-x86_64.exe: dist/coralc-windows.c
 	@command -v "$(MINGW)" >/dev/null 2>&1 || { \
 		echo "error: $(MINGW) not found (install mingw-w64 or w64devkit)"; exit 1; }
-	$(MINGW) -std=gnu11 -O0 -o $@ $< -lm
+	$(MINGW) --std=gnu11 -O3 -march=native -o $@ $< -lm
 
 install: $(HOST)
 	mkdir -p "$(PREFIX)/bin"
