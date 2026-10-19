@@ -45039,7 +45039,7 @@ void crl__loc__coral_frontend__args__usage(void) {
     printf("  -f <file>         build file (default coral.crlb, fallback build.crlb)\n");
     printf("  -o <file>         output file (single-file compile)\n");
     printf("  --opt <level>     optimization: debug (default), release, size, O3\n");
-    printf("  --extra           Print all flags.\n");
+    printf("  --extra           Print all flags. coralc -h --extra\n");
 }
 _Bool crl__loc__coral_frontend__args__parseArgs(crl__loc__coral_frontend__args__Options* opts) {
     (((*(opts)) = ((crl__loc__coral_frontend__args__Options){.cmd = crl__loc__coral_frontend__args__Command_Build, .buildFile = crl__loc__coral_common__slice__Slice_fromStr((_coral_str){ (const uint8_t*)"coral.crlb", 10 }), .buildFileSet = 0, .input = crl__loc__coral_common__slice__Slice_from(0, 0), .output = crl__loc__coral_common__slice__Slice_from(0, 0), .help = 0, .force = 0, .dryRun = 0, .mapOnly = 0, .strict = 0, .emitHir = 0, .version = 0, .explain = crl__loc__coral_common__slice__Slice_from(0, 0), .explainSet = 0, .errorLimit = 20, .flagNames = 0, .flagValues = 0, .flagsCount = 0, .allowIntPtr = 0, .noPrelude = 0, .quiet = 0, .opt = crl__loc__coral_common__slice__Slice_fromStr((_coral_str){ (const uint8_t*)"debug", 5 }), .emitC = 0, .showGcc = 0, .serve = 0, .extras = 0})));
