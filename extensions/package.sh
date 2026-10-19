@@ -105,6 +105,7 @@ manifest = {
 }
 for name, body in data.get('language_servers', {}).items():
     manifest['language_servers'][name] = {
+        'name': body.get('name', name),
         'language': body.get('language'),
         'languages': body.get('languages', []),
         'language_ids': body.get('language_ids', {}),
