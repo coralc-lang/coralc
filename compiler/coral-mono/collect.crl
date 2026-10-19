@@ -146,7 +146,9 @@ pub extend MonoContext
 
     bool enqueue(MonoDeclKind kind, NodeId declaration, Ty* arguments, u32 argumentsLen)
     {
-        return self.enqueueVal(kind, declaration, arguments, argumentsLen, 0, 0, null, null, 0, null, null, 0);
+        NodeId noCall;
+        noCall.index = 0;
+        return self.enqueueVal(kind, declaration, arguments, argumentsLen, 0, 0, null, null, 0, null, null, 0, noCall);
     }
 
     /* dedup by (kind, decl, sameType args, valueKey, tail types) before
@@ -154,7 +156,7 @@ pub extend MonoContext
      * work item; the caller keeps ownership of its originals. */
     bool enqueueVal(MonoDeclKind kind, NodeId declaration, Ty* arguments, u32 argumentsLen,
                     u64 valueKey, u32 packArity, Str* literalNames, NodeId* literalNodes, u32 literalsLen,
-                    Ty* tailTypes, NodeId* tailNodes, u32 tailLen)
+                    Ty* tailTypes, NodeId* tailNodes, u32 tailLen, NodeId callSite)
     {
         if (self.genericCount(declaration) != argumentsLen)
         {
@@ -199,6 +201,7 @@ pub extend MonoContext
         MonoWorkItem* item = self.work + self.workLen;
         item.kind = kind;
         item.declaration = declaration;
+        item.callSite = callSite;
         item.arguments = self.copyTypes(arguments, argumentsLen);
         item.argumentsLen = argumentsLen;
         item.inherited = null;
@@ -337,6 +340,65 @@ pub extend MonoContext
         return true;
     }
 
+    /* the trailing param of a variadic function carries flag bit 16;
+     * its pack only exists per call site, so such functions are never
+     * statically evaluated */
+    bool hasVariadicParam(Decl* d)
+    {
+        if (d == null || d->kind.tag != DeclKind::Func) return false;
+        if (d->kind.payload.Func.paramsLen == 0) return false;
+        NodeId lastId = d->kind.payload.Func.params[d->kind.payload.Func.paramsLen - 1];
+        Node* pn = self.nodeAt(lastId);
+        return pn != null && pn->kind.tag == NodeKind::Param &&
+               (pn->kind.payload.Param.value.flags & 16) != 0;
+    }
+
+    bool recordStaticDecl(NodeId declId)
+    {
+        u32 i = 0;
+        while (i < self.staticCtLen)
+        {
+            if (self.staticCtDecls[i].index == declId.index) return true;
+            i++;
+        }
+        if (!self.reserveStaticCt()) return false;
+        NodeId none;
+        none.index = 0;
+        self.staticCtDecls[self.staticCtLen] = declId;
+        self.staticCtCalls[self.staticCtLen] = none;
+        self.staticCtLen++;
+        return true;
+    }
+
+    bool recordStaticCall(NodeId declId, NodeId callId)
+    {
+        u32 first = 0;
+        bool haveFirst = false;
+        u32 i = 0;
+        while (i < self.staticCtLen)
+        {
+            if (self.staticCtDecls[i].index == declId.index)
+            {
+                if (self.staticCtCalls[i].index == callId.index) return true;
+                if (!haveFirst) { first = i; haveFirst = true; }
+            }
+            i++;
+        }
+        if (!haveFirst) return true; /* decl not recorded: not static */
+        /* the placeholder entry carries the first use site; later use
+         * sites get their own entry so each literal call is checked */
+        if (self.staticCtCalls[first].index == 0)
+        {
+            self.staticCtCalls[first] = callId;
+            return true;
+        }
+        if (!self.reserveStaticCt()) return false;
+        self.staticCtDecls[self.staticCtLen] = declId;
+        self.staticCtCalls[self.staticCtLen] = callId;
+        self.staticCtLen++;
+        return true;
+    }
+
     /* a function whose body starts with a top-level `comptime` block is
      * inlined by the evaluator; calls to it inside another comptime block
      * never become runtime calls and need no instance. */
@@ -365,6 +427,33 @@ pub extend MonoContext
         return false;
     }
 
+    /* follows a bare name to a global `const` whose value is a literal,
+     * so value specialization binds `print(FMT, x)` exactly like
+     * `print("...", x)` instead of leaving the format unfolded */
+    NodeId constLiteralNode(Str name)
+    {
+        NodeId declId = self.findDeclaration(name);
+        u32 depth = 0;
+        while (declId.index != 0 && depth < 8)
+        {
+            Decl* d = self.declAt(declId);
+            if (d == null || d->kind.tag != DeclKind::Constant) break;
+            NodeId valueId = d->kind.payload.Constant.value;
+            Node* vn = self.nodeAt(valueId);
+            if (vn == null || vn->kind.tag != NodeKind::Expr) break;
+            Expr* ve = &vn->kind.payload.Expr.value;
+            if (ve->kind.tag == ExprKind::StringLit || ve->kind.tag == ExprKind::IntLit ||
+                ve->kind.tag == ExprKind::CharLit || ve->kind.tag == ExprKind::BoolLit)
+                return valueId;
+            if (ve->kind.tag != ExprKind::Ident) break;
+            declId = self.findDeclaration(ve->kind.payload.Ident.name);
+            depth++;
+        }
+        NodeId none;
+        none.index = 0;
+        return none;
+    }
+
     /* generic-call detector: resolves the callee, fills one binding per
      * generic slot from the call args, and enqueues with value key plus
      * literal/tail metadata. Non-generic and unresolved callees return
@@ -381,7 +470,16 @@ pub extend MonoContext
         if (callee->kind.tag != ExprKind::Ident) return true;
         NodeId declaration = self.findDeclaration(callee->kind.payload.Ident.name);
         u32 gcount = self.genericCount(declaration);
-        if (declaration.index == 0 || gcount == 0) return true; /* not a generic call */
+        if (declaration.index == 0 || gcount == 0)
+        {
+            /* non-generic callee: remember the use site of a function
+             * whose comptime block will be evaluated statically */
+            if (declaration.index != 0 && gcount == 0 && self.comptimeCollect == 0)
+            {
+                if (!self.recordStaticCall(declaration, callId)) return false;
+            }
+            return true;
+        }
         /* inside a comptime block, a call to a comptime-inlined function
          * is folded by the evaluator at the outer instance; enqueueing it
          * would re-evaluate the body without the call site's literal
@@ -505,6 +603,11 @@ pub extend MonoContext
                                     ave->kind.tag == ExprKind::IntLit ||
                                     ave->kind.tag == ExprKind::CharLit ||
                                     ave->kind.tag == ExprKind::BoolLit) isLit = true;
+                                else if (ave->kind.tag == ExprKind::Ident)
+                                {
+                                    NodeId cv = self.constLiteralNode(ave->kind.payload.Ident.name);
+                                    if (cv.index != 0) { avId = cv; isLit = true; }
+                                }
                             }
                             if (isLit && litNames != null && litNodes != null && litsLen < litCap)
                             {
@@ -550,7 +653,7 @@ pub extend MonoContext
                                          self.activeSubs, self.activeSubsLen);
         bool ok = self.enqueueVal(MonoDeclKind::FunctionDecl, declaration, arguments, gcount,
                                   key, arity, litNames, litNodes, litsLen,
-                                  tailTypes, tailNodes, tailLen);
+                                  tailTypes, tailNodes, tailLen, callId);
         if (litNames != null) dealloc<Str>(litNames);
         if (litNodes != null) dealloc<NodeId>(litNodes);
         if (tailTypes != null) dealloc<Ty>(tailTypes);
@@ -1066,7 +1169,24 @@ pub extend MonoContext
             self.errors++;
             return false;
         }
+        /* phase 1: name every statically-evaluated function up front so
+         * calls recorded during the body walk find their entry no matter
+         * which order the decls appear in */
         u32 i = 0;
+        while (i < file->declsLen)
+        {
+            Decl* d = self.declAt(file->decls[i]);
+            if (d != null && d->kind.tag == DeclKind::Func &&
+                self.genericCount(file->decls[i]) == 0 &&
+                self.declHasTopComptime(file->decls[i]) &&
+                !self.hasVariadicParam(d))
+            {
+                if (!self.recordStaticDecl(file->decls[i])) return false;
+            }
+            i++;
+        }
+        /* phase 2: walk bodies (this is where call sites are recorded) */
+        i = 0;
         while (i < file->declsLen)
         {
             if (!self.collectDecl(file->decls[i])) return false;
