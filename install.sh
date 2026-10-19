@@ -1,6 +1,6 @@
 #!/bin/sh
-# coralc installer: download (or use the current checkout), build, and
-# install into $CORAL_HOME (default ~/.coral). Run it straight from the web:
+# coralc installer: download (or use the current checkout) and install the
+# prebuilt coralc binary from that folder into $CORAL_HOME (default ~/.coral).
 #   curl -fsSL https://raw.githubusercontent.com/coralc-lang/coralc/main/install.sh | sh
 # or from a checkout: sh install.sh [--prefix DIR]
 set -eu
@@ -42,26 +42,31 @@ if [ ! -f "$SRC/compiler/coral.crlb" ]; then
     SRC="$TMP/coralc"
 fi
 
-cd "$SRC"
+BIN=""
+for candidate in "$SRC/coralc" "$SRC/dist/coralc" "$SRC/build/coralc"; do
+    if [ -f "$candidate" ]; then
+        BIN=$candidate
+        break
+    fi
+done
 
-# ADDED: stop any running coralc (e.g. editor language servers) so the
-# install copy can overwrite the binary instead of failing with ETXTBSY.
+if [ -z "$BIN" ]; then
+    echo "coralc: no prebuilt coralc binary found in $SRC" >&2
+    exit 1
+fi
+
+mkdir -p "$PREFIX/bin"
+
+# stop any running coralc (e.g. editor language servers) so the install
+# copy can overwrite the binary instead of failing with ETXTBSY.
 pkill -f "$PREFIX/bin/coralc" 2>/dev/null || true
 rm -f "$PREFIX/bin/coralc"
 
-if command -v make >/dev/null 2>&1; then
-    case "$(uname -s)" in
-        MINGW*|MSYS*|CYGWIN*) make windows ;;
-        *) make linux ;;
-    esac
-    make install PREFIX="$PREFIX"
-else
-    echo "coralc: make not found; compiling dist/coralc-linux.c directly" >&2
-    mkdir -p "$PREFIX/bin"
-    ${CC:-cc} -std=gnu11 -O0 -o "$PREFIX/bin/coralc" dist/coralc-linux.c -lm
-    rm -rf "$PREFIX/lib"
-    cp -R lib "$PREFIX/lib"
-fi
+cp "$BIN" "$PREFIX/bin/coralc"
+chmod +x "$PREFIX/bin/coralc"
+
+rm -rf "$PREFIX/lib"
+cp -R "$SRC/lib" "$PREFIX/lib"
 
 add_path
 
