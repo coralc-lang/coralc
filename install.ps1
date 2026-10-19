@@ -63,6 +63,10 @@ try {
     Write-Host ""
     Write-Host "coralc installed to $binDir\coralc.exe"
     & (Join-Path $binDir "coralc.exe") --version
+    Write-Host ""
+    Write-Host "editor support:"
+    Write-Host "  Zed:            irm https://raw.githubusercontent.com/coralc-lang/coralc/main/extensions/zed/install.ps1 | iex"
+    Write-Host "  VS Code / fork: irm https://raw.githubusercontent.com/coralc-lang/coralc/main/extensions/vscode/download.ps1 | iex"
 }
 finally {
     Pop-Location

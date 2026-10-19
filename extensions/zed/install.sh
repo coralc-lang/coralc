@@ -36,7 +36,14 @@ while [ $# -gt 0 ]; do
         --url=*) URL=${1#--url=}; shift ;;
         --file) [ $# -ge 2 ] || { echo "--file needs a path" >&2; exit 2; }; FILE=$2; shift 2 ;;
         --file=*) FILE=${1#--file=}; shift ;;
-        -h|--help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)
+            cat <<'EOF'
+Install the Coral extension into Zed.
+
+Usage: install.sh [--data-dir DIR] [--version VERSION]
+                  [--file coral-zed-VERSION.tar.gz] [--url URL]
+EOF
+            exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -46,7 +53,11 @@ if [ -z "$DATA" ]; then
         Darwin) DATA="$HOME/Library/Application Support/Zed" ;;
         MINGW*|MSYS*|CYGWIN*)
             [ -n "${LOCALAPPDATA:-}" ] || { echo "LOCALAPPDATA is not set" >&2; exit 1; }
-            DATA="$LOCALAPPDATA/Zed" ;;
+            winlocal=$LOCALAPPDATA
+            if command -v cygpath >/dev/null 2>&1; then
+                winlocal=$(cygpath -u "$LOCALAPPDATA")
+            fi
+            DATA="$winlocal/Zed" ;;
         *)
             DATA="${XDG_DATA_HOME:-$HOME/.local/share}/zed" ;;
     esac
@@ -56,13 +67,23 @@ EXT="$DATA/extensions"
 DEST="$EXT/installed/coral"
 mkdir -p "$EXT/installed"
 
+get_url() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --retry 3 "$1"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO- "$1"
+    else
+        return 1
+    fi
+}
+
 if [ -z "$FILE" ]; then
     if [ -z "$VERSION" ]; then
         here=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd || true)
         if [ -n "$here" ] && [ -f "$here/VERSION" ]; then
             VERSION=$(cat "$here/VERSION")
         else
-            VERSION=$(curl -fsSL --retry 3 "$BASE/extensions/zed/VERSION" 2>/dev/null || true)
+            VERSION=$(get_url "$BASE/extensions/zed/VERSION" 2>/dev/null || true)
         fi
         [ -n "$VERSION" ] || { echo "cannot determine the latest version; pass --version" >&2; exit 1; }
     fi
@@ -79,7 +100,7 @@ if [ -n "$FILE" ]; then
 else
     echo "downloading $URL"
     if command -v curl >/dev/null 2>&1; then
-        curl -fL --retry 3 --retry-delay 2 -o "$ARCHIVE" "$URL"
+        curl -fsSL --retry 3 --retry-delay 2 -o "$ARCHIVE" "$URL"
     elif command -v wget >/dev/null 2>&1; then
         wget -q -O "$ARCHIVE" "$URL"
     else

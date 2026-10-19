@@ -63,3 +63,7 @@ add_path
 echo
 echo "coralc installed to $PREFIX/bin/coralc"
 "$PREFIX/bin/coralc" --version < /dev/null || true
+echo
+echo "editor support:"
+echo "  Zed:            curl -fsSL https://raw.githubusercontent.com/coralc-lang/coralc/main/extensions/zed/install.sh | sh"
+echo "  VS Code / fork: curl -fsSL https://raw.githubusercontent.com/coralc-lang/coralc/main/extensions/vscode/download.sh | sh"

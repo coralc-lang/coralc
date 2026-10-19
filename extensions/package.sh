@@ -77,7 +77,8 @@ stamp = re.sub(
     r'\1"https://github.com/coralc-lang/coral-zed"',
     stamp)
 stamp = re.sub(r'(?m)^(rev\s*=\s*)"[^"]*"', rf'\1"{rev}"', stamp)
-(stage := pathlib.Path(stage) / 'extension.toml').write_text(stamp)
+stage = pathlib.Path(stage)
+(stage / 'extension.toml').write_text(stamp)
 
 langs = pathlib.Path(stage) / 'languages' / 'coral'
 queries = sorted(langs.glob('*.scm'))

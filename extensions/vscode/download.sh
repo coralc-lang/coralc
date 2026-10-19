@@ -32,7 +32,14 @@ while [ $# -gt 0 ]; do
         --url) [ $# -ge 2 ] || { echo "--url needs a value" >&2; exit 2; }; URL=$2; shift 2 ;;
         --url=*) URL=${1#--url=}; shift ;;
         --force) FORCE=1; shift ;;
-        -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)
+            cat <<'EOF'
+Download the Coral VS Code extension (.vsix) into your Downloads folder.
+
+Usage: download.sh [--out DIR] [--version VERSION] [--force]
+       download.sh --url URL
+EOF
+            exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -47,12 +54,22 @@ if [ -z "$OUT" ]; then
 fi
 mkdir -p "$OUT"
 
+get_url() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --retry 3 "$1"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO- "$1"
+    else
+        return 1
+    fi
+}
+
 if [ -z "$VERSION" ] && [ -z "$URL" ]; then
     here=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd || true)
     if [ -n "$here" ] && [ -f "$here/VERSION" ]; then
         VERSION=$(cat "$here/VERSION")
     else
-        VERSION=$(curl -fsSL --retry 3 "$BASE/extensions/vscode/VERSION" 2>/dev/null || true)
+        VERSION=$(get_url "$BASE/extensions/vscode/VERSION" 2>/dev/null || true)
     fi
     [ -n "$VERSION" ] || { echo "cannot determine the latest version; pass --version" >&2; exit 1; }
 fi
@@ -73,7 +90,7 @@ TMP="$DEST.part"
 trap 'rm -f "$TMP"' EXIT INT TERM
 echo "downloading $URL"
 if command -v curl >/dev/null 2>&1; then
-    curl -fL --retry 3 --retry-delay 2 -o "$TMP" "$URL"
+    curl -fsSL --retry 3 --retry-delay 2 -o "$TMP" "$URL"
 elif command -v wget >/dev/null 2>&1; then
     wget -q -O "$TMP" "$URL"
 else
