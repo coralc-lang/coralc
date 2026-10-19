@@ -1880,6 +1880,7 @@ struct crl__loc__coral_mono__mono__MonoInstance {
     crl__loc__coral_mono__mono__MonoInstanceKind kind;
     uint32_t name;
     crl__loc__coral_ast__id__NodeId declaration;
+    crl__loc__coral_ast__id__NodeId callSite;
     uint32_t typeNode;
     uint32_t returnType;
     uint32_t* paramTypes;
@@ -1906,6 +1907,7 @@ struct crl__loc__coral_mono__mono__MonoInstance {
 struct crl__loc__coral_mono__mono__MonoWorkItem {
     crl__loc__coral_mono__mono__MonoDeclKind kind;
     crl__loc__coral_ast__id__NodeId declaration;
+    crl__loc__coral_ast__id__NodeId callSite;
     uint32_t* arguments;
     uint32_t argumentsLen;
     crl__loc__coral_mono__mono__MonoSubstitution* inherited;
@@ -1936,6 +1938,10 @@ struct crl__loc__coral_mono__mono__MonoContext {
     crl__loc__coral_mono__mono__MonoSubstitution* activeSubs;
     uint32_t activeSubsLen;
     uint32_t comptimeCollect;
+    crl__loc__coral_ast__id__NodeId* staticCtDecls;
+    crl__loc__coral_ast__id__NodeId* staticCtCalls;
+    uint32_t staticCtLen;
+    uint32_t staticCtCap;
 };
 struct crl__loc__coral_semantics__member__MemberInfo {
     uint32_t typeNode;
@@ -3260,6 +3266,7 @@ uint32_t crl__loc__coral_mono__mono__MonoContext_substituteType(crl__loc__coral_
 _Bool crl__loc__coral_mono__mono__MonoContext_reserveDeclarations(crl__loc__coral_mono__mono__MonoContext* self);
 _Bool crl__loc__coral_mono__mono__MonoContext_reserveWork(crl__loc__coral_mono__mono__MonoContext* self);
 _Bool crl__loc__coral_mono__mono__MonoContext_reserveInstances(crl__loc__coral_mono__mono__MonoContext* self);
+_Bool crl__loc__coral_mono__mono__MonoContext_reserveStaticCt(crl__loc__coral_mono__mono__MonoContext* self);
 uint32_t* crl__loc__coral_mono__mono__MonoContext_copyTypes(crl__loc__coral_mono__mono__MonoContext* self, uint32_t* values, uint32_t len);
 crl__loc__coral_mono__mono__MonoSubstitution* crl__loc__coral_mono__mono__MonoContext_copySubstitutions(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_mono__mono__MonoSubstitution* values, uint32_t len);
 crl__loc__coral_ast__node__Node* crl__loc__coral_mono__mono__MonoContext_nodeAt(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_ast__id__NodeId id);
@@ -3283,9 +3290,13 @@ crl__loc__coral_ast__id__NodeId crl__loc__coral_mono__collect__MonoContext_findG
 _Bool crl__loc__coral_mono__collect__MonoContext_isConcreteType(crl__loc__coral_mono__mono__MonoContext* self, uint32_t typeNode);
 _Bool crl__loc__coral_mono__collect__MonoContext_areConcreteTypes(crl__loc__coral_mono__mono__MonoContext* self, uint32_t* types, uint32_t len);
 _Bool crl__loc__coral_mono__collect__MonoContext_enqueue(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_mono__mono__MonoDeclKind kind, crl__loc__coral_ast__id__NodeId declaration, uint32_t* arguments, uint32_t argumentsLen);
-_Bool crl__loc__coral_mono__collect__MonoContext_enqueueVal(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_mono__mono__MonoDeclKind kind, crl__loc__coral_ast__id__NodeId declaration, uint32_t* arguments, uint32_t argumentsLen, uint64_t valueKey, uint32_t packArity, uint32_t* literalNames, crl__loc__coral_ast__id__NodeId* literalNodes, uint32_t literalsLen, uint32_t* tailTypes, crl__loc__coral_ast__id__NodeId* tailNodes, uint32_t tailLen);
+_Bool crl__loc__coral_mono__collect__MonoContext_enqueueVal(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_mono__mono__MonoDeclKind kind, crl__loc__coral_ast__id__NodeId declaration, uint32_t* arguments, uint32_t argumentsLen, uint64_t valueKey, uint32_t packArity, uint32_t* literalNames, crl__loc__coral_ast__id__NodeId* literalNodes, uint32_t literalsLen, uint32_t* tailTypes, crl__loc__coral_ast__id__NodeId* tailNodes, uint32_t tailLen, crl__loc__coral_ast__id__NodeId callSite);
 _Bool crl__loc__coral_mono__collect__MonoContext_collectType(crl__loc__coral_mono__mono__MonoContext* self, uint32_t typeNode);
+_Bool crl__loc__coral_mono__collect__MonoContext_hasVariadicParam(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_ast__decl__Decl* d);
+_Bool crl__loc__coral_mono__collect__MonoContext_recordStaticDecl(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_ast__id__NodeId declId);
+_Bool crl__loc__coral_mono__collect__MonoContext_recordStaticCall(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_ast__id__NodeId declId, crl__loc__coral_ast__id__NodeId callId);
 _Bool crl__loc__coral_mono__collect__MonoContext_declHasTopComptime(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_ast__id__NodeId declId);
+crl__loc__coral_ast__id__NodeId crl__loc__coral_mono__collect__MonoContext_constLiteralNode(crl__loc__coral_mono__mono__MonoContext* self, uint32_t name);
 _Bool crl__loc__coral_mono__collect__MonoContext_collectCall(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_ast__id__NodeId callId);
 _Bool crl__loc__coral_mono__collect__MonoContext_collectNode(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_ast__id__NodeId id);
 _Bool crl__loc__coral_mono__collect__MonoContext_collectExpr(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_ast__id__NodeId id);
@@ -3382,9 +3393,11 @@ void crl__loc__coral_mono__comptime__ctEvalStmts(crl__loc__coral_mono__comptime_
 crl__loc__coral_mono__mono__MonoSubstitution* crl__loc__coral_mono__instantiate__MonoContext_buildSubstitutions(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_ast__id__NodeId declaration, uint32_t* arguments, uint32_t argumentsLen);
 _Bool crl__loc__coral_mono__instantiate__MonoContext_sameArguments(crl__loc__coral_mono__mono__MonoContext* self, uint32_t* left, uint32_t* right, uint32_t len);
 _Bool crl__loc__coral_mono__instantiate__MonoContext_hasInstance(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_mono__mono__MonoDeclKind kind, uint32_t name, uint32_t* arguments, uint32_t argumentsLen, uint64_t valueKey);
-_Bool crl__loc__coral_mono__instantiate__MonoContext_addInstance(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_ast__id__NodeId declaration, uint32_t* arguments, uint32_t argumentsLen, uint64_t valueKey, uint32_t packArity, uint32_t* literalNames, crl__loc__coral_ast__id__NodeId* literalNodes, uint32_t literalsLen, uint32_t* tailTypes, crl__loc__coral_ast__id__NodeId* tailNodes, uint32_t tailLen, uint32_t* outIndex);
+_Bool crl__loc__coral_mono__instantiate__MonoContext_addInstance(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_ast__id__NodeId declaration, uint32_t* arguments, uint32_t argumentsLen, uint64_t valueKey, uint32_t packArity, uint32_t* literalNames, crl__loc__coral_ast__id__NodeId* literalNodes, uint32_t literalsLen, uint32_t* tailTypes, crl__loc__coral_ast__id__NodeId* tailNodes, uint32_t tailLen, crl__loc__coral_ast__id__NodeId callSite, uint32_t* outIndex);
 _Bool crl__loc__coral_mono__instantiate__MonoContext_validateInstance(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_mono__mono__MonoInstance* instance);
 _Bool crl__loc__coral_mono__instantiate__MonoContext_run(crl__loc__coral_mono__mono__MonoContext* self);
+_Bool crl__loc__coral_mono__instantiate__MonoContext_evalStaticComptimeBlocks(crl__loc__coral_mono__mono__MonoContext* self);
+void crl__loc__coral_mono__instantiate__MonoContext_bindStaticCallLiterals(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_mono__mono__MonoInstance* inst, crl__loc__coral_ast__decl__Decl* d);
 void crl__loc__coral_mono__instantiate__MonoContext_evalComptimeBody(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_mono__mono__MonoInstance* instance);
 _Bool crl__loc__coral_semantics__decl__Sema_checkDecl(crl__loc__coral_semantics__sema__Sema* self, crl__loc__coral_ast__id__NodeId id, _Bool bodies);
 void crl__loc__coral_semantics__decl__Sema_checkGenericDups(crl__loc__coral_semantics__sema__Sema* self, crl__loc__coral_ast__id__NodeId* params, uint32_t len);
@@ -24118,6 +24131,10 @@ void crl__loc__coral_mono__mono__MonoContext_init(crl__loc__coral_mono__mono__Mo
     ((self->activeSubs = 0));
     ((self->activeSubsLen = 0));
     ((self->comptimeCollect = 0));
+    ((self->staticCtDecls = 0));
+    ((self->staticCtCalls = 0));
+    ((self->staticCtLen = 0));
+    ((self->staticCtCap = 0));
     if (((ast == 0)))
     {
         ((self->errors = 1));
@@ -24202,6 +24219,18 @@ void crl__loc__coral_mono__mono__MonoContext_clear(crl__loc__coral_mono__mono__M
     {
         crl__lib__std__x86_64__linux__memory__mman__dealloc_crl__loc__coral_mono__mono__MonoDecl(self->declarations);
     }
+    if (((self->staticCtDecls != 0)))
+    {
+        crl__lib__std__x86_64__linux__memory__mman__dealloc_crl__loc__coral_ast__id__NodeId(self->staticCtDecls);
+    }
+    if (((self->staticCtCalls != 0)))
+    {
+        crl__lib__std__x86_64__linux__memory__mman__dealloc_crl__loc__coral_ast__id__NodeId(self->staticCtCalls);
+    }
+    ((self->staticCtDecls = 0));
+    ((self->staticCtCalls = 0));
+    ((self->staticCtLen = 0));
+    ((self->staticCtCap = 0));
     ((self->file = 0));
     ((self->work = 0));
     ((self->workLen = 0));
@@ -24423,6 +24452,33 @@ _Bool crl__loc__coral_mono__mono__MonoContext_reserveInstances(crl__loc__coral_m
     }
     ((self->instances = raw));
     ((self->instancesCap = newCap));
+    return 1;
+}
+_Bool crl__loc__coral_mono__mono__MonoContext_reserveStaticCt(crl__loc__coral_mono__mono__MonoContext* self) {
+    if (((self->staticCtLen < self->staticCtCap)))
+    {
+        return 1;
+    }
+    uint32_t newCap = ((self->staticCtCap * 2));
+    if (((newCap == 0)))
+    {
+        ((newCap = 16));
+    }
+    crl__loc__coral_ast__id__NodeId* decls = crl__lib__std__x86_64__linux__memory__mman__realloc_crl__loc__coral_ast__id__NodeId(self->staticCtDecls, ((size_t)(newCap)));
+    if (((decls == 0)))
+    {
+        ((self->errors)++);
+        return 0;
+    }
+    ((self->staticCtDecls = decls));
+    crl__loc__coral_ast__id__NodeId* calls = crl__lib__std__x86_64__linux__memory__mman__realloc_crl__loc__coral_ast__id__NodeId(self->staticCtCalls, ((size_t)(newCap)));
+    if (((calls == 0)))
+    {
+        ((self->errors)++);
+        return 0;
+    }
+    ((self->staticCtCalls = calls));
+    ((self->staticCtCap = newCap));
     return 1;
 }
 uint32_t* crl__loc__coral_mono__mono__MonoContext_copyTypes(crl__loc__coral_mono__mono__MonoContext* self, uint32_t* values, uint32_t len) {
@@ -25183,9 +25239,11 @@ _Bool crl__loc__coral_mono__collect__MonoContext_areConcreteTypes(crl__loc__cora
     return 1;
 }
 _Bool crl__loc__coral_mono__collect__MonoContext_enqueue(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_mono__mono__MonoDeclKind kind, crl__loc__coral_ast__id__NodeId declaration, uint32_t* arguments, uint32_t argumentsLen) {
-    return crl__loc__coral_mono__collect__MonoContext_enqueueVal(self, kind, declaration, arguments, argumentsLen, 0, 0, 0, 0, 0, 0, 0, 0);
+    crl__loc__coral_ast__id__NodeId noCall;
+    ((noCall.index = 0));
+    return crl__loc__coral_mono__collect__MonoContext_enqueueVal(self, kind, declaration, arguments, argumentsLen, 0, 0, 0, 0, 0, 0, 0, 0, noCall);
 }
-_Bool crl__loc__coral_mono__collect__MonoContext_enqueueVal(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_mono__mono__MonoDeclKind kind, crl__loc__coral_ast__id__NodeId declaration, uint32_t* arguments, uint32_t argumentsLen, uint64_t valueKey, uint32_t packArity, uint32_t* literalNames, crl__loc__coral_ast__id__NodeId* literalNodes, uint32_t literalsLen, uint32_t* tailTypes, crl__loc__coral_ast__id__NodeId* tailNodes, uint32_t tailLen) {
+_Bool crl__loc__coral_mono__collect__MonoContext_enqueueVal(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_mono__mono__MonoDeclKind kind, crl__loc__coral_ast__id__NodeId declaration, uint32_t* arguments, uint32_t argumentsLen, uint64_t valueKey, uint32_t packArity, uint32_t* literalNames, crl__loc__coral_ast__id__NodeId* literalNodes, uint32_t literalsLen, uint32_t* tailTypes, crl__loc__coral_ast__id__NodeId* tailNodes, uint32_t tailLen, crl__loc__coral_ast__id__NodeId callSite) {
     if (((crl__loc__coral_mono__mono__MonoContext_genericCount(self, declaration) != argumentsLen)))
     {
         ((self->errors)++);
@@ -25237,6 +25295,7 @@ _Bool crl__loc__coral_mono__collect__MonoContext_enqueueVal(crl__loc__coral_mono
     crl__loc__coral_mono__mono__MonoWorkItem* item = ((self->work + self->workLen));
     ((item->kind = kind));
     ((item->declaration = declaration));
+    ((item->callSite = callSite));
     ((item->arguments = crl__loc__coral_mono__mono__MonoContext_copyTypes(self, arguments, argumentsLen)));
     ((item->argumentsLen = argumentsLen));
     ((item->inherited = 0));
@@ -25427,6 +25486,78 @@ _Bool crl__loc__coral_mono__collect__MonoContext_collectType(crl__loc__coral_mon
     }
     return 1;
 }
+_Bool crl__loc__coral_mono__collect__MonoContext_hasVariadicParam(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_ast__decl__Decl* d) {
+    if (((((d == 0))) || (((d->kind.tag != 9)))))
+    {
+        return 0;
+    }
+    if (((d->kind.u.v9.paramsLen == 0)))
+    {
+        return 0;
+    }
+    crl__loc__coral_ast__id__NodeId lastId = d->kind.u.v9.params[((d->kind.u.v9.paramsLen - 1))];
+    crl__loc__coral_ast__node__Node* pn = crl__loc__coral_mono__mono__MonoContext_nodeAt(self, lastId);
+    return ((((((pn != 0))) && (((pn->kind.tag == 6))))) && (((((pn->kind.u.v6.value.flags & 16)) != 0))));
+}
+_Bool crl__loc__coral_mono__collect__MonoContext_recordStaticDecl(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_ast__id__NodeId declId) {
+    uint32_t i = 0;
+    while (((i < self->staticCtLen)))
+    {
+        if (((self->staticCtDecls[i].index == declId.index)))
+        {
+            return 1;
+        }
+        ((i)++);
+    }
+    if ((!(crl__loc__coral_mono__mono__MonoContext_reserveStaticCt(self))))
+    {
+        return 0;
+    }
+    crl__loc__coral_ast__id__NodeId none;
+    ((none.index = 0));
+    ((self->staticCtDecls[self->staticCtLen] = declId));
+    ((self->staticCtCalls[self->staticCtLen] = none));
+    ((self->staticCtLen)++);
+    return 1;
+}
+_Bool crl__loc__coral_mono__collect__MonoContext_recordStaticCall(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_ast__id__NodeId declId, crl__loc__coral_ast__id__NodeId callId) {
+    uint32_t first = 0;
+    _Bool haveFirst = 0;
+    uint32_t i = 0;
+    while (((i < self->staticCtLen)))
+    {
+        if (((self->staticCtDecls[i].index == declId.index)))
+        {
+            if (((self->staticCtCalls[i].index == callId.index)))
+            {
+                return 1;
+            }
+            if ((!(haveFirst)))
+            {
+                ((first = i));
+                ((haveFirst = 1));
+            }
+        }
+        ((i)++);
+    }
+    if ((!(haveFirst)))
+    {
+        return 1;
+    }
+    if (((self->staticCtCalls[first].index == 0)))
+    {
+        ((self->staticCtCalls[first] = callId));
+        return 1;
+    }
+    if ((!(crl__loc__coral_mono__mono__MonoContext_reserveStaticCt(self))))
+    {
+        return 0;
+    }
+    ((self->staticCtDecls[self->staticCtLen] = declId));
+    ((self->staticCtCalls[self->staticCtLen] = callId));
+    ((self->staticCtLen)++);
+    return 1;
+}
 _Bool crl__loc__coral_mono__collect__MonoContext_declHasTopComptime(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_ast__id__NodeId declId) {
     crl__loc__coral_ast__node__Node* dn = crl__loc__coral_mono__mono__MonoContext_nodeAt(self, declId);
     if (((((dn == 0))) || (((dn->kind.tag != 3)))))
@@ -25463,6 +25594,38 @@ _Bool crl__loc__coral_mono__collect__MonoContext_declHasTopComptime(crl__loc__co
     }
     return 0;
 }
+crl__loc__coral_ast__id__NodeId crl__loc__coral_mono__collect__MonoContext_constLiteralNode(crl__loc__coral_mono__mono__MonoContext* self, uint32_t name) {
+    crl__loc__coral_ast__id__NodeId declId = crl__loc__coral_mono__collect__MonoContext_findDeclaration(self, name);
+    uint32_t depth = 0;
+    while (((((declId.index != 0))) && (((depth < 8)))))
+    {
+        crl__loc__coral_ast__decl__Decl* d = crl__loc__coral_mono__mono__MonoContext_declAt(self, declId);
+        if (((((d == 0))) || (((d->kind.tag != 10)))))
+        {
+            break;
+        }
+        crl__loc__coral_ast__id__NodeId valueId = d->kind.u.v10.value;
+        crl__loc__coral_ast__node__Node* vn = crl__loc__coral_mono__mono__MonoContext_nodeAt(self, valueId);
+        if (((((vn == 0))) || (((vn->kind.tag != 1)))))
+        {
+            break;
+        }
+        crl__loc__coral_ast__expr__Expr* ve = (&(vn->kind.u.v1.value));
+        if (((((((((ve->kind.tag == 2))) || (((ve->kind.tag == 0))))) || (((ve->kind.tag == 3))))) || (((ve->kind.tag == 4)))))
+        {
+            return valueId;
+        }
+        if (((ve->kind.tag != 6)))
+        {
+            break;
+        }
+        ((declId = crl__loc__coral_mono__collect__MonoContext_findDeclaration(self, ve->kind.u.v6.name)));
+        ((depth)++);
+    }
+    crl__loc__coral_ast__id__NodeId none;
+    ((none.index = 0));
+    return none;
+}
 _Bool crl__loc__coral_mono__collect__MonoContext_collectCall(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_ast__id__NodeId callId) {
     crl__loc__coral_ast__node__Node* callNode = crl__loc__coral_mono__mono__MonoContext_nodeAt(self, callId);
     if (((((callNode == 0))) || (((callNode->kind.tag != 1)))))
@@ -25488,6 +25651,13 @@ _Bool crl__loc__coral_mono__collect__MonoContext_collectCall(crl__loc__coral_mon
     uint32_t gcount = crl__loc__coral_mono__mono__MonoContext_genericCount(self, declaration);
     if (((((declaration.index == 0))) || (((gcount == 0)))))
     {
+        if (((((((declaration.index != 0))) && (((gcount == 0))))) && (((self->comptimeCollect == 0)))))
+        {
+            if ((!(crl__loc__coral_mono__collect__MonoContext_recordStaticCall(self, declaration, callId))))
+            {
+                return 0;
+            }
+        }
         return 1;
     }
     if (((((self->comptimeCollect > 0))) && (crl__loc__coral_mono__collect__MonoContext_declHasTopComptime(self, declaration))))
@@ -25619,6 +25789,18 @@ _Bool crl__loc__coral_mono__collect__MonoContext_collectCall(crl__loc__coral_mon
                             {
                                 ((isLit = 1));
                             }
+                            else
+                            {
+                                if (((ave->kind.tag == 6)))
+                                {
+                                    crl__loc__coral_ast__id__NodeId cv = crl__loc__coral_mono__collect__MonoContext_constLiteralNode(self, ave->kind.u.v6.name);
+                                    if (((cv.index != 0)))
+                                    {
+                                        ((avId = cv));
+                                        ((isLit = 1));
+                                    }
+                                }
+                            }
                         }
                         if (((((((isLit) && (((litNames != 0))))) && (((litNodes != 0))))) && (((litsLen < litCap)))))
                         {
@@ -25661,7 +25843,7 @@ _Bool crl__loc__coral_mono__collect__MonoContext_collectCall(crl__loc__coral_mon
     }
     uint32_t arity = tailLen;
     uint64_t key = crl__loc__coral_mono__mono__MonoContext_callValueKeyTyped(self, call->kind.u.v9.args, call->kind.u.v9.argsLen, self->activeSubs, self->activeSubsLen);
-    _Bool ok = crl__loc__coral_mono__collect__MonoContext_enqueueVal(self, crl__loc__coral_mono__mono__MonoDeclKind_FunctionDecl, declaration, arguments, gcount, key, arity, litNames, litNodes, litsLen, tailTypes, tailNodes, tailLen);
+    _Bool ok = crl__loc__coral_mono__collect__MonoContext_enqueueVal(self, crl__loc__coral_mono__mono__MonoDeclKind_FunctionDecl, declaration, arguments, gcount, key, arity, litNames, litNodes, litsLen, tailTypes, tailNodes, tailLen, callId);
     if (((litNames != 0)))
     {
         crl__lib__std__x86_64__linux__memory__mman__dealloc_uint32_t(litNames);
@@ -26675,6 +26857,19 @@ _Bool crl__loc__coral_mono__collect__MonoContext_collectFile(crl__loc__coral_mon
         return 0;
     }
     uint32_t i = 0;
+    while (((i < file->declsLen)))
+    {
+        crl__loc__coral_ast__decl__Decl* d = crl__loc__coral_mono__mono__MonoContext_declAt(self, file->decls[i]);
+        if (((((((((((d != 0))) && (((d->kind.tag == 9))))) && (((crl__loc__coral_mono__mono__MonoContext_genericCount(self, file->decls[i]) == 0))))) && (crl__loc__coral_mono__collect__MonoContext_declHasTopComptime(self, file->decls[i])))) && ((!(crl__loc__coral_mono__collect__MonoContext_hasVariadicParam(self, d))))))
+        {
+            if ((!(crl__loc__coral_mono__collect__MonoContext_recordStaticDecl(self, file->decls[i]))))
+            {
+                return 0;
+            }
+        }
+        ((i)++);
+    }
+    ((i = 0));
     while (((i < file->declsLen)))
     {
         if ((!(crl__loc__coral_mono__collect__MonoContext_collectDecl(self, file->decls[i]))))
@@ -30410,14 +30605,7 @@ void crl__loc__coral_mono__comptime__CtEval_evalIf(crl__loc__coral_mono__comptim
         }
         return;
     }
-    if (((self->depth > 0)))
-    {
-        crl__loc__coral_mono__comptime__CtEval_emit(self, crl__loc__coral_mono__comptime__CtEval_rwStmt(self, id));
-    }
-    else
-    {
-        crl__loc__coral_mono__comptime__CtEval_emit(self, id);
-    }
+    crl__loc__coral_mono__comptime__CtEval_emit(self, crl__loc__coral_mono__comptime__CtEval_rwStmt(self, id));
 }
 void crl__loc__coral_mono__comptime__CtEval_evalArmBody(crl__loc__coral_mono__comptime__CtEval* self, crl__loc__coral_ast__id__NodeId bodyId) {
     crl__loc__coral_ast__node__Node* bn = crl__loc__coral_mono__comptime__CtEval_nodeAt(self, bodyId);
@@ -30907,7 +31095,7 @@ _Bool crl__loc__coral_mono__instantiate__MonoContext_hasInstance(crl__loc__coral
     }
     return 0;
 }
-_Bool crl__loc__coral_mono__instantiate__MonoContext_addInstance(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_ast__id__NodeId declaration, uint32_t* arguments, uint32_t argumentsLen, uint64_t valueKey, uint32_t packArity, uint32_t* literalNames, crl__loc__coral_ast__id__NodeId* literalNodes, uint32_t literalsLen, uint32_t* tailTypes, crl__loc__coral_ast__id__NodeId* tailNodes, uint32_t tailLen, uint32_t* outIndex) {
+_Bool crl__loc__coral_mono__instantiate__MonoContext_addInstance(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_ast__id__NodeId declaration, uint32_t* arguments, uint32_t argumentsLen, uint64_t valueKey, uint32_t packArity, uint32_t* literalNames, crl__loc__coral_ast__id__NodeId* literalNodes, uint32_t literalsLen, uint32_t* tailTypes, crl__loc__coral_ast__id__NodeId* tailNodes, uint32_t tailLen, crl__loc__coral_ast__id__NodeId callSite, uint32_t* outIndex) {
     crl__loc__coral_ast__decl__Decl* decl = crl__loc__coral_mono__mono__MonoContext_declAt(self, declaration);
     if (((decl == 0)))
     {
@@ -30959,6 +31147,7 @@ _Bool crl__loc__coral_mono__instantiate__MonoContext_addInstance(crl__loc__coral
     }
     ((instance->name = name));
     ((instance->declaration = declaration));
+    ((instance->callSite = callSite));
     ((instance->typeNode = 0));
     ((instance->returnType = 0));
     ((instance->paramTypes = 0));
@@ -31126,7 +31315,7 @@ _Bool crl__loc__coral_mono__instantiate__MonoContext_run(crl__loc__coral_mono__m
     while (((i < self->workLen)))
     {
         uint32_t instIdx = 0;
-        if ((!(crl__loc__coral_mono__instantiate__MonoContext_addInstance(self, self->work[i].declaration, self->work[i].arguments, self->work[i].argumentsLen, self->work[i].valueKey, self->work[i].packArity, self->work[i].literalNames, self->work[i].literalNodes, self->work[i].literalsLen, self->work[i].tailTypes, self->work[i].tailNodes, self->work[i].tailLen, (&(instIdx))))))
+        if ((!(crl__loc__coral_mono__instantiate__MonoContext_addInstance(self, self->work[i].declaration, self->work[i].arguments, self->work[i].argumentsLen, self->work[i].valueKey, self->work[i].packArity, self->work[i].literalNames, self->work[i].literalNodes, self->work[i].literalsLen, self->work[i].tailTypes, self->work[i].tailNodes, self->work[i].tailLen, self->work[i].callSite, (&(instIdx))))))
         {
             return 0;
         }
@@ -31189,7 +31378,152 @@ _Bool crl__loc__coral_mono__instantiate__MonoContext_run(crl__loc__coral_mono__m
         ((self->activeSubsLen = 0));
         ((i)++);
     }
+    if (((((self->errors == 0))) && ((!(crl__loc__coral_mono__instantiate__MonoContext_evalStaticComptimeBlocks(self))))))
+    {
+        return 0;
+    }
     return ((self->errors == 0));
+}
+_Bool crl__loc__coral_mono__instantiate__MonoContext_evalStaticComptimeBlocks(crl__loc__coral_mono__mono__MonoContext* self) {
+    uint32_t i = 0;
+    while (((i < self->staticCtLen)))
+    {
+        crl__loc__coral_ast__id__NodeId declId = self->staticCtDecls[i];
+        crl__loc__coral_ast__id__NodeId callId = self->staticCtCalls[i];
+        crl__loc__coral_ast__decl__Decl* d = crl__loc__coral_mono__mono__MonoContext_declAt(self, declId);
+        _Bool skipUnbound = 0;
+        if (((((d != 0))) && (((callId.index == 0)))))
+        {
+            uint32_t j = 0;
+            while (((j < self->staticCtLen)))
+            {
+                if (((((((j != i))) && (((self->staticCtDecls[j].index == declId.index))))) && (((self->staticCtCalls[j].index != 0)))))
+                {
+                    ((skipUnbound = 1));
+                    break;
+                }
+                ((j)++);
+            }
+        }
+        if (((((((d != 0))) && (((d->kind.tag == 9))))) && ((!(skipUnbound)))))
+        {
+            crl__loc__coral_mono__mono__MonoInstance inst;
+            ((inst.kind = crl__loc__coral_mono__mono__MonoInstanceKind_FunctionInstance));
+            ((inst.name = crl__loc__coral_mono__mono__MonoContext_declarationName(self, declId)));
+            ((inst.declaration = declId));
+            ((inst.callSite = callId));
+            ((inst.typeNode = 0));
+            ((inst.returnType = 0));
+            ((inst.paramTypes = 0));
+            ((inst.paramTypesLen = 0));
+            ((inst.arguments = 0));
+            ((inst.argumentsLen = 0));
+            ((inst.substitutions = 0));
+            ((inst.substitutionsLen = 0));
+            ((inst.body = d->kind.u.v9.body));
+            ((inst.attributes = 0));
+            ((inst.attributesLen = 0));
+            ((inst.validationAttempted = 0));
+            ((inst.validated = 0));
+            ((inst.valueKey = 0));
+            ((inst.packArity = 0));
+            ((inst.literalNames = 0));
+            ((inst.literalNodes = 0));
+            ((inst.literalsLen = 0));
+            ((inst.tailTypes = 0));
+            ((inst.tailNodes = 0));
+            ((inst.tailArgNames = 0));
+            ((inst.tailLen = 0));
+            crl__loc__coral_mono__instantiate__MonoContext_bindStaticCallLiterals(self, (&(inst)), d);
+            crl__loc__coral_mono__instantiate__MonoContext_evalComptimeBody(self, (&(inst)));
+            if (((inst.literalNames != 0)))
+            {
+                crl__lib__std__x86_64__linux__memory__mman__dealloc_uint32_t(inst.literalNames);
+            }
+            if (((inst.literalNodes != 0)))
+            {
+                crl__lib__std__x86_64__linux__memory__mman__dealloc_crl__loc__coral_ast__id__NodeId(inst.literalNodes);
+            }
+            if (((self->errors != 0)))
+            {
+                return 0;
+            }
+        }
+        ((i)++);
+    }
+    return 1;
+}
+void crl__loc__coral_mono__instantiate__MonoContext_bindStaticCallLiterals(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_mono__mono__MonoInstance* inst, crl__loc__coral_ast__decl__Decl* d) {
+    crl__loc__coral_ast__node__Node* csn = crl__loc__coral_mono__mono__MonoContext_nodeAt(self, inst->callSite);
+    if (((((csn == 0))) || (((csn->kind.tag != 1)))))
+    {
+        return;
+    }
+    crl__loc__coral_ast__expr__Expr* call = (&(csn->kind.u.v1.value));
+    if (((call->kind.tag != 9)))
+    {
+        return;
+    }
+    uint32_t cap = d->kind.u.v9.paramsLen;
+    if (((((cap == 0))) || (((call->kind.u.v9.argsLen == 0)))))
+    {
+        return;
+    }
+    uint32_t* names = crl__lib__std__x86_64__linux__memory__mman__alloc_uint32_t(((size_t)(cap)));
+    crl__loc__coral_ast__id__NodeId* nodes = crl__lib__std__x86_64__linux__memory__mman__alloc_crl__loc__coral_ast__id__NodeId(((size_t)(cap)));
+    if (((((names == 0))) || (((nodes == 0)))))
+    {
+        if (((names != 0)))
+        {
+            crl__lib__std__x86_64__linux__memory__mman__dealloc_uint32_t(names);
+        }
+        if (((nodes != 0)))
+        {
+            crl__lib__std__x86_64__linux__memory__mman__dealloc_crl__loc__coral_ast__id__NodeId(nodes);
+        }
+        return;
+    }
+    uint32_t len = 0;
+    uint32_t p = 0;
+    while (((((p < cap))) && (((p < call->kind.u.v9.argsLen)))))
+    {
+        crl__loc__coral_ast__node__Node* pn = crl__loc__coral_mono__mono__MonoContext_nodeAt(self, d->kind.u.v9.params[p]);
+        if (((((((((pn != 0))) && (((pn->kind.tag == 6))))) && (((((pn->kind.u.v6.value.flags & 16)) == 0))))) && (((pn->kind.u.v6.value.name != 0)))))
+        {
+            crl__loc__coral_ast__id__NodeId avId = call->kind.u.v9.args[p];
+            crl__loc__coral_ast__node__Node* avn = crl__loc__coral_mono__mono__MonoContext_nodeAt(self, avId);
+            if (((((avn != 0))) && (((avn->kind.tag == 1)))))
+            {
+                crl__loc__coral_ast__expr__Expr* ave = (&(avn->kind.u.v1.value));
+                _Bool isLit = ((((((((ave->kind.tag == 2))) || (((ave->kind.tag == 0))))) || (((ave->kind.tag == 3))))) || (((ave->kind.tag == 4))));
+                if ((((!(isLit))) && (((ave->kind.tag == 6)))))
+                {
+                    crl__loc__coral_ast__id__NodeId cv = crl__loc__coral_mono__collect__MonoContext_constLiteralNode(self, ave->kind.u.v6.name);
+                    if (((cv.index != 0)))
+                    {
+                        ((avId = cv));
+                        ((isLit = 1));
+                    }
+                }
+                if (isLit)
+                {
+                    ((names[len] = pn->kind.u.v6.value.name));
+                    ((nodes[len] = avId));
+                    ((len)++);
+                }
+            }
+        }
+        ((p)++);
+    }
+    if (((len == 0)))
+    {
+        crl__lib__std__x86_64__linux__memory__mman__dealloc_uint32_t(names);
+        crl__lib__std__x86_64__linux__memory__mman__dealloc_crl__loc__coral_ast__id__NodeId(nodes);
+        return;
+    }
+    ((inst->literalNames = names));
+    ((inst->literalNodes = nodes));
+    ((inst->literalsLen = len));
 }
 void crl__loc__coral_mono__instantiate__MonoContext_evalComptimeBody(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_mono__mono__MonoInstance* instance) {
     crl__loc__coral_ast__node__Node* bn = crl__loc__coral_mono__mono__MonoContext_nodeAt(self, instance->body);
@@ -31401,9 +31735,18 @@ void crl__loc__coral_mono__instantiate__MonoContext_evalComptimeBody(crl__loc__c
     crl__loc__coral_mono__comptime__CtEval_evalStmt((&(ct)), instance->body);
     if (ct.failed)
     {
+        crl__loc__coral_ast__id__SourceLoc loc = ct.errLoc;
+        if (((instance->callSite.index != 0)))
+        {
+            crl__loc__coral_ast__node__Node* callNode = crl__loc__coral_mono__mono__MonoContext_nodeAt(self, instance->callSite);
+            if (((callNode != 0)))
+            {
+                ((loc = callNode->loc));
+            }
+        }
         if (((((self->sema != 0))) && (((self->sema->diag != 0)))))
         {
-            crl__loc__coral_diagnostics__engine__DiagnosticEngine_emitError(self->sema->diag, crl__loc__coral_diagnostics__code__ErrorCode_ComptimeError, ct.errLoc, ct.errMsg, (_coral_str){ (const uint8_t*)"", 0 });
+            crl__loc__coral_diagnostics__engine__DiagnosticEngine_emitError(self->sema->diag, crl__loc__coral_diagnostics__code__ErrorCode_ComptimeError, loc, ct.errMsg, (_coral_str){ (const uint8_t*)"", 0 });
         }
         ((self->errors)++);
         crl__loc__coral_mono__comptime__CtEval_dispose((&(ct)));
