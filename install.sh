@@ -1,6 +1,6 @@
 #!/bin/sh
-# coralc installer: download (or use the current checkout) and install the
-# prebuilt coralc binary from that folder into $CORAL_HOME (default ~/.coral).
+# coralc installer: download (or use the current checkout), pull the prebuilt
+# coralc out of that folder, and install into $CORAL_HOME (default ~/.coral).
 #   curl -fsSL https://raw.githubusercontent.com/coralc-lang/coralc/main/install.sh | sh
 # or from a checkout: sh install.sh [--prefix DIR]
 set -eu
@@ -72,7 +72,6 @@ add_path
 
 echo
 echo "coralc installed to $PREFIX/bin/coralc"
-"$PREFIX/bin/coralc" --version < /dev/null || true
 echo
 echo "editor support:"
 echo "  Zed:            curl -fsSL https://raw.githubusercontent.com/coralc-lang/coralc/main/extensions/zed/install.sh | sh"
