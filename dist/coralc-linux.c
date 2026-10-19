@@ -37,6 +37,7 @@ typedef struct crl__lib__std__x86_64__linux__memory__mman__ArenaAllocator crl__l
 typedef struct crl__lib__std__x86_64__linux__memory__mman__PoolAllocator crl__lib__std__x86_64__linux__memory__mman__PoolAllocator;
 typedef struct crl__lib__std__x86_64__linux__memory__mman__ScopeAlloc crl__lib__std__x86_64__linux__memory__mman__ScopeAlloc;
 typedef struct crl__lib__std__x86_64__linux__memory__mman__LoggingAllocator crl__lib__std__x86_64__linux__memory__mman__LoggingAllocator;
+typedef struct crl__lib__std__x86_64__linux__collections__range__IterRange crl__lib__std__x86_64__linux__collections__range__IterRange;
 typedef struct crl__lib__std__x86_64__linux__text__string__String crl__lib__std__x86_64__linux__text__string__String;
 typedef struct crl__lib__std__x86_64__linux__io__ios___Buf crl__lib__std__x86_64__linux__io__ios___Buf;
 typedef struct crl__lib__std__x86_64__linux__io__ios__Spaces crl__lib__std__x86_64__linux__io__ios__Spaces;
@@ -672,6 +673,10 @@ struct crl__lib__std__x86_64__linux__memory__mman__LoggingAllocator {
     size_t* trackSizes;
     size_t trackLen;
     size_t trackCap;
+};
+struct crl__lib__std__x86_64__linux__collections__range__IterRange {
+    size_t start;
+    size_t end;
 };
 struct crl__lib__std__x86_64__linux__text__string__String {
     uint8_t* ptr;
@@ -1346,6 +1351,8 @@ struct crl__loc__coral_ast__stmt__StmtKind {
             uint32_t bindName;
             uint32_t bindType;
             crl__loc__coral_ast__id__NodeId iterExpr;
+            crl__loc__coral_ast__id__NodeId rangeStart;
+            crl__loc__coral_ast__id__NodeId rangeEnd;
             crl__loc__coral_ast__id__NodeId body;
             uint8_t flags;
         } v11;
@@ -3077,7 +3084,7 @@ crl__loc__coral_ast__id__NodeId crl__loc__coral_parser__stmt__Parser_parseReturn
 void crl__loc__coral_parser__stmt__Parser_checkCondAssign(crl__loc__coral_parser__base__Parser* self, crl__loc__coral_ast__id__NodeId cond);
 crl__loc__coral_ast__id__NodeId crl__loc__coral_parser__stmt__Parser_parseIfStmt(crl__loc__coral_parser__base__Parser* self);
 crl__loc__coral_ast__id__NodeId crl__loc__coral_parser__stmt__Parser_parseWhileStmt(crl__loc__coral_parser__base__Parser* self);
-void crl__loc__coral_parser__stmt__Parser_parseForIterExpr(crl__loc__coral_parser__base__Parser* self, crl__loc__coral_ast__id__NodeId* iterExpr);
+void crl__loc__coral_parser__stmt__Parser_parseForIterExpr(crl__loc__coral_parser__base__Parser* self, crl__loc__coral_ast__id__NodeId* iterExpr, crl__loc__coral_ast__id__NodeId* rangeStart, crl__loc__coral_ast__id__NodeId* rangeEnd);
 crl__loc__coral_ast__id__NodeId crl__loc__coral_parser__stmt__Parser_parseForStmt(crl__loc__coral_parser__base__Parser* self);
 crl__loc__coral_ast__id__NodeId crl__loc__coral_parser__stmt__Parser_parseLoopStmt(crl__loc__coral_parser__base__Parser* self);
 crl__loc__coral_ast__id__NodeId crl__loc__coral_parser__stmt__Parser_parseSwitchStmt(crl__loc__coral_parser__base__Parser* self);
@@ -3267,6 +3274,7 @@ _Bool crl__loc__coral_mono__collect__MonoContext_enqueue(crl__loc__coral_mono__m
 _Bool crl__loc__coral_mono__collect__MonoContext_enqueueVal(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_mono__mono__MonoDeclKind kind, crl__loc__coral_ast__id__NodeId declaration, uint32_t* arguments, uint32_t argumentsLen, uint64_t valueKey, uint32_t packArity, uint32_t* literalNames, crl__loc__coral_ast__id__NodeId* literalNodes, uint32_t literalsLen, uint32_t* tailTypes, crl__loc__coral_ast__id__NodeId* tailNodes, uint32_t tailLen);
 _Bool crl__loc__coral_mono__collect__MonoContext_collectType(crl__loc__coral_mono__mono__MonoContext* self, uint32_t typeNode);
 _Bool crl__loc__coral_mono__collect__MonoContext_collectCall(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_ast__id__NodeId callId);
+_Bool crl__loc__coral_mono__collect__MonoContext_collectNode(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_ast__id__NodeId id);
 _Bool crl__loc__coral_mono__collect__MonoContext_collectExpr(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_ast__id__NodeId id);
 _Bool crl__loc__coral_mono__collect__MonoContext_collectStmt(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_ast__id__NodeId id);
 _Bool crl__loc__coral_mono__collect__MonoContext_collectDecl(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_ast__id__NodeId id);
@@ -3589,6 +3597,7 @@ crl__loc__coral_common__slice__Slice crl__loc__coral_backend__codegen__stTail(cr
 void crl__loc__coral_backend__codegen__stTrunc(crl__loc__coral_backend__codegen__Stream* s, size_t n);
 void crl__loc__coral_backend__codegen__stNL(crl__loc__coral_backend__codegen__Stream* s, uint32_t ind);
 void crl__loc__coral_backend__codegen__cgError(crl__loc__coral_backend__codegen__Codegen* cg, _coral_str msg);
+void crl__loc__coral_backend__codegen__cgErrorAt(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_ast__id__NodeId at, _coral_str msg);
 void crl__loc__coral_backend__codegen__cgErrorUnsupported(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_ast__id__NodeId at, _coral_str msg);
 uint32_t crl__loc__coral_backend__codegen__cgLabel(crl__loc__coral_backend__codegen__Codegen* cg);
 uint32_t crl__loc__coral_backend__codegen__cgNewTemp(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_common__slice__Slice ty, uint32_t arrLen);
@@ -3680,6 +3689,7 @@ void cgStmt(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_ast__
 crl__loc__coral_common__slice__Slice cgAddrOfValue(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_ast__id__NodeId oid, crl__loc__coral_common__slice__Slice vtext);
 crl__loc__coral_common__slice__Slice cgExpr(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_ast__id__NodeId id);
 crl__loc__coral_common__slice__Slice cgAddrOfValue(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_ast__id__NodeId oid, crl__loc__coral_common__slice__Slice vtext);
+crl__loc__coral_common__slice__Slice crl__loc__coral_backend__codegen__cgForInRecv(crl__loc__coral_backend__codegen__Codegen* cg, _Bool simpleIter, _Bool iterIsPtr, uint32_t simpleName, uint32_t rt);
 crl__loc__coral_common__slice__Slice cgLvalue(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_ast__id__NodeId id);
 crl__loc__coral_common__slice__Slice cgValBody(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_ast__id__NodeId id);
 uint32_t crl__loc__coral_backend__codegen__cgTyUnwrap(crl__loc__coral_backend__codegen__Codegen* cg, uint32_t t);
@@ -3777,7 +3787,7 @@ void crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_dispose(Vec_
 void crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_drop(Vec__coral_str* self);
 size_t crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_count(Vec__coral_str* self);
 _coral_str crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_at(Vec__coral_str* self, size_t i);
-Vec__coral_str crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_range(Vec__coral_str* self, size_t start, size_t end);
+crl__lib__std__x86_64__linux__collections__range__IterRange crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_range(Vec__coral_str* self, size_t start, size_t end);
 void crl__lib__std__x86_64__linux__memory__mman__copy_uint8_t(uint8_t* dst, uint8_t* src, size_t count);
 crl__loc__coral_build__arena__ArenaBlock* crl__lib__std__x86_64__linux__memory__mman__alloc_crl__loc__coral_build__arena__ArenaBlock(size_t count);
 void crl__lib__std__x86_64__linux__memory__mman__dealloc_crl__loc__coral_build__arena__ArenaBlock(crl__loc__coral_build__arena__ArenaBlock* ptr);
@@ -3901,7 +3911,7 @@ void crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_dispose(Vec_ui
 void crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_drop(Vec_uint8_tp* self);
 size_t crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_count(Vec_uint8_tp* self);
 uint8_t* crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_at(Vec_uint8_tp* self, size_t i);
-Vec_uint8_tp crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_range(Vec_uint8_tp* self, size_t start, size_t end);
+crl__lib__std__x86_64__linux__collections__range__IterRange crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_range(Vec_uint8_tp* self, size_t start, size_t end);
 void crl__lib__std__x86_64__linux__memory__mman__zero_uint8_t(uint8_t* ptr, size_t count);
 void crl__lib__std__x86_64__linux__memory__mman__dealloc_voidp(void** ptr);
 void crl__lib__std__x86_64__linux__memory__mman__dealloc_crl__loc__coral_context__context__InternEntry(crl__loc__coral_context__context__InternEntry* ptr);
@@ -4003,7 +4013,7 @@ void crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__
 void crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_drop(Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue* self);
 size_t crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_count(Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue* self);
 crl__lib__std__x86_64__linux__parser__json__JsonValue crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_at(Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue* self, size_t i);
-Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_range(Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue* self, size_t start, size_t end);
+crl__lib__std__x86_64__linux__collections__range__IterRange crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_range(Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue* self, size_t start, size_t end);
 Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_new(void);
 Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_withCap(size_t capacity);
 void crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_reserve(Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair* self, size_t newCap);
@@ -4035,7 +4045,7 @@ void crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__
 void crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_drop(Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair* self);
 size_t crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_count(Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair* self);
 crl__lib__std__x86_64__linux__parser__json__JsonPair crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_at(Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair* self, size_t i);
-Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_range(Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair* self, size_t start, size_t end);
+crl__lib__std__x86_64__linux__collections__range__IterRange crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_range(Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair* self, size_t start, size_t end);
 _Bool crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__parser__json__JsonValue_crl__lib__std__x86_64__linux__parser__json__ParseError_isOk(Result_crl__lib__std__x86_64__linux__parser__json__JsonValue_crl__lib__std__x86_64__linux__parser__json__ParseError* self);
 _Bool crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__parser__json__JsonValue_crl__lib__std__x86_64__linux__parser__json__ParseError_isErr(Result_crl__lib__std__x86_64__linux__parser__json__JsonValue_crl__lib__std__x86_64__linux__parser__json__ParseError* self);
 crl__lib__std__x86_64__linux__parser__json__JsonValue crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__parser__json__JsonValue_crl__lib__std__x86_64__linux__parser__json__ParseError_unwrap(Result_crl__lib__std__x86_64__linux__parser__json__JsonValue_crl__lib__std__x86_64__linux__parser__json__ParseError* self);
@@ -4081,7 +4091,7 @@ void crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__
 void crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_drop(Vec_crl__lib__std__x86_64__linux__text__string__String* self);
 size_t crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_count(Vec_crl__lib__std__x86_64__linux__text__string__String* self);
 crl__lib__std__x86_64__linux__text__string__String crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_at(Vec_crl__lib__std__x86_64__linux__text__string__String* self, size_t i);
-Vec_crl__lib__std__x86_64__linux__text__string__String crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_range(Vec_crl__lib__std__x86_64__linux__text__string__String* self, size_t start, size_t end);
+crl__lib__std__x86_64__linux__collections__range__IterRange crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_range(Vec_crl__lib__std__x86_64__linux__text__string__String* self, size_t start, size_t end);
 _Bool crl__lib__std__x86_64__linux__data__option__Option__coral_str_isSome(Option__coral_str* self);
 _Bool crl__lib__std__x86_64__linux__data__option__Option__coral_str_isNone(Option__coral_str* self);
 _coral_str crl__lib__std__x86_64__linux__data__option__Option__coral_str_unwrap(Option__coral_str* self);
@@ -4124,7 +4134,7 @@ void crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_dispose(Vec_ui
 void crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_drop(Vec_uint32_t* self);
 size_t crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_count(Vec_uint32_t* self);
 uint32_t crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_at(Vec_uint32_t* self, size_t i);
-Vec_uint32_t crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_range(Vec_uint32_t* self, size_t start, size_t end);
+crl__lib__std__x86_64__linux__collections__range__IterRange crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_range(Vec_uint32_t* self, size_t start, size_t end);
 crl__loc__coral_hir__hir__HirModule* crl__lib__std__x86_64__linux__memory__mman__alloc_crl__loc__coral_hir__hir__HirModule(size_t count);
 _Bool crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__io__process__Process_crl__lib__std__x86_64__linux__io__fs__IoError_isOk(Result_crl__lib__std__x86_64__linux__io__process__Process_crl__lib__std__x86_64__linux__io__fs__IoError* self);
 _Bool crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__io__process__Process_crl__lib__std__x86_64__linux__io__fs__IoError_isErr(Result_crl__lib__std__x86_64__linux__io__process__Process_crl__lib__std__x86_64__linux__io__fs__IoError* self);
@@ -4172,9 +4182,11 @@ void crl__lib__std__x86_64__linux__memory__mman__dealloc_crl__lib__std__x86_64__
 crl__lib__std__x86_64__linux__parser__json__JsonPair* crl__lib__std__x86_64__linux__memory__mman__alloc_crl__lib__std__x86_64__linux__parser__json__JsonPair(size_t count);
 crl__lib__std__x86_64__linux__parser__json__JsonPair* crl__lib__std__x86_64__linux__memory__mman__realloc_crl__lib__std__x86_64__linux__parser__json__JsonPair(crl__lib__std__x86_64__linux__parser__json__JsonPair* ptr, size_t newCount);
 void crl__lib__std__x86_64__linux__memory__mman__dealloc_crl__lib__std__x86_64__linux__parser__json__JsonPair(crl__lib__std__x86_64__linux__parser__json__JsonPair* ptr);
+void crl__lib__std__x86_64__linux__io__ios___printEmit__coral_str_v20d0e77f3979a2b7(crl__lib__std__x86_64__linux__io__ios___Buf* out, _coral_str fmt, ...);
 crl__lib__std__x86_64__linux__text__string__String* crl__lib__std__x86_64__linux__memory__mman__alloc_crl__lib__std__x86_64__linux__text__string__String(size_t count);
 crl__lib__std__x86_64__linux__text__string__String* crl__lib__std__x86_64__linux__memory__mman__realloc_crl__lib__std__x86_64__linux__text__string__String(crl__lib__std__x86_64__linux__text__string__String* ptr, size_t newCount);
-void crl__lib__std__x86_64__linux__memory__mman__dealloc_crl__lib__std__x86_64__linux__text__string__String(crl__lib__std__x86_64__linux__text__string__String* ptr);extern char** environ;
+void crl__lib__std__x86_64__linux__memory__mman__dealloc_crl__lib__std__x86_64__linux__text__string__String(crl__lib__std__x86_64__linux__text__string__String* ptr);
+void crl__lib__std__x86_64__linux__io__ios___fprintOne__coral_str_ve66f82f6492e8bb2(crl__lib__std__x86_64__linux__io__ios___Buf* out, _coral_str val);extern char** environ;
 size_t crl__lib__std__x86_64__linux__memory__allocators__mimalloc__MI_ARENA_SIZE = ((64*1024)*1024);
 size_t crl__lib__std__x86_64__linux__memory__allocators__mimalloc__MI_SEGMENT_SIZE = ((4*1024)*1024);
 size_t crl__lib__std__x86_64__linux__memory__allocators__mimalloc__MI_PAGE_SIZE = (64*1024);
@@ -11914,7 +11926,7 @@ _Bool crl__loc__coral_diagnostics__explain__exOne(crl__lib__std__x86_64__linux__
     {
         crl__loc__coral_diagnostics__explain__exTitle(b, code, (_coral_str){ (const uint8_t*)"unused variable", 15 });
         crl__loc__coral_diagnostics__explain__exWhy(b, (_coral_str){ (const uint8_t*)"a local variable is declared and never read; this is a warning enabled by --warn-unused.", 88 });
-        crl__loc__coral_diagnostics__explain__exFix(b, (_coral_str){ (const uint8_t*)"remove it, or prefix the name with `#[[maybe_unused]]` if it is deliberately unused.", 84 });
+        crl__loc__coral_diagnostics__explain__exFix(b, (_coral_str){ (const uint8_t*)"remove it, read it, prefix the name with `_`, or annotate the declaration with `#[[maybe_unused]]` when it is deliberately unused.", 130 });
         return 1;
     }
     if (crl__loc__coral_diagnostics__explain__exEq(code, (_coral_str){ (const uint8_t*)"T0013", 5 }))
@@ -12516,7 +12528,7 @@ _coral_str crl__loc__coral_diagnostics__error__helpFor(_coral_str code) {
     }
     if (crl__lib__core__str___coral_str_equals((&(code)), (_coral_str){ (const uint8_t*)"T0012", 5 }))
     {
-        return (_coral_str){ (const uint8_t*)"remove the local, use it, or name it `#[[maybe_unused]]` to mark it intentionally unused", 88 };
+        return (_coral_str){ (const uint8_t*)"remove it, read it, prefix the name with '_', or annotate the declaration with `#[[maybe_unused]]`", 98 };
     }
     if (crl__lib__core__str___coral_str_equals((&(code)), (_coral_str){ (const uint8_t*)"T0013", 5 }))
     {
@@ -17817,7 +17829,7 @@ crl__loc__coral_ast__id__NodeId crl__loc__coral_parser__stmt__Parser_parseStmt(c
         }
         else
         {
-            if (((((attrName != crl__loc__coral_context__context__AstContext_intern(self->ctx, (_coral_str){ (const uint8_t*)"fallthrough", 11 })))) && (((attrName != crl__loc__coral_context__context__AstContext_intern(self->ctx, (_coral_str){ (const uint8_t*)"no_drop", 7 }))))))
+            if (((((((attrName != crl__loc__coral_context__context__AstContext_intern(self->ctx, (_coral_str){ (const uint8_t*)"fallthrough", 11 })))) && (((attrName != crl__loc__coral_context__context__AstContext_intern(self->ctx, (_coral_str){ (const uint8_t*)"no_drop", 7 })))))) && (((attrName != crl__loc__coral_context__context__AstContext_intern(self->ctx, (_coral_str){ (const uint8_t*)"maybe_unused", 12 }))))))
             {
                 crl__loc__coral_parser__recovery__Parser_reportWarningAt(self, crl__loc__coral_diagnostics__code__ErrorCode_ParseMisplacedAttr, attrs[ai].loc, (_coral_str){ (const uint8_t*)"attribute has no meaning on a statement; attach it to a declaration instead", 75 });
             }
@@ -17942,13 +17954,20 @@ crl__loc__coral_ast__id__NodeId crl__loc__coral_parser__stmt__Parser_parseWhileS
     crl__loc__coral_ast__id__NodeId body = crl__loc__coral_parser__stmt__Parser_parseStmt(self);
     return crl__loc__coral_parser__stmt__Parser_storeStmt(self, ((crl__loc__coral_ast__stmt__StmtKind){ .tag = 8, .u.v8 = {.cond = cond, .body = body}}));
 }
-void crl__loc__coral_parser__stmt__Parser_parseForIterExpr(crl__loc__coral_parser__base__Parser* self, crl__loc__coral_ast__id__NodeId* iterExpr) {
+void crl__loc__coral_parser__stmt__Parser_parseForIterExpr(crl__loc__coral_parser__base__Parser* self, crl__loc__coral_ast__id__NodeId* iterExpr, crl__loc__coral_ast__id__NodeId* rangeStart, crl__loc__coral_ast__id__NodeId* rangeEnd) {
     crl__loc__coral_ast__node__Node* n = ((self->ctx->nodes + iterExpr->index));
     if (((n->kind.tag != 1)))
     {
         return;
     }
     crl__loc__coral_ast__expr__Expr* e = (&(n->kind.u.v1.value));
+    if (((((((e->kind.tag == 10))) && (((e->kind.u.v10.method == crl__loc__coral_context__context__AstContext_intern(self->ctx, (_coral_str){ (const uint8_t*)"range", 5 })))))) && (((e->kind.u.v10.argsLen == 2)))))
+    {
+        (((*(iterExpr)) = e->kind.u.v10.receiver));
+        (((*(rangeStart)) = e->kind.u.v10.args[0]));
+        (((*(rangeEnd)) = e->kind.u.v10.args[1]));
+        return;
+    }
     if (((((e->kind.tag != 9))) || (((e->kind.u.v9.argsLen != 2)))))
     {
         return;
@@ -17959,7 +17978,9 @@ void crl__loc__coral_parser__stmt__Parser_parseForIterExpr(crl__loc__coral_parse
     {
         return;
     }
-    (((*(iterExpr)) = crl__loc__coral_parser__expr__Parser_storeExpr(self, ((crl__loc__coral_ast__expr__ExprKind){ .tag = 10, .u.v10 = {.receiver = calleeId, .method = crl__loc__coral_context__context__AstContext_intern(self->ctx, (_coral_str){ (const uint8_t*)"range", 5 }), .args = e->kind.u.v9.args, .argsLen = e->kind.u.v9.argsLen}}))));
+    (((*(iterExpr)) = calleeId));
+    (((*(rangeStart)) = e->kind.u.v9.args[0]));
+    (((*(rangeEnd)) = e->kind.u.v9.args[1]));
 }
 crl__loc__coral_ast__id__NodeId crl__loc__coral_parser__stmt__Parser_parseForStmt(crl__loc__coral_parser__base__Parser* self) {
     crl__loc__coral_ast__id__SourceLoc forLoc = crl__loc__coral_parser__parser__Parser_tokenLoc(self, self->current);
@@ -17981,7 +18002,9 @@ crl__loc__coral_ast__id__NodeId crl__loc__coral_parser__stmt__Parser_parseForStm
         if (crl__loc__coral_parser__parser__Parser_match(self, crl__loc__coral_common__token__TokenKind_Colon))
         {
             crl__loc__coral_ast__id__NodeId iterExpr = crl__loc__coral_parser__expr__Parser_parseExpr(self);
-            crl__loc__coral_parser__stmt__Parser_parseForIterExpr(self, (&(iterExpr)));
+            crl__loc__coral_ast__id__NodeId rangeStart = crl__loc__coral_parser__parser__Parser_noneNode(self);
+            crl__loc__coral_ast__id__NodeId rangeEnd = crl__loc__coral_parser__parser__Parser_noneNode(self);
+            crl__loc__coral_parser__stmt__Parser_parseForIterExpr(self, (&(iterExpr)), (&(rangeStart)), (&(rangeEnd)));
             crl__loc__coral_parser__parser__Parser_expect(self, crl__loc__coral_common__token__TokenKind_RParen);
             crl__loc__coral_ast__id__NodeId body = crl__loc__coral_parser__stmt__Parser_parseStmt(self);
             uint8_t forInFlags = 0;
@@ -17989,7 +18012,7 @@ crl__loc__coral_ast__id__NodeId crl__loc__coral_parser__stmt__Parser_parseForStm
             {
                 ((forInFlags = 1));
             }
-            return crl__loc__coral_parser__stmt__Parser_storeStmtAt(self, ((crl__loc__coral_ast__stmt__StmtKind){ .tag = 11, .u.v11 = {.bindName = bindName, .bindType = 0, .iterExpr = iterExpr, .body = body, .flags = forInFlags}}), forLoc);
+            return crl__loc__coral_parser__stmt__Parser_storeStmtAt(self, ((crl__loc__coral_ast__stmt__StmtKind){ .tag = 11, .u.v11 = {.bindName = bindName, .bindType = 0, .iterExpr = iterExpr, .rangeStart = rangeStart, .rangeEnd = rangeEnd, .body = body, .flags = forInFlags}}), forLoc);
         }
         crl__loc__coral_parser__parser__Parser_expect(self, crl__loc__coral_common__token__TokenKind_Equal);
         ((init = crl__loc__coral_parser__expr__Parser_parseExpr(self)));
@@ -18007,11 +18030,13 @@ crl__loc__coral_ast__id__NodeId crl__loc__coral_parser__stmt__Parser_parseForStm
             if (crl__loc__coral_parser__parser__Parser_match(self, crl__loc__coral_common__token__TokenKind_Colon))
             {
                 crl__loc__coral_ast__id__NodeId iterExpr = crl__loc__coral_parser__expr__Parser_parseExpr(self);
-                crl__loc__coral_parser__stmt__Parser_parseForIterExpr(self, (&(iterExpr)));
+                crl__loc__coral_ast__id__NodeId rangeStart = crl__loc__coral_parser__parser__Parser_noneNode(self);
+                crl__loc__coral_ast__id__NodeId rangeEnd = crl__loc__coral_parser__parser__Parser_noneNode(self);
+                crl__loc__coral_parser__stmt__Parser_parseForIterExpr(self, (&(iterExpr)), (&(rangeStart)), (&(rangeEnd)));
                 crl__loc__coral_parser__parser__Parser_expect(self, crl__loc__coral_common__token__TokenKind_RParen);
                 crl__loc__coral_ast__id__NodeId body = crl__loc__coral_parser__stmt__Parser_parseStmt(self);
                 crl__loc__coral_parser__recovery__Parser_endSpeculation(self);
-                return crl__loc__coral_parser__stmt__Parser_storeStmtAt(self, ((crl__loc__coral_ast__stmt__StmtKind){ .tag = 11, .u.v11 = {.bindName = bindName, .bindType = bindType, .iterExpr = iterExpr, .body = body, .flags = 0}}), forLoc);
+                return crl__loc__coral_parser__stmt__Parser_storeStmtAt(self, ((crl__loc__coral_ast__stmt__StmtKind){ .tag = 11, .u.v11 = {.bindName = bindName, .bindType = bindType, .iterExpr = iterExpr, .rangeStart = rangeStart, .rangeEnd = rangeEnd, .body = body, .flags = 0}}), forLoc);
             }
             crl__loc__coral_parser__parser__Parser_restore(self, mark);
         }
@@ -18696,6 +18721,10 @@ _Bool crl__loc__coral_parser__decl__Parser_isKnownAttr(crl__loc__coral_parser__b
     {
         return 1;
     }
+    if (((name == crl__loc__coral_context__context__AstContext_intern(self->ctx, (_coral_str){ (const uint8_t*)"maybe_unused", 12 }))))
+    {
+        return 1;
+    }
     if (((name == crl__loc__coral_context__context__AstContext_intern(self->ctx, (_coral_str){ (const uint8_t*)"generate", 8 }))))
     {
         return 1;
@@ -18818,6 +18847,8 @@ uint32_t crl__loc__coral_parser__decl__Parser_closestAttrName(crl__loc__coral_pa
     ((cands[n] = crl__loc__coral_context__context__AstContext_intern(self->ctx, (_coral_str){ (const uint8_t*)"noreturn", 8 })));
     ((n)++);
     ((cands[n] = crl__loc__coral_context__context__AstContext_intern(self->ctx, (_coral_str){ (const uint8_t*)"reorder", 7 })));
+    ((n)++);
+    ((cands[n] = crl__loc__coral_context__context__AstContext_intern(self->ctx, (_coral_str){ (const uint8_t*)"maybe_unused", 12 })));
     ((n)++);
     ((cands[n] = crl__loc__coral_context__context__AstContext_intern(self->ctx, (_coral_str){ (const uint8_t*)"generate", 8 })));
     ((n)++);
@@ -25507,6 +25538,22 @@ _Bool crl__loc__coral_mono__collect__MonoContext_collectCall(crl__loc__coral_mon
     crl__lib__std__x86_64__linux__memory__mman__dealloc_uint32_t(arguments);
     return ok;
 }
+_Bool crl__loc__coral_mono__collect__MonoContext_collectNode(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_ast__id__NodeId id) {
+    crl__loc__coral_ast__node__Node* node = crl__loc__coral_mono__mono__MonoContext_nodeAt(self, id);
+    if (((node == 0)))
+    {
+        return 1;
+    }
+    if (((node->kind.tag == 2)))
+    {
+        return crl__loc__coral_mono__collect__MonoContext_collectStmt(self, id);
+    }
+    if (((node->kind.tag == 1)))
+    {
+        return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, id);
+    }
+    return 1;
+}
 _Bool crl__loc__coral_mono__collect__MonoContext_collectExpr(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_ast__id__NodeId id) {
     crl__loc__coral_ast__node__Node* node = crl__loc__coral_mono__mono__MonoContext_nodeAt(self, id);
     if (((node == 0)))
@@ -25530,10 +25577,98 @@ _Bool crl__loc__coral_mono__collect__MonoContext_collectExpr(crl__loc__coral_mon
             return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v11.obj);
         }
     }
+    else if ((expr->kind.tag == 12))
+    {
+        {
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v12.obj);
+        }
+    }
+    else if ((expr->kind.tag == 53))
+    {
+        {
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v53.obj);
+        }
+    }
     else if ((expr->kind.tag == 15))
     {
         {
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectType(self, expr->kind.u.v15.targetType))))
+            {
+                return 0;
+            }
             return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v15.expr);
+        }
+    }
+    else if ((expr->kind.tag == 16))
+    {
+        {
+            return crl__loc__coral_mono__collect__MonoContext_collectType(self, expr->kind.u.v16.targetType);
+        }
+    }
+    else if ((expr->kind.tag == 17))
+    {
+        {
+            return crl__loc__coral_mono__collect__MonoContext_collectType(self, expr->kind.u.v17.targetType);
+        }
+    }
+    else if ((expr->kind.tag == 18))
+    {
+        {
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v18.expr);
+        }
+    }
+    else if ((expr->kind.tag == 19))
+    {
+        {
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v19.expr);
+        }
+    }
+    else if ((expr->kind.tag == 20))
+    {
+        {
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v20.expr);
+        }
+    }
+    else if ((expr->kind.tag == 21))
+    {
+        {
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v21.expr);
+        }
+    }
+    else if ((expr->kind.tag == 22))
+    {
+        {
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v22.expr);
+        }
+    }
+    else if ((expr->kind.tag == 23))
+    {
+        {
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v23.expr);
+        }
+    }
+    else if ((expr->kind.tag == 61))
+    {
+        {
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v61.expr);
+        }
+    }
+    else if ((expr->kind.tag == 62))
+    {
+        {
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v62.expr);
+        }
+    }
+    else if ((expr->kind.tag == 63))
+    {
+        {
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v63.expr);
+        }
+    }
+    else if ((expr->kind.tag == 64))
+    {
+        {
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v64.expr);
         }
     }
     else if ((expr->kind.tag == 57))
@@ -25561,6 +25696,36 @@ _Bool crl__loc__coral_mono__collect__MonoContext_collectExpr(crl__loc__coral_mon
             return 1;
         }
     }
+    else if ((expr->kind.tag == 55))
+    {
+        {
+            uint32_t i = 0;
+            while (((i < expr->kind.u.v55.elemsLen)))
+            {
+                if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v55.elems[i]))))
+                {
+                    return 0;
+                }
+                ((i)++);
+            }
+            return 1;
+        }
+    }
+    else if ((expr->kind.tag == 58))
+    {
+        {
+            uint32_t i = 0;
+            while (((i < expr->kind.u.v58.elemsLen)))
+            {
+                if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v58.elems[i]))))
+                {
+                    return 0;
+                }
+                ((i)++);
+            }
+            return 1;
+        }
+    }
     else if ((expr->kind.tag == 9))
     {
         {
@@ -25580,21 +25745,6 @@ _Bool crl__loc__coral_mono__collect__MonoContext_collectExpr(crl__loc__coral_mon
             return crl__loc__coral_mono__collect__MonoContext_collectCall(self, id);
         }
     }
-    else if ((expr->kind.tag == 8))
-    {
-        {
-            uint32_t i = 0;
-            while (((i < expr->kind.u.v8.segmentsLen)))
-            {
-                if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v8.segments[i]))))
-                {
-                    return 0;
-                }
-                ((i)++);
-            }
-            return 1;
-        }
-    }
     else if ((expr->kind.tag == 10))
     {
         {
@@ -25606,6 +25756,51 @@ _Bool crl__loc__coral_mono__collect__MonoContext_collectExpr(crl__loc__coral_mon
             while (((i < expr->kind.u.v10.argsLen)))
             {
                 if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v10.args[i]))))
+                {
+                    return 0;
+                }
+                ((i)++);
+            }
+            return 1;
+        }
+    }
+    else if ((expr->kind.tag == 14))
+    {
+        {
+            uint32_t i = 0;
+            while (((i < expr->kind.u.v14.argsLen)))
+            {
+                if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v14.args[i]))))
+                {
+                    return 0;
+                }
+                ((i)++);
+            }
+            return 1;
+        }
+    }
+    else if ((expr->kind.tag == 56))
+    {
+        {
+            uint32_t i = 0;
+            while (((i < expr->kind.u.v56.argsLen)))
+            {
+                if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v56.args[i]))))
+                {
+                    return 0;
+                }
+                ((i)++);
+            }
+            return 1;
+        }
+    }
+    else if ((expr->kind.tag == 8))
+    {
+        {
+            uint32_t i = 0;
+            while (((i < expr->kind.u.v8.segmentsLen)))
+            {
+                if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v8.segments[i]))))
                 {
                     return 0;
                 }
@@ -25634,6 +25829,176 @@ _Bool crl__loc__coral_mono__collect__MonoContext_collectExpr(crl__loc__coral_mon
             return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v24.right);
         }
     }
+    else if ((expr->kind.tag == 25))
+    {
+        {
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v25.left))))
+            {
+                return 0;
+            }
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v25.right);
+        }
+    }
+    else if ((expr->kind.tag == 26))
+    {
+        {
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v26.left))))
+            {
+                return 0;
+            }
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v26.right);
+        }
+    }
+    else if ((expr->kind.tag == 27))
+    {
+        {
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v27.left))))
+            {
+                return 0;
+            }
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v27.right);
+        }
+    }
+    else if ((expr->kind.tag == 28))
+    {
+        {
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v28.left))))
+            {
+                return 0;
+            }
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v28.right);
+        }
+    }
+    else if ((expr->kind.tag == 29))
+    {
+        {
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v29.left))))
+            {
+                return 0;
+            }
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v29.right);
+        }
+    }
+    else if ((expr->kind.tag == 30))
+    {
+        {
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v30.left))))
+            {
+                return 0;
+            }
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v30.right);
+        }
+    }
+    else if ((expr->kind.tag == 31))
+    {
+        {
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v31.left))))
+            {
+                return 0;
+            }
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v31.right);
+        }
+    }
+    else if ((expr->kind.tag == 32))
+    {
+        {
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v32.left))))
+            {
+                return 0;
+            }
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v32.right);
+        }
+    }
+    else if ((expr->kind.tag == 33))
+    {
+        {
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v33.left))))
+            {
+                return 0;
+            }
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v33.right);
+        }
+    }
+    else if ((expr->kind.tag == 34))
+    {
+        {
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v34.left))))
+            {
+                return 0;
+            }
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v34.right);
+        }
+    }
+    else if ((expr->kind.tag == 35))
+    {
+        {
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v35.left))))
+            {
+                return 0;
+            }
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v35.right);
+        }
+    }
+    else if ((expr->kind.tag == 36))
+    {
+        {
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v36.left))))
+            {
+                return 0;
+            }
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v36.right);
+        }
+    }
+    else if ((expr->kind.tag == 37))
+    {
+        {
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v37.left))))
+            {
+                return 0;
+            }
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v37.right);
+        }
+    }
+    else if ((expr->kind.tag == 38))
+    {
+        {
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v38.left))))
+            {
+                return 0;
+            }
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v38.right);
+        }
+    }
+    else if ((expr->kind.tag == 39))
+    {
+        {
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v39.left))))
+            {
+                return 0;
+            }
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v39.right);
+        }
+    }
+    else if ((expr->kind.tag == 40))
+    {
+        {
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v40.left))))
+            {
+                return 0;
+            }
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v40.right);
+        }
+    }
+    else if ((expr->kind.tag == 41))
+    {
+        {
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v41.left))))
+            {
+                return 0;
+            }
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v41.right);
+        }
+    }
     else if ((expr->kind.tag == 42))
     {
         {
@@ -25642,6 +26007,173 @@ _Bool crl__loc__coral_mono__collect__MonoContext_collectExpr(crl__loc__coral_mon
                 return 0;
             }
             return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v42.value);
+        }
+    }
+    else if ((expr->kind.tag == 43))
+    {
+        {
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v43.target))))
+            {
+                return 0;
+            }
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v43.value);
+        }
+    }
+    else if ((expr->kind.tag == 44))
+    {
+        {
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v44.target))))
+            {
+                return 0;
+            }
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v44.value);
+        }
+    }
+    else if ((expr->kind.tag == 45))
+    {
+        {
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v45.target))))
+            {
+                return 0;
+            }
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v45.value);
+        }
+    }
+    else if ((expr->kind.tag == 46))
+    {
+        {
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v46.target))))
+            {
+                return 0;
+            }
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v46.value);
+        }
+    }
+    else if ((expr->kind.tag == 47))
+    {
+        {
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v47.target))))
+            {
+                return 0;
+            }
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v47.value);
+        }
+    }
+    else if ((expr->kind.tag == 48))
+    {
+        {
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v48.target))))
+            {
+                return 0;
+            }
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v48.value);
+        }
+    }
+    else if ((expr->kind.tag == 49))
+    {
+        {
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v49.target))))
+            {
+                return 0;
+            }
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v49.value);
+        }
+    }
+    else if ((expr->kind.tag == 50))
+    {
+        {
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v50.target))))
+            {
+                return 0;
+            }
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v50.value);
+        }
+    }
+    else if ((expr->kind.tag == 51))
+    {
+        {
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v51.target))))
+            {
+                return 0;
+            }
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v51.value);
+        }
+    }
+    else if ((expr->kind.tag == 52))
+    {
+        {
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v52.target))))
+            {
+                return 0;
+            }
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v52.value);
+        }
+    }
+    else if ((expr->kind.tag == 60))
+    {
+        {
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v60.cond))))
+            {
+                return 0;
+            }
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v60.thenExpr))))
+            {
+                return 0;
+            }
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v60.elseExpr);
+        }
+    }
+    else if ((expr->kind.tag == 59))
+    {
+        {
+            uint32_t i = 0;
+            while (((i < expr->kind.u.v59.stmtsLen)))
+            {
+                if ((!(crl__loc__coral_mono__collect__MonoContext_collectNode(self, expr->kind.u.v59.stmts[i]))))
+                {
+                    return 0;
+                }
+                ((i)++);
+            }
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v59.result);
+        }
+    }
+    else if ((expr->kind.tag == 65))
+    {
+        {
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v65.cond))))
+            {
+                return 0;
+            }
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectNode(self, expr->kind.u.v65.thenBody))))
+            {
+                return 0;
+            }
+            return crl__loc__coral_mono__collect__MonoContext_collectNode(self, expr->kind.u.v65.elseBody);
+        }
+    }
+    else if ((expr->kind.tag == 66))
+    {
+        {
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, expr->kind.u.v66.expr))))
+            {
+                return 0;
+            }
+            uint32_t i = 0;
+            while (((i < expr->kind.u.v66.casesLen)))
+            {
+                crl__loc__coral_ast__stmt__SwitchCase* c = (&(expr->kind.u.v66.cases[i]));
+                if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, c->guard))))
+                {
+                    return 0;
+                }
+                if ((!(crl__loc__coral_mono__collect__MonoContext_collectNode(self, c->body))))
+                {
+                    return 0;
+                }
+                ((i)++);
+            }
+            return 1;
         }
     }
     else
@@ -25679,6 +26211,16 @@ _Bool crl__loc__coral_mono__collect__MonoContext_collectStmt(crl__loc__coral_mon
             return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, stmt->kind.u.v1.init);
         }
     }
+    else if ((stmt->kind.tag == 2))
+    {
+        {
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, stmt->kind.u.v2.target))))
+            {
+                return 0;
+            }
+            return crl__loc__coral_mono__collect__MonoContext_collectExpr(self, stmt->kind.u.v2.value);
+        }
+    }
     else if ((stmt->kind.tag == 3))
     {
         {
@@ -25691,7 +26233,7 @@ _Bool crl__loc__coral_mono__collect__MonoContext_collectStmt(crl__loc__coral_mon
             uint32_t i = 0;
             while (((i < stmt->kind.u.v6.stmtsLen)))
             {
-                if ((!(crl__loc__coral_mono__collect__MonoContext_collectStmt(self, stmt->kind.u.v6.stmts[i]))))
+                if ((!(crl__loc__coral_mono__collect__MonoContext_collectNode(self, stmt->kind.u.v6.stmts[i]))))
                 {
                     return 0;
                 }
@@ -25707,11 +26249,11 @@ _Bool crl__loc__coral_mono__collect__MonoContext_collectStmt(crl__loc__coral_mon
             {
                 return 0;
             }
-            if ((!(crl__loc__coral_mono__collect__MonoContext_collectStmt(self, stmt->kind.u.v7.thenBody))))
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectNode(self, stmt->kind.u.v7.thenBody))))
             {
                 return 0;
             }
-            return crl__loc__coral_mono__collect__MonoContext_collectStmt(self, stmt->kind.u.v7.elseBody);
+            return crl__loc__coral_mono__collect__MonoContext_collectNode(self, stmt->kind.u.v7.elseBody);
         }
     }
     else if ((stmt->kind.tag == 8))
@@ -25721,7 +26263,127 @@ _Bool crl__loc__coral_mono__collect__MonoContext_collectStmt(crl__loc__coral_mon
             {
                 return 0;
             }
-            return crl__loc__coral_mono__collect__MonoContext_collectStmt(self, stmt->kind.u.v8.body);
+            return crl__loc__coral_mono__collect__MonoContext_collectNode(self, stmt->kind.u.v8.body);
+        }
+    }
+    else if ((stmt->kind.tag == 9))
+    {
+        {
+            return crl__loc__coral_mono__collect__MonoContext_collectNode(self, stmt->kind.u.v9.body);
+        }
+    }
+    else if ((stmt->kind.tag == 10))
+    {
+        {
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectNode(self, stmt->kind.u.v10.init))))
+            {
+                return 0;
+            }
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, stmt->kind.u.v10.cond))))
+            {
+                return 0;
+            }
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, stmt->kind.u.v10.post))))
+            {
+                return 0;
+            }
+            return crl__loc__coral_mono__collect__MonoContext_collectNode(self, stmt->kind.u.v10.body);
+        }
+    }
+    else if ((stmt->kind.tag == 11))
+    {
+        {
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, stmt->kind.u.v11.iterExpr))))
+            {
+                return 0;
+            }
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, stmt->kind.u.v11.rangeStart))))
+            {
+                return 0;
+            }
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, stmt->kind.u.v11.rangeEnd))))
+            {
+                return 0;
+            }
+            return crl__loc__coral_mono__collect__MonoContext_collectNode(self, stmt->kind.u.v11.body);
+        }
+    }
+    else if ((stmt->kind.tag == 12))
+    {
+        {
+            if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, stmt->kind.u.v12.expr))))
+            {
+                return 0;
+            }
+            uint32_t i = 0;
+            while (((i < stmt->kind.u.v12.casesLen)))
+            {
+                crl__loc__coral_ast__stmt__SwitchCase* c = (&(stmt->kind.u.v12.cases[i]));
+                if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, c->guard))))
+                {
+                    return 0;
+                }
+                if ((!(crl__loc__coral_mono__collect__MonoContext_collectNode(self, c->body))))
+                {
+                    return 0;
+                }
+                ((i)++);
+            }
+            return 1;
+        }
+    }
+    else if ((stmt->kind.tag == 13))
+    {
+        {
+            return crl__loc__coral_mono__collect__MonoContext_collectNode(self, stmt->kind.u.v13.stmt);
+        }
+    }
+    else if ((stmt->kind.tag == 14))
+    {
+        {
+            uint32_t i = 0;
+            while (((i < stmt->kind.u.v14.stmtsLen)))
+            {
+                if ((!(crl__loc__coral_mono__collect__MonoContext_collectNode(self, stmt->kind.u.v14.stmts[i]))))
+                {
+                    return 0;
+                }
+                ((i)++);
+            }
+            return 1;
+        }
+    }
+    else if ((stmt->kind.tag == 15))
+    {
+        {
+            uint32_t i = 0;
+            while (((i < stmt->kind.u.v15.outputsLen)))
+            {
+                if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, stmt->kind.u.v15.outputs[i]))))
+                {
+                    return 0;
+                }
+                ((i)++);
+            }
+            ((i = 0));
+            while (((i < stmt->kind.u.v15.inputsLen)))
+            {
+                if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, stmt->kind.u.v15.inputs[i]))))
+                {
+                    return 0;
+                }
+                ((i)++);
+            }
+            ((i = 0));
+            while (((i < stmt->kind.u.v15.clobbersLen)))
+            {
+                if ((!(crl__loc__coral_mono__collect__MonoContext_collectExpr(self, stmt->kind.u.v15.clobbers[i]))))
+                {
+                    return 0;
+                }
+                ((i)++);
+            }
+            return 1;
         }
     }
     else
@@ -29524,8 +30186,10 @@ crl__loc__coral_ast__id__NodeId crl__loc__coral_mono__comptime__CtEval_rwStmt(cr
         {
             crl__loc__coral_mono__comptime__CtEval_promoteLoopAssigns(self, st->kind.u.v11.body);
             crl__loc__coral_ast__id__NodeId ni = crl__loc__coral_mono__comptime__CtEval_rwExprRef(self, st->kind.u.v11.iterExpr);
+            crl__loc__coral_ast__id__NodeId nrs = crl__loc__coral_mono__comptime__CtEval_rwExprRef(self, st->kind.u.v11.rangeStart);
+            crl__loc__coral_ast__id__NodeId nre = crl__loc__coral_mono__comptime__CtEval_rwExprRef(self, st->kind.u.v11.rangeEnd);
             crl__loc__coral_ast__id__NodeId nb = crl__loc__coral_mono__comptime__CtEval_rwStmt(self, st->kind.u.v11.body);
-            crl__loc__coral_ast__id__NodeId nf = crl__loc__coral_mono__comptime__CtEval_mkStmt(self, ((crl__loc__coral_ast__stmt__StmtKind){ .tag = 11, .u.v11 = {.bindName = st->kind.u.v11.bindName, .iterExpr = ni, .bindType = st->kind.u.v11.bindType, .body = nb, .flags = st->kind.u.v11.flags}}));
+            crl__loc__coral_ast__id__NodeId nf = crl__loc__coral_mono__comptime__CtEval_mkStmt(self, ((crl__loc__coral_ast__stmt__StmtKind){ .tag = 11, .u.v11 = {.bindName = st->kind.u.v11.bindName, .iterExpr = ni, .rangeStart = nrs, .rangeEnd = nre, .bindType = st->kind.u.v11.bindType, .body = nb, .flags = st->kind.u.v11.flags}}));
             return ((((nf.index != 0))) ? (nf) : (stmtId));
         }
     }
@@ -31827,11 +32491,24 @@ _Bool crl__loc__coral_semantics__expr__Sema_checkFnPtrCall(crl__loc__coral_seman
     return 1;
 }
 _Bool crl__loc__coral_semantics__expr__Sema_checkCall(crl__loc__coral_semantics__sema__Sema* self, crl__loc__coral_ast__id__NodeId callId, uint32_t name, crl__loc__coral_ast__id__NodeId* args, uint32_t argsLen, uint32_t calleeTy) {
+    _Bool __t0;
     crl__loc__coral_semantics__scope__Symbol* symbol = crl__loc__coral_semantics__sema__Sema_lookupAt(self, name, callId);
     if (((symbol == 0)))
     {
         crl__loc__coral_semantics__sema__Sema_semaErrorNode(self, crl__loc__coral_diagnostics__code__ErrorCode_SemaUndeclaredIdent, callId, (_coral_str){ (const uint8_t*)"call to undeclared function", 27 });
         return 0;
+    }
+    if (((((symbol->kind == 3))) && (((argsLen > 0)))))
+    {
+        crl__lib__std__x86_64__linux__text__string__String msg = crl__lib__std__x86_64__linux__text__string__String_new();
+        crl__lib__std__x86_64__linux__text__string__String_pushView((&(msg)), (_coral_str){ (const uint8_t*)"type '", 6 });
+        crl__lib__std__x86_64__linux__text__string__String_pushView((&(msg)), crl__loc__coral_semantics__expr__Sema_nameTextView(self, name));
+        crl__lib__std__x86_64__linux__text__string__String_pushView((&(msg)), (_coral_str){ (const uint8_t*)"' is not callable", 17 });
+        crl__loc__coral_semantics__sema__Sema_semaErrorNodeHelp(self, crl__loc__coral_diagnostics__code__ErrorCode_SemaTypeMismatch, callId, crl__lib__std__x86_64__linux__text__string__String_asView((&(msg))), (_coral_str){ (const uint8_t*)"construct a struct with `Type { .field = value }`, or call a constructor function such as `spaces(n)`", 101 });
+        __t0 = 0;
+        crl__lib__std__x86_64__linux__text__string__String_drop(&msg);
+        return __t0;
+        crl__lib__std__x86_64__linux__text__string__String_drop(&msg);
     }
     return crl__loc__coral_semantics__expr__Sema_checkCallResolved(self, callId, symbol, args, argsLen, calleeTy);
 }
@@ -35111,7 +35788,7 @@ _Bool crl__loc__coral_semantics__stmt__Sema_checkStmt(crl__loc__coral_semantics_
                     ((stmt->kind.u.v1.dropMethod = dropInfo.declaration));
                 }
             }
-            if (((((stmt->kind.u.v1.flags & 4)) == 0)))
+            if (((((((stmt->kind.u.v1.flags & 4)) == 0))) && ((!(crl__loc__coral_semantics__stmt__Sema_stmtHasAttr(self, stmt, crl__loc__coral_context__context__AstContext_intern(self->ctx, (_coral_str){ (const uint8_t*)"maybe_unused", 12 })))))))
             {
                 crl__loc__coral_semantics__stmt__Sema_noteLocal(self, stmt->kind.u.v1.name, stmt->kind.u.v1.nameLoc);
             }
@@ -35224,6 +35901,28 @@ _Bool crl__loc__coral_semantics__stmt__Sema_checkStmt(crl__loc__coral_semantics_
             {
                 return 0;
             }
+            _Bool ranged = ((stmt->kind.u.v11.rangeStart.index != 0));
+            if (ranged)
+            {
+                if ((!(crl__loc__coral_semantics__expr__Sema_checkExpr(self, stmt->kind.u.v11.rangeStart))))
+                {
+                    return 0;
+                }
+                if ((!(crl__loc__coral_semantics__expr__Sema_checkExpr(self, stmt->kind.u.v11.rangeEnd))))
+                {
+                    return 0;
+                }
+                uint32_t startTy = crl__loc__coral_semantics__typecheck__Sema_exprType(self, stmt->kind.u.v11.rangeStart);
+                uint32_t endTy = crl__loc__coral_semantics__typecheck__Sema_exprType(self, stmt->kind.u.v11.rangeEnd);
+                if (((((startTy != 0))) && ((!(crl__loc__coral_semantics__typecheck__Sema_integerType(self, crl__loc__coral_semantics__member__Sema_stripType(self, startTy)))))))
+                {
+                    crl__loc__coral_semantics__sema__Sema_semaErrorNode(self, crl__loc__coral_diagnostics__code__ErrorCode_SemaTypeMismatch, id, (_coral_str){ (const uint8_t*)"for-in range start must be an integer", 37 });
+                }
+                if (((((endTy != 0))) && ((!(crl__loc__coral_semantics__typecheck__Sema_integerType(self, crl__loc__coral_semantics__member__Sema_stripType(self, endTy)))))))
+                {
+                    crl__loc__coral_semantics__sema__Sema_semaErrorNode(self, crl__loc__coral_diagnostics__code__ErrorCode_SemaTypeMismatch, id, (_coral_str){ (const uint8_t*)"for-in range end must be an integer", 35 });
+                }
+            }
             uint32_t iterTy = crl__loc__coral_semantics__typecheck__Sema_exprType(self, stmt->kind.u.v11.iterExpr);
             if (((iterTy != 0)))
             {
@@ -35240,7 +35939,7 @@ _Bool crl__loc__coral_semantics__stmt__Sema_checkStmt(crl__loc__coral_semantics_
                     {
                         if ((!(crl__loc__coral_semantics__member__Sema_implementsIter(self, iterTy))))
                         {
-                            crl__loc__coral_semantics__sema__Sema_semaErrorNodeHelp(self, crl__loc__coral_diagnostics__code__ErrorCode_SemaTypeMismatch, id, (_coral_str){ (const uint8_t*)"for-in iterator must be an array, slice, or @iter collection", 60 }, (_coral_str){ (const uint8_t*)"implement `extend Type : @iter {}` with `usize count()` and `T at(usize i)`", 75 });
+                            crl__loc__coral_semantics__sema__Sema_semaErrorNodeHelp(self, crl__loc__coral_diagnostics__code__ErrorCode_SemaTypeMismatch, id, (_coral_str){ (const uint8_t*)"for-in iterator must be an array, slice, or @iter collection", 60 }, (_coral_str){ (const uint8_t*)"implement `extend Type : @iter {}` with `usize count()`, `T at(usize i)`, and `IterRange range(usize start, usize end)`", 119 });
                         }
                         else
                         {
@@ -35281,6 +35980,43 @@ _Bool crl__loc__coral_semantics__stmt__Sema_checkStmt(crl__loc__coral_semantics_
                                 crl__lib__std__x86_64__linux__text__string__String_pushView((&(msg)), (_coral_str){ (const uint8_t*)"'", 1 });
                                 crl__loc__coral_semantics__sema__Sema_semaErrorNodeHelp(self, crl__loc__coral_diagnostics__code__ErrorCode_SemaUnknownMember, id, crl__lib__std__x86_64__linux__text__string__String_asView((&(msg))), (_coral_str){ (const uint8_t*)"the type implements @iter, whose indexed protocol requires `usize count()` and `T at(usize)`; add at(usize) to the type's `extend Type : @iter` block", 149 });
                                 crl__lib__std__x86_64__linux__text__string__String_drop(&msg);
+                            }
+                            if (ranged)
+                            {
+                                crl__loc__coral_semantics__member__MemberInfo rangeInfo = crl__loc__coral_semantics__member__Sema_findMethod(self, iterTy, crl__loc__coral_context__context__AstContext_intern(self->ctx, (_coral_str){ (const uint8_t*)"range", 5 }));
+                                if (((rangeInfo.declaration.index == 0)))
+                                {
+                                    uint8_t* tb = crl__lib__std__x86_64__linux__memory__mman__alloc_uint8_t(256);
+                                    crl__lib__std__x86_64__linux__text__string__String msg = crl__lib__std__x86_64__linux__text__string__String_new();
+                                    crl__lib__std__x86_64__linux__text__string__String_pushView((&(msg)), (_coral_str){ (const uint8_t*)"method 'range' not found on type '", 34 });
+                                    if (((tb != 0)))
+                                    {
+                                        crl__lib__std__x86_64__linux__text__string__String_pushView((&(msg)), crl__loc__coral_semantics__expr__Sema_typeTextView(self, crl__loc__coral_semantics__member__Sema_stripType(self, iterTy), tb, 256));
+                                        crl__lib__std__x86_64__linux__memory__mman__dealloc_uint8_t(tb);
+                                    }
+                                    else
+                                    {
+                                        crl__lib__std__x86_64__linux__text__string__String_pushView((&(msg)), (_coral_str){ (const uint8_t*)"?", 1 });
+                                    }
+                                    crl__lib__std__x86_64__linux__text__string__String_pushView((&(msg)), (_coral_str){ (const uint8_t*)"'", 1 });
+                                    crl__loc__coral_semantics__sema__Sema_semaErrorNodeHelp(self, crl__loc__coral_diagnostics__code__ErrorCode_SemaUnknownMember, id, crl__lib__std__x86_64__linux__text__string__String_asView((&(msg))), (_coral_str){ (const uint8_t*)"the type implements @iter; ranged for-in requires `range(usize start, usize end)` returning IterRange, in addition to `usize count()` and `T at(usize)`", 151 });
+                                    crl__lib__std__x86_64__linux__text__string__String_drop(&msg);
+                                }
+                                else
+                                {
+                                    uint32_t rangeRet = crl__loc__coral_semantics__typecheck__Sema_substituteFieldTy(self, rangeInfo.typeNode, iterTy);
+                                    uint32_t rangeBase = crl__loc__coral_semantics__member__Sema_stripType(self, rangeRet);
+                                    _Bool isBounds = 0;
+                                    if (((rangeBase != 0)))
+                                    {
+                                        crl__loc__coral_ast__types__TypeEntry* re = ((self->ctx->types + rangeBase));
+                                        ((isBounds = ((((re->kind.tag == 24))) && (((re->kind.u.v24.name == crl__loc__coral_context__context__AstContext_intern(self->ctx, (_coral_str){ (const uint8_t*)"IterRange", 9 })))))));
+                                    }
+                                    if ((!(isBounds)))
+                                    {
+                                        crl__loc__coral_semantics__sema__Sema_semaErrorNodeHelp(self, crl__loc__coral_diagnostics__code__ErrorCode_SemaTypeMismatch, id, (_coral_str){ (const uint8_t*)"@iter range() must return IterRange", 35 }, (_coral_str){ (const uint8_t*)"range() returns `IterRange { usize start; usize end; }`; ranged for-in walks that half-open index interval", 106 });
+                                    }
+                                }
                             }
                             if (((((atInfo.declaration.index != 0))) && (((countInfo.declaration.index != 0)))))
                             {
@@ -40452,39 +41188,46 @@ crl__lib__std__x86_64__linux__text__string__String crl__loc__coral_lsp__server__
                 }
                 else
                 {
-                    if (crl__lib__core__str___coral_str_equals((&(w)), (_coral_str){ (const uint8_t*)"inline", 6 }))
+                    if (crl__lib__core__str___coral_str_equals((&(w)), (_coral_str){ (const uint8_t*)"maybe_unused", 12 }))
                     {
-                        crl__lib__std__x86_64__linux__text__string__String_pushView((&(s)), (_coral_str){ (const uint8_t*)"attribute inline\nhint that this function is worth inlining\nstatus: recognized by codegen", 88 });
+                        crl__lib__std__x86_64__linux__text__string__String_pushView((&(s)), (_coral_str){ (const uint8_t*)"attribute maybe_unused\nsuppresses the unused-local warning for a deliberately unused declaration\nstatus: recognized by the unused-local check", 141 });
                     }
                     else
                     {
-                        if (crl__lib__core__str___coral_str_equals((&(w)), (_coral_str){ (const uint8_t*)"const", 5 }))
+                        if (crl__lib__core__str___coral_str_equals((&(w)), (_coral_str){ (const uint8_t*)"inline", 6 }))
                         {
-                            crl__lib__std__x86_64__linux__text__string__String_pushView((&(s)), (_coral_str){ (const uint8_t*)"attribute const\nmethod or function may not mutate self or its parameters", 72 });
+                            crl__lib__std__x86_64__linux__text__string__String_pushView((&(s)), (_coral_str){ (const uint8_t*)"attribute inline\nhint that this function is worth inlining\nstatus: recognized by codegen", 88 });
                         }
                         else
                         {
-                            if (crl__lib__core__str___coral_str_equals((&(w)), (_coral_str){ (const uint8_t*)"condassign", 10 }))
+                            if (crl__lib__core__str___coral_str_equals((&(w)), (_coral_str){ (const uint8_t*)"const", 5 }))
                             {
-                                crl__lib__std__x86_64__linux__text__string__String_pushView((&(s)), (_coral_str){ (const uint8_t*)"attribute condassign\nallows `=` at the top level of the next condition (assignment in condition)", 96 });
+                                crl__lib__std__x86_64__linux__text__string__String_pushView((&(s)), (_coral_str){ (const uint8_t*)"attribute const\nmethod or function may not mutate self or its parameters", 72 });
                             }
                             else
                             {
-                                if (crl__lib__core__str___coral_str_equals((&(w)), (_coral_str){ (const uint8_t*)"fallthrough", 11 }))
+                                if (crl__lib__core__str___coral_str_equals((&(w)), (_coral_str){ (const uint8_t*)"condassign", 10 }))
                                 {
-                                    crl__lib__std__x86_64__linux__text__string__String_pushView((&(s)), (_coral_str){ (const uint8_t*)"attribute fallthrough\nswitch case continues into the next case instead of erroring", 82 });
+                                    crl__lib__std__x86_64__linux__text__string__String_pushView((&(s)), (_coral_str){ (const uint8_t*)"attribute condassign\nallows `=` at the top level of the next condition (assignment in condition)", 96 });
                                 }
                                 else
                                 {
-                                    if (crl__lib__core__str___coral_str_equals((&(w)), (_coral_str){ (const uint8_t*)"generate", 8 }))
+                                    if (crl__lib__core__str___coral_str_equals((&(w)), (_coral_str){ (const uint8_t*)"fallthrough", 11 }))
                                     {
-                                        crl__lib__std__x86_64__linux__text__string__String_pushView((&(s)), (_coral_str){ (const uint8_t*)"attribute generate(...)\ngenerates trait/impl boilerplate (derive); e.g. #[[generate(Drop, Eq)]]\nstatus: planned, not implemented", 128 });
+                                        crl__lib__std__x86_64__linux__text__string__String_pushView((&(s)), (_coral_str){ (const uint8_t*)"attribute fallthrough\nswitch case continues into the next case instead of erroring", 82 });
                                     }
                                     else
                                     {
-                                        if (crl__lib__core__str___coral_str_equals((&(w)), (_coral_str){ (const uint8_t*)"deprecated", 10 }))
+                                        if (crl__lib__core__str___coral_str_equals((&(w)), (_coral_str){ (const uint8_t*)"generate", 8 }))
                                         {
-                                            crl__lib__std__x86_64__linux__text__string__String_pushView((&(s)), (_coral_str){ (const uint8_t*)"attribute deprecated\nmarks a declaration as deprecated; uses should warn", 72 });
+                                            crl__lib__std__x86_64__linux__text__string__String_pushView((&(s)), (_coral_str){ (const uint8_t*)"attribute generate(...)\ngenerates trait/impl boilerplate (derive); e.g. #[[generate(Drop, Eq)]]\nstatus: planned, not implemented", 128 });
+                                        }
+                                        else
+                                        {
+                                            if (crl__lib__core__str___coral_str_equals((&(w)), (_coral_str){ (const uint8_t*)"deprecated", 10 }))
+                                            {
+                                                crl__lib__std__x86_64__linux__text__string__String_pushView((&(s)), (_coral_str){ (const uint8_t*)"attribute deprecated\nmarks a declaration as deprecated; uses should warn", 72 });
+                                            }
                                         }
                                     }
                                 }
@@ -43765,6 +44508,21 @@ void crl__loc__coral_backend__codegen__cgError(crl__loc__coral_backend__codegen_
         ((loc.data = 0));
         crl__loc__coral_semantics__sema__Sema_semaError(cg->sema, crl__loc__coral_diagnostics__code__ErrorCode_CodegenInternal, loc, msg);
     }
+}
+void crl__loc__coral_backend__codegen__cgErrorAt(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_ast__id__NodeId at, _coral_str msg) {
+    ((cg->errors)++);
+    if (((cg->sema == 0)))
+    {
+        return;
+    }
+    if (((at.index != 0)))
+    {
+        crl__loc__coral_semantics__sema__Sema_semaErrorNode(cg->sema, crl__loc__coral_diagnostics__code__ErrorCode_CodegenInternal, at, msg);
+        return;
+    }
+    crl__loc__coral_ast__id__SourceLoc loc;
+    ((loc.data = 0));
+    crl__loc__coral_semantics__sema__Sema_semaError(cg->sema, crl__loc__coral_diagnostics__code__ErrorCode_CodegenInternal, loc, msg);
 }
 void crl__loc__coral_backend__codegen__cgErrorUnsupported(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_ast__id__NodeId at, _coral_str msg) {
     ((cg->errors)++);
@@ -47354,6 +48112,10 @@ crl__loc__coral_common__slice__Slice cgExpr(crl__loc__coral_backend__codegen__Co
                     }
                     else
                     {
+                        if (((((fdecl.index != 0))) && (crl__loc__coral_backend__codegen__cgDeclIsGeneric(cg, fdecl))))
+                        {
+                            crl__loc__coral_backend__codegen__cgErrorAt(cg, id, (_coral_str){ (const uint8_t*)"no monomorphized instance for generic call; the call site was not collected", 75 });
+                        }
                         size_t cs = cg->ebuf.len;
                         crl__loc__coral_backend__codegen__stPS((&(cg->ebuf)), crl__loc__coral_backend__codegen__cgIntern(cg, s0->kind.u.v1.value.kind.u.v6.name));
                         crl__loc__coral_backend__codegen__stCh((&(cg->ebuf)), '_');
@@ -47374,6 +48136,10 @@ crl__loc__coral_common__slice__Slice cgExpr(crl__loc__coral_backend__codegen__Co
                         }
                         else
                         {
+                            if (((((fdecl.index != 0))) && (crl__loc__coral_backend__codegen__cgDeclIsGeneric(cg, fdecl))))
+                            {
+                                crl__loc__coral_backend__codegen__cgErrorAt(cg, id, (_coral_str){ (const uint8_t*)"no monomorphized instance for generic call; the call site was not collected", 75 });
+                            }
                             ((calleeText = cgExpr(cg, calleeId)));
                             ((retTy = crl__loc__coral_backend__codegen__cgResultTy(cg, id, e)));
                         }
@@ -47421,6 +48187,10 @@ crl__loc__coral_common__slice__Slice cgExpr(crl__loc__coral_backend__codegen__Co
                     }
                     else
                     {
+                        if (((((fdecl.index != 0))) && (crl__loc__coral_backend__codegen__cgDeclIsGeneric(cg, fdecl))))
+                        {
+                            crl__loc__coral_backend__codegen__cgErrorAt(cg, id, (_coral_str){ (const uint8_t*)"no monomorphized instance for generic call; the call site was not collected", 75 });
+                        }
                         ((calleeText = cgExpr(cg, calleeId)));
                         ((retTy = crl__loc__coral_backend__codegen__cgResultTy(cg, id, e)));
                     }
@@ -47437,6 +48207,10 @@ crl__loc__coral_common__slice__Slice cgExpr(crl__loc__coral_backend__codegen__Co
                         }
                         else
                         {
+                            if (((((fdecl.index != 0))) && (crl__loc__coral_backend__codegen__cgDeclIsGeneric(cg, fdecl))))
+                            {
+                                crl__loc__coral_backend__codegen__cgErrorAt(cg, id, (_coral_str){ (const uint8_t*)"no monomorphized instance for generic call; the call site was not collected", 75 });
+                            }
                             ((calleeText = cgExpr(cg, calleeId)));
                             ((retTy = crl__loc__coral_backend__codegen__cgResultTy(cg, id, e)));
                         }
@@ -48455,6 +49229,22 @@ crl__loc__coral_common__slice__Slice cgAddrOfValue(crl__loc__coral_backend__code
     size_t rs = cg->ebuf.len;
     crl__loc__coral_backend__codegen__stP((&(cg->ebuf)), (_coral_str){ (const uint8_t*)"(&(", 3 });
     crl__loc__coral_backend__codegen__stPS((&(cg->ebuf)), c);
+    crl__loc__coral_backend__codegen__stP((&(cg->ebuf)), (_coral_str){ (const uint8_t*)"))", 2 });
+    return crl__loc__coral_backend__codegen__stTail((&(cg->ebuf)), rs);
+}
+crl__loc__coral_common__slice__Slice crl__loc__coral_backend__codegen__cgForInRecv(crl__loc__coral_backend__codegen__Codegen* cg, _Bool simpleIter, _Bool iterIsPtr, uint32_t simpleName, uint32_t rt) {
+    if ((!(simpleIter)))
+    {
+        return crl__loc__coral_backend__codegen__cgTempName(cg, rt);
+    }
+    crl__loc__coral_common__slice__Slice name = crl__loc__coral_backend__codegen__cgIdent(cg, simpleName);
+    if (iterIsPtr)
+    {
+        return name;
+    }
+    size_t rs = cg->ebuf.len;
+    crl__loc__coral_backend__codegen__stP((&(cg->ebuf)), (_coral_str){ (const uint8_t*)"(&(", 3 });
+    crl__loc__coral_backend__codegen__stPS((&(cg->ebuf)), name);
     crl__loc__coral_backend__codegen__stP((&(cg->ebuf)), (_coral_str){ (const uint8_t*)"))", 2 });
     return crl__loc__coral_backend__codegen__stTail((&(cg->ebuf)), rs);
 }
@@ -49773,6 +50563,9 @@ void cgStmt(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_ast__
             crl__loc__coral_backend__codegen__stCh((&(cg->body)), '{');
             ((cg->ind)++);
             crl__loc__coral_ast__id__NodeId iter = s->kind.u.v11.iterExpr;
+            crl__loc__coral_ast__id__NodeId rangeStart = s->kind.u.v11.rangeStart;
+            crl__loc__coral_ast__id__NodeId rangeEnd = s->kind.u.v11.rangeEnd;
+            _Bool ranged = ((rangeStart.index != 0));
             crl__loc__coral_common__slice__Slice it = cgExpr(cg, iter);
             crl__loc__coral_ast__node__Node* in = crl__loc__coral_backend__codegen__cgNode(cg, iter);
             uint32_t iterTy = 0;
@@ -49787,13 +50580,103 @@ void cgStmt(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_ast__
             }
             _Bool indexed = ((((te != 0))) && (((((te->kind.tag == 23))) || (((te->kind.tag == 25))))));
             _Bool useAt = 0;
+            _Bool simpleIter = ((((in->kind.tag == 1))) && (((in->kind.u.v1.value.kind.tag == 6))));
+            uint32_t simpleIterName = 0;
+            if (simpleIter)
+            {
+                ((simpleIterName = in->kind.u.v1.value.kind.u.v6.name));
+                if ((!(crl__loc__coral_backend__codegen__cgIsLocalName(cg, simpleIterName))))
+                {
+                    ((simpleIter = 0));
+                }
+            }
+            _Bool iterIsPtr = 0;
+            uint32_t rt = 0;
             crl__loc__coral_common__slice__Slice elemTy;
-            crl__loc__coral_common__slice__Slice iterRecv;
             crl__loc__coral_common__slice__Slice atCallee;
             uint32_t countLabel = 0;
+            uint32_t rangeLabel = 0;
             if (indexed)
             {
                 ((elemTy = tyStr(cg, ((((te->kind.tag == 23))) ? (te->kind.u.v23.base) : (te->kind.u.v25.base)))));
+                if (ranged)
+                {
+                    ((rangeLabel = crl__loc__coral_backend__codegen__cgLabel(cg)));
+                    crl__loc__coral_backend__codegen__stNL((&(cg->body)), cg->ind);
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)"size_t coral_rs", 15 });
+                    crl__loc__coral_backend__codegen__stU64((&(cg->body)), ((uint64_t)(rangeLabel)));
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)" = (size_t)(", 12 });
+                    crl__loc__coral_backend__codegen__stPS((&(cg->body)), cgExpr(cg, rangeStart));
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)");", 2 });
+                    crl__loc__coral_backend__codegen__stNL((&(cg->body)), cg->ind);
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)"size_t coral_re", 15 });
+                    crl__loc__coral_backend__codegen__stU64((&(cg->body)), ((uint64_t)(rangeLabel)));
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)" = (size_t)(", 12 });
+                    crl__loc__coral_backend__codegen__stPS((&(cg->body)), cgExpr(cg, rangeEnd));
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)");", 2 });
+                    crl__loc__coral_backend__codegen__stNL((&(cg->body)), cg->ind);
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)"if (coral_rs", 12 });
+                    crl__loc__coral_backend__codegen__stU64((&(cg->body)), ((uint64_t)(rangeLabel)));
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)" > ", 3 });
+                    if (((te->kind.tag == 25)))
+                    {
+                        crl__loc__coral_backend__codegen__stU64((&(cg->body)), ((uint64_t)(te->kind.u.v25.len)));
+                    }
+                    else
+                    {
+                        crl__loc__coral_backend__codegen__stPS((&(cg->body)), it);
+                        crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)".len", 4 });
+                    }
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)") coral_rs", 10 });
+                    crl__loc__coral_backend__codegen__stU64((&(cg->body)), ((uint64_t)(rangeLabel)));
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)" = ", 3 });
+                    if (((te->kind.tag == 25)))
+                    {
+                        crl__loc__coral_backend__codegen__stU64((&(cg->body)), ((uint64_t)(te->kind.u.v25.len)));
+                    }
+                    else
+                    {
+                        crl__loc__coral_backend__codegen__stPS((&(cg->body)), it);
+                        crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)".len", 4 });
+                    }
+                    crl__loc__coral_backend__codegen__stCh((&(cg->body)), ';');
+                    crl__loc__coral_backend__codegen__stNL((&(cg->body)), cg->ind);
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)"if (coral_re", 12 });
+                    crl__loc__coral_backend__codegen__stU64((&(cg->body)), ((uint64_t)(rangeLabel)));
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)" > ", 3 });
+                    if (((te->kind.tag == 25)))
+                    {
+                        crl__loc__coral_backend__codegen__stU64((&(cg->body)), ((uint64_t)(te->kind.u.v25.len)));
+                    }
+                    else
+                    {
+                        crl__loc__coral_backend__codegen__stPS((&(cg->body)), it);
+                        crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)".len", 4 });
+                    }
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)") coral_re", 10 });
+                    crl__loc__coral_backend__codegen__stU64((&(cg->body)), ((uint64_t)(rangeLabel)));
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)" = ", 3 });
+                    if (((te->kind.tag == 25)))
+                    {
+                        crl__loc__coral_backend__codegen__stU64((&(cg->body)), ((uint64_t)(te->kind.u.v25.len)));
+                    }
+                    else
+                    {
+                        crl__loc__coral_backend__codegen__stPS((&(cg->body)), it);
+                        crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)".len", 4 });
+                    }
+                    crl__loc__coral_backend__codegen__stCh((&(cg->body)), ';');
+                    crl__loc__coral_backend__codegen__stNL((&(cg->body)), cg->ind);
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)"if (coral_re", 12 });
+                    crl__loc__coral_backend__codegen__stU64((&(cg->body)), ((uint64_t)(rangeLabel)));
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)" < coral_rs", 11 });
+                    crl__loc__coral_backend__codegen__stU64((&(cg->body)), ((uint64_t)(rangeLabel)));
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)") coral_re", 10 });
+                    crl__loc__coral_backend__codegen__stU64((&(cg->body)), ((uint64_t)(rangeLabel)));
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)" = coral_rs", 11 });
+                    crl__loc__coral_backend__codegen__stU64((&(cg->body)), ((uint64_t)(rangeLabel)));
+                    crl__loc__coral_backend__codegen__stCh((&(cg->body)), ';');
+                }
             }
             else
             {
@@ -49805,7 +50688,7 @@ void cgStmt(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_ast__
                     return;
                 }
                 uint32_t baseTy = crl__loc__coral_backend__codegen__cgTyUnwrap(cg, iterTy);
-                _Bool iterIsPtr = ((((baseTy != 0))) && (((((cg->ctx->types + baseTy))->kind.tag == 20))));
+                ((iterIsPtr = ((((baseTy != 0))) && (((((cg->ctx->types + baseTy))->kind.tag == 20))))));
                 if (iterIsPtr)
                 {
                     ((baseTy = crl__loc__coral_backend__codegen__cgTyUnwrap(cg, ((cg->ctx->types + baseTy))->kind.u.v20.base)));
@@ -49815,49 +50698,106 @@ void cgStmt(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_ast__
                     crl__loc__coral_backend__codegen__cgError(cg, (_coral_str){ (const uint8_t*)"for-in over unknown iterator type", 33 });
                     return;
                 }
-                size_t ps = cg->tybuf.len;
-                tyStr(cg, baseTy);
-                crl__loc__coral_backend__codegen__stCh((&(cg->tybuf)), '*');
-                crl__loc__coral_common__slice__Slice ptrTy = crl__loc__coral_backend__codegen__stTail((&(cg->tybuf)), ps);
-                uint32_t rt = crl__loc__coral_backend__codegen__cgNewTemp(cg, ptrTy, 0);
-                crl__loc__coral_backend__codegen__stNL((&(cg->body)), cg->ind);
-                crl__loc__coral_backend__codegen__stPS((&(cg->body)), crl__loc__coral_backend__codegen__cgTempName(cg, rt));
-                crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)" = ", 3 });
-                if (iterIsPtr)
+                if ((!(simpleIter)))
                 {
-                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)"(", 1 });
-                    crl__loc__coral_backend__codegen__stPS((&(cg->body)), ptrTy);
-                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)")", 1 });
-                    crl__loc__coral_backend__codegen__stPS((&(cg->body)), it);
+                    size_t ps = cg->tybuf.len;
+                    tyStr(cg, baseTy);
+                    crl__loc__coral_backend__codegen__stCh((&(cg->tybuf)), '*');
+                    crl__loc__coral_common__slice__Slice ptrTy = crl__loc__coral_backend__codegen__stTail((&(cg->tybuf)), ps);
+                    ((rt = crl__loc__coral_backend__codegen__cgNewTemp(cg, ptrTy, 0)));
+                    if (iterIsPtr)
+                    {
+                        crl__loc__coral_backend__codegen__stNL((&(cg->body)), cg->ind);
+                        crl__loc__coral_backend__codegen__stPS((&(cg->body)), crl__loc__coral_backend__codegen__cgTempName(cg, rt));
+                        crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)" = (", 4 });
+                        crl__loc__coral_backend__codegen__stPS((&(cg->body)), ptrTy);
+                        crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)")", 1 });
+                        crl__loc__coral_backend__codegen__stPS((&(cg->body)), it);
+                        crl__loc__coral_backend__codegen__stCh((&(cg->body)), ';');
+                    }
+                    else
+                    {
+                        crl__loc__coral_common__slice__Slice ptrExpr = cgAddrOfValue(cg, iter, it);
+                        crl__loc__coral_backend__codegen__stNL((&(cg->body)), cg->ind);
+                        crl__loc__coral_backend__codegen__stPS((&(cg->body)), crl__loc__coral_backend__codegen__cgTempName(cg, rt));
+                        crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)" = ", 3 });
+                        crl__loc__coral_backend__codegen__stPS((&(cg->body)), ptrExpr);
+                        crl__loc__coral_backend__codegen__stCh((&(cg->body)), ';');
+                    }
+                }
+                if (ranged)
+                {
+                    ((rangeLabel = crl__loc__coral_backend__codegen__cgLabel(cg)));
+                    crl__loc__coral_backend__codegen__stNL((&(cg->body)), cg->ind);
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)"size_t coral_rs", 15 });
+                    crl__loc__coral_backend__codegen__stU64((&(cg->body)), ((uint64_t)(rangeLabel)));
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)" = (size_t)(", 12 });
+                    crl__loc__coral_backend__codegen__stPS((&(cg->body)), cgExpr(cg, rangeStart));
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)");", 2 });
+                    crl__loc__coral_backend__codegen__stNL((&(cg->body)), cg->ind);
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)"size_t coral_re", 15 });
+                    crl__loc__coral_backend__codegen__stU64((&(cg->body)), ((uint64_t)(rangeLabel)));
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)" = (size_t)(", 12 });
+                    crl__loc__coral_backend__codegen__stPS((&(cg->body)), cgExpr(cg, rangeEnd));
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)");", 2 });
+                    crl__loc__coral_ast__id__NodeId rangeDecl = crl__loc__coral_backend__codegen__cgFindMethodDecl(cg, iterTy, crl__loc__coral_context__context__AstContext_intern(cg->ctx, (_coral_str){ (const uint8_t*)"range", 5 }));
+                    if (((rangeDecl.index == 0)))
+                    {
+                        crl__loc__coral_backend__codegen__cgError(cg, (_coral_str){ (const uint8_t*)"for-in range() not found", 24 });
+                        return;
+                    }
+                    crl__loc__coral_ast__node__Node* rd = crl__loc__coral_backend__codegen__cgNode(cg, rangeDecl);
+                    uint32_t rangeRetTy = 0;
+                    if (((((rd->kind.tag == 3))) && (((rd->kind.u.v3.value.kind.tag == 9)))))
+                    {
+                        ((rangeRetTy = rd->kind.u.v3.value.kind.u.v9.returnType));
+                    }
+                    crl__loc__coral_common__slice__Slice rangeTy = tyStr(cg, crl__loc__coral_backend__codegen__cgSubstTy(cg, rangeRetTy));
+                    crl__loc__coral_common__slice__Slice owner = crl__loc__coral_backend__codegen__cgOwnerName(cg, baseTy);
+                    size_t cs = cg->ebuf.len;
+                    crl__loc__coral_backend__codegen__stPS((&(cg->ebuf)), owner);
+                    crl__loc__coral_backend__codegen__stCh((&(cg->ebuf)), '_');
+                    crl__loc__coral_backend__codegen__stPS((&(cg->ebuf)), crl__loc__coral_backend__codegen__cgIntern(cg, crl__loc__coral_context__context__AstContext_intern(cg->ctx, (_coral_str){ (const uint8_t*)"range", 5 })));
+                    crl__loc__coral_common__slice__Slice rangeCallee = crl__loc__coral_backend__codegen__cgMangleS(cg, rangeDecl, crl__loc__coral_backend__codegen__stTail((&(cg->ebuf)), cs), 0);
+                    crl__loc__coral_backend__codegen__stNL((&(cg->body)), cg->ind);
+                    crl__loc__coral_backend__codegen__stPS((&(cg->body)), rangeTy);
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)" coral_r", 8 });
+                    crl__loc__coral_backend__codegen__stU64((&(cg->body)), ((uint64_t)(rangeLabel)));
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)" = ", 3 });
+                    crl__loc__coral_backend__codegen__stPS((&(cg->body)), rangeCallee);
+                    crl__loc__coral_backend__codegen__stCh((&(cg->body)), '(');
+                    crl__loc__coral_backend__codegen__stPS((&(cg->body)), crl__loc__coral_backend__codegen__cgForInRecv(cg, simpleIter, iterIsPtr, simpleIterName, rt));
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)", coral_rs", 10 });
+                    crl__loc__coral_backend__codegen__stU64((&(cg->body)), ((uint64_t)(rangeLabel)));
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)", coral_re", 10 });
+                    crl__loc__coral_backend__codegen__stU64((&(cg->body)), ((uint64_t)(rangeLabel)));
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)");", 2 });
                 }
                 else
                 {
-                    crl__loc__coral_backend__codegen__stPS((&(cg->body)), cgAddrOfValue(cg, iter, it));
+                    crl__loc__coral_common__slice__Slice owner = crl__loc__coral_backend__codegen__cgOwnerName(cg, baseTy);
+                    size_t cs = cg->ebuf.len;
+                    crl__loc__coral_backend__codegen__stPS((&(cg->ebuf)), owner);
+                    crl__loc__coral_backend__codegen__stCh((&(cg->ebuf)), '_');
+                    crl__loc__coral_backend__codegen__stPS((&(cg->ebuf)), crl__loc__coral_backend__codegen__cgIntern(cg, crl__loc__coral_context__context__AstContext_intern(cg->ctx, (_coral_str){ (const uint8_t*)"count", 5 })));
+                    crl__loc__coral_common__slice__Slice countCallee = crl__loc__coral_backend__codegen__cgMangleS(cg, countDecl, crl__loc__coral_backend__codegen__stTail((&(cg->ebuf)), cs), 0);
+                    ((countLabel = crl__loc__coral_backend__codegen__cgLabel(cg)));
+                    crl__loc__coral_backend__codegen__stNL((&(cg->body)), cg->ind);
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)"size_t coral_n", 14 });
+                    crl__loc__coral_backend__codegen__stU64((&(cg->body)), ((uint64_t)(countLabel)));
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)" = ", 3 });
+                    crl__loc__coral_backend__codegen__stPS((&(cg->body)), countCallee);
+                    crl__loc__coral_backend__codegen__stCh((&(cg->body)), '(');
+                    crl__loc__coral_backend__codegen__stPS((&(cg->body)), crl__loc__coral_backend__codegen__cgForInRecv(cg, simpleIter, iterIsPtr, simpleIterName, rt));
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)");", 2 });
                 }
-                crl__loc__coral_backend__codegen__stCh((&(cg->body)), ';');
                 crl__loc__coral_common__slice__Slice owner = crl__loc__coral_backend__codegen__cgOwnerName(cg, baseTy);
                 size_t cs = cg->ebuf.len;
-                crl__loc__coral_backend__codegen__stPS((&(cg->ebuf)), owner);
-                crl__loc__coral_backend__codegen__stCh((&(cg->ebuf)), '_');
-                crl__loc__coral_backend__codegen__stPS((&(cg->ebuf)), crl__loc__coral_backend__codegen__cgIntern(cg, crl__loc__coral_context__context__AstContext_intern(cg->ctx, (_coral_str){ (const uint8_t*)"count", 5 })));
-                crl__loc__coral_common__slice__Slice countCallee = crl__loc__coral_backend__codegen__cgMangleS(cg, countDecl, crl__loc__coral_backend__codegen__stTail((&(cg->ebuf)), cs), 0);
-                ((countLabel = crl__loc__coral_backend__codegen__cgLabel(cg)));
-                crl__loc__coral_backend__codegen__stNL((&(cg->body)), cg->ind);
-                crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)"size_t coral_n", 14 });
-                crl__loc__coral_backend__codegen__stU64((&(cg->body)), ((uint64_t)(countLabel)));
-                crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)" = ", 3 });
-                crl__loc__coral_backend__codegen__stPS((&(cg->body)), countCallee);
-                crl__loc__coral_backend__codegen__stCh((&(cg->body)), '(');
-                crl__loc__coral_backend__codegen__stPS((&(cg->body)), crl__loc__coral_backend__codegen__cgTempName(cg, rt));
-                crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)");", 2 });
-                ((owner = crl__loc__coral_backend__codegen__cgOwnerName(cg, baseTy)));
-                ((cs = cg->ebuf.len));
                 crl__loc__coral_backend__codegen__stPS((&(cg->ebuf)), owner);
                 crl__loc__coral_backend__codegen__stCh((&(cg->ebuf)), '_');
                 crl__loc__coral_backend__codegen__stPS((&(cg->ebuf)), crl__loc__coral_backend__codegen__cgIntern(cg, crl__loc__coral_context__context__AstContext_intern(cg->ctx, (_coral_str){ (const uint8_t*)"at", 2 })));
                 ((atCallee = crl__loc__coral_backend__codegen__cgMangleS(cg, atDecl, crl__loc__coral_backend__codegen__stTail((&(cg->ebuf)), cs), 0)));
                 ((elemTy = tyStr(cg, crl__loc__coral_backend__codegen__cgSubstTy(cg, s->kind.u.v11.bindType))));
-                ((iterRecv = crl__loc__coral_backend__codegen__cgTempName(cg, rt)));
                 ((useAt = 1));
             }
             uint32_t k = crl__loc__coral_backend__codegen__cgLabel(cg);
@@ -49868,24 +50808,60 @@ void cgStmt(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_ast__
             crl__loc__coral_backend__codegen__stNL((&(cg->body)), cg->ind);
             crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)"for (size_t ", 12 });
             crl__loc__coral_backend__codegen__stPS((&(cg->body)), ix);
-            crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)" = 0; ", 6 });
-            crl__loc__coral_backend__codegen__stPS((&(cg->body)), ix);
-            crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)" < ", 3 });
-            if (((indexed) && (((te->kind.tag == 25)))))
+            crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)" = ", 3 });
+            if (((ranged) && ((!(indexed)))))
             {
-                crl__loc__coral_backend__codegen__stU64((&(cg->body)), ((uint64_t)(te->kind.u.v25.len)));
+                crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)"coral_r", 7 });
+                crl__loc__coral_backend__codegen__stU64((&(cg->body)), ((uint64_t)(rangeLabel)));
+                crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)".start", 6 });
             }
             else
             {
-                if (indexed)
+                if (ranged)
                 {
-                    crl__loc__coral_backend__codegen__stPS((&(cg->body)), it);
-                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)".len", 4 });
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)"coral_rs", 8 });
+                    crl__loc__coral_backend__codegen__stU64((&(cg->body)), ((uint64_t)(rangeLabel)));
                 }
                 else
                 {
-                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)"coral_n", 7 });
-                    crl__loc__coral_backend__codegen__stU64((&(cg->body)), ((uint64_t)(countLabel)));
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)"0", 1 });
+                }
+            }
+            crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)"; ", 2 });
+            crl__loc__coral_backend__codegen__stPS((&(cg->body)), ix);
+            crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)" < ", 3 });
+            if (((ranged) && ((!(indexed)))))
+            {
+                crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)"coral_r", 7 });
+                crl__loc__coral_backend__codegen__stU64((&(cg->body)), ((uint64_t)(rangeLabel)));
+                crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)".end", 4 });
+            }
+            else
+            {
+                if (ranged)
+                {
+                    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)"coral_re", 8 });
+                    crl__loc__coral_backend__codegen__stU64((&(cg->body)), ((uint64_t)(rangeLabel)));
+                }
+                else
+                {
+                    if (((indexed) && (((te->kind.tag == 25)))))
+                    {
+                        crl__loc__coral_backend__codegen__stU64((&(cg->body)), ((uint64_t)(te->kind.u.v25.len)));
+                    }
+                    else
+                    {
+                        if (indexed)
+                        {
+                            crl__loc__coral_backend__codegen__stPS((&(cg->body)), it);
+                            crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)".len", 4 });
+                        }
+                        else
+                        {
+                            crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)"coral_n", 7 });
+                            crl__loc__coral_backend__codegen__stU64((&(cg->body)), ((uint64_t)(countLabel)));
+                        }
+                    }
                 }
             }
             crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)"; ", 2 });
@@ -49906,7 +50882,7 @@ void cgStmt(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_ast__
             {
                 crl__loc__coral_backend__codegen__stPS((&(cg->body)), atCallee);
                 crl__loc__coral_backend__codegen__stCh((&(cg->body)), '(');
-                crl__loc__coral_backend__codegen__stPS((&(cg->body)), iterRecv);
+                crl__loc__coral_backend__codegen__stPS((&(cg->body)), crl__loc__coral_backend__codegen__cgForInRecv(cg, simpleIter, iterIsPtr, simpleIterName, rt));
                 crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)", ", 2 });
                 crl__loc__coral_backend__codegen__stPS((&(cg->body)), ix);
                 crl__loc__coral_backend__codegen__stCh((&(cg->body)), ')');
@@ -53669,8 +54645,8 @@ _coral_str crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_at(Vec
     0;
     return self->data[i];
 }
-Vec__coral_str crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_range(Vec__coral_str* self, size_t start, size_t end) {
-    size_t n = self->len;
+crl__lib__std__x86_64__linux__collections__range__IterRange crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_range(Vec__coral_str* self, size_t start, size_t end) {
+    size_t n = crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_count(self);
     if (((start > n)))
     {
         ((start = n));
@@ -53683,14 +54659,7 @@ Vec__coral_str crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_ra
     {
         ((end = start));
     }
-    Vec__coral_str out = crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_withCap(((end - start)));
-    for (
-    size_t i = start;((i < end));((i)++))
-    {
-        crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_push((&(out)), self->data[i]);
-    }
-    return out;
-    crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_drop(&out);
+    return ((crl__lib__std__x86_64__linux__collections__range__IterRange){.start = start, .end = end});
 }
 void crl__lib__std__x86_64__linux__memory__mman__copy_uint8_t(uint8_t* dst, uint8_t* src, size_t count) {
     if (((((dst) && (src))) && (((count > 0)))))
@@ -55201,8 +56170,8 @@ uint8_t* crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_at(Vec_uin
     0;
     return self->data[i];
 }
-Vec_uint8_tp crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_range(Vec_uint8_tp* self, size_t start, size_t end) {
-    size_t n = self->len;
+crl__lib__std__x86_64__linux__collections__range__IterRange crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_range(Vec_uint8_tp* self, size_t start, size_t end) {
+    size_t n = crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_count(self);
     if (((start > n)))
     {
         ((start = n));
@@ -55215,14 +56184,7 @@ Vec_uint8_tp crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_range(
     {
         ((end = start));
     }
-    Vec_uint8_tp out = crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_withCap(((end - start)));
-    for (
-    size_t i = start;((i < end));((i)++))
-    {
-        crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_push((&(out)), self->data[i]);
-    }
-    return out;
-    crl__lib__std__x86_64__linux__collections__vec__Vec_uint8_tp_drop(&out);
+    return ((crl__lib__std__x86_64__linux__collections__range__IterRange){.start = start, .end = end});
 }
 void crl__lib__std__x86_64__linux__memory__mman__zero_uint8_t(uint8_t* ptr, size_t count) {
     memset(((void*)(ptr)), 0, ((sizeof(uint8_t) * count)));
@@ -56245,8 +57207,8 @@ crl__lib__std__x86_64__linux__parser__json__JsonValue crl__lib__std__x86_64__lin
     0;
     return self->data[i];
 }
-Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_range(Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue* self, size_t start, size_t end) {
-    size_t n = self->len;
+crl__lib__std__x86_64__linux__collections__range__IterRange crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_range(Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue* self, size_t start, size_t end) {
+    size_t n = crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_count(self);
     if (((start > n)))
     {
         ((start = n));
@@ -56259,14 +57221,7 @@ Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue crl__lib__std__x86_64_
     {
         ((end = start));
     }
-    Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue out = crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_withCap(((end - start)));
-    for (
-    size_t i = start;((i < end));((i)++))
-    {
-        crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_push((&(out)), self->data[i]);
-    }
-    return out;
-    crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonValue_drop(&out);
+    return ((crl__lib__std__x86_64__linux__collections__range__IterRange){.start = start, .end = end});
 }
 Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_new(void) {
     return ((Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair){.data = 0, .len = 0, .cap = 0});
@@ -56507,8 +57462,8 @@ crl__lib__std__x86_64__linux__parser__json__JsonPair crl__lib__std__x86_64__linu
     0;
     return self->data[i];
 }
-Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_range(Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair* self, size_t start, size_t end) {
-    size_t n = self->len;
+crl__lib__std__x86_64__linux__collections__range__IterRange crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_range(Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair* self, size_t start, size_t end) {
+    size_t n = crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_count(self);
     if (((start > n)))
     {
         ((start = n));
@@ -56521,14 +57476,7 @@ Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair crl__lib__std__x86_64__
     {
         ((end = start));
     }
-    Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair out = crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_withCap(((end - start)));
-    for (
-    size_t i = start;((i < end));((i)++))
-    {
-        crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_push((&(out)), self->data[i]);
-    }
-    return out;
-    crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__parser__json__JsonPair_drop(&out);
+    return ((crl__lib__std__x86_64__linux__collections__range__IterRange){.start = start, .end = end});
 }
 _Bool crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__parser__json__JsonValue_crl__lib__std__x86_64__linux__parser__json__ParseError_isOk(Result_crl__lib__std__x86_64__linux__parser__json__JsonValue_crl__lib__std__x86_64__linux__parser__json__ParseError* self) {
     crl__lib__std__x86_64__linux__parser__json__JsonValue value;
@@ -56950,8 +57898,8 @@ crl__lib__std__x86_64__linux__text__string__String crl__lib__std__x86_64__linux_
     0;
     return self->data[i];
 }
-Vec_crl__lib__std__x86_64__linux__text__string__String crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_range(Vec_crl__lib__std__x86_64__linux__text__string__String* self, size_t start, size_t end) {
-    size_t n = self->len;
+crl__lib__std__x86_64__linux__collections__range__IterRange crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_range(Vec_crl__lib__std__x86_64__linux__text__string__String* self, size_t start, size_t end) {
+    size_t n = crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_count(self);
     if (((start > n)))
     {
         ((start = n));
@@ -56964,14 +57912,7 @@ Vec_crl__lib__std__x86_64__linux__text__string__String crl__lib__std__x86_64__li
     {
         ((end = start));
     }
-    Vec_crl__lib__std__x86_64__linux__text__string__String out = crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_withCap(((end - start)));
-    for (
-    size_t i = start;((i < end));((i)++))
-    {
-        crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_push((&(out)), self->data[i]);
-    }
-    return out;
-    crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_drop(&out);
+    return ((crl__lib__std__x86_64__linux__collections__range__IterRange){.start = start, .end = end});
 }
 _Bool crl__lib__std__x86_64__linux__data__option__Option__coral_str_isSome(Option__coral_str* self) {
     _coral_str value;
@@ -57382,8 +58323,8 @@ uint32_t crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_at(Vec_uin
     0;
     return self->data[i];
 }
-Vec_uint32_t crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_range(Vec_uint32_t* self, size_t start, size_t end) {
-    size_t n = self->len;
+crl__lib__std__x86_64__linux__collections__range__IterRange crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_range(Vec_uint32_t* self, size_t start, size_t end) {
+    size_t n = crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_count(self);
     if (((start > n)))
     {
         ((start = n));
@@ -57396,14 +58337,7 @@ Vec_uint32_t crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_range(
     {
         ((end = start));
     }
-    Vec_uint32_t out = crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_withCap(((end - start)));
-    for (
-    size_t i = start;((i < end));((i)++))
-    {
-        crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_push((&(out)), self->data[i]);
-    }
-    return out;
-    crl__lib__std__x86_64__linux__collections__vec__Vec_uint32_t_drop(&out);
+    return ((crl__lib__std__x86_64__linux__collections__range__IterRange){.start = start, .end = end});
 }
 crl__loc__coral_hir__hir__HirModule* crl__lib__std__x86_64__linux__memory__mman__alloc_crl__loc__coral_hir__hir__HirModule(size_t count) {
     if (((count == 0)))
@@ -58029,6 +58963,9 @@ void crl__lib__std__x86_64__linux__memory__mman__dealloc_crl__lib__std__x86_64__
     }
     (crl__lib__std__x86_64__linux__memory__mman__defaultAllocator->free)(crl__lib__std__x86_64__linux__memory__mman__defaultAllocator->ctx, ((void*)(ptr)));
 }
+void crl__lib__std__x86_64__linux__io__ios___printEmit__coral_str_v20d0e77f3979a2b7(crl__lib__std__x86_64__linux__io__ios___Buf* out, _coral_str fmt, ...) {
+    crl__lib__std__x86_64__linux__io__ios___fprintBytes(out, fmt.ptr, fmt.len);
+}
 crl__lib__std__x86_64__linux__text__string__String* crl__lib__std__x86_64__linux__memory__mman__alloc_crl__lib__std__x86_64__linux__text__string__String(size_t count) {
     if (((count == 0)))
     {
@@ -58065,4 +59002,8 @@ void crl__lib__std__x86_64__linux__memory__mman__dealloc_crl__lib__std__x86_64__
         return;
     }
     (crl__lib__std__x86_64__linux__memory__mman__defaultAllocator->free)(crl__lib__std__x86_64__linux__memory__mman__defaultAllocator->ctx, ((void*)(ptr)));
+}
+void crl__lib__std__x86_64__linux__io__ios___fprintOne__coral_str_ve66f82f6492e8bb2(crl__lib__std__x86_64__linux__io__ios___Buf* out, _coral_str val) {
+    crl__lib__std__x86_64__linux__io__ios___fprintBytes(out, val.ptr, val.len);
+    return;
 }
