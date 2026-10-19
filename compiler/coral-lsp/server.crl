@@ -24,6 +24,7 @@ import sem::analyze { CompileUnit, analyzeForCompile, freeUnit };
 import sem { scope { Symbol }, sema { Sema }, member { MemberInfo } };
 import diag::engine { DiagList, DiagRecord };
 import diag::error { helpFor };
+import diag::explain { explainText };
 import ast::id { SourceLoc, NodeId, locFile, locLine, locCol };
 import ast::types { Ty, TypeEntry, TypeKind };
 import ast::node { Node, NodeKind };
@@ -49,6 +50,9 @@ pub struct LspDoc
     String text;
     CompileUnit unit;
     bool analyzed;
+    /* kept after publishing so code actions can offer "explain this code"
+     * without re-analyzing the buffer */
+    DiagList diags;
 }
 
 /* stdout carries the protocol; the quiet flags keep every other
@@ -396,7 +400,17 @@ JsonValue lspDiagItem(DiagRecord* r)
     lspPut(&d, "range", lspDiagRange(r));
     lspPut(&d, "severity", JsonValue::i64Val(lspSeverity(r->level.asView())));
     if (r->code.len > 0)
+    {
         lspPut(&d, "code", JsonValue::stringVal(String::from(r->code.asView())));
+        /* clickable code: clients that understand the scheme can run
+         * `coralc.explain` (registered as an executeCommand) and show the
+         * long-form explanation in place */
+        String href = String::from("coral-explain://");
+        href.pushView(r->code.asView());
+        JsonValue cd = lspObj();
+        lspPut(&cd, "href", JsonValue::stringVal(href));
+        lspPut(&d, "codeDescription", cd);
+    }
     lspPut(&d, "source", JsonValue::stringVal(String::from("coral")));
     /* the help line is part of the diagnostic: editors get the full
      * message so models can act on it, not just restate it. Records
@@ -427,6 +441,50 @@ void lspPublishEmpty(str uri)
     lspPut(&msg, "method", JsonValue::stringVal(String::from("textDocument/publishDiagnostics")));
     lspPut(&msg, "params", params);
     lspSend(&msg);
+}
+
+/* strip ANSI SGR sequences (`\x1b[...m`) so editor banners stay clean */
+void lspStripAnsi(String* out, str s)
+{
+    usize i = 0;
+    while (i < s.len)
+    {
+        if (s.ptr[i] == 27)
+        {
+            i++;
+            while (i < s.len && s.ptr[i] != 109) i++;
+            if (i < s.len) i++;
+            continue;
+        }
+        out->pushByte(s.ptr[i]);
+        i++;
+    }
+}
+
+void lspShowMessage(i64 kind, str message)
+{
+    JsonValue params = lspObj();
+    lspPut(&params, "type", JsonValue::i64Val(kind));
+    lspPut(&params, "message", JsonValue::stringVal(String::from(message)));
+    JsonValue msg = lspObj();
+    lspPut(&msg, "jsonrpc", JsonValue::stringVal(String::from("2.0")));
+    lspPut(&msg, "method", JsonValue::stringVal(String::from("window/showMessage")));
+    lspPut(&msg, "params", params);
+    lspSend(&msg);
+}
+
+/* `coralc.explain CODE`: render the long-form explanation (same text as
+ * `coralc --explain`) as an editor message */
+void lspExplainCode(str code)
+{
+    String b = String::new();
+    explainText(&b, code);
+    String plain = String::new();
+    lspStripAnsi(&plain, b.asView());
+    b.free();
+    if (plain.asView().len == 0) plain.pushView("no explanation available");
+    lspShowMessage(3, plain.asView());
+    plain.free();
 }
 
 /* does `file` name one of the `count` paths? (paths are the buffers the
@@ -550,7 +608,8 @@ LspDoc* lspDocNew(str uri)
             .semanticErrors = 0,
             .monoErrors = 0
         },
-        .analyzed = false
+        .analyzed = false,
+        .diags = DiagList { .items = null, .len = 0, .cap = 0 }
     };
     return d;
 }
@@ -559,6 +618,7 @@ void lspDocFree(LspDoc* d)
 {
     if (d == null) return;
     freeUnit(&d->unit);
+    d->diags.dispose();
     d->uri.free();
     d->path.free();
     d->text.free();
@@ -569,15 +629,14 @@ void lspDocFree(LspDoc* d)
 void lspAnalyze(LspDoc* d, Slice* modKeys, Slice* modVals, u32 modLen, str rootPath)
 {
     freeUnit(&d->unit);
-    DiagList diags;
-    diags.init();
+    d->diags.dispose();
+    d->diags.init();
     /* errorLimit 0: the editor never gets a truncated error list */
     d->unit = analyzeForCompile(d->text.asU8(), d->text.len, d->path.asU8(), null, null, 0,
                                 0, false, false, true,
-                                modKeys, modVals, modLen, true, &diags);
+                                modKeys, modVals, modLen, true, &d->diags);
     d->analyzed = true;
-    lspPublish(&diags, d->path.asView(), d->uri.asView(), rootPath, null, null, null, 0);
-    diags.dispose();
+    lspPublish(&d->diags, d->path.asView(), d->uri.asView(), rootPath, null, null, null, 0);
 }
 
 /* whole-project error report: analyze the build entry so its entire
@@ -1687,6 +1746,223 @@ bool lspDeclForeignPrivate(Decl* dd)
     return !lspDeclPublic(dd);
 }
 
+/* does `ty` name a declaration from another file that is not `pub`?
+ * pointers/slices/etc. resolve through to their named base */
+bool lspTypeForeignPrivate(LspDoc* d, Ty ty)
+{
+    if (ty == 0 || d->unit.ctx == null || d->unit.sema == null) return false;
+    if (ty >= d->unit.ctx.typesLen) return false;
+    TypeEntry* e = d->unit.ctx.types + ty;
+    switch (e->kind.tag)
+    {
+        TypeKind::Pointer => { return lspTypeForeignPrivate(d, e->kind.payload.Pointer.base); },
+        TypeKind::Const => { return lspTypeForeignPrivate(d, e->kind.payload.Const.base); },
+        TypeKind::Comptime => { return lspTypeForeignPrivate(d, e->kind.payload.Comptime.base); },
+        TypeKind::Slice => { return lspTypeForeignPrivate(d, e->kind.payload.Slice.base); },
+        TypeKind::Named => {
+            Symbol* sym = d->unit.sema.scopes.lookupFrom(e->kind.payload.Named.name, 0);
+            if (sym == null || sym->declaration.index == 0 || sym->declaration.index >= d->unit.ctx.nodesLen) return false;
+            Node* dn = d->unit.ctx.nodes + sym->declaration.index;
+            if (dn->kind.tag != NodeKind::Decl) return false;
+            return lspDeclForeignPrivate(&dn->kind.payload.Decl.value);
+        },
+        else => { return false; },
+    }
+}
+
+bool lspStartsWith(str s, str p)
+{
+    if (p.len > s.len) return false;
+    usize i = 0;
+    while (i < p.len)
+    {
+        if (s.ptr[i] != p.ptr[i]) return false;
+        i++;
+    }
+    return true;
+}
+
+/* LSP CompletionItemKind number for a declaration */
+i64 lspCompletionKind(Decl* decl)
+{
+    switch (decl->kind.tag)
+    {
+        DeclKind::Func => { return 3; },
+        DeclKind::Constant => { return 21; },
+        DeclKind::Struct => { return 22; },
+        DeclKind::Union => { return 22; },
+        DeclKind::Variant => { return 22; },
+        DeclKind::Enum => { return 13; },
+        DeclKind::Trait => { return 8; },
+        DeclKind::TypeAlias => { return 7; },
+        DeclKind::Distinct => { return 22; },
+        else => { return 6; },
+    }
+}
+
+/* top-level names for the word being typed: the document's own first,
+ * then imported files, foreign privates never; `print`-family functions
+ * carry a format-literal snippet because the format must be comptime */
+JsonValue lspCompletionResult(LspDoc* d, i64 line0, i64 char0, str rootPath)
+{
+    JsonValue items = JsonValue::arrayVal();
+    if (d->unit.ctx == null || d->unit.sema == null) return items;
+    u8* base = d->text.asU8();
+    usize n = d->text.len;
+    usize pos = 0;
+    i64 ln = 0;
+    while (pos < n && ln < line0)
+    {
+        if (base[pos] == 10) ln++;
+        pos++;
+    }
+    if (ln < line0) return items;
+    i64 c = 0;
+    while (pos < n && c < char0 && base[pos] != 10 && base[pos] != 13)
+    {
+        usize sz = (usize)lspUtf8Seq(base[pos]);
+        if (sz == 4) c = c + 2; else c = c + 1;
+        pos = pos + sz;
+    }
+    usize s = pos;
+    while (s > 0 && lspWordByte(base[s - 1])) s--;
+    str prefix = str { .ptr = base + s, .len = pos - s };
+
+    u8* buf = alloc<u8>(512);
+    if (buf == null) return items;
+    str seen[256];
+    u32 seenLen = 0;
+    u32 pass = 0;
+    while (pass < 2)
+    {
+        u32 i = 1;
+        while (i < d->unit.ctx.nodesLen)
+        {
+            if (items.arrVal.count() >= 256) break;
+            Node* nd = d->unit.ctx.nodes + i;
+            i++;
+            if (nd->kind.tag != NodeKind::Decl) continue;
+            Decl* decl = &nd->kind.payload.Decl.value;
+            switch (decl->kind.tag)
+            {
+                DeclKind::Import => { continue; },
+                DeclKind::ModReexport => { continue; },
+                DeclKind::Extend => { continue; },
+                DeclKind::ExtendTrait => { continue; },
+                DeclKind::Comptime => { continue; },
+                DeclKind::Flag => { continue; },
+                else => {}
+            }
+            str nm = lspDeclName(d, decl);
+            if (nm.len == 0) continue;
+            if (prefix.len > 0 && !lspStartsWith(nm, prefix)) continue;
+            SourceLoc nl = decl->nameLoc;
+            if (nl.data == 0) nl = decl->loc;
+            bool own = locFile(nl) == 0;
+            if ((pass == 0) != own) continue;
+            if (!own && !lspDeclPublic(decl)) continue;
+            bool dup = false;
+            u32 z = 0;
+            while (z < seenLen)
+            {
+                if (seen[z].len == nm.len && seen[z].equals(nm)) { dup = true; break; }
+                z++;
+            }
+            if (dup) continue;
+            if (seenLen < 256) { seen[seenLen] = nm; seenLen++; }
+
+            JsonValue item = lspObj();
+            lspPut(&item, "label", JsonValue::stringVal(String::from(nm)));
+            lspPut(&item, "kind", JsonValue::i64Val(lspCompletionKind(decl)));
+            String detail = lspDeclDetail(d, decl, buf, 512);
+            if (detail.len > 0) lspPut(&item, "detail", JsonValue::stringVal(detail));
+            bool fmtFn = nm.equals("print") || nm.equals("println") ||
+                         nm.equals("eprint") || nm.equals("eprintln");
+            if (fmtFn)
+            {
+                String ins = String::new();
+                ins.pushView(nm);
+                ins.pushView("(\"${1:format}\"${2:, args})");
+                lspPut(&item, "insertText", JsonValue::stringVal(ins));
+                lspPut(&item, "insertTextFormat", JsonValue::i64Val(2));
+            }
+            items.arrVal.push(item);
+        }
+        pass++;
+    }
+    dealloc<u8>(buf);
+    return items;
+}
+
+JsonValue lspExplainAction(DiagRecord* r)
+{
+    String title = String::from("Explain ");
+    title.pushView(r->code.asView());
+    JsonValue action = lspObj();
+    lspPut(&action, "title", JsonValue::stringVal(String::from(title.asView())));
+    lspPut(&action, "kind", JsonValue::stringVal(String::from("quickfix")));
+    JsonValue diagArr = JsonValue::arrayVal();
+    diagArr.arrVal.push(lspDiagItem(r));
+    lspPut(&action, "diagnostics", diagArr);
+    JsonValue cmd = lspObj();
+    lspPut(&cmd, "title", JsonValue::stringVal(title));
+    lspPut(&cmd, "command", JsonValue::stringVal(String::from("coralc.explain")));
+    JsonValue args = JsonValue::arrayVal();
+    args.arrVal.push(JsonValue::stringVal(String::from(r->code.asView())));
+    lspPut(&cmd, "arguments", args);
+    lspPut(&action, "command", cmd);
+    return action;
+}
+
+/* `Explain CODE` quick fixes for the diagnostics already published on
+ * this document; the command runs `coralc.explain` server-side */
+JsonValue lspCodeActionResult(LspDoc* d, i64 l0, i64 l1, str rootPath)
+{
+    JsonValue actions = JsonValue::arrayVal();
+    /* diagnostics reported in this document, on the requested lines */
+    u32 i = 0;
+    while (i < d->diags.len)
+    {
+        DiagRecord* r = d->diags.items + i;
+        i++;
+        if (r->code.len == 0) continue;
+        if (!lspPathEquals(r->file.asView(), d->path.asView(), rootPath)) continue;
+        i64 rl0 = r->line > 0 ? (i64)r->line - 1 : 0;
+        if (rl0 < l0 || rl0 > l1) continue;
+        actions.arrVal.push(lspExplainAction(r));
+    }
+    if (actions.arrVal.count() > 0) return actions;
+    /* errors raised while evaluating a callee's comptime block are
+     * reported in the callee's file (e.g. a std `print` format error in
+     * ios.crl); the call site cannot be pinpointed, so offer one action
+     * per distinct code instead of hiding the explanation */
+    String seen[32];
+    u32 seenLen = 0;
+    i = 0;
+    while (i < d->diags.len)
+    {
+        DiagRecord* r = d->diags.items + i;
+        i++;
+        if (r->code.len == 0) continue;
+        if (lspPathEquals(r->file.asView(), d->path.asView(), rootPath)) continue;
+        bool dup = false;
+        u32 z = 0;
+        while (z < seenLen)
+        {
+            if (seen[z].len == r->code.len && seen[z].asView().equals(r->code.asView())) { dup = true; break; }
+            z++;
+        }
+        if (dup) continue;
+        if (seenLen >= 32) break;
+        seen[seenLen] = String::from(r->code.asView());
+        seenLen++;
+        actions.arrVal.push(lspExplainAction(r));
+    }
+    i = 0;
+    while (i < seenLen) { seen[i].free(); i++; }
+    return actions;
+}
+
 JsonValue lspHoverResult(LspDoc* d, i64 line0, i64 char0, str rootPath)
 {
     u8* buf = alloc<u8>(512);
@@ -1901,6 +2177,7 @@ JsonValue lspHoverResult(LspDoc* d, i64 line0, i64 char0, str rootPath)
         // expressions (and anything else): just the type
         Ty ty = lspHoverType(d, line0, char0);
         if (ty == 0) { dealloc<u8>(buf); return JsonValue::nullVal(); }
+        if (lspTypeForeignPrivate(d, ty)) { dealloc<u8>(buf); return JsonValue::nullVal(); }
         if (lspIsFnPtrTy(d, ty))
         {
             lspPushFnPtrSentence(&val, d, ty, buf, 512);
@@ -2176,6 +2453,17 @@ JsonValue lspInitializeResult()
     lspPut(&caps, "textDocumentSync", JsonValue::i64Val(1));
     lspPut(&caps, "hoverProvider", JsonValue::boolVal(true));
     lspPut(&caps, "definitionProvider", JsonValue::boolVal(true));
+    JsonValue trig = JsonValue::arrayVal();
+    trig.arrVal.push(JsonValue::stringVal(String::from(".")));
+    JsonValue compCap = lspObj();
+    lspPut(&compCap, "triggerCharacters", trig);
+    lspPut(&caps, "completionProvider", compCap);
+    lspPut(&caps, "codeActionProvider", JsonValue::boolVal(true));
+    JsonValue cmds = JsonValue::arrayVal();
+    cmds.arrVal.push(JsonValue::stringVal(String::from("coralc.explain")));
+    JsonValue execCap = lspObj();
+    lspPut(&execCap, "commands", cmds);
+    lspPut(&caps, "executeCommandProvider", execCap);
     JsonValue info = lspObj();
     lspPut(&info, "name", JsonValue::stringVal(String::from("coralc")));
     lspPut(&info, "version", JsonValue::stringVal(String::from("0.1.0")));
@@ -2564,6 +2852,90 @@ pub i32 runServer(Slice buildFile, bool buildFileSet)
             if (id != null)
             {
                 JsonValue resp = lspResp(id, res);
+                lspSend(&resp);
+            }
+        }
+        else if (method.equals("textDocument/completion"))
+        {
+            JsonValue* td = jGet(params, "textDocument");
+            str uri = jStr(jGet(td, "uri"));
+            JsonValue* posn = jGet(params, "position");
+            i64 line0 = jInt(jGet(posn, "line"), 0);
+            i64 char0 = jInt(jGet(posn, "character"), 0);
+            JsonValue res = JsonValue::arrayVal();
+            if (uri.len > 0)
+            {
+                usize fi = 0;
+                while (fi < 16)
+                {
+                    if (docs[fi] != null)
+                    {
+                        if (docs[fi]->uri.asView().equals(uri))
+                        {
+                            res = lspCompletionResult(docs[fi], line0, char0, rootPath.asView());
+                            break;
+                        }
+                    }
+                    fi++;
+                }
+            }
+            if (id != null)
+            {
+                JsonValue resp = lspResp(id, res);
+                lspSend(&resp);
+            }
+        }
+        else if (method.equals("textDocument/codeAction"))
+        {
+            JsonValue* td = jGet(params, "textDocument");
+            str uri = jStr(jGet(td, "uri"));
+            JsonValue* rng = jGet(params, "range");
+            i64 l0 = 0;
+            i64 l1 = 0;
+            if (rng != null)
+            {
+                JsonValue* st = jGet(rng, "start");
+                JsonValue* en = jGet(rng, "end");
+                l0 = jInt(jGet(st, "line"), 0);
+                l1 = jInt(jGet(en, "line"), 0);
+            }
+            JsonValue res = JsonValue::arrayVal();
+            if (uri.len > 0)
+            {
+                usize fi = 0;
+                while (fi < 16)
+                {
+                    if (docs[fi] != null)
+                    {
+                        if (docs[fi]->uri.asView().equals(uri))
+                        {
+                            res = lspCodeActionResult(docs[fi], l0, l1, rootPath.asView());
+                            break;
+                        }
+                    }
+                    fi++;
+                }
+            }
+            if (id != null)
+            {
+                JsonValue resp = lspResp(id, res);
+                lspSend(&resp);
+            }
+        }
+        else if (method.equals("workspace/executeCommand"))
+        {
+            str command = jStr(jGet(params, "command"));
+            if (command.equals("coralc.explain"))
+            {
+                JsonValue* args = jGet(params, "arguments");
+                str code = str::empty();
+                if (args != null && args->type == JsonType::Array && args->arrVal.count() > 0)
+                    code = jStr(args->arrVal.atPtr(0));
+                if (code.len > 0) lspExplainCode(code);
+            }
+            if (id != null)
+            {
+                JsonValue resp = lspResp(id, JsonValue::nullVal());
                 lspSend(&resp);
             }
         }
