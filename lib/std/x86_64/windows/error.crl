@@ -1,0 +1,284 @@
+#[[no_drop_all]]
+/// Concise fatal assertions and error reporting with stack-ish unwinding.
+/// Windows implementation (kernel32 `CaptureStackBackTrace` + SEH unhandled
+/// exception filter). The Linux build uses `x86_64/linux/error.crl`.
+///
+/// A cleaner replacement for the `@assert` / `@assertOut` builtins: a failure
+/// prints a short human-readable line plus a captured backtrace to stderr and
+/// aborts — instead of dumping a raw C assertion expression.
+/// (`assert` / `assertOut` are reserved keywords, so the functions are named
+/// `check` / `_assertOut`.)
+///
+///   import(lib) std::error;
+///   error._assert(x > 0);                           // basic guard
+///   error._assertOut(i < n, "index oob");           // out-of-bounds / unreachable guard
+///   error._assertRange(i, n, "index oob");          // specialized bounds check
+///   error._assertEq(got, want, "length mismatch");  // value compare, prints both
+///   error.panic("not implemented");               // unconditional
+///
+/// Output goes through the CRT `write(2, …)` (stderr), so a report survives a
+/// crash and can be reused from the exception filter.
+import(lib) platform::libc { write, _exit };
+import(lib) platform::win32 { CaptureStackBackTrace, SetUnhandledExceptionFilter, TerminateProcess, GetCurrentProcess };
+
+// Windows exception codes we name explicitly (ntstatus-style).
+const u32 EXC_ACCESS_VIOLATION      = 0xC0000005;
+const u32 EXC_ILLEGAL_INSTRUCTION   = 0xC000001D;
+const u32 EXC_ARRAY_BOUNDS          = 0xC000008C;
+const u32 EXC_FLT_DIVIDE_BY_ZERO    = 0xC000008E;
+const u32 EXC_FLT_INVALID_OPERATION = 0xC0000093;
+const u32 EXC_INT_DIVIDE_BY_ZERO    = 0xC0000094;
+const u32 EXC_INTEGER_OVERFLOW      = 0xC0000095;
+const u32 EXC_PRIVILEGED_INSTRUCTION= 0xC0000026;
+
+// EXCEPTION_CONTINUE_SEARCH: pass the exception to the OS default handler so a
+// debugger / WER crash dump still fires after our report.
+const i32 EXC_CONTINUE_SEARCH = 0;
+
+// Reentrancy guard: never let a crash during reporting re-enter the filter.
+static bool _handling = false;
+
+// --- low-level async-signal-safe writers -----------------------------------
+
+// Write a Coral str to fd (casts to the libc `const cchar*` only at the boundary).
+void _wr(i32 fd, str s) { write(fd, (const cchar*)s.ptr, s.len); }
+
+// Write a u64 as hex, skipping leading zeros (always at least one digit).
+void _wrHex(i32 fd, u64 v)
+{
+    _wr(fd, "0x");
+    bool started = false;
+    for (i32 shift = 60; shift >= 0; shift -= 4)
+    {
+        u8 d = (u8)((v >> (u64)shift) & 0xF);
+        if (!started && d == 0 && shift != 0) continue;
+        started = true;
+        cchar c = (d < 10) ? (cchar)(48 + d) : (cchar)(87 + d);
+        write(fd, &c, 1);
+    }
+}
+
+// Write a u64 as decimal.
+void _wrDec(i32 fd, u64 v)
+{
+    if (v == 0) { _wr(fd, "0"); return; }
+    cchar buf[20];
+    i32 i = 0;
+    while (v > 0) { buf[i] = (cchar)(48 + (v % 10)); v = v / 10; i++; }
+    while (i > 0) { i--; cchar d = buf[i]; write(fd, &d, 1); }
+}
+
+void _wrExcName(i32 fd, u32 code)
+{
+    switch (code) {
+        EXC_ACCESS_VIOLATION => { _wr(fd, "ACCESS_VIOLATION"); },
+        EXC_ILLEGAL_INSTRUCTION => { _wr(fd, "ILLEGAL_INSTRUCTION"); },
+        EXC_ARRAY_BOUNDS => { _wr(fd, "ARRAY_BOUNDS_EXCEEDED"); },
+        EXC_FLT_DIVIDE_BY_ZERO => { _wr(fd, "FLT_DIVIDE_BY_ZERO"); },
+        EXC_FLT_INVALID_OPERATION => { _wr(fd, "FLT_INVALID_OPERATION"); },
+        EXC_INT_DIVIDE_BY_ZERO => { _wr(fd, "INT_DIVIDE_BY_ZERO"); },
+        EXC_INTEGER_OVERFLOW => { _wr(fd, "INTEGER_OVERFLOW"); },
+        EXC_PRIVILEGED_INSTRUCTION => { _wr(fd, "PRIVILEGED_INSTRUCTION"); },
+        else => { _wr(fd, "exception "); _wrHex(fd, (u64)code); }
+    }
+}
+
+// --- backtrace / process control -------------------------------------------
+
+/// Print a captured backtrace to fd (raw addresses; resolve with the debugger
+/// or `addr2line`-style tooling). Best-effort; one line per frame.
+pub void backtraceTo(i32 fd)
+{
+    rawptr frames[32];
+    u32 hash = 0;
+    u32 n = CaptureStackBackTrace(0, 32, frames, &hash);
+    if (n == 0) { _wr(fd, "  <no frames>\n"); return; }
+    _wr(fd, "  stack:\n");
+    for (u32 i = 0; i < n; i++)
+    {
+        _wr(fd, "  #");
+        _wrDec(fd, (u64)i);
+        _wr(fd, " ");
+        _wrHex(fd, (u64)frames[i]);
+        _wr(fd, "\n");
+    }
+}
+
+/// Terminate the process with the given exit code (134 mirrors Linux abort).
+pub void abortNow()
+{
+    TerminateProcess((rawptr)GetCurrentProcess, 134);
+    _exit(134); // fallback
+}
+
+// --- reporting (print, do not abort) ---------------------------------------
+
+/// Print a concise fatal message + backtrace to stderr. Does not abort.
+pub void report(str msg)
+{
+    _wr(2, "\ncoral: error: ");
+    _wr(2, msg);
+    _wr(2, "\n");
+    backtraceTo(2);
+    _wr(2, "\n");
+}
+
+/// Like `report`, but appends `name = 0x<hex>` before the backtrace.
+pub void reportHex(str msg, str name, u64 value)
+{
+    _wr(2, "\ncoral: error: ");
+    _wr(2, msg);
+    _wr(2, " (");
+    _wr(2, name);
+    _wr(2, " = ");
+    _wrHex(2, value);
+    _wr(2, ")\n");
+    backtraceTo(2);
+    _wr(2, "\n");
+}
+
+// --- unconditional fatals ---------------------------------------------------
+
+/// Unconditional concise panic: message + backtrace, then abort.
+pub void panic(str msg)
+{
+    report(msg);
+    abortNow();
+}
+
+/// Mark a path as impossible. Same as `panic`; signals unreachable intent.
+pub void unreachable(str msg)
+{
+    report(msg);
+    abortNow();
+}
+
+// --- asserts (abort on failure) ---------------------------------------------
+
+/// Basic guard with no message. On failure: "assertion failed" + backtrace.
+pub void _assert(bool cond)
+{
+    if (!cond) { report("assertion failed"); abortNow(); }
+}
+
+/// Out-of-bounds / unreachable guard carrying a message. The required `msg`
+/// describes what must hold; used for index guards and "cannot happen" checks.
+pub void _assertOut(bool cond, str msg)
+{
+    if (!cond) { report(msg); abortNow(); }
+}
+
+// Shared body for the comparison asserts: prints `a <op> b (msg)` + backtrace.
+void _failCmp(str op, u64 a, u64 b, str msg)
+{
+    _wr(2, "\ncoral: error: assert ");
+    _wr(2, op);
+    _wr(2, " failed: ");
+    _wrDec(2, a);
+    _wr(2, " ");
+    _wr(2, op);
+    _wr(2, " ");
+    _wrDec(2, b);
+    _wr(2, ": ");
+    _wr(2, msg);
+    _wr(2, "\n");
+    backtraceTo(2);
+    _wr(2, "\n");
+    abortNow();
+}
+
+/// `expected == actual`, else prints both values.
+pub void _assertEq(u64 expected, u64 actual, str msg)
+{
+    if (expected != actual) _failCmp("==", actual, expected, msg);
+}
+/// `a != b`, else prints both values.
+pub void _assertNe(u64 a, u64 b, str msg)
+{
+    if (a == b) _failCmp("!=", a, b, msg);
+}
+/// `a < b`, else prints both values.
+pub void _assertLt(u64 a, u64 b, str msg)
+{
+    if (!(a < b)) _failCmp("<", a, b, msg);
+}
+/// `a <= b`, else prints both values.
+pub void _assertLe(u64 a, u64 b, str msg)
+{
+    if (!(a <= b)) _failCmp("<=", a, b, msg);
+}
+/// `a > b`, else prints both values.
+pub void _assertGt(u64 a, u64 b, str msg)
+{
+    if (!(a > b)) _failCmp(">", a, b, msg);
+}
+/// `a >= b`, else prints both values.
+pub void _assertGe(u64 a, u64 b, str msg)
+{
+    if (!(a >= b)) _failCmp(">=", a, b, msg);
+}
+
+/// The classic bounds guard: `idx < len`, else prints `idx vs len`.
+pub void _assertRange(usize idx, usize len, str msg)
+{
+    if (!(idx < len))
+    {
+        _wr(2, "\ncoral: error: index ");
+        _wrDec(2, (u64)idx);
+        _wr(2, " out of bounds for length ");
+        _wrDec(2, (u64)len);
+        _wr(2, ": ");
+        _wr(2, msg);
+        _wr(2, "\n");
+        backtraceTo(2);
+        _wr(2, "\n");
+        abortNow();
+    }
+}
+
+/// Guard: pointer must be non-null.
+pub void _assertNonNull(rawptr p, str msg)
+{
+    if (p == null) { report(msg); abortNow(); }
+}
+
+/// Guard: pointer must be aligned to `align` (a power of two).
+pub void _assertAligned(rawptr p, u64 align, str msg)
+{
+    if (((u64)p & (align - 1)) != 0)
+    {
+        reportHex(msg, "pointer", (u64)p);
+        abortNow();
+    }
+}
+
+// --- crash handling ---------------------------------------------------------
+
+// Top-level SEH filter. `ep` is an EXCEPTION_POINTERS*; the exception code is
+// EXCEPTION_POINTERS->ExceptionRecord->ExceptionCode, both at offset 0.
+i32 _excFilter(rawptr ep)
+{
+    if (_handling) return EXC_CONTINUE_SEARCH; // recursion: let the OS proceed
+    _handling = true;
+
+    rawptr rec = *(rawptr*)ep;   // EXCEPTION_RECORD*
+    u32 code = *(u32*)rec;       // ExceptionCode
+
+    _wr(2, "\ncoral: fatal: ");
+    _wrExcName(2, code);
+    _wr(2, "\n");
+    backtraceTo(2);
+    _wr(2, "\n");
+
+    // Pass the exception on so the OS default handler (debugger / WER dump)
+    // still runs after our report.
+    return EXC_CONTINUE_SEARCH;
+}
+
+/// Install a concise top-level crash handler (SEH unhandled-exception filter).
+/// An access violation / illegal instruction etc. then prints the exception
+/// name + a backtrace before the OS takes over to dump/terminate.
+pub void catchFatalSignals()
+{
+    SetUnhandledExceptionFilter((rawptr)_excFilter);
+}
