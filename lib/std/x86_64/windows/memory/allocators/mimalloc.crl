@@ -1,6 +1,7 @@
 #[[no_drop_all]]
 import allocator { Allocator };
 import(lib) std::intrinsics { mmap, munmap, memcpy };
+import(lib) std::error { __report, __panic };
 import(lib) platform::libc { printf };
 import(lib) platform::win32 { GetCurrentThreadId, SwitchToThread };
 import(lib) core::cchar { cchar };
@@ -167,12 +168,16 @@ u32 _miSizeClass(usize size)
 }
 
 #[[inline]]
-usize _miBlockSize(u32 sc) { return (usize)MI_BLOCK_SIZES[sc]; }
+usize _miBlockSize(u32 sc)
+{
+    usize b = (usize)MI_BLOCK_SIZES[sc];
+    return (b + (usize)(MI_ALIGN - 1)) & ~((usize)(MI_ALIGN - 1)); // round up to MI_ALIGN
+}
 
 u32 _miBlocksPerPage(u32 sc)
 {
     usize blockSize = _miBlockSize(sc);
-    usize pageSize = (usize)MI_PAGE_SIZES[sc];
+    usize pageSize = MI_PAGE_SIZE; // uniform 64 KiB pages
     usize metaSize = (@sizeof(MiPage) + 255) & ~(usize)255;
     usize usable = pageSize - metaSize;
     return (u32)(usable / blockSize);
@@ -235,7 +240,7 @@ void _miLockAcquire(u64* p)
         if (_miAtomicCAS(p, &expected, 1)) return;
         SwitchToThread();
     }
-    printf((const cchar*)C"mimalloc: internal error: lock cannot be acquired\n");
+    __panic("mimalloc: internal error: lock cannot be acquired");
 }
 
 #[[inline]]
@@ -253,7 +258,7 @@ static u64 _miMapLockWord = 0;
 // Encode a free list pointer using per-page keys:
 //   set:   rotl(next ^ key2, key1) + key1
 //   get:   rotr(encoded - key1, key1) ^ key2
-// key1 is the rotation amount (0..63), key2 the xor mask; the additive
+// key1 is the rotation amount (1..63), key2 the xor mask; the additive
 // key1 term defeats the xor/rotate linearity of plain p^k encodings.
 // A null next encodes to the fixed sentinel below and decodes back to
 // null (the sentinel branch keeps a distinct value out of real chains).
@@ -276,7 +281,7 @@ MiBlock* _miFreeBlockDecode(MiBlock* block, MiPage* page)
     u8* end = page->base + page->capacity * page->blockSize;
     if (p < page->base || p >= end || (usize)(p - page->base) % page->blockSize != 0)
     {
-        printf((const cchar*)C"mimalloc: corrupted free list entry\n");
+        __report("mimalloc: corrupted free list entry");
         return null;
     }
     return (MiBlock*)raw;
@@ -431,11 +436,8 @@ void _miArenaSliceFree(MiArena* arena, rawptr ptr, u32 count)
 
 // Segment Management
 
-MiSegment* _miSegmentAlloc(MiHeap* heap, u32 pageCount)
+MiSegment* _miSegmentAlloc(MiHeap* heap, usize segSize)
 {
-    usize segSize = (usize)pageCount * MI_PAGE_SIZE;
-    if (segSize < MI_SEGMENT_SIZE) segSize = MI_SEGMENT_SIZE;
-
     // Try arena first
     u32 slicesNeeded = (u32)((segSize + MI_SLICE_SIZE - 1) / MI_SLICE_SIZE);
     MiArena* arena = heap->arenas;
@@ -447,7 +449,7 @@ MiSegment* _miSegmentAlloc(MiHeap* heap, u32 pageCount)
             MiSegment* seg = (MiSegment*)mem;
             seg->base = (u8*)mem;
             seg->size = segSize;
-            seg->pageCount = pageCount;
+            seg->pageCount = 1;
             seg->usedCount = 0;
             seg->arena = arena;
             seg->threadId = heap->threadId;
@@ -469,7 +471,7 @@ MiSegment* _miSegmentAlloc(MiHeap* heap, u32 pageCount)
     MiSegment* seg = (MiSegment*)mem;
     seg->base = mem;
     seg->size = segSize;
-    seg->pageCount = pageCount;
+    seg->pageCount = 1;
     seg->usedCount = 0;
     seg->arena = null;
     seg->threadId = heap->threadId;
@@ -503,29 +505,36 @@ void _miSegmentFree(MiHeap* heap, MiSegment* seg)
 
 MiPage* _miPageAlloc(MiHeap* heap, u32 sc)
 {
-    usize pageSize = (usize)MI_PAGE_SIZES[sc];
-    u32 pageCount = 1;
-    if (pageSize < MI_SEGMENT_SIZE) pageCount = (u32)(MI_SEGMENT_SIZE / pageSize);
-
-    MiSegment* seg = _miSegmentAlloc(heap, pageCount);
-    if (seg == null) return null;
-
-    // Page metadata goes at the start, blocks follow after alignment
+    // Size the segment to fit exactly one page of this size class:
+    // segment+page metadata followed by a full 64 KiB page's worth of
+    // blocks, rounded up to the system page so mmap/munmap accounting is
+    // exact.
     usize blockSize = _miBlockSize(sc);
     usize blocksPerPage = (usize)_miBlocksPerPage(sc);
     usize metaSize = (@sizeof(MiSegment) + @sizeof(MiPage) + 255) & ~(usize)255; // align to 256 bytes
+    usize segSize = (metaSize + blocksPerPage * blockSize + 4095) & ~(usize)4095;
 
+    MiSegment* seg = _miSegmentAlloc(heap, segSize);
+    if (seg == null) return null;
+
+    // Page metadata goes at the start, blocks follow after alignment.
     // the segment struct itself lives at seg->base — page metadata must
     // follow it, otherwise `page->sizeClass` aliases (and clobbers) the
     // segment's `base` field that later lines still read
     MiPage* page = (MiPage*)(seg->base + @sizeof(MiSegment));
+    // Start with MI_INITIAL_CAPACITY blocks, but never more than the page
+    // can actually hold — large size classes have blocksPerPage < 4, and
+    // building a free list beyond that would write blocks past the segment
+    // into adjacent memory.
+    usize initialCap = MI_INITIAL_CAPACITY;
+    if (initialCap > blocksPerPage) initialCap = blocksPerPage;
     page->next = null;
     page->prev = null;
     page->sizeClass = sc;
     page->blockSize = blockSize;
-    page->capacity = MI_INITIAL_CAPACITY; // start small
+    page->capacity = initialCap; // start small, extendable up to reserved
     page->used = 0;
-    page->freeCount = (u32)MI_INITIAL_CAPACITY;
+    page->freeCount = (u32)initialCap;
     page->reserved = blocksPerPage; // can extend up to this
     page->base = seg->base + metaSize; // blocks start after metadata
     page->free = null;
@@ -537,12 +546,12 @@ MiPage* _miPageAlloc(MiHeap* heap, u32 sc)
     page->pageIdx = 0;
     page->retired = false;
     page->retireCount = 0;
-    page->key1 = _miRandomU64() % 64; // rotation amount 0-63
+    page->key1 = (_miRandomU64() % 63) + 1; // rotation amount 1-63 (never 0: rot-by-0 is UB via >>64)
     page->key2 = _miRandomU64();       // XOR mask
 
     // Build free list (only initial capacity)
     MiBlock* head = null;
-    for (usize i = 0; i < MI_INITIAL_CAPACITY; i++)
+    for (usize i = 0; i < initialCap; i++)
     {
         MiBlock* block = (MiBlock*)(page->base + i * blockSize);
         _miFreeBlockEncode(block, head, page);
@@ -712,7 +721,7 @@ void _miPageCollect(MiHeap* heap, MiPage* page)
         count++;
         if ((usize)count > page->capacity)
         {
-            printf((const cchar*)C"mimalloc: corrupted thread-free list\n");
+            __report("mimalloc: corrupted thread-free list");
             return;
         }
         current = decoded;
@@ -739,8 +748,10 @@ rawptr _miAllocFast(MiHeap* heap, u32 sc)
         page->freeCount--;
         heap->totalAllocated += _miBlockSize(sc);
 
-        // If page becomes full, move to fullPages
-        if (page->freeCount == 0)
+        // Move to fullPages only when the page truly can't grow. While
+        // capacity < reserved the page stays in pages[] so the extension
+        // path can find it and double capacity on the next allocation.
+        if (page->freeCount == 0 && page->capacity >= page->reserved)
             _miPageMoveToFull(heap, page, sc);
 
         return (rawptr)block;
@@ -764,8 +775,8 @@ rawptr _miAllocFast(MiHeap* heap, u32 sc)
             page->freeCount--;
             heap->totalAllocated += _miBlockSize(sc);
 
-            // If page becomes full, move to fullPages
-            if (page->freeCount == 0)
+            // Move to fullPages only when the page truly can't grow.
+            if (page->freeCount == 0 && page->capacity >= page->reserved)
                 _miPageMoveToFull(heap, page, sc);
 
             return (rawptr)block;
@@ -959,7 +970,7 @@ pub struct MiAlloc
             page->pageIdx = 0;
             page->retired = false;
             page->retireCount = 0;
-            page->key1 = _miRandomU64() % 64;
+            page->key1 = (_miRandomU64() % 63) + 1;
             page->key2 = _miRandomU64();
             page->inFull = false;
 
@@ -1011,8 +1022,8 @@ pub struct MiAlloc
             page->freeCount--;
             self.heap.totalAllocated += _miBlockSize(sc);
 
-            // If page becomes full, move to fullPages
-            if (page->freeCount == 0)
+            // Move to fullPages only when the page truly can't grow.
+            if (page->freeCount == 0 && page->capacity >= page->reserved)
             {
                 _miPageMoveToFull(&self.heap, page, sc);
             }
