@@ -12,11 +12,12 @@ import(lib) std::text::string { String };
 import(lib) std::result { Result };
 import(lib) std::mman { alloc, dealloc };
 import(lib) std::io::fs { fileOpen, fileClose, fileRead, fileWrite, fileSeek, File, IoError, SEEK_SET, SEEK_END };
-import elf { EM_X86_64, EM_386, FMT_ELF_EXE, FMT_PE_EXE, FMT_PE_DLL, leU16 };
+import elf { EM_X86_64, EM_386, FMT_ELF_EXE, FMT_ELF_DYN, FMT_PE_EXE, FMT_PE_DLL, FMT_RAW, ET_DYN, SHN_UNDEF, SHN_COMMON, STB_LOCAL, STB_WEAK, STT_SECTION, STT_FILE, leU16 };
 import imports { Imports };
-import object { ObjFile, parseObject };
-import coff { parseObjectCoff, isCoffMachine };
-import pe { finalizeReloc };
+import object { ObjFile, Sym, parseObject };
+import coff { parseObjectCoff, isCoffMachine, parseImportMember, isImportHeader };
+import archive { isArchive, parseArchive, ArFile, ArMember, isIndexMember };
+import pe { finalizeReloc, parsePeExports, sizeEdata, buildEdata, isPeImage };
 import emit { emitImage, emitPeImage };
 import resolve { GlobalDef, resolveSyms };
 import layout { Layout, computeLayout };
@@ -37,6 +38,8 @@ pub struct Config
     u8 outFmt;
     u16 subsystem;
     bool isDll;
+    u64 entryAddr;
+    bool entryAddrSet;
 }
 
 pub struct Buffer
@@ -55,6 +58,8 @@ pub Config configFor(Arch arch)
     c.outFmt = FMT_ELF_EXE;
     c.subsystem = 3; /* console */
     c.isDll = false;
+    c.entryAddr = 0;
+    c.entryAddrSet = false;
     return c;
 }
 
@@ -70,13 +75,35 @@ pub struct Linker
 {
     Config cfg;
     Vec<Pending> inputs;
+    Vec<str> exports;
+    bool exportAll;
+    str moduleName;
 
     static Linker new(Config cfg)
     {
         Linker l;
         l.cfg = cfg;
         l.inputs = Vec<Pending>::new();
+        l.exports = Vec<str>::new();
+        l.exportAll = false;
+        l.moduleName = str::empty();
         return l;
+    }
+
+    void addExport(str name)
+    {
+        for (usize i = 0; i < self.exports.count(); i++)
+            if (self.exports.at(i).equals(name)) return;
+        self.exports.push(name);
+    }
+
+    void setExportAll(bool on) { self.exportAll = on; }
+    void setModuleName(str name) { self.moduleName = name; }
+
+    void setEntryAddress(u64 addr)
+    {
+        self.cfg.entryAddr = addr;
+        self.cfg.entryAddrSet = true;
     }
 
     void addObject(str name, str data)
@@ -123,7 +150,7 @@ pub struct Linker
         String* errp = alloc<String>(1);
         *errp = String::new();
         Vec<u8> out = Vec<u8>::new();
-        if (!_run(self.cfg, &self.inputs, &out, errp))
+        if (!_run(self.cfg, &self.inputs, &self.exports, self.exportAll, self.moduleName, &out, errp))
         {
             out.dispose();
             Result<Vec<u8>, String> bad = Result<Vec<u8>, String>::Err { .error = *errp };
@@ -151,6 +178,39 @@ pub struct Linker
         return wok;
     }
 
+    Result<Vec<u8>, String> produceStatic()
+    {
+        String* errp = alloc<String>(1);
+        *errp = String::new();
+        Vec<u8> out = Vec<u8>::new();
+        if (!_buildArchive(&self.inputs, &out, errp))
+        {
+            out.dispose();
+            Result<Vec<u8>, String> bad = Result<Vec<u8>, String>::Err { .error = *errp };
+            dealloc<String>(errp);
+            return bad;
+        }
+        errp->free();
+        dealloc<String>(errp);
+        return Result<Vec<u8>, String>::Ok { .value = out };
+    }
+
+    bool writeStatic(str path, String* err)
+    {
+        Result<Vec<u8>, String> r = self.produceStatic();
+        if (r.isErr())
+        {
+            String e = r.unwrapErr();
+            err->pushView(e.asView());
+            e.free();
+            return false;
+        }
+        Vec<u8> bytes = r.unwrap();
+        bool wok = _writeFile(path, str::fromParts((const u8*)bytes.ptr(), bytes.count()), err);
+        bytes.dispose();
+        return wok;
+    }
+
     void dispose()
     {
         for (usize i = 0; i < self.inputs.count(); i++)
@@ -159,6 +219,7 @@ pub struct Linker
             if (p->owned) p->bytes.dispose();
         }
         self.inputs.dispose();
+        self.exports.dispose();
     }
 }
 
@@ -243,6 +304,214 @@ bool _writeFile(str path, str data, String* err)
     return true;
 }
 
+str _baseName(str p)
+{
+    usize i = p.len;
+    while (i > 0)
+    {
+        i--;
+        if (p.ptr[i] == '/') return p.slice(i + 1, p.len);
+    }
+    return p;
+}
+
+u64 _pad2(u64 v) { return (v + 1) & ~(u64)1; }
+
+bool _putView(Vec<u8>* out, str s)
+{
+    for (usize i = 0; i < s.len; i++) out->push(s.ptr[i]);
+    return true;
+}
+
+bool _arNum(Vec<u8>* out, u64 v, usize width)
+{
+    u8* tmp = alloc<u8>(width > 0 ? width : 1);
+    for (usize i = 0; i < width; i++) tmp[i] = ' ';
+    usize i = width;
+    if (v == 0)
+    {
+        if (i > 0) { i--; tmp[i] = '0'; }
+    }
+    else
+    {
+        while (v > 0 && i > 0)
+        {
+            i--;
+            tmp[i] = (u8)('0' + (v % 10));
+            v /= 10;
+        }
+    }
+    for (usize k = 0; k < width; k++) out->push(tmp[k]);
+    dealloc<u8>(tmp);
+    return true;
+}
+
+bool _arRaw(Vec<u8>* out, str s, usize width)
+{
+    for (usize i = 0; i < width; i++) out->push(i < s.len ? s.ptr[i] : (u8)' ');
+    return true;
+}
+
+bool _arShortName(Vec<u8>* out, str name)
+{
+    usize n = name.len > 15 ? 15 : name.len;
+    for (usize i = 0; i < n; i++) out->push(name.ptr[i]);
+    if (n < 16) out->push('/');
+    for (usize i = n + 1; i < 16; i++) out->push(' ');
+    return true;
+}
+
+bool _arLongName(Vec<u8>* out, u32 off)
+{
+    out->push('/');
+    u8* tmp = alloc<u8>(15);
+    usize i = 15;
+    u32 v = off;
+    if (v == 0) { i--; tmp[i] = '0'; }
+    else
+    {
+        while (v > 0 && i > 0) { i--; tmp[i] = (u8)('0' + (v % 10)); v /= 10; }
+    }
+    for (usize k = i; k < 15; k++) out->push(tmp[k]);
+    dealloc<u8>(tmp);
+    for (usize k = 1 + (15 - i); k < 16; k++) out->push(' ');
+    return true;
+}
+
+bool _arHeader(Vec<u8>* out, str name, u32 longOff, u64 size, bool longName, bool isIndex, bool isLongTab)
+{
+    if (isIndex) _arRaw(out, "/", 16);
+    else if (isLongTab) _arRaw(out, "//", 16);
+    else if (longName) _arLongName(out, longOff);
+    else _arShortName(out, name);
+    _arNum(out, 0, 12);   /* mtime */
+    _arNum(out, 0, 6);    /* uid */
+    _arNum(out, 0, 6);    /* gid */
+    _arRaw(out, "100644", 8);
+    _arNum(out, size, 10);
+    out->push('`');
+    out->push('\n');
+    return true;
+}
+
+bool _putBE32(Vec<u8>* out, u32 v)
+{
+    out->push((u8)(v >> 24));
+    out->push((u8)(v >> 16));
+    out->push((u8)(v >> 8));
+    out->push((u8)v);
+    return true;
+}
+
+bool _buildArchive(Vec<Pending>* inputs, Vec<u8>* out, String* err)
+{
+    Vec<str> names = Vec<str>::new();
+    Vec<str> datas = Vec<str>::new();
+    Vec<u32> symStart = Vec<u32>::new();
+    Vec<str> syms = Vec<str>::new();
+    Vec<u32> symMember = Vec<u32>::new();
+
+    for (usize pi = 0; pi < inputs->count(); pi++)
+    {
+        Pending* p = inputs->atPtr(pi);
+        str bytes = p->owned ? str::fromParts((const u8*)p->bytes.ptr(), p->bytes.count()) : p->view;
+        if (isArchive(bytes))
+        {
+            names.dispose(); datas.dispose(); symStart.dispose(); syms.dispose(); symMember.dispose();
+            err->pushView("linker: cannot put archive into a static library: ");
+            err->pushView(p->name);
+            return false;
+        }
+        Result<ObjFile, String> r;
+        if (bytes.len >= 2 && isCoffMachine(leU16(bytes.ptr))) r = parseObjectCoff(p->name, bytes);
+        else r = parseObject(p->name, bytes);
+        if (r.isErr())
+        {
+            String e = r.unwrapErr();
+            err->pushView(e.asView());
+            e.free();
+            names.dispose(); datas.dispose(); symStart.dispose(); syms.dispose(); symMember.dispose();
+            return false;
+        }
+        ObjFile o = r.unwrap();
+        names.push(_baseName(p->name));
+        datas.push(bytes);
+        symStart.push((u32)syms.count());
+        for (usize i = 0; i < o.syms.count(); i++)
+        {
+            Sym* sym = o.syms.atPtr(i);
+            if (sym->bind == STB_LOCAL || sym->name.len == 0) continue;
+            if (sym->shndx == SHN_UNDEF) continue;
+            if (sym->type == STT_SECTION || sym->type == STT_FILE) continue;
+            syms.push(sym->name);
+            symMember.push((u32)pi);
+        }
+        o.dispose();
+    }
+    symStart.push((u32)syms.count());
+
+    String longTab = String::new();
+    Vec<u32> longOff = Vec<u32>::new();
+    for (usize i = 0; i < names.count(); i++)
+    {
+        str n = names.at(i);
+        if (n.len > 15)
+        {
+            longOff.push((u32)longTab.len);
+            longTab.pushView(n);
+            longTab.pushChar('/');
+            longTab.pushChar('\n');
+        }
+        else longOff.push(0);
+    }
+
+    u64 idxData = 4 + (u64)syms.count() * 4;
+    for (usize i = 0; i < syms.count(); i++) idxData += (u64)syms.at(i).len + 1;
+    u64 idxBlock = 60 + _pad2(idxData);
+    u64 longBlock = longTab.len > 0 ? 60 + _pad2((u64)longTab.len) : 0;
+    u64 pos = 8 + idxBlock + longBlock;
+    Vec<u64> memberOff = Vec<u64>::new();
+    for (usize i = 0; i < names.count(); i++)
+    {
+        memberOff.push(pos);
+        pos += 60 + _pad2((u64)datas.at(i).len);
+    }
+
+    _putView(out, "!<arch>\n");
+    if (syms.count() > 0)
+    {
+        _arHeader(out, str::empty(), 0, idxData, false, true, false);
+        _putBE32(out, (u32)syms.count());
+        for (usize i = 0; i < syms.count(); i++)
+            _putBE32(out, (u32)memberOff.at((usize)symMember.at(i)));
+        for (usize i = 0; i < syms.count(); i++)
+        {
+            _putView(out, syms.at(i));
+            out->push(0);
+        }
+        if ((idxData & 1) != 0) out->push('\n');
+    }
+    if (longTab.len > 0)
+    {
+        _arHeader(out, str::empty(), 0, (u64)longTab.len, false, false, true);
+        for (usize i = 0; i < longTab.len; i++) out->push((u8)longTab.ptr[i]);
+        if ((longTab.len & 1) != 0) out->push('\n');
+    }
+    for (usize i = 0; i < names.count(); i++)
+    {
+        str n = names.at(i);
+        u32 lo = longOff.at(i);
+        _arHeader(out, n, lo, (u64)datas.at(i).len, n.len > 15, false, false);
+        _putView(out, datas.at(i));
+        if ((datas.at(i).len & 1) != 0) out->push('\n');
+    }
+
+    longTab.free();
+    names.dispose(); datas.dispose(); symStart.dispose();
+    longOff.dispose(); memberOff.dispose(); syms.dispose(); symMember.dispose();
+    return true;
+}
+
 void _cleanup(Vec<ObjFile>* objs, Vec<GlobalDef>* defs, Layout* L, Imports* imps)
 {
     for (usize k = 0; k < objs->count(); k++) objs->atPtr(k)->dispose();
@@ -252,7 +521,103 @@ void _cleanup(Vec<ObjFile>* objs, Vec<GlobalDef>* defs, Layout* L, Imports* imps
     imps->dispose();
 }
 
-bool _run(Config cfg, Vec<Pending>* inputs, Vec<u8>* out, String* err)
+bool _nameIn(Vec<str>* v, str name)
+{
+    for (usize i = 0; i < v->count(); i++) if (v->at(i).equals(name)) return true;
+    return false;
+}
+
+bool _definedIn(Vec<ObjFile>* objs, str name)
+{
+    for (usize o = 0; o < objs->count(); o++)
+    {
+        ObjFile* obj = objs->atPtr(o);
+        for (usize i = 0; i < obj->syms.count(); i++)
+        {
+            Sym* sym = obj->syms.atPtr(i);
+            if (sym->bind == STB_LOCAL || sym->shndx == SHN_UNDEF) continue;
+            if (sym->name.equals(name)) return true;
+        }
+    }
+    return false;
+}
+
+void _collectMissing(Vec<ObjFile>* objs, Imports* imps, Vec<str>* missing)
+{
+    for (usize o = 0; o < objs->count(); o++)
+    {
+        ObjFile* obj = objs->atPtr(o);
+        for (usize i = 0; i < obj->syms.count(); i++)
+        {
+            Sym* sym = obj->syms.atPtr(i);
+            if (sym->bind == STB_LOCAL || sym->bind == STB_WEAK) continue;
+            if (sym->name.len == 0 || sym->shndx != SHN_UNDEF) continue;
+            if (sym->type == STT_SECTION || sym->type == STT_FILE) continue;
+            if (_definedIn(objs, sym->name)) continue;
+            if (imps != null && imps->find(sym->name) >= 0) continue;
+            if (!_nameIn(missing, sym->name)) missing->push(sym->name);
+        }
+    }
+}
+
+bool _objDefines(ObjFile* obj, Vec<str>* missing)
+{
+    for (usize i = 0; i < obj->syms.count(); i++)
+    {
+        Sym* sym = obj->syms.atPtr(i);
+        if (sym->bind == STB_LOCAL || sym->shndx == SHN_UNDEF) continue;
+        if (_nameIn(missing, sym->name)) return true;
+    }
+    return false;
+}
+
+bool _importNeeded(Vec<str>* missing, str name)
+{
+    for (usize i = 0; i < missing->count(); i++)
+    {
+        str m = missing->at(i);
+        if (m.equals(name)) return true;
+        if (m.startsWith("__imp_") && m.slice(6, m.len).equals(name)) return true;
+        if (name.startsWith("__imp_") && name.slice(6, name.len).equals(m)) return true;
+    }
+    return false;
+}
+
+bool _addUnique(Vec<str>* v, str name)
+{
+    if (name.len == 0) return false;
+    for (usize i = 0; i < v->count(); i++) if (v->at(i).equals(name)) return false;
+    v->push(name);
+    return true;
+}
+
+bool _strLess(str a, str b)
+{
+    usize n = a.len < b.len ? a.len : b.len;
+    for (usize i = 0; i < n; i++)
+    {
+        if (a.ptr[i] < b.ptr[i]) return true;
+        if (a.ptr[i] > b.ptr[i]) return false;
+    }
+    return a.len < b.len;
+}
+
+void _sortNames(Vec<str>* v)
+{
+    for (usize i = 1; i < v->count(); i++)
+    {
+        str key = v->at(i);
+        usize j = i;
+        while (j > 0 && _strLess(key, v->at(j - 1)))
+        {
+            *v->atPtr(j) = v->at(j - 1);
+            j--;
+        }
+        *v->atPtr(j) = key;
+    }
+}
+
+bool _run(Config cfg, Vec<Pending>* inputs, Vec<str>* requestedExports, bool exportAll, str moduleName, Vec<u8>* out, String* err)
 {
     u16 machine = 0;
     bool want64 = false;
@@ -261,11 +626,13 @@ bool _run(Config cfg, Vec<Pending>* inputs, Vec<u8>* out, String* err)
         Arch::X86_64 => { machine = EM_X86_64; want64 = true; },
         else => { machine = EM_386; want64 = false; }
     }
+    bool pe = cfg.outFmt == FMT_PE_EXE || cfg.outFmt == FMT_PE_DLL;
 
     Vec<ObjFile> objs = Vec<ObjFile>::new();
     Vec<GlobalDef> defs = Vec<GlobalDef>::new();
     Layout L = Layout::empty();
     Imports imps = Imports::new();
+    Vec<usize> archives = Vec<usize>::new();
 
     for (usize i = 0; i < inputs->count(); i++)
     {
@@ -275,6 +642,31 @@ bool _run(Config cfg, Vec<Pending>* inputs, Vec<u8>* out, String* err)
             bytes = str::fromParts((const u8*)p->bytes.ptr(), p->bytes.count());
         else
             bytes = p->view;
+
+        if (isArchive(bytes))
+        {
+            archives.push(i);
+            continue;
+        }
+        if (isPeImage(bytes))
+        {
+            if (!pe)
+            {
+                err->pushView("linker: PE image input requires PE output: ");
+                err->pushView(p->name);
+                _cleanup(&objs, &defs, &L, &imps);
+                archives.dispose();
+                return false;
+            }
+            if (!parsePeExports(p->name, bytes, &imps, err))
+            {
+                _cleanup(&objs, &defs, &L, &imps);
+                archives.dispose();
+                return false;
+            }
+            continue;
+        }
+
         Result<ObjFile, String> r;
         if (bytes.len >= 2 && isCoffMachine(leU16(bytes.ptr)))
             r = parseObjectCoff(p->name, bytes);
@@ -286,9 +678,90 @@ bool _run(Config cfg, Vec<Pending>* inputs, Vec<u8>* out, String* err)
             err->pushView(e.asView());
             e.free();
             _cleanup(&objs, &defs, &L, &imps);
+            archives.dispose();
             return false;
         }
         objs.push(r.unwrap());
+    }
+
+    /* Pull members out of static archives until every reference that
+     * can be satisfied is present. Import-library members only create
+     * records for symbols that are actually referenced.
+     */
+    bool changed = true;
+    u32 pass = 0;
+    while (changed && pass < 64)
+    {
+        changed = false;
+        pass++;
+        Vec<str> missing = Vec<str>::new();
+        _collectMissing(&objs, &imps, &missing);
+        if (cfg.entry.len > 0 && !_definedIn(&objs, cfg.entry) && !_nameIn(&missing, cfg.entry))
+            missing.push(cfg.entry);
+        if (missing.count() == 0)
+        {
+            missing.dispose();
+            break;
+        }
+        for (usize ai = 0; ai < archives.count(); ai++)
+        {
+            Pending* p = inputs->atPtr(archives.at(ai));
+            str bytes = p->owned ? str::fromParts((const u8*)p->bytes.ptr(), p->bytes.count()) : p->view;
+            Result<ArFile, String> ar = parseArchive(p->name, bytes);
+            if (ar.isErr())
+            {
+                String e = ar.unwrapErr();
+                err->pushView(e.asView());
+                e.free();
+                missing.dispose();
+                _cleanup(&objs, &defs, &L, &imps);
+                archives.dispose();
+                return false;
+            }
+            ArFile a = ar.unwrap();
+            for (usize mi = 0; mi < a.members.count(); mi++)
+            {
+                ArMember* m = a.members.atPtr(mi);
+                if (isIndexMember(m->name)) continue;
+                str md = bytes.slice(m->dataOff, m->dataOff + m->dataLen);
+                if (isImportHeader(md))
+                {
+                    str iname = str::empty();
+                    str idll = str::empty();
+                    bool iord = false;
+                    u16 iordv = 0;
+                    if (!parseImportMember(md, &iname, &idll, &iord, &iordv)) continue;
+                    if (!_importNeeded(&missing, iname)) continue;
+                    imps.add(idll, iname, iord, iordv);
+                    changed = true;
+                    continue;
+                }
+                Result<ObjFile, String> r;
+                if (md.len >= 2 && isCoffMachine(leU16(md.ptr))) r = parseObjectCoff(m->name, md);
+                else r = parseObject(m->name, md);
+                if (r.isErr())
+                {
+                    String e = r.unwrapErr();
+                    err->pushView(e.asView());
+                    e.free();
+                    a.dispose();
+                    missing.dispose();
+                    _cleanup(&objs, &defs, &L, &imps);
+                    archives.dispose();
+                    return false;
+                }
+                ObjFile o = r.unwrap();
+                if (!_objDefines(&o, &missing))
+                {
+                    o.dispose();
+                    continue;
+                }
+                objs.push(o);
+                changed = true;
+            }
+            a.dispose();
+        }
+        missing.dispose();
     }
 
     for (usize i = 0; i < objs.count(); i++)
@@ -301,6 +774,7 @@ bool _run(Config cfg, Vec<Pending>* inputs, Vec<u8>* out, String* err)
             err->pushView(obj->name);
             err->pushView(": machine does not match target arch");
             _cleanup(&objs, &defs, &L, &imps);
+            archives.dispose();
             return false;
         }
         if (obj->cls != wantCls)
@@ -309,9 +783,11 @@ bool _run(Config cfg, Vec<Pending>* inputs, Vec<u8>* out, String* err)
             err->pushView(obj->name);
             err->pushView(": ELF class does not match target arch");
             _cleanup(&objs, &defs, &L, &imps);
+            archives.dispose();
             return false;
         }
     }
+    archives.dispose();
 
     if (!resolveSyms(&objs, &defs, &imps, err))
     {
@@ -319,22 +795,55 @@ bool _run(Config cfg, Vec<Pending>* inputs, Vec<u8>* out, String* err)
         return false;
     }
 
-    if (!computeLayout(machine, cfg.outFmt, cfg.imageBase, cfg.entry, 0, &objs, &defs, &imps, &L, err))
+    Vec<str> exportList = Vec<str>::new();
+    if (cfg.outFmt == FMT_PE_DLL)
     {
+        for (usize i = 0; i < requestedExports->count(); i++) _addUnique(&exportList, requestedExports->at(i));
+        for (usize i = 0; i < objs.count(); i++)
+        {
+            ObjFile* obj = objs.atPtr(i);
+            for (usize k = 0; k < obj->exports.count(); k++) _addUnique(&exportList, obj->exports.at(k));
+        }
+        if (exportAll)
+        {
+            for (usize i = 0; i < defs.count(); i++)
+            {
+                GlobalDef* def = defs.atPtr(i);
+                if (def->isImport) continue;
+                _addUnique(&exportList, def->name);
+            }
+        }
+        _sortNames(&exportList);
+    }
+    usize edataSz = exportList.count() > 0 ? sizeEdata(&exportList, moduleName) : 0;
+
+    if (!computeLayout(machine, cfg.outFmt, cfg.imageBase, cfg.entry, cfg.entryAddr, cfg.entryAddrSet, edataSz, &objs, &defs, &imps, &L, err))
+    {
+        exportList.dispose();
         _cleanup(&objs, &defs, &L, &imps);
         return false;
     }
 
     u8* img = null;
     usize len = 0;
-    bool pe = cfg.outFmt == FMT_PE_EXE || cfg.outFmt == FMT_PE_DLL;
     bool emitted;
     if (pe) emitted = emitPeImage(machine, cfg.isDll, cfg.subsystem, &objs, &defs, &L, &imps, &img, &len, err);
-    else emitted = emitImage(machine, cfg.emitSymtab, &objs, &defs, &L, &img, &len, err);
+    else emitted = emitImage(machine, cfg.outFmt, cfg.emitSymtab, &objs, &defs, &L, &img, &len, err);
     if (!emitted)
     {
+        exportList.dispose();
         _cleanup(&objs, &defs, &L, &imps);
         return false;
+    }
+    if (pe && edataSz > 0)
+    {
+        if (!buildEdata(img, &L, &defs, &objs, &exportList, moduleName, err))
+        {
+            dealloc<u8>(img);
+            exportList.dispose();
+            _cleanup(&objs, &defs, &L, &imps);
+            return false;
+        }
     }
 
     Vec<u32> fixups = Vec<u32>::new();
@@ -342,6 +851,7 @@ bool _run(Config cfg, Vec<Pending>* inputs, Vec<u8>* out, String* err)
     {
         fixups.dispose();
         dealloc<u8>(img);
+        exportList.dispose();
         _cleanup(&objs, &defs, &L, &imps);
         return false;
     }
@@ -349,6 +859,7 @@ bool _run(Config cfg, Vec<Pending>* inputs, Vec<u8>* out, String* err)
     {
         fixups.dispose();
         dealloc<u8>(img);
+        exportList.dispose();
         _cleanup(&objs, &defs, &L, &imps);
         return false;
     }
@@ -359,6 +870,7 @@ bool _run(Config cfg, Vec<Pending>* inputs, Vec<u8>* out, String* err)
     dealloc<u8>(img);
     *out = v;
 
+    exportList.dispose();
     _cleanup(&objs, &defs, &L, &imps);
     return true;
 }
