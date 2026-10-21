@@ -713,9 +713,13 @@ bool cgMangleExempt(Codegen* cg, NodeId declId, Slice name)
             if (dd.kind.tag == DeclKind::Constant && (dd.kind.payload.Constant.flags & 2) != 0) return true;
             /* a definition whose file also declares an extern("C") proto
              * of the same name is C-visible: calls bind the proto (which
-             * is exempt), so the definition must spell bare as well */
+             * is exempt), so the definition must spell bare as well. Only
+             * same-source-file protos count: the merged unit holds every
+             * file, so a libc extern("C") sleep must not strip the prefix
+             * from concurrent::async's unrelated sleep */
             if (dd.kind.tag == DeclKind::Func && cg.file != null)
             {
+                u32 defFid = locFile(n->loc);
                 u32 fi = 0;
                 while (fi < cg.file.declsLen)
                 {
@@ -724,6 +728,7 @@ bool cgMangleExempt(Codegen* cg, NodeId declId, Slice name)
                     {
                         Decl* fd = &fn.kind.payload.Decl.value;
                         if (fd.kind.tag == DeclKind::Func && (fd.kind.payload.Func.flags & 2) != 0 &&
+                            locFile(fn->loc) == defFid &&
                             cgSliceEq(name, cgIntern(cg, fd.kind.payload.Func.name)))
                             return true;
                     }
@@ -1302,6 +1307,27 @@ bool cgIsStructTy(Codegen* cg, NodeId id)
     if (t == 0) return false;
     if ((cg.ctx->types + t)->kind.tag != TypeKind::Named) return false;
     NodeId d = cgFindDecl(cg, (cg.ctx->types + t)->kind.payload.Named.name, (u32)DeclKind::Struct);
+    return d.index != 0;
+}
+
+/* variant-typed value: a Named type resolving to a Variant decl. C maps
+ * variants to a struct with an int `tag`, so ordering/equality compares
+ * must go through `.tag` — the struct itself has no C operators */
+bool cgIsVariantTy(Codegen* cg, NodeId id)
+{
+    if (id.index == 0) return false;
+    Node* n = cgNode(cg, id);
+    if (n.kind.tag != NodeKind::Expr) return false;
+    Ty t = cgSubstTy(cg, n.kind.payload.Expr.value.resolvedType);
+    while (t != 0 && ((cg.ctx->types + t)->kind.tag == TypeKind::Const ||
+                      (cg.ctx->types + t)->kind.tag == TypeKind::Comptime))
+    {
+        if ((cg.ctx->types + t)->kind.tag == TypeKind::Const) t = (cg.ctx->types + t)->kind.payload.Const.base;
+        else t = (cg.ctx->types + t)->kind.payload.Comptime.base;
+    }
+    if (t == 0) return false;
+    if ((cg.ctx->types + t)->kind.tag != TypeKind::Named) return false;
+    NodeId d = cgFindDecl(cg, (cg.ctx->types + t)->kind.payload.Named.name, (u32)DeclKind::Variant);
     return d.index != 0;
 }
 
@@ -2868,13 +2894,27 @@ Slice cgExpr(Codegen* cg, NodeId id)
             right = e.kind.payload.Add.right;
             Slice l;
             Slice r;
+            /* variant operands compare by tag ordinal: `V::Case` lowers to
+             * its declaration index, a variant-typed value reads `.tag`.
+             * covers ==/!= directly and the ordering ops (declaration order) */
             {
                 u64 cidx = 0;
-                bool cmp = e.kind.tag == ExprKind::Eq || e.kind.tag == ExprKind::Ne;
-                if (cmp && cgVariantCaseIdx(cg, left, &cidx)) l = cgU64Text(cg, cidx);
-                else l = cgExpr(cg, left);
-                if (cmp && cgVariantCaseIdx(cg, right, &cidx)) r = cgU64Text(cg, cidx);
-                else r = cgExpr(cg, right);
+                bool isCmp = e.kind.tag == ExprKind::Eq || e.kind.tag == ExprKind::Ne ||
+                             e.kind.tag == ExprKind::Lt || e.kind.tag == ExprKind::Le ||
+                             e.kind.tag == ExprKind::Gt || e.kind.tag == ExprKind::Ge;
+                if (isCmp && cgVariantCaseIdx(cg, left, &cidx)) l = cgU64Text(cg, cidx);
+                else
+                {
+                    l = cgExpr(cg, left);
+                    /* extend the slice over the appended ".tag" */
+                    if (isCmp && cgIsVariantTy(cg, left)) { stP(&cg.ebuf, ".tag"); l.len = l.len + 4; }
+                }
+                if (isCmp && cgVariantCaseIdx(cg, right, &cidx)) r = cgU64Text(cg, cidx);
+                else
+                {
+                    r = cgExpr(cg, right);
+                    if (isCmp && cgIsVariantTy(cg, right)) { stP(&cg.ebuf, ".tag"); r.len = r.len + 4; }
+                }
             }
             // str is a slice view: compare by content, not by struct bits
             if (cgIsStrTy(cg, left) &&
@@ -6270,7 +6310,11 @@ void cgConstExpr(Codegen* cg, NodeId id)
     if (k == ExprKind::Cast)
     {
         stP(&cg.defs, "(");
-        stPS(&cg.defs, cgResultTy(cg, id, e));
+        /* const exprs may lack resolvedType; the cast target is authoritative */
+        if (e->kind.payload.Cast.targetType != 0)
+            stPS(&cg.defs, tyStr(cg, cgSubstTy(cg, e->kind.payload.Cast.targetType)));
+        else
+            stPS(&cg.defs, cgResultTy(cg, id, e));
         stP(&cg.defs, ")(");
         cgConstExpr(cg, e->kind.payload.Cast.expr);
         stP(&cg.defs, ")");
@@ -6504,6 +6548,111 @@ void cgEmitGlobals(Codegen* cg)
     }
 }
 
+/* completeness walk for by-value field ordering: pointer and slice
+ * fields name an incomplete type legally; const/comptime/array wrap a
+ * by-value element; a Named must already be emitted */
+void cgTypeCompleteDeps(Codegen* cg, Ty t, Slice* names, u8* emitted, u32 n, bool* ready)
+{
+    if (!*ready || t == 0 || names == null) return;
+    TypeKind k = (cg.ctx->types + t)->kind;
+    if (k.tag == TypeKind::Pointer) return;
+    if (k.tag == TypeKind::Slice) return;
+    if (k.tag == TypeKind::Const) { cgTypeCompleteDeps(cg, k.payload.Const.base, names, emitted, n, ready); return; }
+    if (k.tag == TypeKind::Comptime) { cgTypeCompleteDeps(cg, k.payload.Comptime.base, names, emitted, n, ready); return; }
+    if (k.tag == TypeKind::Array) { cgTypeCompleteDeps(cg, k.payload.Array.base, names, emitted, n, ready); return; }
+    if (k.tag == TypeKind::Named)
+    {
+        Slice want = tyStr(cg, t);
+        u32 j = 0;
+        while (j < n)
+        {
+            if (!emitted[j] && cgSliceEq(names[j], want)) { *ready = false; return; }
+            j++;
+        }
+    }
+}
+
+bool cgTypeBodyReady(Codegen* cg, NodeId declId, MonoInstance* inst, Slice* names, u8* emitted, u32 n)
+{
+    Node* d = cgNode(cg, declId);
+    if (d.kind.tag != NodeKind::Decl || names == null) return true;
+    Decl* dd = &d.kind.payload.Decl.value;
+    MonoSubstitution* oldSubs = cg.subs;
+    u32 oldSubsLen = cg.subsLen;
+    if (inst != null) { cg.subs = inst->substitutions; cg.subsLen = inst->substitutionsLen; }
+    else { cg.subs = null; cg.subsLen = 0; }
+    bool ready = true;
+    if (dd.kind.tag == DeclKind::Struct)
+    {
+        u32 f = 0;
+        while (f < dd.kind.payload.Struct.fieldsLen && ready)
+        {
+            Node* fn = cgNode(cg, dd.kind.payload.Struct.fields[f]);
+            if (fn.kind.tag == NodeKind::Field)
+                cgTypeCompleteDeps(cg, fn.kind.payload.Field.value.typeNode, names, emitted, n, &ready);
+            f++;
+        }
+    }
+    else if (dd.kind.tag == DeclKind::Union)
+    {
+        u32 f = 0;
+        while (f < dd.kind.payload.Union.fieldsLen && ready)
+        {
+            Node* fn = cgNode(cg, dd.kind.payload.Union.fields[f]);
+            if (fn.kind.tag == NodeKind::Field)
+                cgTypeCompleteDeps(cg, fn.kind.payload.Field.value.typeNode, names, emitted, n, &ready);
+            f++;
+        }
+    }
+    else if (dd.kind.tag == DeclKind::Variant)
+    {
+        u32 v = 0;
+        while (v < dd.kind.payload.Variant.variantsLen && ready)
+        {
+            u32 f = 0;
+            while (f < dd.kind.payload.Variant.variants[v].fieldsLen && ready)
+            {
+                cgTypeCompleteDeps(cg, dd.kind.payload.Variant.variants[v].fieldTypes[f], names, emitted, n, &ready);
+                f++;
+            }
+            v++;
+        }
+    }
+    cg.subs = oldSubs;
+    cg.subsLen = oldSubsLen;
+    return ready;
+}
+
+void cgEmitTypeBody(Codegen* cg, NodeId declId, MonoInstance* inst, Slice m)
+{
+    Node* d = cgNode(cg, declId);
+    if (d.kind.tag != NodeKind::Decl) return;
+    Decl* dd = &d.kind.payload.Decl.value;
+    MonoSubstitution* oldSubs = cg.subs;
+    u32 oldSubsLen = cg.subsLen;
+    if (inst != null) { cg.subs = inst->substitutions; cg.subsLen = inst->substitutionsLen; }
+    else { cg.subs = null; cg.subsLen = 0; }
+    if (dd.kind.tag == DeclKind::Struct)
+    {
+        stP(&cg.defs, "struct ");
+        stPS(&cg.defs, m);
+        stP(&cg.defs, " {");
+        cgEmitStructFields(cg, dd.kind.payload.Struct.fields, dd.kind.payload.Struct.fieldsLen, 4);
+        stP(&cg.defs, "\n};\n");
+    }
+    else if (dd.kind.tag == DeclKind::Union)
+    {
+        stP(&cg.defs, "union ");
+        stPS(&cg.defs, m);
+        stP(&cg.defs, " {");
+        cgEmitStructFields(cg, dd.kind.payload.Union.fields, dd.kind.payload.Union.fieldsLen, 4);
+        stP(&cg.defs, "\n};\n");
+    }
+    else if (dd.kind.tag == DeclKind::Variant) cgEmitVariantDef(cg, dd, m);
+    cg.subs = oldSubs;
+    cg.subsLen = oldSubsLen;
+}
+
 void cgEmitTypeDefs(Codegen* cg)
 {
     u32 i = 0;
@@ -6574,123 +6723,158 @@ void cgEmitTypeDefs(Codegen* cg)
     }
     cg.typedefs = cg.defs;
     cg.defs = defsSaved;
-    /* sweep 2b: monomorphised struct/union instances — file structs hold
-     * them by value (`Vec_String entries`), while a Vec-style instance
-     * only reaches its element type through a pointer, so instances go
-     * first. Variant instances stay after the file structs: a payload
-     * (`Result<String, IoError>`) holds one by value. */
-    if (cg.mono != null)
+    /* sweep 2b+3+5 combined: struct/union/variant bodies — file decls
+     * and monomorphised instances — in by-value dependency order.
+     * Instances hold file types by value (HashMapEntry<String,String>
+     * contains String) and file structs hold instances by value
+     * (entries as Vec<String>), so neither fixed order works: emit any
+     * body whose by-value named fields are already emitted, repeating
+     * until none remain. Pointer and slice fields need no ordering (the
+     * typedefs above make the names visible); a by-value cycle is
+     * illegal in Coral and falls back to source order. */
     {
+        u32 count = 0;
         i = 0;
-        while (i < cg.mono.instancesLen)
+        while (i < cg.file.declsLen)
         {
-            MonoInstance* inst = cg.mono.instances + i;
-            if (inst.kind == MonoInstanceKind::TypeInstance)
+            Node* d = cgNode(cg, cg.file.decls[i]);
+            if (d.kind.tag == NodeKind::Decl)
             {
-                Node* d = cgNode(cg, inst.declaration);
-                if (d.kind.tag == NodeKind::Decl)
-                {
-                    Decl* dd = &d.kind.payload.Decl.value;
-                    if (dd.kind.tag == DeclKind::Struct || dd.kind.tag == DeclKind::Union)
-                    {
-                        Slice m = cgInstanceName(cg, inst.name, inst.arguments, inst.argumentsLen);
-                        MonoSubstitution* oldSubs = cg.subs;
-                        u32 oldSubsLen = cg.subsLen;
-                        cg.subs = inst.substitutions;
-                        cg.subsLen = inst.substitutionsLen;
-                        if (dd.kind.tag == DeclKind::Struct)
-                        {
-                            stP(&cg.defs, "struct ");
-                            stPS(&cg.defs, m);
-                            stP(&cg.defs, " {");
-                            cgEmitStructFields(cg, dd.kind.payload.Struct.fields, dd.kind.payload.Struct.fieldsLen, 4);
-                            stP(&cg.defs, "\n};\n");
-                        }
-                        else
-                        {
-                            stP(&cg.defs, "union ");
-                            stPS(&cg.defs, m);
-                            stP(&cg.defs, " {");
-                            cgEmitStructFields(cg, dd.kind.payload.Union.fields, dd.kind.payload.Union.fieldsLen, 4);
-                            stP(&cg.defs, "\n};\n");
-                        }
-                        cg.subs = oldSubs;
-                        cg.subsLen = oldSubsLen;
-                    }
-                }
+                Decl* dd = &d.kind.payload.Decl.value;
+                if ((dd.kind.tag == DeclKind::Struct || dd.kind.tag == DeclKind::Union || dd.kind.tag == DeclKind::Variant) &&
+                    !cgDeclIsGeneric(cg, cg.file.decls[i])) count++;
             }
             i++;
         }
-    }
-    // sweep 3: structs / unions / variants
-    i = 0;
-    while (i < cg.file.declsLen)
-    {
-        NodeId id = cg.file.decls[i];
-        Node* d = cgNode(cg, id);
-        if (d.kind.tag == NodeKind::Decl)
+        u32 instCount = 0;
+        if (cg.mono != null)
         {
-            Decl* dd = &d.kind.payload.Decl.value;
-            switch (dd.kind.tag)
+            i = 0;
+            while (i < cg.mono.instancesLen)
             {
-                DeclKind::Struct => {
-                    if (cgDeclIsGeneric(cg, id)) break;
-                    stP(&cg.defs, "struct ");
-                    stPS(&cg.defs, cgMangle(cg, id, dd.kind.payload.Struct.name, 0));
-                    stP(&cg.defs, " {");
-                    cgEmitStructFields(cg, dd.kind.payload.Struct.fields, dd.kind.payload.Struct.fieldsLen, 4);
-                    stP(&cg.defs, "\n};\n");
-                },
-                DeclKind::Union => {
-                    if (cgDeclIsGeneric(cg, id)) break;
-                    stP(&cg.defs, "union ");
-                    stPS(&cg.defs, cgMangle(cg, id, dd.kind.payload.Union.name, 0));
-                    stP(&cg.defs, " {");
-                    cgEmitStructFields(cg, dd.kind.payload.Union.fields, dd.kind.payload.Union.fieldsLen, 4);
-                    stP(&cg.defs, "\n};\n");
-                },
-                DeclKind::Variant => {
-                    if (cgDeclIsGeneric(cg, id)) break;
-                    cgEmitVariantDef(cg, dd, cgMangle(cg, id, dd.kind.payload.Variant.name, 0));
-                },
-                else => {},
+                MonoInstance* inst = cg.mono.instances + i;
+                if (inst.kind == MonoInstanceKind::TypeInstance)
+                {
+                    Node* d = cgNode(cg, inst.declaration);
+                    if (d.kind.tag == NodeKind::Decl)
+                    {
+                        Decl* dd = &d.kind.payload.Decl.value;
+                        if (dd.kind.tag == DeclKind::Struct || dd.kind.tag == DeclKind::Union || dd.kind.tag == DeclKind::Variant) instCount++;
+                    }
+                }
+                i++;
             }
         }
-        i++;
+        if (count + instCount > 0)
+        {
+            NodeId* declIds = alloc<NodeId>((usize)(count + instCount));
+            MonoInstance** insts = alloc<MonoInstance*>((usize)(count + instCount));
+            Slice* names = alloc<Slice>((usize)(count + instCount));
+            u8* emitted = alloc<u8>((usize)(count + instCount));
+            if (declIds != null && insts != null && names != null && emitted != null)
+            {
+                zero<u8>(emitted, (usize)(count + instCount));
+                u32 n = 0;
+                i = 0;
+                while (i < cg.file.declsLen)
+                {
+                    Node* d = cgNode(cg, cg.file.decls[i]);
+                    if (d.kind.tag == NodeKind::Decl)
+                    {
+                        Decl* dd = &d.kind.payload.Decl.value;
+                        bool take = !cgDeclIsGeneric(cg, cg.file.decls[i]);
+                        Slice m = Slice::from(null, 0);
+                        if (take && dd.kind.tag == DeclKind::Struct) m = cgMangle(cg, cg.file.decls[i], dd.kind.payload.Struct.name, 0);
+                        else if (take && dd.kind.tag == DeclKind::Union) m = cgMangle(cg, cg.file.decls[i], dd.kind.payload.Union.name, 0);
+                        else if (take && dd.kind.tag == DeclKind::Variant) m = cgMangle(cg, cg.file.decls[i], dd.kind.payload.Variant.name, 0);
+                        else take = false;
+                        if (take)
+                        {
+                            declIds[n] = cg.file.decls[i];
+                            insts[n] = null;
+                            names[n] = m;
+                            n++;
+                        }
+                    }
+                    i++;
+                }
+                if (cg.mono != null)
+                {
+                    i = 0;
+                    while (i < cg.mono.instancesLen)
+                    {
+                        MonoInstance* inst = cg.mono.instances + i;
+                        if (inst.kind == MonoInstanceKind::TypeInstance)
+                        {
+                            Node* d = cgNode(cg, inst.declaration);
+                            if (d.kind.tag == NodeKind::Decl)
+                            {
+                                Decl* dd = &d.kind.payload.Decl.value;
+                                if (dd.kind.tag == DeclKind::Struct || dd.kind.tag == DeclKind::Union || dd.kind.tag == DeclKind::Variant)
+                                {
+                                    declIds[n] = inst.declaration;
+                                    insts[n] = inst;
+                                    names[n] = cgInstanceName(cg, inst.name, inst.arguments, inst.argumentsLen);
+                                    n++;
+                                }
+                            }
+                        }
+                        i++;
+                    }
+                }
+                u32 remaining = n;
+                while (remaining > 0)
+                {
+                    u32 progress = 0;
+                    u32 bi = 0;
+                    while (bi < n)
+                    {
+                        if (!emitted[bi])
+                        {
+                            bool ready = cgTypeBodyReady(cg, declIds[bi], insts[bi], names, emitted, n);
+                            if (ready)
+                            {
+                                cgEmitTypeBody(cg, declIds[bi], insts[bi], names[bi]);
+                                emitted[bi] = 1;
+                                remaining--;
+                                progress++;
+                            }
+                        }
+                        bi++;
+                    }
+                    if (progress == 0)
+                    {
+                        bi = 0;
+                        while (bi < n)
+                        {
+                            if (!emitted[bi])
+                            {
+                                cgEmitTypeBody(cg, declIds[bi], insts[bi], names[bi]);
+                                emitted[bi] = 1;
+                                remaining--;
+                            }
+                            bi++;
+                        }
+                    }
+                }
+                dealloc<NodeId>(declIds);
+                dealloc<MonoInstance*>(insts);
+                dealloc<Slice>(names);
+                dealloc<u8>(emitted);
+            }
+            else
+            {
+                if (declIds != null) dealloc<NodeId>(declIds);
+                if (insts != null) dealloc<MonoInstance*>(insts);
+                if (names != null) dealloc<Slice>(names);
+                if (emitted != null) dealloc<u8>(emitted);
+                cg.errors++;
+            }
+        }
     }
     /* sweep 4 (file-scope constants) moved to cgEmitGlobals: it runs
      * after the prototypes so fn-pointer initializers see a prior
      * declaration of the function */
-    /* sweep 5: monomorphised variant instances (struct/union instances
-     * went out in sweep 2b) */
-    if (cg.mono != null)
-    {
-        i = 0;
-        while (i < cg.mono.instancesLen)
-        {
-            MonoInstance* inst = cg.mono.instances + i;
-            if (inst.kind == MonoInstanceKind::TypeInstance)
-            {
-                Node* d = cgNode(cg, inst.declaration);
-                if (d.kind.tag == NodeKind::Decl)
-                {
-                    Decl* dd = &d.kind.payload.Decl.value;
-                    if (dd.kind.tag == DeclKind::Variant)
-                    {
-                        Slice m = cgInstanceName(cg, inst.name, inst.arguments, inst.argumentsLen);
-                        MonoSubstitution* oldSubs = cg.subs;
-                        u32 oldSubsLen = cg.subsLen;
-                        cg.subs = inst.substitutions;
-                        cg.subsLen = inst.substitutionsLen;
-                        cgEmitVariantDef(cg, dd, m);
-                        cg.subs = oldSubs;
-                        cg.subsLen = oldSubsLen;
-                    }
-                }
-            }
-            i++;
-        }
-    }
 }
 
 // owner prefix for methods of a type/extend decl

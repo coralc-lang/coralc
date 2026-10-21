@@ -21,8 +21,8 @@ Landed in commit `8508d68` (`compiler: optimize interning, declaration parsing, 
 | F8 | **DONE** | Doc table kept sorted by `(fileId, declLine)` with binary-search insert/lookup. |
 | F9 | **DONE** | One `rebindTypeParams` walk handles local and outer generics. |
 | F10a | **DONE** | `scanDocsAbove` frees its temporary `String`. |
-| F4, F5 | **NOT STARTED** | Token-buffer / single-lex redesign; largest remaining parser work. |
-| F10b–F10f | **NOT STARTED** | Minor/hygiene items. |
+| F4, F5 | **DONE** | Lex-once token array (`Parser.toks`/`pos`); `save()/restore()` are pure index rewinds; `prescanConstInts` walks the array with no lexer/save/restore; `Parser::init` is a static factory taking `fileId`. Self-host round-2 with new parser: rc=0 (12.4s), regressions + full std (linux link, windows C→object) all pass. |
+| F10b–F10f | **PARTIAL** | (c) **DONE**: lexer `reportErrorCode` derives the line from the lexer's own line counter (O(token) instead of O(file) per diagnostic). (f) **free under F4/F5**: the attribute peek's save/restore is a pure index rewind; `intern("no_drop_all")` is hashed. (b)/(d)/(e) remain: doc-walk side vector, SmallVec list builders, const-table hash — all need profiling evidence or are invasive. |
 | Parts 2–9 | **NOT REVIEWED** | Only Part 1 has been implementation-checked so far. |
 
 Validation at that commit: two self-host builds, `opttest` rc 5, `sigtest` rc 0, generic fixtures matched, Mu rebuilt and ran.
