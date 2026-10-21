@@ -109,10 +109,19 @@ pub extend Sema
                 if (noDrop) self.noDropDepth++;
                 self.scopes.enter();
                 bool ok = true;
+                bool warnedUnreachable = false;
                 u32 i = 0;
                 while (i < stmt->kind.payload.Block.stmtsLen)
                 {
                     if (!self.checkStmt(stmt->kind.payload.Block.stmts[i])) ok = false;
+                    if (!warnedUnreachable && i + 1 < stmt->kind.payload.Block.stmtsLen &&
+                        self.stmtDiverges(stmt->kind.payload.Block.stmts[i]))
+                    {
+                        self.semaWarnNode(ErrorCode::SemaUnreachableCode,
+                            stmt->kind.payload.Block.stmts[i + 1],
+                            "unreachable code: the preceding statement always leaves this block");
+                        warnedUnreachable = true;
+                    }
                     i++;
                 }
                 self.scopes.leave();
@@ -413,6 +422,7 @@ pub extend Sema
                     self.scopes.leave();
                     i++;
                 }
+                if (scrutTy != 0) self.checkSwitchCoverage(stmt, scrutTy);
                 return ok;
             },
             else => {
@@ -551,6 +561,25 @@ pub extend Sema
         Expr* ae = &an->kind.payload.Expr.value;
         if (ae->kind.tag != ExprKind::BoolLit) return false;
         return (ae->kind.payload.BoolLit.flags & 1) == 0;
+    }
+
+    /* E0603: statements that always leave the current block. Break and
+     * continue only leave the block (not the function), but any following
+     * statement in the same block is still unreachable. */
+    bool stmtDiverges(NodeId id)
+    {
+        if (id.index == 0) return false;
+        Node* n = self.ctx.nodes + id.index;
+        if (n->kind.tag != NodeKind::Stmt) return false;
+        Stmt* st = &n->kind.payload.Stmt.value;
+        if (st->kind.tag == StmtKind::Return || st->kind.tag == StmtKind::Break ||
+            st->kind.tag == StmtKind::Continue) return true;
+        if (st->kind.tag == StmtKind::ExprStmt)
+            return self.exprIsNoReturnCall(st->kind.payload.ExprStmt.expr);
+        /* deliberately do not use stmtAlwaysReturns here: an exhaustive
+         * switch or if/else followed by a return is common and valid-looking,
+         * and warning on it is noise rather than a real dead statement */
+        return false;
     }
 
     /* T0011 support: only the obvious shapes count as "always returns" —
@@ -998,5 +1027,183 @@ pub extend Sema
             f++;
         }
         return ok;
+    }
+
+    /* E0608/E0609 support: the enum or variant declaration behind a switch
+     * scrutinee; null for switches over integers, pointers, strings, etc. */
+    Decl* switchScrutineeDecl(Ty scrutTy)
+    {
+        Ty base = self.stripType(scrutTy);
+        if (base == 0) return null;
+        TypeEntry* te = self.ctx.types + base;
+        if (te->kind.tag != TypeKind::Named) return null;
+        Symbol* sym = self.lookupType(te->kind.payload.Named.name, te->loc);
+        if (sym == null || sym->declaration.index == 0) return null;
+        Node* dn = self.ctx.nodes + sym->declaration.index;
+        if (dn->kind.tag != NodeKind::Decl) return null;
+        Decl* d = &dn->kind.payload.Decl.value;
+        if (d->kind.tag == DeclKind::Enum || d->kind.tag == DeclKind::Variant) return d;
+        return null;
+    }
+
+    bool switchDeclHasCase(Decl* d, Str name)
+    {
+        if (d == null || name == 0) return false;
+        if (d->kind.tag == DeclKind::Enum)
+        {
+            u32 i = 0;
+            while (i < d->kind.payload.Enum.variantsLen)
+            {
+                Node* vn = self.ctx.nodes + d->kind.payload.Enum.variants[i].index;
+                if (vn->kind.tag == NodeKind::EnumVariant &&
+                    vn->kind.payload.EnumVariant.value.name == name) return true;
+                i++;
+            }
+            return false;
+        }
+        u32 i = 0;
+        while (i < d->kind.payload.Variant.variantsLen)
+        {
+            if (d->kind.payload.Variant.variants[i].name == name) return true;
+            i++;
+        }
+        return false;
+    }
+
+    /* record one pattern's enum/variant case. guarded arms do not cover
+     * their case, but a later arm for an already-covered case is still
+     * unreachable and warns. */
+    void switchCoverPattern(NodeId patId, Decl* d, Str* covered, u32* coveredLen, bool guarded)
+    {
+        if (patId.index == 0) return;
+        Node* n = self.ctx.nodes + patId.index;
+        if (n->kind.tag != NodeKind::Pat) return;
+        Pat* p = &n->kind.payload.Pat.value;
+        if (p->kind.tag == PatKind::Or)
+        {
+            u32 i = 0;
+            while (i < p->kind.payload.Or.alternativesLen)
+            {
+                self.switchCoverPattern(p->kind.payload.Or.alternatives[i], d,
+                                        covered, coveredLen, guarded);
+                i++;
+            }
+            return;
+        }
+        Str name = 0;
+        if (p->kind.tag == PatKind::Variant) name = p->kind.payload.Variant.variantName;
+        else if (p->kind.tag == PatKind::Ident) name = p->kind.payload.Ident.name;
+        else return;
+        if (!self.switchDeclHasCase(d, name)) return;
+        bool seen = false;
+        u32 i = 0;
+        while (i < *coveredLen)
+        {
+            if (covered[i] == name) { seen = true; break; }
+            i++;
+        }
+        if (seen)
+        {
+            String msg = String::new();
+            msg.pushView("unreachable switch case: '");
+            msg.pushView(self.nameTextView(name));
+            msg.pushView("' is already covered by an earlier arm");
+            self.semaWarnNode(ErrorCode::SemaUnreachableSwitchCase, patId, msg.asView());
+            return;
+        }
+        if (!guarded && *coveredLen < 256)
+        {
+            covered[*coveredLen] = name;
+            (*coveredLen)++;
+        }
+    }
+
+    void checkSwitchCoverage(Stmt* st, Ty scrutTy)
+    {
+        Decl* d = self.switchScrutineeDecl(scrutTy);
+        if (d == null) return;
+        Str covered[256];
+        u32 coveredLen = 0;
+        bool hasElse = false;
+        u32 i = 0;
+        while (i < st->kind.payload.Switch.casesLen)
+        {
+            SwitchCase* c = st->kind.payload.Switch.cases + i;
+            if ((c->flags & 4) != 0 || c->patternsLen == 0)
+            {
+                hasElse = true;
+                i++;
+                continue;
+            }
+            bool guarded = (c->flags & 1) != 0 && c->guard.index != 0;
+            u32 p = 0;
+            while (p < c->patternsLen)
+            {
+                self.switchCoverPattern(c->patterns[p], d, covered, &coveredLen, guarded);
+                p++;
+            }
+            i++;
+        }
+        if (hasElse || self.stmtHasAttr(st, self.ctx.intern("fallthrough"))) return;
+
+        Ty base = self.stripType(scrutTy);
+        Str typeName = 0;
+        if (base != 0 && (self.ctx.types + base)->kind.tag == TypeKind::Named)
+            typeName = (self.ctx.types + base)->kind.payload.Named.name;
+        String msg = String::new();
+        msg.pushView("switch on '");
+        if (typeName != 0) msg.pushView(self.nameTextView(typeName));
+        else msg.pushView("value");
+        msg.pushView("' is not exhaustive; missing ");
+        u32 missing = 0;
+        if (d->kind.tag == DeclKind::Enum)
+        {
+            u32 v = 0;
+            while (v < d->kind.payload.Enum.variantsLen)
+            {
+                Node* vn = self.ctx.nodes + d->kind.payload.Enum.variants[v].index;
+                if (vn->kind.tag == NodeKind::EnumVariant)
+                {
+                    Str nm = vn->kind.payload.EnumVariant.value.name;
+                    bool hit = false;
+                    u32 k = 0;
+                    while (k < coveredLen) { if (covered[k] == nm) { hit = true; break; } k++; }
+                    if (!hit)
+                    {
+                        if (missing > 0) msg.pushView(", ");
+                        if (missing == 3) { msg.pushView("..."); break; }
+                        msg.pushView("'");
+                        msg.pushView(self.nameTextView(nm));
+                        msg.pushView("'");
+                        missing++;
+                    }
+                }
+                v++;
+            }
+        }
+        else
+        {
+            u32 v = 0;
+            while (v < d->kind.payload.Variant.variantsLen)
+            {
+                Str nm = d->kind.payload.Variant.variants[v].name;
+                bool hit = false;
+                u32 k = 0;
+                while (k < coveredLen) { if (covered[k] == nm) { hit = true; break; } k++; }
+                if (!hit)
+                {
+                    if (missing > 0) msg.pushView(", ");
+                    if (missing == 3) { msg.pushView("..."); break; }
+                    msg.pushView("'");
+                    msg.pushView(self.nameTextView(nm));
+                    msg.pushView("'");
+                    missing++;
+                }
+                v++;
+            }
+        }
+        if (missing == 0) return;
+        SourceLoc loc = st->loc;
+        self.semaError(ErrorCode::SemaNonExhaustiveSwitch, loc, msg.asView());
     }
 }
