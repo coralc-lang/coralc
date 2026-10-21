@@ -17,7 +17,7 @@ pass=0
 fail=0
 for case in cases/*.ir; do
     name=$(basename "$case" .ir)
-    expect=$(sed -n 's/^; expect: *//p' "$case" | head -1)
+    expect=$(sed -n 's|^// *expect: *||p' "$case" | head -1)
     [ -z "$expect" ] && expect=0
     for lv in $LEVELS; do
         if ! ./irtool "$case" "$TMP/${name}_${lv}.s" "$lv" 2>"$TMP/${name}_${lv}.err"; then
