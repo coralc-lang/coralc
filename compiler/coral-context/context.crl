@@ -24,6 +24,7 @@ pub struct InternEntry
     u8* ptr;
     usize len;
     u32 id;
+    u32 hash;
 }
 
 /* append-buffers for list-ish fields. append reallocs through ctx.grow;
@@ -80,6 +81,8 @@ pub struct AstContext
     InternEntry* interns;
     u32 internsLen;
     u32 internsCap;
+    u32* internIndex;
+    u32 internIndexCap;
     TypeEntry* types;
     u32 typesLen;
     u32 typesCap;
@@ -107,6 +110,8 @@ pub struct AstContext
             .interns = null,
             .internsLen = 0,
             .internsCap = 0,
+            .internIndex = null,
+            .internIndexCap = 0,
             .types = null,
             .typesLen = 0,
             .typesCap = 0,
@@ -189,12 +194,15 @@ pub struct AstContext
         }
         if (self.owned != null) dealloc<rawptr>(self.owned);
         if (self.interns != null) dealloc<InternEntry>(self.interns);
+        if (self.internIndex != null) dealloc<u32>(self.internIndex);
         if (self.types != null) dealloc<TypeEntry>(self.types);
         if (self.nodes != null) dealloc<Node>(self.nodes);
         
         self.interns = null;
         self.internsLen = 0;
         self.internsCap = 0;
+        self.internIndex = null;
+        self.internIndexCap = 0;
         self.types = null;
         self.typesLen = 0;
         self.typesCap = 0;
@@ -296,6 +304,7 @@ pub struct AstContext
             self.interns[0].ptr = null;
             self.interns[0].len = 0;
             self.interns[0].id = 0;
+            self.interns[0].hash = 0;
             self.internsLen = 1;
         }
         return true;
@@ -446,29 +455,95 @@ pub struct AstContext
         return result;
     }
 
+    u32 hashStr(str s)
+    {
+        u32 h = 2166136261;
+        usize i = 0;
+        while (i < s.len)
+        {
+            h = (h ^ (u32)s.ptr[i]) * 16777619;
+            i++;
+        }
+        return h;
+    }
+
+    bool growInternIndex()
+    {
+        if (self.error != 0) return false;
+        u32 oldCap = self.internIndexCap;
+        u32 newCap = oldCap == 0 ? 16 : oldCap * 2;
+        if (newCap <= oldCap)
+        {
+            self.setError();
+            return false;
+        }
+        usize bytes = 0;
+        if (!self.byteCount(newCap, @sizeof(u32), &bytes)) return false;
+        u32* idx = (u32*)alloc<u8>(bytes);
+        if (idx == null)
+        {
+            self.setError();
+            return false;
+        }
+        zero<u8>((u8*)idx, bytes);
+
+        u32 i = 1;
+        u32 mask = newCap - 1;
+        while (i < self.internsLen)
+        {
+            InternEntry* e = self.interns + i;
+            u32 slot = e.hash & mask;
+            while (idx[slot] != 0) slot = (slot + 1) & mask;
+            idx[slot] = e.id;
+            i++;
+        }
+        if (self.internIndex != null) dealloc<u32>(self.internIndex);
+        self.internIndex = idx;
+        self.internIndexCap = newCap;
+        return true;
+    }
+
+    bool ensureInternIndex()
+    {
+        if (self.internIndex != null && self.internIndexCap != 0) return true;
+        return self.growInternIndex();
+    }
+
     /* id for a byte string; 0 means empty input or a failed context.
-     * linear scan over distinct strings; O(n) per call, fine until a
-     * profile says otherwise */
+     * open-addressed index keeps lookup O(1) instead of scanning the
+     * entire intern table for every identifier. */
     u32 intern(str s)
     {
         if (s.len == 0 || s.ptr == null) return 0;
         if (self.error != 0) return 0;
         if (!self.ensureInterns()) return 0;
+        if (!self.ensureInternIndex()) return 0;
 
-        u32 i = 1;
-        while (i < self.internsLen)
+        u32 h = self.hashStr(s);
+        u32 mask = self.internIndexCap - 1;
+        u32 slot = h & mask;
+        while (true)
         {
-            InternEntry* e = self.interns + i;
-            if (self.streq(str { .ptr = e.ptr, .len = e.len }, s))
+            u32 id = self.internIndex[slot];
+            if (id == 0) break;
+            InternEntry* e = self.interns + id;
+            if (e.hash == h && e.len == s.len &&
+                self.streq(str { .ptr = e.ptr, .len = e.len }, s))
             {
                 return e.id;
             }
-            i++;
+            slot = (slot + 1) & mask;
         }
+
         if (!self.growInterns()) return 0;
         if (self.internsLen == 4294967295) {
             self.setError();
             return 0;
+        }
+        if ((usize)(self.internsLen + 1) * 4 > (usize)self.internIndexCap * 3)
+        {
+            if (!self.growInternIndex()) return 0;
+            mask = self.internIndexCap - 1;
         }
         /* copy the bytes: callers free their buffers after parsing
          * (lib loader candidate paths) while entries live as long as
@@ -491,25 +566,44 @@ pub struct AstContext
         e.ptr = copy;
         e.len = s.len;
         e.id = self.internsLen;
+        e.hash = h;
         self.internsLen++;
+
+        slot = h & mask;
+        while (self.internIndex[slot] != 0) slot = (slot + 1) & mask;
+        self.internIndex[slot] = e.id;
         return e.id;
     }
 
     /* parser hook: remember the `///` block above a declaration whose
      * name is on `declLine` (1-based, within fileId). text is interned by
      * the caller. re-parses of the same line overwrite (speculation). */
+    u64 docKey(u32 fileId, u32 declLine)
+    {
+        return ((u64)fileId << 32) | (u64)declLine;
+    }
+
     void addDocBlock(u32 fileId, u32 declLine, Str text)
     {
         if (text == 0 || self.error != 0) return;
-        u32 i = 0;
-        while (i < self.docsLen)
+        u64 key = self.docKey(fileId, declLine);
+        u32 lo = 0;
+        u32 hi = self.docsLen;
+        while (lo < hi)
         {
-            if (self.docs[i].fileId == fileId && self.docs[i].declLine == declLine)
+            u32 mid = lo + (hi - lo) / 2;
+            u64 midKey = self.docKey(self.docs[mid].fileId, self.docs[mid].declLine);
+            if (midKey < key) lo = mid + 1;
+            else hi = mid;
+        }
+        if (lo < self.docsLen)
+        {
+            u64 atKey = self.docKey(self.docs[lo].fileId, self.docs[lo].declLine);
+            if (atKey == key)
             {
-                self.docs[i].text = text;
+                self.docs[lo].text = text;
                 return;
             }
-            i++;
         }
         if (self.docs == null || self.docsLen >= self.docsCap)
         {
@@ -519,9 +613,15 @@ pub struct AstContext
             self.docs = (DocBlock*)raw;
             self.docsCap = newCap;
         }
-        self.docs[self.docsLen].fileId = fileId;
-        self.docs[self.docsLen].declLine = declLine;
-        self.docs[self.docsLen].text = text;
+        u32 i = self.docsLen;
+        while (i > lo)
+        {
+            self.docs[i] = self.docs[i - 1];
+            i--;
+        }
+        self.docs[lo].fileId = fileId;
+        self.docs[lo].declLine = declLine;
+        self.docs[lo].text = text;
         self.docsLen++;
     }
 
@@ -529,12 +629,20 @@ pub struct AstContext
      * `declLine`; 0 when the declaration carries no docs */
     Str docFor(u32 fileId, u32 declLine)
     {
-        u32 i = 0;
-        while (i < self.docsLen)
+        u64 key = self.docKey(fileId, declLine);
+        u32 lo = 0;
+        u32 hi = self.docsLen;
+        while (lo < hi)
         {
-            if (self.docs[i].fileId == fileId && self.docs[i].declLine == declLine)
-                return self.docs[i].text;
-            i++;
+            u32 mid = lo + (hi - lo) / 2;
+            u64 midKey = self.docKey(self.docs[mid].fileId, self.docs[mid].declLine);
+            if (midKey < key) lo = mid + 1;
+            else hi = mid;
+        }
+        if (lo < self.docsLen)
+        {
+            if (self.docKey(self.docs[lo].fileId, self.docs[lo].declLine) == key)
+                return self.docs[lo].text;
         }
         return 0;
     }
