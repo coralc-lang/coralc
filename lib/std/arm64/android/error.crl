@@ -1,0 +1,265 @@
+#[[no_drop_all]]
+/// Concise fatal assertions and error reporting with stack-ish unwinding.
+/// Android/x86_64 implementation (POSIX signals on bionic).
+/// bionic has no glibc `<execinfo.h>` `backtrace()` / `backtrace_symbols_fd()`,
+/// so `__backtraceTo` is a stub and the failure text is instead handed to
+/// `android_set_abort_message` so it shows up in the crash tombstone. The
+/// assert / panic / report surface is identical to the other platforms.
+///
+/// A cleaner replacement for the `@assert` / `@assertOut` builtins: a failure
+/// prints a short human-readable line plus a symbolized backtrace to stderr and
+/// aborts with a core dump — instead of dumping a raw C assertion expression.
+/// (`assert` / `assertOut` are reserved keywords, so the functions are named
+/// `check` / `__assertOut`.)
+///
+///   import(lib) std::error;
+///   error::__assert(x > 0);                           // basic guard
+///   error::__assertOut(i < n, "index oob");           // out-of-bounds / __unreachable guard
+///   error::__assertRange(i, n, "index oob");          // specialized bounds check
+///   error::__assertEq(got, want, "length mismatch");  // value compare, prints both
+///   error::__panic("not implemented");               // unconditional
+///
+/// All output goes through `write(2, ...)` (no stdio buffering), so a __report
+/// survives a crash and can be reused from a signal handler.
+import(lib) platform::libc { write, strlen, signal, raise, _exit };
+import(lib) platform::android { android_set_abort_message };
+
+// Signal numbers (linux x86_64).
+const i32 SIGABRT_ = 6;
+const i32 SIGBUS_  = 7;
+const i32 SIGFPE_  = 8;
+const i32 SIGILL_  = 4;
+const i32 SIGSEGV_ = 11;
+
+// Reentrancy guard: never let a crash during reporting re-enter the handler.
+static bool _handling = false;
+
+// --- low-level async-signal-safe writers -----------------------------------
+
+// Write a Coral str to fd (casts to the libc `const cchar*` only at the boundary).
+void _wr(i32 fd, str s) { write(fd, (const cchar*)s.ptr, s.len); }
+
+// Write a u64 as hex, skipping leading zeros (always at least one digit).
+void _wrHex(i32 fd, u64 v)
+{
+    _wr(fd, "0x");
+    bool started = false;
+    for (i32 shift = 60; shift >= 0; shift -= 4)
+    {
+        u8 d = (u8)((v >> (u64)shift) & 0xF);
+        if (!started && d == 0 && shift != 0) continue;
+        started = true;
+        cchar c = (d < 10) ? (cchar)(48 + d) : (cchar)(87 + d);
+        write(fd, &c, 1);
+    }
+}
+
+// Write a u64 as decimal.
+void _wrDec(i32 fd, u64 v)
+{
+    if (v == 0) { _wr(fd, "0"); return; }
+    cchar buf[20];
+    i32 i = 0;
+    while (v > 0) { buf[i] = (cchar)(48 + (v % 10)); v = v / 10; i++; }
+    while (i > 0) { i--; cchar d = buf[i]; write(fd, &d, 1); }
+}
+
+void _wrSigName(i32 fd, i32 sig)
+{
+    if (sig == SIGSEGV_) _wr(fd, "SIGSEGV (segmentation fault)");
+    else if (sig == SIGBUS_)  _wr(fd, "SIGBUS (bus error)");
+    else if (sig == SIGILL_)  _wr(fd, "SIGILL (illegal instruction)");
+    else if (sig == SIGFPE_)  _wr(fd, "SIGFPE (arithmetic fault)");
+    else if (sig == SIGABRT_) _wr(fd, "SIGABRT (abort)");
+    else { _wr(fd, "signal "); _wrDec(fd, (u64)sig); }
+}
+
+// --- backtrace / process control -------------------------------------------
+
+/// Print a backtrace to fd. bionic has no `<execinfo.h>` unwinder, so this is
+/// a stub; the real failure text is carried by `android_set_abort_message`
+/// (see `__report`) and appears in the crash tombstone.
+pub void __backtraceTo(i32 fd)
+{
+    _wr(fd, "  stack: <backtrace unavailable on android>\n");
+}
+
+/// Abort with a core dump (restores the default SIGABRT disposition first).
+pub void __abortNow()
+{
+    signal(SIGABRT_, (rawptr)(usize)0); // SIG_DFL
+    raise(SIGABRT_);
+    _exit(134); // 128 + SIGABRT fallback
+}
+
+// --- reporting (print, do not abort) ---------------------------------------
+
+/// Print a concise fatal message + backtrace to stderr. Does not abort.
+pub void __report(str msg)
+{
+    android_set_abort_message(msg); // bionic tombstone carries the real text
+    _wr(2, "\ncoral: error: ");
+    _wr(2, msg);
+    _wr(2, "\n");
+    __backtraceTo(2);
+    _wr(2, "\n");
+}
+
+/// Like `__report`, but appends `name = 0x<hex>` before the backtrace.
+pub void __reportHex(str msg, str name, u64 value)
+{
+    _wr(2, "\ncoral: error: ");
+    _wr(2, msg);
+    _wr(2, " (");
+    _wr(2, name);
+    _wr(2, " = ");
+    _wrHex(2, value);
+    _wr(2, ")\n");
+    __backtraceTo(2);
+    _wr(2, "\n");
+}
+
+// --- unconditional fatals ---------------------------------------------------
+
+/// Unconditional concise __panic: message + backtrace, then abort.
+pub void __panic(str msg)
+{
+    __report(msg);
+    __abortNow();
+}
+
+/// Mark a path as impossible. Same as `__panic`; signals __unreachable intent.
+pub void __unreachable(str msg)
+{
+    __report(msg);
+    __abortNow();
+}
+
+// --- asserts (abort on failure) ---------------------------------------------
+
+/// Basic guard with no message. On failure: "assertion failed" + backtrace.
+pub void __assert(bool cond)
+{
+    if (!cond) { __report("assertion failed"); __abortNow(); }
+}
+
+/// Out-of-bounds / __unreachable guard carrying a message. The required `msg`
+/// describes what must hold; used for index guards and "cannot happen" checks.
+pub void __assertOut(bool cond, str msg)
+{
+    if (!cond) { __report(msg); __abortNow(); }
+}
+
+// Shared body for the comparison asserts: prints `a <op> b (msg)` + backtrace.
+void _failCmp(str op, u64 a, u64 b, str msg)
+{
+    _wr(2, "\ncoral: error: assert ");
+    _wr(2, op);
+    _wr(2, " failed: ");
+    _wrDec(2, a);
+    _wr(2, " ");
+    _wr(2, op);
+    _wr(2, " ");
+    _wrDec(2, b);
+    _wr(2, ": ");
+    _wr(2, msg);
+    _wr(2, "\n");
+    __backtraceTo(2);
+    _wr(2, "\n");
+    __abortNow();
+}
+
+/// `expected == actual`, else prints both values.
+pub void __assertEq(u64 expected, u64 actual, str msg)
+{
+    if (expected != actual) _failCmp("==", actual, expected, msg);
+}
+/// `a != b`, else prints both values.
+pub void __assertNe(u64 a, u64 b, str msg)
+{
+    if (a == b) _failCmp("!=", a, b, msg);
+}
+/// `a < b`, else prints both values.
+pub void __assertLt(u64 a, u64 b, str msg)
+{
+    if (!(a < b)) _failCmp("<", a, b, msg);
+}
+/// `a <= b`, else prints both values.
+pub void __assertLe(u64 a, u64 b, str msg)
+{
+    if (!(a <= b)) _failCmp("<=", a, b, msg);
+}
+/// `a > b`, else prints both values.
+pub void __assertGt(u64 a, u64 b, str msg)
+{
+    if (!(a > b)) _failCmp(">", a, b, msg);
+}
+/// `a >= b`, else prints both values.
+pub void __assertGe(u64 a, u64 b, str msg)
+{
+    if (!(a >= b)) _failCmp(">=", a, b, msg);
+}
+
+/// The classic bounds guard: `idx < len`, else prints `idx vs len`.
+pub void __assertRange(usize idx, usize len, str msg)
+{
+    if (!(idx < len))
+    {
+        _wr(2, "\ncoral: error: index ");
+        _wrDec(2, (u64)idx);
+        _wr(2, " out of bounds for length ");
+        _wrDec(2, (u64)len);
+        _wr(2, ": ");
+        _wr(2, msg);
+        _wr(2, "\n");
+        __backtraceTo(2);
+        _wr(2, "\n");
+        __abortNow();
+    }
+}
+
+/// Guard: pointer must be non-null.
+pub void __assertNonNull(rawptr p, str msg)
+{
+    if (p == null) { __report(msg); __abortNow(); }
+}
+
+/// Guard: pointer must be aligned to `align` (a power of two).
+pub void __assertAligned(rawptr p, u64 align, str msg)
+{
+    if (((u64)p & (align - 1)) != 0)
+    {
+        __reportHex(msg, "pointer", (u64)p);
+        __abortNow();
+    }
+}
+
+// --- crash handling ---------------------------------------------------------
+
+void _fatalHandler(i32 sig)
+{
+    if (_handling) _exit(128 + sig); // recursion: bail immediately
+    _handling = true;
+
+    _wr(2, "\ncoral: fatal: ");
+    _wrSigName(2, sig);
+    _wr(2, "\n");
+    __backtraceTo(2);
+    _wr(2, "\n");
+
+    // Restore the default disposition and re-raise so the exit status and core
+    // dump reflect the real signal rather than a silent _exit.
+    signal(sig, (rawptr)(usize)0); // SIG_DFL
+    raise(sig);
+    _exit(128 + sig);
+}
+
+/// Install concise handlers for the common crash signals (SEGV/BUS/ILL/FPE).
+/// A crash then prints the signal name + a backtrace before dying with a core.
+pub void __catchFatalSignals()
+{
+    signal(SIGSEGV_, (rawptr)_fatalHandler);
+    signal(SIGBUS_,  (rawptr)_fatalHandler);
+    signal(SIGILL_,  (rawptr)_fatalHandler);
+    signal(SIGFPE_,  (rawptr)_fatalHandler);
+}
