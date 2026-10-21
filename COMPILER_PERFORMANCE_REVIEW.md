@@ -7,6 +7,26 @@ Method: 8 parallel review agents (parser ×3, semantics ×3, frontend ×1, codeg
 
 **Second universal finding:** statement/declaration disambiguation does a full speculative `parseType()` + `save()/restore()` (which rewinds the *source cursor*, forcing a re-lex) + a second real parse — doubling type-parse + intern work on the majority of statements and 100% of struct/union members and `const` decls. **Third:** `prescanConstInts` re-lexes the entire file once before parsing (47.6% of all lexing). **Fourth:** no token buffer, so every `save()/restore()` re-lexes. **Fifth:** the compiler is built with `opt = "debug"`, paying every constant factor at -O0.
 
+## Implementation status (2026-10-21)
+
+Landed in commit `8508d68` (`compiler: optimize interning, declaration parsing, and doc lookup`).
+
+| Item | Status | Notes |
+|---|---|---|
+| F1 | **DONE** | FNV-1a open-addressed intern index. Measured ~1.27× full self-host speedup (21.6/23.2s → 16.8/18.4s), not the 2–3× headline above. |
+| F2 | **DONE** | Struct/union members parse their type once via `parseFuncDeclTail`; benchmark impact inconclusive. |
+| F3 | **DONE** | Single-pass `parseConstDecl` / `finishConstDecl`. |
+| F6 | **DONE** | `ParserMark.nodesLen` saved and restored. |
+| F7 | **DONE** | Attribute checks now hit the hashed interner; edit-distance table uses stack storage and length early-out. |
+| F8 | **DONE** | Doc table kept sorted by `(fileId, declLine)` with binary-search insert/lookup. |
+| F9 | **DONE** | One `rebindTypeParams` walk handles local and outer generics. |
+| F10a | **DONE** | `scanDocsAbove` frees its temporary `String`. |
+| F4, F5 | **NOT STARTED** | Token-buffer / single-lex redesign; largest remaining parser work. |
+| F10b–F10f | **NOT STARTED** | Minor/hygiene items. |
+| Parts 2–9 | **NOT REVIEWED** | Only Part 1 has been implementation-checked so far. |
+
+Validation at that commit: two self-host builds, `opttest` rc 5, `sigtest` rc 0, generic fixtures matched, Mu rebuilt and ran.
+
 ---
 
 # PART 1 — Parser: Declaration Layer & Core
@@ -21,6 +41,8 @@ Scope reviewed: `coral-parser/decl.crl` (1711 lines), `base.crl`, `lib.crl`, `fi
 ---
 
 ### F1. `AstContext.intern` is a linear scan with string compares — O(n) per call, O(n²) per compile
+
+**Status: DONE (`8508d68`).** Replaced the linear scan with a FNV-1a open-addressed index. Measured whole-compile improvement is ~1.27×, so the 2–3× headline is overstated; the O(n²) mechanism was real.
 
 **Location:** `coral-context/context.crl:452-496` (the `streq` loop at 458-467), invoked from **69 call sites in `decl.crl` alone** (e.g. `decl.crl:272, 594, 697, 817, 877, 915, 1041, 1130, 1481, 1534`) and 169 across the compiler.
 
@@ -68,6 +90,8 @@ u32 intern(str s) {
 ---
 
 ### F2. Struct/union members parse every type **twice** (field-vs-method lookahead re-parses from scratch)
+
+**Status: DONE (`8508d68`).** Added `parseFuncDeclTail` and made struct/union members commit after one type parse. No confirmed speedup yet; benchmark noise was too high to attribute a gain.
 
 **Location:** `decl.crl:854-869` (struct), `decl.crl:1077-1090` (union).
 
@@ -120,6 +144,8 @@ Semantics are preserved: diagnostics still emit exactly once (the old code suppr
 ---
 
 ### F3. `const` declarations parse the type twice (backtracking disambiguation)
+
+**Status: DONE (`8508d68`).** Replaced the speculative const head with one forward parse through `parseConstDecl` / `finishConstDecl`.
 
 **Location:** `decl.crl:410-425` (`parseDeclBody`, `TokenKind::Const` case), followed by re-parse in `parseConstDecl` (`decl.crl:1258-1296`) or `parseFuncOrVarDecl` (`decl.crl:589`).
 
@@ -210,6 +236,8 @@ Lookahead at any depth becomes O(1) with no re-lexing, and `lexer.setCur/setLine
 
 ### F6. Speculation leaks node-arena slots — `restore()` rewinds `typesLen` but not `nodesLen`
 
+**Status: DONE (`8508d68`).** `ParserMark` now records `nodesLen`; `restore()` rewinds it alongside `typesLen`.
+
 **Location:** `parser.crl:117-122` (comment admits it: *"restore() rewinds everything except the node arena; nodes the discarded pass allocated stay behind"*); `base.crl:9-24` (`ParserMark` has `typesLen`, no `nodesLen`); `restore()` at `parser.crl:140-152`; allocation at `context.crl:820-834`.
 
 **What it does / why it's slow:** every discarded `parseType` (array-size exprs via `parseTypeSuffix` → `parseExpr`, `type.crl:76`), discarded member/const/var lookahead, failed `parseGenericArguments`, and failed cast parse permanently consumes node-arena slots. Consequences: (a) `ctx.nodes` grows well beyond the real AST — wasted memory and cache footprint; (b) `growNodes` arena copies trigger more often; (c) any pass iterating `0..nodesLen` pays for ghosts — the LSP alone has **six** such full scans (`lsp/server.crl:1398, 1492, 1653, 1841, 2161, 2249`); (d) it *amplifies* F2: struct-heavy files inflate `nodesLen` by roughly the speculative member type-expr count. The `typesLen` rewind exists precisely because unrewound speculative entries broke sema (`base.crl:19-23`) — nodes are the same problem without the fix.
@@ -228,6 +256,8 @@ Safety invariant (matches the one already relied on for types): nothing reachabl
 ---
 
 ### F7. Attribute handling: up to 18 linear-scan `intern()` calls per name check + heap allocs in edit distance
+
+**Status: DONE (`8508d68`).** The linear `intern()` cost disappeared with F1; `attrNameDistance` now uses stack arrays and an `abs(lenA-lenB)` early-out. The 18 candidate checks remain but are integer-only hashed lookups.
 
 **Location:** `isKnownAttr` `decl.crl:132-153`; `attrNameDistance` `decl.crl:158-199`; `closestAttrName` `decl.crl:202-234`; called from `parseAttrListTo` `decl.crl:276` — which runs for **every** attribute on every decl, member, and statement (`parseAttrListTo` also interns the name at line 272 even when `outAttrs == null`).
 
@@ -257,6 +287,8 @@ bool isKnownAttr(Str name) {
 
 ### F8. `attachDoc` → `addDocBlock` linear scan: O(D²) doc table per file
 
+**Status: DONE (`8508d68`).** Doc entries are kept sorted by `(fileId, declLine)`; insert and lookup are binary searches.
+
 **Location:** `decl.crl:93-99` (`attachDoc`) → `context.crl:501-526` (`addDocBlock`, linear scan at 503-513); lookup twin `docFor` `context.crl:530-540`.
 
 **What it does / why it's slow:** every documented declaration scans all doc entries collected so far comparing `(fileId, declLine)`. A file with D documented decls does ≈ D²/2 iterations (e.g. D=5000 → ~12M compares — plus the same quadratic again in any consumer calling `docFor` repeatedly). `scanDocsAbove` is invoked per decl/member (`decl.crl:368, 723, 846, 1070, 1155, 1234`), so this runs at full decl throughput.
@@ -268,6 +300,8 @@ bool isKnownAttr(Str name) {
 ---
 
 ### F9. `rebindTypeParams` walks each type tree twice per declaration
+
+**Status: DONE (`8508d68`).** Local and outer generic lists are now passed through a single recursive walk.
 
 **Location:** `decl.crl:485-580` (function), invoked at `decl.crl:602-603` (return type ×2 lists) and `decl.crl:655-656` (per param ×2 lists).
 
@@ -286,9 +320,11 @@ Alternatively build a tiny `name → (listIdx, paramIdx)` table once per decl (1
 
 ### F10. Minor / hygiene findings
 
+**Status: PARTIAL (`8508d68`).** (a) is fixed; (b)–(f) remain.
+
 | # | Location | Issue | Fix |
 |---|---|---|---|
-| a | `decl.crl:76-88` | `scanDocsAbove` builds `String out`, interns it, and **never calls `out.free()`** — leaks one heap buffer per doc block (contrast `strListJoin` at `decl.crl:1467` which frees). Memory pressure, not CPU. | `Str r = self.ctx.intern(out.asView()); out.free(); return r;` |
+| a | `decl.crl:76-88` | **DONE (`8508d68`).** `scanDocsAbove` builds `String out`, interns it, and **never calls `out.free()`** — leaks one heap buffer per doc block (contrast `strListJoin` at `decl.crl:1467` which frees). Memory pressure, not CPU. | `Str r = self.ctx.intern(out.asView()); out.free(); return r;` |
 | b | `decl.crl:39-89` | `scanDocsAbove` runs unconditionally for every decl/member: ≥1 backward line-walk even when no comment exists. Bounded (64 lines) — acceptable, but after F1-F5 it may be visible in profiles. | Keep, but only after F1-F5; if it still shows up, record `///`-run line numbers in the lexer (it already walks comment bytes) into a side vector and have the parser binary-search by line — same trick as F8. |
 | c | `coral-lexer/base.crl:75-81` | `reportErrorCode` recomputes the line by scanning **from `bufStart` to `errPtr`** — O(file) per lexer diagnostic → O(n²) if a file has many bad bytes. `makeToken` already tracks `self.line`. | Track line delta incrementally or scan backward from `self.line`'s position; error path only, but trivially fixable. |
 | d | `context.crl:561-596` + all list builders | Every params/fields/generic/variant list starts at cap 4 → per-declaration small-malloc sequences (`nodeListInit` → grow 4→8→16 + `track`). Not quadratic (amortized doubling), but high allocation *count*. | SmallVec-style inline capacity (`u32 inlineBuf[4]` in the builder, heap only on overflow) or a bump arena for per-decl scratch lists freed at scope end — clang's `SmallVector`/factory pattern; rustc `ThinVec`/`SmallVec`. |
