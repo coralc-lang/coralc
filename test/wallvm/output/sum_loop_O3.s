@@ -1,0 +1,45 @@
+.section .text
+.globl main
+.type main, @function
+main:
+	pushq %rbp
+	movq %rsp, %rbp
+	subq $80, %rsp
+.Lmain_entry_2:
+	leaq -64(%rbp), %rsi
+	leaq -80(%rbp), %rdi
+	movabsq $0x0000000000000000, %r10
+	movq %r10, (%rdi)
+	movabsq $0x0000000000000000, %r10
+	movq %r10, (%rsi)
+	jmp .Lmain_loop_3
+.Lmain_loop_3:
+	movq (%rdi), %r8
+	movabsq $0x000000000000000a, %r11
+	cmpq %r11, %r8
+	setl %r11b
+	movzbq %r11b, %r9
+	testq %r9, %r9
+	jne .Lmain_body_4
+	jmp .Lmain_done_5
+.Lmain_body_4:
+	movq (%rsi), %r10
+	movq %r10, -16(%rbp)
+	movq %r8, %r10
+	addq -16(%rbp), %r10
+	movq %r10, -32(%rbp)
+	movq -32(%rbp), %r10
+	movq %r10, (%rsi)
+	movq $0x0000000000000001, %r10
+	addq %r8, %r10
+	movq %r10, -48(%rbp)
+	movq -48(%rbp), %r10
+	movq %r10, (%rdi)
+	jmp .Lmain_loop_3
+.Lmain_done_5:
+	movq (%rsi), %rdi
+	movl %edi, %r8d
+	movq %r8, %rax
+	addq $80, %rsp
+	leave
+	ret
