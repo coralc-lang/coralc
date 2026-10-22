@@ -343,6 +343,18 @@ str sibText(u32 disp, str idxReg, u32 scale)
 static String _r32buf[16];
 static u32 _r32i = 0;
 
+// True for the r8-r15 family: 'r' followed by one or two digits. Only
+// these get a d/w/b suffix appended by toReg32/16/8; memory operands
+// ("-32(%rbp)") and already-sized names ("esi") pass through untouched.
+bool isRnReg(str r)
+{
+    if (r.len < 2 || r.len > 3) return false;
+    if (r.ptr[0] != 'r') return false;
+    for (usize i = 1; i < r.len; i++)
+        if (r.ptr[i] < '0' || r.ptr[i] > '9') return false;
+    return true;
+}
+
 str toReg32(str r)
 {
     String* b = &_r32buf[_r32i++ & 15];
@@ -360,9 +372,13 @@ str toReg32(str r)
         b->pushChar(r.ptr[2]);
         return b->asView();
     }
-    b->pushView(r);
-    b->pushChar('d');
-    return b->asView();
+    if (isRnReg(r))
+    {
+        b->pushView(r);
+        b->pushChar('d');
+        return b->asView();
+    }
+    return r;
 }
 
 static String _r16buf[16];
@@ -384,9 +400,13 @@ str toReg16(str r)
         b->pushChar(r.ptr[2]);
         return b->asView();
     }
-    b->pushView(r);
-    b->pushChar('w');
-    return b->asView();
+    if (isRnReg(r))
+    {
+        b->pushView(r);
+        b->pushChar('w');
+        return b->asView();
+    }
+    return r;
 }
 
 // Strip the 32-bit suffix from an opcode and append w/b for narrow work.
@@ -429,9 +449,13 @@ str toReg8(str r)
         b->pushChar('l');
         return b->asView();
     }
-    b->pushView(r);
-    b->pushChar('b');
-    return b->asView();
+    if (isRnReg(r))
+    {
+        b->pushView(r);
+        b->pushChar('b');
+        return b->asView();
+    }
+    return r;
 }
 
 pub struct X86_64CodeGen
@@ -1513,6 +1537,30 @@ pub struct X86_64CodeGen
     bool iselEmitMulConst(IrInst* inst, str dst, str src1)
     {
         if (inst->nops < 2) return false;
+        // The shift/lea patterns below print src1 into register and SIB
+        // positions — a constant left operand has no register form, and
+        // constfold normally rewrites the whole product anyway.
+        if (valueIsIntConst(inst->ops[0])) return false;
+        u64 c = 0;
+        if (!self.iselIsConstInt(inst->ops[1], &c)) return false;
+        // SIB operands and the add/shl-after-lea tails need registers:
+        // a spilled left operand reloads into r10 and a spilled result
+        // computes in r11, stored back after the pattern matched
+        if (self.valueIsSpill(inst->ops[0]))
+            src1 = self.opForReg(inst->ops[0], "r10");
+        bool needStore = self.valueIsSpill(&inst->base);
+        str realDst = needStore ? "r11" : dst;
+        if (!self.iselEmitMulConstBody(inst, realDst, src1)) return false;
+        if (needStore)
+        {
+            self.emitter.emit("\tmovq %r11, ");
+            self.emitter.emitLine(dst);
+        }
+        return true;
+    }
+
+    bool iselEmitMulConstBody(IrInst* inst, str dst, str src1)
+    {
         u64 c = 0;
         if (!self.iselIsConstInt(inst->ops[1], &c)) return false;
 
@@ -2088,10 +2136,29 @@ pub struct X86_64CodeGen
 
         if (loadInst->ops[0] != addrVal) return false;
 
+        // The memory operand position accepts a register or (at 64-bit)
+        // an immediate — a spilled operand reloads through r11 first,
+        // because printing the slot text there yields an illegal
+        // memory+memory encoding.
+        u32 width = loadInst->base.type != null ? loadInst->base.type->width : 64;
+        str operand;
+        IrValue* operandVal = srcInst->ops[1];
+        if (self.valueIsSpill(operandVal))
+        {
+            operand = self.opForReg(operandVal, "r11");
+        }
+        else if (valueIsIntConst(operandVal))
+        {
+            if (width != 64) return false;
+            operand = intImmText(operandVal);
+        }
+        else
+        {
+            operand = self.getRegForValue(operandVal);
+        }
+
         // the memory operand's address register, a spill reloads first
         str addr = self.opForReg(addrVal, "r10");
-        str operand = self.getRegForValue(srcInst->ops[1]);
-        u32 width = loadInst->base.type != null ? loadInst->base.type->width : 64;
 
         // one switch does both jobs the old two did, membership and naming
         str opName;
@@ -2147,6 +2214,10 @@ pub struct X86_64CodeGen
         IrInst* addrInst = (IrInst*)addrVal;
         if (addrInst->opcode != IrOpcode::Gep) return false;
         if (addrInst->nops < 3) return false;
+
+        // A spilled destination has no register form in the SIB load —
+        // emitLoadWidth sinks it through r10 instead.
+        if (self.valueIsSpill(&inst->base)) return false;
 
         str dst = self.getRegForValue(&inst->base);
         // sib parts are register-only, spills reload into the scratches
@@ -2209,7 +2280,13 @@ pub struct X86_64CodeGen
         if (addrInst->opcode != IrOpcode::Gep) return false;
         if (addrInst->nops < 3) return false;
 
-        str src = self.getRegForValue(inst->ops[0]);
+        // The stored value sits in a register position: a spilled source
+        // reloads through rax, and a constant has no register form here
+        // (the generic store path emits it as an immediate).
+        if (valueIsIntConst(inst->ops[0])) return false;
+        str src = self.valueIsSpill(inst->ops[0])
+            ? self.opForReg(inst->ops[0], "rax")
+            : self.getRegForValue(inst->ops[0]);
         // sib parts are register-only, spills reload into the scratches
         str base = self.opForReg(addrInst->ops[0], "r10");
         str idx = self.opForReg(addrInst->ops[1], "r11");
@@ -2292,8 +2369,21 @@ pub struct X86_64CodeGen
         self.emitter.emit("\t");
         self.emitter.emit(setOp);
         self.emitter.emitLine(" %r11b");
-        self.emitter.emit("\tmovzbq %r11b, ");
-        self.emitter.emitLine(dst);
+        // movzb's destination must be a register; a spilled result
+        // sinks a full zero-extended qword so the slot's upper bytes
+        // never carry garbage into a later wide reload
+        if (self.valueIsSpill(&inst->base))
+        {
+            self.emitter.emit("\tmovzbq %r11b, %r10");
+            self.emitter.emitLine("");
+            self.emitter.emit("\tmovq %r10, ");
+            self.emitter.emitLine(dst);
+        }
+        else
+        {
+            self.emitter.emit("\tmovzbq %r11b, ");
+            self.emitter.emitLine(dst);
+        }
         return true;
     }
 
@@ -2325,60 +2415,35 @@ pub struct X86_64CodeGen
         if (inst->nops < 2) return false;
         u64 c = 0;
         if (!self.iselIsConstInt(inst->ops[1], &c)) return false;
-
-        if (inst->opcode == IrOpcode::Add && c == 0xFFFFFFFFFFFFFFFFUL)
+        bool isInc = (inst->opcode == IrOpcode::Add && c == 1)
+                  || (inst->opcode == IrOpcode::Sub && c == 0xFFFFFFFFFFFFFFFFUL);
+        bool isDec = (inst->opcode == IrOpcode::Add && c == 0xFFFFFFFFFFFFFFFFUL)
+                  || (inst->opcode == IrOpcode::Sub && c == 1);
+        if (!isInc && !isDec) return false;
+        str opName = isInc ? "\tincq " : "\tdecq ";
+        // both operands spilled: movq mem, mem is invalid, so bounce
+        // src1 through r10, inc/dec there, and store back
+        if (self.valueIsSpill(inst->ops[0]) && self.valueIsSpill(&inst->base))
         {
-            if (!src1.equals(dst))
-            {
-                self.emitter.emit("\tmovq ");
-                self.emitter.emit(src1);
-                self.emitter.emit(", ");
-                self.emitter.emitLine(dst);
-            }
-            self.emitter.emit("\tdecq ");
+            self.emitter.emit("\tmovq ");
+            self.emitter.emit(src1);
+            self.emitter.emitLine(", %r10");
+            self.emitter.emit(opName);
+            self.emitter.emitLine("%r10");
+            self.emitter.emit("\tmovq %r10, ");
             self.emitter.emitLine(dst);
             return true;
         }
-        if (inst->opcode == IrOpcode::Sub && c == 1)
+        if (!src1.equals(dst))
         {
-            if (!src1.equals(dst))
-            {
-                self.emitter.emit("\tmovq ");
-                self.emitter.emit(src1);
-                self.emitter.emit(", ");
-                self.emitter.emitLine(dst);
-            }
-            self.emitter.emit("\tdecq ");
+            self.emitter.emit("\tmovq ");
+            self.emitter.emit(src1);
+            self.emitter.emit(", ");
             self.emitter.emitLine(dst);
-            return true;
         }
-        if (inst->opcode == IrOpcode::Add && c == 1)
-        {
-            if (!src1.equals(dst))
-            {
-                self.emitter.emit("\tmovq ");
-                self.emitter.emit(src1);
-                self.emitter.emit(", ");
-                self.emitter.emitLine(dst);
-            }
-            self.emitter.emit("\tincq ");
-            self.emitter.emitLine(dst);
-            return true;
-        }
-        if (inst->opcode == IrOpcode::Sub && c == 0xFFFFFFFFFFFFFFFFUL)
-        {
-            if (!src1.equals(dst))
-            {
-                self.emitter.emit("\tmovq ");
-                self.emitter.emit(src1);
-                self.emitter.emit(", ");
-                self.emitter.emitLine(dst);
-            }
-            self.emitter.emit("\tincq ");
-            self.emitter.emitLine(dst);
-            return true;
-        }
-        return false;
+        self.emitter.emit(opName);
+        self.emitter.emitLine(dst);
+        return true;
     }
 
     // NEG: 0 - x → neg
@@ -3162,27 +3227,112 @@ void emitIntExtendTo(str src, str dst32, u32 width, bool isSigned)
         str base = (inst->nops > 0) ? self.opForReg(inst->ops[0], "r10") : "rax";
         bool dstSpill = self.valueIsSpill(&inst->base);
         str work = dstSpill ? "r10" : dst;
-        IrValue* iv = inst->nops > 1 ? inst->ops[1] : null;
-        IrType* elem = null;
-        if (inst->ops[0] != null && inst->ops[0]->type != null)
+
+        // Strides follow the parser's type walk: each index descends one
+        // aggregate level, so an array index steps by the size of the
+        // type it lands on — C element indexing. sizeOf(pointee) made
+        // every ptr-to-array gep jump the whole array (N elements) per
+        // step, which happened to work only while no spill slot shared
+        // the mis-strided addresses.
+        IrType* rt = null;
+        if (inst->nops > 0 && inst->ops[0] != null && inst->ops[0]->type != null)
         {
             IrType* pt = inst->ops[0]->type;
-            elem = pt->kind == IrTypeKind::Ptr ? pt->elem : pt;
+            rt = pt->kind == IrTypeKind::Ptr ? pt->elem : pt;
         }
-        u32 esz = elem != null ? self.ctx.irTypeSizeOf(elem) : 1;
-        if (esz == 0) esz = 1;
 
-        if (valueIsIntConst(iv))
+        i64 constOff = 0;
+        bool haveDyn = false;
+        u32 leaScale = 1; // SIB scale deferred to the final lea
+        for (u32 k = 1; k < inst->nops && rt != null; k++)
         {
-            i64 c = (i64)iv->valData;
-            u32 iw = iv->type != null ? iv->type->width : 64;
-            if (iw < 64 && iw > 0 && (c & ((i64)1 << (i64)(iw - 1))) != 0)
-                c |= ~(((i64)1 << (i64)iw) - 1);
-            i64 off = c * (i64)esz;
-            if (off >= -2147483648 && off <= 2147483647)
+            IrValue* iv = inst->ops[k];
+            if (iv == null) break;
+
+            if (rt->kind == IrTypeKind::Struct)
+            {
+                // parser requires a constant field index; layout offset
+                // mirrors createStructType's align-then-place walk
+                if (!valueIsIntConst(iv)) break;
+                u32 fi = (u32)(iv->valData & 0xFFFFFFFF);
+                if (fi >= rt->nparams) break;
+                u32 off = 0;
+                for (u32 f = 0; f < rt->nparams; f++)
+                {
+                    u32 al = self.ctx.irTypeAlignOf(rt->params[f]);
+                    if (al > 1) off = (off + al - 1u) / al * al;
+                    if (f == fi) break;
+                    off += self.ctx.irTypeSizeOf(rt->params[f]);
+                }
+                constOff += (i64)off;
+                rt = rt->params[fi];
+                continue;
+            }
+            if (rt->kind != IrTypeKind::Array && rt->kind != IrTypeKind::Vector)
+                break; // scalar: parser rejects with "index into non-aggregate"
+            u32 stride = self.ctx.irTypeSizeOf(rt->elem);
+            if (stride == 0) stride = 1;
+
+            if (valueIsIntConst(iv))
+            {
+                i64 c = (i64)iv->valData;
+                u32 iw = iv->type != null ? iv->type->width : 64;
+                if (iw < 64 && iw > 0 && (c & ((i64)1 << (i64)(iw - 1))) != 0)
+                    c |= ~(((i64)1 << (i64)iw) - 1);
+                constOff += c * (i64)stride;
+            }
+            else if (!haveDyn)
+            {
+                self.opForReg(iv, "r11");
+                u32 iw = iv->type != null ? iv->type->width : 64;
+                if (iw == 32) self.emitter.emitLine("\tmovslq %r11d, %r11");
+                else if (iw == 16) self.emitter.emitLine("\tmovswq %r11w, %r11");
+                else if (iw == 8) self.emitter.emitLine("\tmovsbq %r11b, %r11");
+                if (stride == 2 || stride == 4 || stride == 8)
+                {
+                    // only the last index may ride the lea's SIB scale;
+                    // an index behind it needs its product right now
+                    if (k + 1 == inst->nops) leaScale = stride;
+                    else if (stride > 1)
+                    {
+                        self.emitter.emit("\timulq $");
+                        self.emitter.emit(u32ToStr(stride));
+                        self.emitter.emitLine(", %r11");
+                    }
+                }
+                else if (stride > 1)
+                {
+                    self.emitter.emit("\timulq $");
+                    self.emitter.emit(u32ToStr(stride));
+                    self.emitter.emitLine(", %r11");
+                }
+                haveDyn = true;
+            }
+            else
+            {
+                // extra dynamic index: scale in rax, fold into r11
+                self.opForReg(iv, "rax");
+                u32 iw = iv->type != null ? iv->type->width : 64;
+                if (iw == 32) self.emitter.emitLine("\tmovslq %eax, %rax");
+                else if (iw == 16) self.emitter.emitLine("\tmovswq %ax, %rax");
+                else if (iw == 8) self.emitter.emitLine("\tmovsbq %al, %rax");
+                if (stride > 1)
+                {
+                    self.emitter.emit("\timulq $");
+                    self.emitter.emit(u32ToStr(stride));
+                    self.emitter.emitLine(", %rax");
+                }
+                self.emitter.emitLine("\taddq %rax, %r11");
+            }
+            rt = rt->elem;
+        }
+
+        if (!haveDyn)
+        {
+            if (constOff >= -2147483648 && constOff <= 2147483647)
             {
                 self.emitter.emit("\tleaq ");
-                if (off != 0) self.emitter.emit(i64ToDec(off));
+                if (constOff != 0) self.emitter.emit(i64ToDec(constOff));
                 self.emitter.emit("(");
                 self.emitter.emit(base);
                 self.emitter.emit("), ");
@@ -3191,41 +3341,40 @@ void emitIntExtendTo(str src, str dst32, u32 width, bool isSigned)
             else
             {
                 self.emitter.emit("\tmovabsq ");
-                self.emitter.emit(i64ToHex(off));
+                self.emitter.emit(i64ToHex(constOff));
                 self.emitter.emitLine(", %r11");
                 self.emitter.emit("\tleaq (");
                 self.emitter.emit(base);
-                self.emitter.emit(", r11, 1), ");
+                self.emitter.emit(", %r11, 1), ");
                 self.emitter.emitLine(work);
             }
+            if (dstSpill) self.sinkInt(&inst->base, "r10");
+            return;
         }
-        else
+
+        str disp = "";
+        if (constOff != 0)
         {
-            str idx = (iv != null) ? self.opForReg(iv, "r11") : "r11";
-            u32 iw = iv != null && iv->type != null ? iv->type->width : 64;
-            if (iw == 32) self.emitter.emitLine("\tmovslq %r11d, %r11");
-            else if (iw == 16) self.emitter.emitLine("\tmovswq %r11w, %r11");
-            else if (iw == 8) self.emitter.emitLine("\tmovsbq %r11b, %r11");
-            u32 scale = esz;
-            if (scale != 1 && scale != 2 && scale != 4 && scale != 8)
+            if (constOff >= -2147483648 && constOff <= 2147483647)
             {
-                self.emitter.emit("\timulq $");
-                self.emitter.emit(u32ToStr(scale));
-                self.emitter.emitLine(", %r11");
-                scale = 1;
+                disp = i64ToDec(constOff);
             }
-            self.emitter.emit("\tleaq (");
-            self.emitter.emit(base);
-            self.emitter.emit(", ");
-            self.emitter.emit(idx);
-            if (scale != 1)
+            else
             {
-                self.emitter.emit(", ");
-                self.emitter.emit(u32ToStr(scale));
+                self.emitter.emit("\tmovabsq ");
+                self.emitter.emit(i64ToHex(constOff));
+                self.emitter.emitLine(", %rax");
+                self.emitter.emitLine("\taddq %rax, %r11");
             }
-            self.emitter.emit("), ");
-            self.emitter.emitLine(work);
         }
+        self.emitter.emit("\tleaq ");
+        self.emitter.emit(disp);
+        self.emitter.emit("(");
+        self.emitter.emit(base);
+        self.emitter.emit(", %r11, ");
+        self.emitter.emit(u32ToStr(leaScale));
+        self.emitter.emit("), ");
+        self.emitter.emitLine(work);
         if (dstSpill) self.sinkInt(&inst->base, "r10");
     }
 
@@ -3265,8 +3414,18 @@ void emitIntExtendTo(str src, str dst32, u32 width, bool isSigned)
         self.emitter.emit(setOp);
         self.emitter.emit(" %r11b");
         self.emitter.emitLine("");
-        self.emitter.emit("\tmovzbq %r11b, ");
-        self.emitter.emitLine(dst);
+        if (self.valueIsSpill(&inst->base))
+        {
+            self.emitter.emit("\tmovzbq %r11b, %r10");
+            self.emitter.emitLine("");
+            self.emitter.emit("\tmovq %r10, ");
+            self.emitter.emitLine(dst);
+        }
+        else
+        {
+            self.emitter.emit("\tmovzbq %r11b, ");
+            self.emitter.emitLine(dst);
+        }
     }
 
     void emitFCmp(IrInst* inst)
@@ -3314,8 +3473,20 @@ void emitIntExtendTo(str src, str dst32, u32 width, bool isSigned)
             self.emitter.emitLine("\tsetp %r10b");
             self.emitter.emitLine("\tor %r10b, %r11b");
         }
-        self.emitter.emit("\tmovzbq %r11b, ");
-        self.emitter.emitLine(dst);
+        // same spill rule as emitICmp: movzb needs a register target,
+        // and a spilled i1 must land in its slot zero-extended to 64
+        if (self.valueIsSpill(&inst->base))
+        {
+            self.emitter.emit("\tmovzbq %r11b, %r10");
+            self.emitter.emitLine("");
+            self.emitter.emit("\tmovq %r10, ");
+            self.emitter.emitLine(dst);
+        }
+        else
+        {
+            self.emitter.emit("\tmovzbq %r11b, ");
+            self.emitter.emitLine(dst);
+        }
     }
 
     // Block labels are local to an object file, so include the function and
@@ -3364,7 +3535,9 @@ void emitIntExtendTo(str src, str dst32, u32 width, bool isSigned)
                 self.emitter.emitLine("");
                 return;
             }
-            str cond = self.getRegForValue(inst->ops[0]);
+            str cond = self.valueIsSpill(inst->ops[0])
+                ? self.opForReg(inst->ops[0], "r10")
+                : self.getRegForValue(inst->ops[0]);
             self.emitter.emit("\ttestq ");
             self.emitter.emit(cond);
             self.emitter.emit(", ");

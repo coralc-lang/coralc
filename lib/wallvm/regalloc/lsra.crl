@@ -555,6 +555,118 @@ pub struct LinearScanRegAlloc
             }
         }
 
+        // Loop-carried liveness fixpoint. The use walk above extends
+        // intervals to their last use in *linear order*, which misses
+        // values defined before a loop and used inside it: the next
+        // iteration re-executes the same linear use position, so the
+        // value must stay live across the backedge (a pointer alloca
+        // whose register gets recycled at the loop tail would otherwise
+        // be dereferenced through garbage on the next iteration).
+        // Classic backward dataflow over the CFG — liveIn = use ∪
+        // (liveOut − def) to a fixpoint — and every block a value is
+        // live-in to extends its interval through that block's last
+        // instruction. Per-block use/def sets are conservative (every
+        // operand and result in the block, ignoring intra-block order),
+        // which only ever over-extends liveness — sound for scan RA.
+        {
+            u32 nb = self.numBlocks;
+            u32 nv = self.numVregs;
+            if (nb > 0 && nv > 0)
+            {
+                usize setLen = (usize)nb * (usize)nv;
+                bool* useSet = alloc<bool>(setLen);
+                bool* defSet = alloc<bool>(setLen);
+                bool* liveIn = alloc<bool>(setLen);
+                bool* liveOut = alloc<bool>(setLen);
+                for (usize i = 0; i < setLen; i++)
+                {
+                    useSet[i] = 0;
+                    defSet[i] = 0;
+                    liveIn[i] = 0;
+                    liveOut[i] = 0;
+                }
+                for (u32 b = 0; b < nb; b++)
+                {
+                    IrBlock* bb = self.blocks[b];
+                    usize bo = (usize)b * (usize)nv;
+                    for (u32 i = 0; i < bb->ninsts; i++)
+                    {
+                        IrInst* inst = bb->insts[i];
+                        for (u32 j = 0; j < inst->nops; j++)
+                        {
+                            IrValue* op = inst->ops[j];
+                            if (op == null || op->kind != IrValueKind::Inst) continue;
+                            u32 v = (u32)op->valData;
+                            if (v < nv) useSet[bo + (usize)v] = 1;
+                        }
+                        u32 dv = self.instVreg[self.blockStartInst[b] + i];
+                        if (dv != NO_REG && dv < nv) defSet[bo + (usize)dv] = 1;
+                    }
+                }
+                loop {
+                   bool changed = false;
+                    for (u32 b = nb; b-- > 0; )
+                    {
+                        IrBlock* bb = self.blocks[b];
+                        usize bo = (usize)b * (usize)nv;
+                        for (u32 s = 0; s < bb->nsuccs; s++)
+                        {
+                            u32 si = 0;
+                            bool found = false;
+                            for (u32 k = 0; k < nb; k++)
+                            {
+                                if (self.blocks[k] == bb->succs[s]) { si = k; found = true; break; }
+                            }
+                            if (!found) continue;
+                            usize so = (usize)si * (usize)nv;
+                            for (u32 v = 0; v < nv; v++)
+                            {
+                                if (liveIn[so + (usize)v] && !liveOut[bo + (usize)v])
+                                {
+                                    liveOut[bo + (usize)v] = 1;
+                                    changed = true;
+                                }
+                            }
+                        }
+                        for (u32 v = 0; v < nv; v++)
+                        {
+                            bool li = useSet[bo + (usize)v] ||
+                                      (liveOut[bo + (usize)v] && !defSet[bo + (usize)v]);
+                            if (li && !liveIn[bo + (usize)v])
+                            {
+                                liveIn[bo + (usize)v] = 1;
+                                changed = true;
+                            }
+                        }
+                    }
+                    if (!changed) break;
+                }
+                for (u32 b = 0; b < nb; b++)
+                {
+                    u32 blockEnd = self.blockStartInst[b] + self.blocks[b]->ninsts;
+                    if (blockEnd > 0) blockEnd -= 1;
+                    usize bo = (usize)b * (usize)nv;
+                    for (u32 v = 0; v < nv; v++)
+                    {
+                        if (!liveIn[bo + (usize)v]) continue;
+                        for (u32 k = 0; k < self.numIntervals; k++)
+                        {
+                            if (self.intervals[k].vreg == v)
+                            {
+                                if (blockEnd > self.intervals[k].end)
+                                    self.intervals[k].end = blockEnd;
+                                break;
+                            }
+                        }
+                    }
+                }
+                dealloc<bool>(useSet);
+                dealloc<bool>(defSet);
+                dealloc<bool>(liveIn);
+                dealloc<bool>(liveOut);
+            }
+        }
+
         for (u32 i = 0; i < self.numVregs; i++)
         {
             self.regForVreg[i] = NO_REG;
@@ -638,17 +750,23 @@ pub struct LinearScanRegAlloc
         return x;
     }
 
+    // Scan order must be start-ascending: the active-list expiry test
+    // (a->end < cur->start) is only sound when intervals are processed
+    // in program order — a later-starting interval already in the active
+    // list would never expire against an earlier newcomer, and the
+    // newcomer could be handed a register an expired-but-still-live
+    // value holds. Spill weight stays what drives eviction choice
+    // (scanClass), never scan order.
     static void sortIntervals(LiveInterval* intervals, u32 count)
     {
-        const f64 EPSILON = 0.0001;
         for (u32 i = 1; i < count; i++)
         {
             LiveInterval key = intervals[i];
             i32 j = (i32)i - 1;
             while (j >= 0 &&
-                   (intervals[j].spillWeight < key.spillWeight ||
-                    (self.absF64(intervals[j].spillWeight - key.spillWeight) < EPSILON &&
-                     intervals[j].start > key.start)))
+                   (intervals[j].start > key.start ||
+                    (intervals[j].start == key.start &&
+                     intervals[j].vreg > key.vreg)))
             {
                 intervals[j + 1] = intervals[j];
                 j--;
@@ -1109,10 +1227,16 @@ pub struct LinearScanRegAlloc
 
         self.wordType = self.ctx->tyInt(64);
 
+        if (gLsraVerbose)
+            eprintln("; lsra {}: assignVregs", func->base.name);
         self.assignVregs(func);
         if (self.numVregs == 0) return true;
 
+        if (gLsraVerbose)
+            eprintln("; lsra {}: computeIntervals", func->base.name);
         self.computeIntervals(func);
+        if (gLsraVerbose)
+            eprintln("; lsra {}: linearScan", func->base.name);
         self.linearScan();
         if (gLsraVerbose)
         {
@@ -1137,7 +1261,11 @@ pub struct LinearScanRegAlloc
                     li->isFloat, li->physReg, li->spillSlot);
             }
         }
+        if (gLsraVerbose)
+            eprintln("; lsra {}: handleSpills", func->base.name);
         self.handleSpills(func);
+        if (gLsraVerbose)
+            eprintln("; lsra {}: rewrite", func->base.name);
         self.rewrite(func);
 
         if (self.instVreg != null) dealloc<u32>(self.instVreg);

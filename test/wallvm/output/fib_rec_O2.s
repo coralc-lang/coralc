@@ -51,7 +51,7 @@ main:
 	movq %r10, -16(%rbp)
 	jmp .Lmain_inl25_3_29
 .Lmain_inl25_0_26:
-	movl %esi, -32(%rbp)d
+	movl %esi, -32(%rbp)
 	movq -32(%rbp), %rax
 	addq $64, %rsp
 	leave
