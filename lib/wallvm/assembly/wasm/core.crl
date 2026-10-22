@@ -1,0 +1,802 @@
+#[[no_drop_all]]
+import(lib) std::text::string { String };
+import(lib) std::vec { Vec };
+import(lib) std::mman { alloc, dealloc };
+import(lib) core::char_util { isSpace, isDigit, isHexDigit, digitValue };
+import(lib) std::io::ios { parseF64 };
+import(lib) std::intrinsics { memcpy };
+
+pub enum WatNodeKind
+{
+    Atom,
+    Str,
+    List
+}
+
+pub struct WatNode
+{
+    WatNodeKind kind;
+    str atom;
+    String bytes;
+    Vec<WatNode*> kids;
+    u32 line;
+}
+
+pub struct WasmType
+{
+    Vec<u8> params;
+    Vec<u8> results;
+    str label;
+}
+
+pub struct WasmFunc
+{
+    str label;
+    u32 typeIndex;
+    Vec<str> paramNames;
+    Vec<u8> locals;
+    Vec<str> localNames;
+    Vec<WatNode*> body;
+    u32 index;
+    bool isImport;
+    String importModule;
+    String importName;
+    u32 line;
+}
+
+pub struct WasmExport
+{
+    String name;
+    u8 kind;
+    str label;
+    u32 index;
+    u32 line;
+}
+
+pub struct WasmGlobal
+{
+    str label;
+    u8 type;
+    bool mut;
+    WatNode* init;
+    u32 index;
+}
+
+pub struct WasmMemory
+{
+    bool present;
+    u32 minPages;
+    u32 maxPages;
+    bool hasMax;
+}
+
+pub struct WasmTable
+{
+    bool present;
+    u32 minElems;
+    u32 maxElems;
+    bool hasMax;
+    WatNode* offset;
+    Vec<str> elems;
+}
+
+pub struct WasmData
+{
+    WatNode* offset;
+    String bytes;
+}
+
+pub struct WasmCtrl
+{
+    str label;
+    u8 kind;
+}
+
+pub u8 wasmValType(str name)
+{
+    if (name.equals("i32")) return 0x7f;
+    if (name.equals("i64")) return 0x7e;
+    if (name.equals("f32")) return 0x7d;
+    if (name.equals("f64")) return 0x7c;
+    if (name.equals("v128")) return 0x7b;
+    if (name.equals("funcref")) return 0x70;
+    if (name.equals("externref")) return 0x6f;
+    return 0;
+}
+
+pub bool watNodeIs(WatNode* n, str head)
+{
+    if (n == null || n->kind != WatNodeKind::List || n->kids.len == 0) return false;
+    WatNode* h = n->kids.data[0];
+    return h != null && h->kind == WatNodeKind::Atom && h->atom.equals(head);
+}
+
+pub str watAtomAt(WatNode* n, usize i)
+{
+    if (n == null || n->kind != WatNodeKind::List || i >= n->kids.len) return str::empty();
+    WatNode* k = n->kids.data[i];
+    if (k == null || k->kind != WatNodeKind::Atom) return str::empty();
+    return k->atom;
+}
+
+pub WatNode* watKidAt(WatNode* n, usize i)
+{
+    if (n == null || n->kind != WatNodeKind::List || i >= n->kids.len) return null;
+    return n->kids.data[i];
+}
+
+pub str watVecAtom(Vec<WatNode*>* v, usize i)
+{
+    if (v == null || i >= v->len) return str::empty();
+    WatNode* n = v->data[i];
+    if (n == null || n->kind != WatNodeKind::Atom) return str::empty();
+    return n->atom;
+}
+
+pub bool strStartsWithDollar(str s)
+{
+    return s.len > 0 && s.ptr[0] == (u8)'$';
+}
+
+pub u64 watParseUnsigned(str s, bool* ok)
+{
+    *ok = false;
+    if (s.len == 0) return 0;
+    usize i = 0;
+    if (s.ptr[0] == (u8)'+') i++;
+    u64 v = 0;
+    bool saw = false;
+    bool hex = false;
+    if (i + 1 < s.len && s.ptr[i] == (u8)'0' && (s.ptr[i + 1] == (u8)'x' || s.ptr[i + 1] == (u8)'X'))
+    {
+        hex = true;
+        i += 2;
+    }
+    for (; i < s.len; i++)
+    {
+        u8 c = s.ptr[i];
+        if (c == (u8)'_') continue;
+        u32 d = 0;
+        if (isDigit(c)) d = (u32)(c - (u8)'0');
+        else if (hex && isHexDigit(c)) d = (u32)digitValue(c);
+        else return 0;
+        bool overflow = v > (0xFFFFFFFFFFFFFFFFu - (u64)d) / (hex ? 16u : 10u);
+        if (overflow) return 0;
+        v = v * (hex ? 16u : 10u) + (u64)d;
+        saw = true;
+    }
+    *ok = saw;
+    return v;
+}
+
+pub i64 watParseSigned(str s, bool* ok)
+{
+    *ok = false;
+    if (s.len == 0) return 0;
+    bool neg = false;
+    str body = s;
+    if (s.ptr[0] == (u8)'-' || s.ptr[0] == (u8)'+')
+    {
+        neg = s.ptr[0] == (u8)'-';
+        body = s.slice(1, s.len);
+    }
+    bool uok = false;
+    u64 uv = watParseUnsigned(body, &uok);
+    if (!uok) return 0;
+    *ok = true;
+    if (neg) return -(i64)uv;
+    return (i64)uv;
+}
+
+pub struct WasmAssembler
+{
+    str src;
+    usize pos;
+    u32 line;
+    u32 depth;
+    bool ok;
+    String error;
+    u32 errLine;
+    Vec<WasmType> types;
+    Vec<WasmFunc> funcs;
+    Vec<WasmExport> exports;
+    Vec<WasmGlobal> globals;
+    WasmMemory memory;
+    WasmTable table;
+    Vec<WasmData> data;
+    str startLabel;
+    String binaryOut;
+    String diagnostics;
+
+    static WasmAssembler new(str wat)
+    {
+        return WasmAssembler {
+            .src = wat,
+            .pos = 0,
+            .line = 1,
+            .depth = 0,
+            .ok = true,
+            .error = String::new(),
+            .errLine = 0,
+            .types = Vec<WasmType>::new(),
+            .funcs = Vec<WasmFunc>::new(),
+            .exports = Vec<WasmExport>::new(),
+            .globals = Vec<WasmGlobal>::new(),
+            .memory = WasmMemory { .present = false, .minPages = 0, .maxPages = 0, .hasMax = false },
+            .table = WasmTable { .present = false, .minElems = 0, .maxElems = 0, .hasMax = false, .offset = null, .elems = Vec<str>::new() },
+            .data = Vec<WasmData>::new(),
+            .startLabel = str::empty(),
+            .binaryOut = String::new(),
+            .diagnostics = String::new()
+        };
+    }
+
+    void fail(str msg, u32 atLine)
+    {
+        if (!self.ok) return;
+        self.ok = false;
+        self.error = String::from(msg);
+        self.errLine = atLine;
+    }
+
+    u8 peek()
+    {
+        if (self.pos >= self.src.len) return 0;
+        return self.src.ptr[self.pos];
+    }
+
+    u8 peekAt(usize off)
+    {
+        if (self.pos + off >= self.src.len) return 0;
+        return self.src.ptr[self.pos + off];
+    }
+
+    bool atEnd()
+    {
+        return self.pos >= self.src.len;
+    }
+
+    void skipSpace()
+    {
+        while (self.pos < self.src.len)
+        {
+            u8 c = self.src.ptr[self.pos];
+            if (isSpace(c))
+            {
+                if (c == (u8)'\n') self.line++;
+                self.pos++;
+                continue;
+            }
+            if (c == (u8)';' && self.peekAt(1) == (u8)';')
+            {
+                self.pos += 2;
+                while (self.pos < self.src.len && self.src.ptr[self.pos] != (u8)'\n') self.pos++;
+                continue;
+            }
+            if (c == (u8)'(' && self.peekAt(1) == (u8)';')
+            {
+                u32 nesting = 1;
+                self.pos += 2;
+                while (self.pos < self.src.len && nesting > 0)
+                {
+                    u8 b = self.src.ptr[self.pos];
+                    if (b == (u8)'\n') self.line++;
+                    if (b == (u8)'(' && self.peekAt(1) == (u8)';') { nesting++; self.pos += 2; continue; }
+                    if (b == (u8)';' && self.peekAt(1) == (u8)')') { nesting--; self.pos += 2; continue; }
+                    self.pos++;
+                }
+                if (nesting != 0) { self.fail("unterminated block comment", self.line); return; }
+                continue;
+            }
+            break;
+        }
+    }
+
+    bool readString(String* out)
+    {
+        self.skipSpace();
+        if (!self.ok) return false;
+        if (self.atEnd() || self.peek() != (u8)'"')
+        {
+            self.fail("expected string literal", self.line);
+            return false;
+        }
+        self.pos++;
+        while (self.pos < self.src.len)
+        {
+            u8 c = self.src.ptr[self.pos];
+            if (c == (u8)'"')
+            {
+                self.pos++;
+                return true;
+            }
+            if (c == (u8)'\\')
+            {
+                self.pos++;
+                if (self.atEnd()) break;
+                u8 e = self.src.ptr[self.pos++];
+                if (e == (u8)'n') out->pushByte((u8)'\n');
+                else if (e == (u8)'t') out->pushByte((u8)'\t');
+                else if (e == (u8)'r') out->pushByte((u8)'\r');
+                else if (e == (u8)'"') out->pushByte((u8)'"');
+                else if (e == (u8)'\'') out->pushByte((u8)'\'');
+                else if (e == (u8)'\\') out->pushByte((u8)'\\');
+                else if (e == (u8)'x' || e == (u8)'X')
+                {
+                    u32 hv = 0;
+                    u32 nd = 0;
+                    while (nd < 2 && self.pos < self.src.len && isHexDigit(self.src.ptr[self.pos]))
+                    {
+                        hv = hv * 16 + (u32)digitValue(self.src.ptr[self.pos]);
+                        self.pos++;
+                        nd++;
+                    }
+                    if (nd != 2) { self.fail("bad hexadecimal string escape", self.line); return false; }
+                    out->pushByte((u8)hv);
+                }
+                else if (e == (u8)'u')
+                {
+                    if (self.atEnd() || self.peek() != (u8)'{') { self.fail("bad unicode string escape", self.line); return false; }
+                    self.pos++;
+                    u64 cp = 0;
+                    u32 nd = 0;
+                    while (self.pos < self.src.len && self.src.ptr[self.pos] != (u8)'}')
+                    {
+                        u8 h = self.src.ptr[self.pos];
+                        if (h == (u8)'_') { self.pos++; continue; }
+                        if (!isHexDigit(h)) { self.fail("bad unicode string escape", self.line); return false; }
+                        cp = cp * 16 + (u64)digitValue(h);
+                        nd++;
+                        self.pos++;
+                    }
+                    if (self.atEnd() || nd == 0) { self.fail("bad unicode string escape", self.line); return false; }
+                    self.pos++;
+                    if (cp > 0x10FFFFu || (cp >= 0xD800u && cp <= 0xDFFFu))
+                    {
+                        self.fail("invalid unicode codepoint", self.line);
+                        return false;
+                    }
+                    out->pushCodepoint((char)cp);
+                }
+                else out->pushByte(e);
+                continue;
+            }
+            if (c == (u8)'\n') self.line++;
+            out->pushByte(c);
+            self.pos++;
+        }
+        self.fail("unterminated string literal", self.line);
+        return false;
+    }
+
+    WatNode* newNode(WatNodeKind kind, u32 atLine)
+    {
+        WatNode* n = alloc<WatNode>(1);
+        if (n == null) { self.fail("out of memory", atLine); return null; }
+        n->kind = kind;
+        n->atom = str::empty();
+        n->bytes = String::new();
+        n->kids = Vec<WatNode*>::new();
+        n->line = atLine;
+        return n;
+    }
+
+    WatNode* parseNode()
+    {
+        self.skipSpace();
+        if (!self.ok) return null;
+        if (self.atEnd()) { self.fail("unexpected end of input", self.line); return null; }
+        u32 atLine = self.line;
+        if (self.depth > 512) { self.fail("expression nesting too deep", atLine); return null; }
+        u8 c = self.peek();
+        if (c == (u8)'(')
+        {
+            self.pos++;
+            WatNode* n = self.newNode(WatNodeKind::List, atLine);
+            if (n == null) return null;
+            self.depth++;
+            while (true)
+            {
+                self.skipSpace();
+                if (!self.ok) return n;
+                if (self.atEnd()) { self.fail("unterminated list", atLine); return n; }
+                if (self.peek() == (u8)')') { self.pos++; break; }
+                WatNode* k = self.parseNode();
+                if (k == null) return n;
+                n->kids.push(k);
+            }
+            self.depth--;
+            return n;
+        }
+        if (c == (u8)'"')
+        {
+            WatNode* n = self.newNode(WatNodeKind::Str, atLine);
+            if (n == null) return null;
+            if (!self.readString(&n->bytes)) return n;
+            return n;
+        }
+        usize start = self.pos;
+        while (self.pos < self.src.len)
+        {
+            u8 b = self.src.ptr[self.pos];
+            if (isSpace(b) || b == (u8)'(' || b == (u8)')' || b == (u8)'"') break;
+            if (b == (u8)';' && self.peekAt(1) == (u8)';') break;
+            self.pos++;
+        }
+        if (start == self.pos) { self.fail("unexpected character", atLine); return null; }
+        WatNode* n = self.newNode(WatNodeKind::Atom, atLine);
+        if (n == null) return null;
+        n->atom = str::fromParts(self.src.ptr + start, self.pos - start);
+        return n;
+    }
+
+    bool parseTypeSig(WatNode* funcNode, usize startIdx, Vec<u8>* params, Vec<u8>* results, Vec<str>* paramNames)
+    {
+        usize i = startIdx;
+        if (i < funcNode->kids.len)
+        {
+            str a = watAtomAt(funcNode, i);
+            if (strStartsWithDollar(a)) i++;
+        }
+        while (i < funcNode->kids.len)
+        {
+            WatNode* k = watKidAt(funcNode, i);
+            if (!watNodeIs(k, "param")) break;
+            str pend = str::empty();
+            usize j = 1;
+            while (j < k->kids.len)
+            {
+                str a = watAtomAt(k, j);
+                if (strStartsWithDollar(a)) { pend = a; j++; continue; }
+                u8 vt = wasmValType(a);
+                if (vt == 0) { self.fail("invalid parameter type", k->line); return false; }
+                params->push(vt);
+                if (paramNames != null) paramNames->push(pend);
+                pend = str::empty();
+                j++;
+            }
+            i++;
+        }
+        while (i < funcNode->kids.len)
+        {
+            WatNode* k = watKidAt(funcNode, i);
+            if (!watNodeIs(k, "result")) break;
+            usize j = 1;
+            while (j < k->kids.len)
+            {
+                u8 vt = wasmValType(watAtomAt(k, j));
+                if (vt == 0) { self.fail("invalid result type", k->line); return false; }
+                results->push(vt);
+                j++;
+            }
+            i++;
+        }
+        return true;
+    }
+
+    bool parseLocals(WatNode* funcNode, usize startIdx, Vec<u8>* locals, Vec<str>* localNames, Vec<WatNode*>* body)
+    {
+        usize i = startIdx;
+        while (i < funcNode->kids.len)
+        {
+            WatNode* k = watKidAt(funcNode, i);
+            if (watNodeIs(k, "local"))
+            {
+                str pend = str::empty();
+                usize j = 1;
+                while (j < k->kids.len)
+                {
+                    str a = watAtomAt(k, j);
+                    if (strStartsWithDollar(a)) { pend = a; j++; continue; }
+                    u8 vt = wasmValType(a);
+                    if (vt == 0) { self.fail("invalid local type", k->line); return false; }
+                    locals->push(vt);
+                    localNames->push(pend);
+                    pend = str::empty();
+                    j++;
+                }
+            }
+            else if (watNodeIs(k, "type") || watNodeIs(k, "param") ||
+                     watNodeIs(k, "result") || watNodeIs(k, "export"))
+            {
+            }
+            else if (body != null) body->push(k);
+            i++;
+        }
+        return true;
+    }
+
+    i32 findTypeLabel(str label)
+    {
+        for (usize i = 0; i < self.types.len; i++)
+            if (self.types.data[i].label.equals(label)) return (i32)i;
+        return -1;
+    }
+
+    u32 internType(Vec<u8>* params, Vec<u8>* results)
+    {
+        for (usize i = 0; i < self.types.len; i++)
+        {
+            WasmType* t = &self.types.data[i];
+            if (t->params.len != params->len || t->results.len != results->len) continue;
+            bool same = true;
+            for (usize j = 0; j < params->len; j++) if (t->params.data[j] != params->data[j]) { same = false; break; }
+            if (same) for (usize j = 0; j < results->len; j++) if (t->results.data[j] != results->data[j]) { same = false; break; }
+            if (same) return (u32)i;
+        }
+        WasmType t = WasmType { .params = Vec<u8>::new(), .results = Vec<u8>::new(), .label = str::empty() };
+        for (usize j = 0; j < params->len; j++) t.params.push(params->data[j]);
+        for (usize j = 0; j < results->len; j++) t.results.push(results->data[j]);
+        self.types.push(t);
+        return (u32)(self.types.len - 1);
+    }
+
+    bool parseTypeField(WatNode* field)
+    {
+        usize i = 1;
+        str label = str::empty();
+        if (i < field->kids.len && strStartsWithDollar(watAtomAt(field, i))) { label = watAtomAt(field, i); i++; }
+        if (i >= field->kids.len) { self.fail("type needs a function signature", field->line); return false; }
+        WatNode* f = watKidAt(field, i);
+        if (!watNodeIs(f, "func")) { self.fail("only function types are supported", field->line); return false; }
+        WasmType t = WasmType { .params = Vec<u8>::new(), .results = Vec<u8>::new(), .label = label };
+        if (!self.parseTypeSig(f, 1, &t.params, &t.results, null)) return false;
+        self.types.push(t);
+        return true;
+    }
+
+    bool addImport(WatNode* field)
+    {
+        if (field->kids.len < 4) { self.fail("malformed import", field->line); return false; }
+        WatNode* m = watKidAt(field, 1);
+        WatNode* n = watKidAt(field, 2);
+        if (m == null || m->kind != WatNodeKind::Str || n == null || n->kind != WatNodeKind::Str)
+        {
+            self.fail("import names must be strings", field->line);
+            return false;
+        }
+        WatNode* f = watKidAt(field, 3);
+        if (!watNodeIs(f, "func"))
+        {
+            self.fail("only function imports are supported", field->line);
+            return false;
+        }
+        Vec<u8> params = Vec<u8>::new();
+        Vec<u8> results = Vec<u8>::new();
+        Vec<str> names = Vec<str>::new();
+        if (!self.parseTypeSig(f, 1, &params, &results, &names)) return false;
+        u32 ti = self.internType(&params, &results);
+        str label = str::empty();
+        usize li = 1;
+        if (li < f->kids.len && strStartsWithDollar(watAtomAt(f, li))) label = watAtomAt(f, li);
+        WasmFunc fn = WasmFunc {
+            .label = label,
+            .typeIndex = ti,
+            .paramNames = names,
+            .locals = Vec<u8>::new(),
+            .localNames = Vec<str>::new(),
+            .body = Vec<WatNode*>::new(),
+            .index = 0,
+            .isImport = true,
+            .importModule = String::from(m->bytes.asView()),
+            .importName = String::from(n->bytes.asView()),
+            .line = field->line
+        };
+        self.funcs.push(fn);
+        return true;
+    }
+
+    bool addExport(str name, u8 kind, str label, u32 line)
+    {
+        WasmExport e = WasmExport {
+            .name = String::from(name),
+            .kind = kind,
+            .label = label,
+            .index = 0xFFFFFFFF,
+            .line = line
+        };
+        self.exports.push(e);
+        return true;
+    }
+
+    bool addExported(WatNode* field)
+    {
+        if (field->kids.len < 3) { self.fail("malformed export", field->line); return false; }
+        WatNode* nameNode = watKidAt(field, 1);
+        WatNode* desc = watKidAt(field, 2);
+        if (nameNode == null || nameNode->kind != WatNodeKind::Str || desc == null || desc->kind != WatNodeKind::List || desc->kids.len < 2)
+        {
+            self.fail("malformed export", field->line);
+            return false;
+        }
+        str kindName = watAtomAt(desc, 0);
+        str target = watAtomAt(desc, 1);
+        u8 kind = 0;
+        if (kindName.equals("func")) kind = 0;
+        else if (kindName.equals("table")) kind = 1;
+        else if (kindName.equals("memory")) kind = 2;
+        else if (kindName.equals("global")) kind = 3;
+        else { self.fail("unknown export kind", field->line); return false; }
+        return self.addExport(nameNode->bytes.asView(), kind, target, field->line);
+    }
+
+    bool addFunc(WatNode* field)
+    {
+        Vec<u8> params = Vec<u8>::new();
+        Vec<u8> results = Vec<u8>::new();
+        Vec<str> names = Vec<str>::new();
+        if (!self.parseTypeSig(field, 1, &params, &results, &names)) return false;
+        u32 ti = self.internType(&params, &results);
+        str label = str::empty();
+        usize i = 1;
+        if (i < field->kids.len && strStartsWithDollar(watAtomAt(field, i))) { label = watAtomAt(field, i); i++; }
+        WasmFunc fn = WasmFunc {
+            .label = label,
+            .typeIndex = ti,
+            .paramNames = names,
+            .locals = Vec<u8>::new(),
+            .localNames = Vec<str>::new(),
+            .body = Vec<WatNode*>::new(),
+            .index = 0,
+            .isImport = false,
+            .importModule = String::new(),
+            .importName = String::new(),
+            .line = field->line
+        };
+        if (!self.parseLocals(field, i, &fn.locals, &fn.localNames, &fn.body)) return false;
+        for (usize e = 0; e < field->kids.len; e++)
+        {
+            WatNode* k = watKidAt(field, e);
+            if (watNodeIs(k, "export") && k->kids.len >= 2)
+            {
+                str en = watAtomAt(k, 1);
+                if (en.len == 0) en = watAtomAt(k, 0);
+                self.addExport(en, 0, label, k->line);
+            }
+        }
+        self.funcs.push(fn);
+        return true;
+    }
+
+    bool addGlobal(WatNode* field)
+    {
+        usize i = 1;
+        str label = str::empty();
+        if (i < field->kids.len && strStartsWithDollar(watAtomAt(field, i))) { label = watAtomAt(field, i); i++; }
+        if (i >= field->kids.len) { self.fail("global needs a type", field->line); return false; }
+        WatNode* t = watKidAt(field, i);
+        u8 vt = 0;
+        bool mut = false;
+        if (t != null && t->kind == WatNodeKind::Atom)
+        {
+            vt = wasmValType(t->atom);
+            i++;
+        }
+        else if (watNodeIs(t, "mut") && t->kids.len >= 2)
+        {
+            mut = true;
+            vt = wasmValType(watAtomAt(t, 1));
+            i++;
+        }
+        if (vt == 0) { self.fail("invalid global type", field->line); return false; }
+        if (i >= field->kids.len) { self.fail("global needs an initializer", field->line); return false; }
+        WatNode* init = watKidAt(field, i);
+        WasmGlobal g = WasmGlobal {
+            .label = label,
+            .type = vt,
+            .mut = mut,
+            .init = init,
+            .index = (u32)self.globals.len
+        };
+        self.globals.push(g);
+        return true;
+    }
+
+    bool addMemory(WatNode* field)
+    {
+        usize i = 1;
+        if (i < field->kids.len && strStartsWithDollar(watAtomAt(field, i))) i++;
+        if (i >= field->kids.len) { self.fail("memory needs a minimum", field->line); return false; }
+        bool ok = false;
+        u64 mn = watParseUnsigned(watAtomAt(field, i), &ok);
+        if (!ok) { self.fail("invalid memory minimum", field->line); return false; }
+        self.memory.present = true;
+        self.memory.minPages = (u32)mn;
+        i++;
+        if (i < field->kids.len)
+        {
+            str a = watAtomAt(field, i);
+            u64 mx = watParseUnsigned(a, &ok);
+            if (ok)
+            {
+                self.memory.maxPages = (u32)mx;
+                self.memory.hasMax = true;
+            }
+        }
+        return true;
+    }
+
+    bool addTable(WatNode* field)
+    {
+        usize i = 1;
+        if (i < field->kids.len && strStartsWithDollar(watAtomAt(field, i))) i++;
+        if (i >= field->kids.len) { self.fail("table needs a minimum", field->line); return false; }
+        bool ok = false;
+        u64 mn = watParseUnsigned(watAtomAt(field, i), &ok);
+        if (!ok) { self.fail("invalid table minimum", field->line); return false; }
+        self.table.present = true;
+        self.table.minElems = (u32)mn;
+        i++;
+        if (i < field->kids.len)
+        {
+            u64 mx = watParseUnsigned(watAtomAt(field, i), &ok);
+            if (ok) { self.table.maxElems = (u32)mx; self.table.hasMax = true; i++; }
+        }
+        return true;
+    }
+
+    bool addElem(WatNode* field)
+    {
+        if (field->kids.len < 3) { self.fail("malformed element segment", field->line); return false; }
+        usize i = 1;
+        if (watNodeIs(watKidAt(field, i), "table")) i++;
+        if (i >= field->kids.len) { self.fail("element segment needs an offset", field->line); return false; }
+        self.table.offset = watKidAt(field, i);
+        i++;
+        while (i < field->kids.len)
+        {
+            str a = watAtomAt(field, i);
+            if (a.len > 0) self.table.elems.push(a);
+            i++;
+        }
+        return true;
+    }
+
+    bool addData(WatNode* field)
+    {
+        if (field->kids.len < 3) { self.fail("malformed data segment", field->line); return false; }
+        usize i = 1;
+        if (i < field->kids.len && watNodeIs(watKidAt(field, i), "memory")) i++;
+        if (i >= field->kids.len) { self.fail("data segment needs an offset", field->line); return false; }
+        WasmData d = WasmData { .offset = watKidAt(field, i), .bytes = String::new() };
+        i++;
+        while (i < field->kids.len)
+        {
+            WatNode* k = watKidAt(field, i);
+            if (k != null && k->kind == WatNodeKind::Str) d.bytes.pushView(k->bytes.asView());
+            i++;
+        }
+        self.data.push(d);
+        return true;
+    }
+
+    bool parseModule(WatNode* root)
+    {
+        if (!watNodeIs(root, "module")) { self.fail("expected (module ...)", root != null ? root->line : 1); return false; }
+        for (usize i = 1; i < root->kids.len; i++)
+        {
+            WatNode* f = root->kids.data[i];
+            if (watNodeIs(f, "type")) { if (!self.parseTypeField(f)) return false; }
+        }
+        for (usize i = 1; i < root->kids.len; i++)
+        {
+            WatNode* f = root->kids.data[i];
+            if (f == null || f->kind != WatNodeKind::List) continue;
+            str h = watAtomAt(f, 0);
+            if (h.equals("import")) { if (!self.addImport(f)) return false; }
+            else if (h.equals("func")) { if (!self.addFunc(f)) return false; }
+            else if (h.equals("global")) { if (!self.addGlobal(f)) return false; }
+            else if (h.equals("memory")) { if (!self.addMemory(f)) return false; }
+            else if (h.equals("table")) { if (!self.addTable(f)) return false; }
+            else if (h.equals("elem")) { if (!self.addElem(f)) return false; }
+            else if (h.equals("data")) { if (!self.addData(f)) return false; }
+            else if (h.equals("export")) { if (!self.addExported(f)) return false; }
+            else if (h.equals("start"))
+            {
+                if (f->kids.len < 2) { self.fail("malformed start", f->line); return false; }
+                self.startLabel = watAtomAt(f, 1);
+            }
+        }
+        return true;
+    }
+}

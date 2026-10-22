@@ -1,0 +1,796 @@
+#[[no_drop_all]]
+import(lib) std::text::string { String };
+import(lib) std::vec { Vec };
+import(lib) std::intrinsics { memcpy };
+import(lib) std::io::ios { parseF64 };
+import(lib) wallvm::assembly::wasm::core { WasmAssembler, WatNode, WatNodeKind, WasmType, WasmFunc, WasmExport, WasmGlobal, WasmMemory, WasmTable, WasmData, WasmCtrl, watAtomAt, watVecAtom, watKidAt, watNodeIs, wasmValType, strStartsWithDollar, watParseUnsigned, watParseSigned };
+import(lib) wallvm::assembly::wasm::ops { WasmMemOp, wasmI32Op, wasmI64Op, wasmF32Op, wasmF64Op, wasmConversionOp, wasmMemoryOp };
+
+pub extend WasmAssembler
+{
+    void emitU32(String* out, u32 v)
+    {
+        u64 x = (u64)v;
+        loop
+        {
+            u8 b = (u8)(x & 0x7f);
+            x >>= 7;
+            if (x != 0) b |= 0x80;
+            out->pushByte(b);
+            if (x == 0) break;
+        }
+    }
+
+    void emitS64(String* out, i64 v)
+    {
+        i64 x = v;
+        loop
+        {
+            u8 b = (u8)(x & 0x7f);
+            x >>= 7;
+            bool done = (x == 0 && (b & 0x40) == 0) || (x == -1 && (b & 0x40) != 0);
+            if (!done) b |= 0x80;
+            out->pushByte(b);
+            if (done) break;
+        }
+    }
+
+    void emitS32(String* out, i32 v)
+    {
+        self.emitS64(out, (i64)v);
+    }
+
+    void emitName(String* out, str name)
+    {
+        self.emitU32(out, (u32)name.len);
+        out->pushView(name);
+    }
+
+    void emitF32(String* out, f32 v)
+    {
+        u32 bits = 0;
+        memcpy((rawptr)&bits, (const rawptr)&v, 4);
+        u8[4] b = { (u8)(bits & 0xff), (u8)((bits >> 8) & 0xff), (u8)((bits >> 16) & 0xff), (u8)((bits >> 24) & 0xff) };
+        for (usize i = 0; i < 4; i++) out->pushByte(b[i]);
+    }
+
+    void emitF64(String* out, f64 v)
+    {
+        u64 bits = 0;
+        memcpy((rawptr)&bits, (const rawptr)&v, 8);
+        for (usize i = 0; i < 8; i++) out->pushByte((u8)((bits >> (i * 8)) & 0xff));
+    }
+
+    void emitSection(String* out, u8 id, String* payload)
+    {
+        out->pushByte(id);
+        self.emitU32(out, (u32)payload->len);
+        out->pushView(payload->asView());
+    }
+
+    i32 funcByLabel(str label)
+    {
+        for (usize i = 0; i < self.funcs.len; i++)
+            if (self.funcs.data[i].label.equals(label)) return (i32)i;
+        return -1;
+    }
+
+    i32 funcByIndex(u32 index)
+    {
+        for (usize i = 0; i < self.funcs.len; i++)
+            if (self.funcs.data[i].index == index) return (i32)i;
+        return -1;
+    }
+
+    i32 globalByLabel(str label)
+    {
+        for (usize i = 0; i < self.globals.len; i++)
+            if (self.globals.data[i].label.equals(label)) return (i32)i;
+        return -1;
+    }
+
+    bool resolveIndex(str label, bool isFunc, u32* out)
+    {
+        if (label.len == 0) return false;
+        if (strStartsWithDollar(label))
+        {
+            i32 i = isFunc ? self.funcByLabel(label) : self.globalByLabel(label);
+            if (i < 0) return false;
+            *out = isFunc ? self.funcs.data[i].index : (u32)i;
+            return true;
+        }
+        bool ok = false;
+        u64 v = watParseUnsigned(label, &ok);
+        if (!ok) return false;
+        *out = (u32)v;
+        return true;
+    }
+
+    bool assignIndices()
+    {
+        u32 next = 0;
+        for (usize i = 0; i < self.funcs.len; i++)
+            if (self.funcs.data[i].isImport) { self.funcs.data[i].index = next; next = next + 1; }
+        for (usize i = 0; i < self.funcs.len; i++)
+            if (!self.funcs.data[i].isImport) { self.funcs.data[i].index = next; next = next + 1; }
+        for (usize i = 0; i < self.globals.len; i++) self.globals.data[i].index = (u32)i;
+        for (usize i = 0; i < self.exports.len; i++)
+        {
+            WasmExport* e = &self.exports.data[i];
+            if (e->kind == 0)
+            {
+                if (!self.resolveIndex(e->label, true, &e->index))
+                {
+                    self.fail("export refers to an unknown function", e->line);
+                    return false;
+                }
+            }
+            else if (e->kind == 3)
+            {
+                if (!self.resolveIndex(e->label, false, &e->index))
+                {
+                    self.fail("export refers to an unknown global", e->line);
+                    return false;
+                }
+            }
+            else e->index = 0;
+        }
+        return true;
+    }
+
+    bool encodeConstExpr(String* out, WatNode* n)
+    {
+        if (n == null || n->kind != WatNodeKind::List || n->kids.len < 2)
+        {
+            self.fail("malformed constant expression", n != null ? n->line : self.line);
+            return false;
+        }
+        str h = watAtomAt(n, 0);
+        str a = watAtomAt(n, 1);
+        if (h.equals("i32.const"))
+        {
+            bool ok = false;
+            i64 v = watParseSigned(a, &ok);
+            if (!ok) { self.fail("invalid i32 constant", n->line); return false; }
+            out->pushByte(0x41);
+            self.emitS32(out, (i32)v);
+        }
+        else if (h.equals("i64.const"))
+        {
+            bool ok = false;
+            i64 v = watParseSigned(a, &ok);
+            if (!ok) { self.fail("invalid i64 constant", n->line); return false; }
+            out->pushByte(0x42);
+            self.emitS64(out, v);
+        }
+        else if (h.equals("f32.const"))
+        {
+            bool ok = false;
+            f64 v = parseF64(a, &ok);
+            if (!ok) { self.fail("invalid f32 constant", n->line); return false; }
+            out->pushByte(0x43);
+            self.emitF32(out, (f32)v);
+        }
+        else if (h.equals("f64.const"))
+        {
+            bool ok = false;
+            f64 v = parseF64(a, &ok);
+            if (!ok) { self.fail("invalid f64 constant", n->line); return false; }
+            out->pushByte(0x44);
+            self.emitF64(out, v);
+        }
+        else if (h.equals("global.get"))
+        {
+            u32 gi = 0;
+            if (!self.resolveIndex(a, false, &gi)) { self.fail("unknown global", n->line); return false; }
+            out->pushByte(0x23);
+            self.emitU32(out, gi);
+        }
+        else if (h.equals("ref.null"))
+        {
+            out->pushByte(0xd0);
+            if (a.equals("func") || a.equals("funcref")) out->pushByte(0x70);
+            else if (a.equals("extern") || a.equals("externref")) out->pushByte(0x6f);
+            else { self.fail("unsupported reference type", n->line); return false; }
+        }
+        else if (h.equals("ref.func"))
+        {
+            u32 fi = 0;
+            if (!self.resolveIndex(a, true, &fi)) { self.fail("unknown function", n->line); return false; }
+            out->pushByte(0xd2);
+            self.emitU32(out, fi);
+        }
+        else
+        {
+            self.fail("unsupported constant expression", n->line);
+            return false;
+        }
+        out->pushByte(0x0b);
+        return true;
+    }
+
+    u32 naturalAlign(str m)
+    {
+        WasmMemOp mi = wasmMemoryOp(m);
+        return (u32)mi.align;
+    }
+
+    bool parseMemArg(WasmFunc* fn, Vec<WatNode*>* body, usize* ip, String* out, str m)
+    {
+        u32 align = self.naturalAlign(m);
+        u64 offset = 0;
+        while (*ip + 1 < body->len)
+        {
+            WatNode* nx = body->data[*ip + 1];
+            if (nx == null || nx->kind != WatNodeKind::Atom) break;
+            str a = nx->atom;
+            if (a.startsWith("offset="))
+            {
+                bool ok = false;
+                offset = watParseUnsigned(a.slice(7, a.len), &ok);
+                if (!ok) { self.fail("invalid memory offset", nx->line); return false; }
+                *ip = *ip + 1;
+            }
+            else if (a.startsWith("align="))
+            {
+                bool ok = false;
+                u64 av = watParseUnsigned(a.slice(6, a.len), &ok);
+                if (!ok || av == 0 || (av & (av - 1)) != 0)
+                {
+                    self.fail("invalid memory alignment", nx->line);
+                    return false;
+                }
+                u32 lg = 0;
+                while (av > 1) { av >>= 1; lg++; }
+                align = lg;
+                *ip = *ip + 1;
+            }
+            else break;
+        }
+        self.emitU32(out, align);
+        self.emitU32(out, (u32)offset);
+        return true;
+    }
+
+    i32 localIndex(WasmFunc* fn, str label)
+    {
+        if (strStartsWithDollar(label))
+        {
+            for (usize i = 0; i < fn->paramNames.len; i++)
+                if (fn->paramNames.data[i].equals(label)) return (i32)i;
+            usize np = self.types.data[fn->typeIndex].params.len;
+            for (usize i = 0; i < fn->localNames.len; i++)
+                if (fn->localNames.data[i].equals(label)) return (i32)(np + i);
+            return -1;
+        }
+        bool ok = false;
+        u64 v = watParseUnsigned(label, &ok);
+        if (!ok) return -1;
+        return (i32)v;
+    }
+
+    i32 labelDepth(Vec<WasmCtrl>* ctrl, str label)
+    {
+        if (label.len == 0) return -1;
+        if (strStartsWithDollar(label))
+        {
+            usize i = ctrl->len;
+            while (i > 0)
+            {
+                i--;
+                if (ctrl->data[i].label.equals(label)) return (i32)(ctrl->len - 1 - i);
+            }
+            return -1;
+        }
+        bool ok = false;
+        u64 v = watParseUnsigned(label, &ok);
+        if (!ok) return -1;
+        return (i32)v;
+    }
+
+    i32 simpleOpcode(str m)
+    {
+        usize dot = m.findByte((u8)'.');
+        if (dot >= m.len) return -1;
+        str pfx = m.slice(0, dot);
+        str op = m.slice(dot + 1, m.len);
+        i32 r = -1;
+        if (pfx.equals("i32")) r = wasmI32Op(op);
+        else if (pfx.equals("i64")) r = wasmI64Op(op);
+        else if (pfx.equals("f32")) r = wasmF32Op(op);
+        else if (pfx.equals("f64")) r = wasmF64Op(op);
+        if (r >= 0) return r;
+        return wasmConversionOp(m);
+    }
+
+    bool encodeInstr(WasmFunc* fn, Vec<WatNode*>* body, usize* ip, String* out, Vec<WasmCtrl>* ctrl)
+    {
+        WatNode* n = body->data[*ip];
+        if (n == null || n->kind != WatNodeKind::Atom)
+        {
+            self.fail("folded instructions are not supported", n != null ? n->line : self.line);
+            return false;
+        }
+        str m = n->atom;
+        if (m.equals("block") || m.equals("loop") || m.equals("if"))
+        {
+            u8 opcode = m.equals("block") ? 0x02 : (m.equals("loop") ? 0x03 : 0x04);
+            str label = str::empty();
+            if (*ip + 1 < body->len)
+            {
+                WatNode* nx = body->data[*ip + 1];
+                if (nx != null && nx->kind == WatNodeKind::Atom && strStartsWithDollar(nx->atom))
+                {
+                    label = nx->atom;
+                    *ip = *ip + 1;
+                }
+            }
+            u8 blockType = 0x40;
+            if (*ip + 1 < body->len)
+            {
+                WatNode* nx = body->data[*ip + 1];
+                if (watNodeIs(nx, "result"))
+                {
+                    if (nx->kids.len == 2)
+                    {
+                        u8 vt = wasmValType(watAtomAt(nx, 1));
+                        if (vt == 0) { self.fail("invalid block result type", nx->line); return false; }
+                        blockType = vt;
+                    }
+                    else
+                    {
+                        Vec<u8> bp = Vec<u8>::new();
+                        Vec<u8> br = Vec<u8>::new();
+                        for (usize r = 1; r < nx->kids.len; r++) br.push(wasmValType(watAtomAt(nx, r)));
+                        u32 ti = self.internType(&bp, &br);
+                        out->pushByte(opcode);
+                        self.emitU32(out, ti);
+                        WasmCtrl c = WasmCtrl { .label = label, .kind = opcode };
+                        ctrl->push(c);
+                        *ip = *ip + 1;
+                        return true;
+                    }
+                    *ip = *ip + 1;
+                }
+            }
+            out->pushByte(opcode);
+            out->pushByte(blockType);
+            WasmCtrl c = WasmCtrl { .label = label, .kind = opcode };
+            ctrl->push(c);
+            return true;
+        }
+        if (m.equals("else"))
+        {
+            if (ctrl->len <= 1 || ctrl->data[ctrl->len - 1].kind != 0x04)
+            {
+                self.fail("else without a matching if", n->line);
+                return false;
+            }
+            out->pushByte(0x05);
+            return true;
+        }
+        if (m.equals("end"))
+        {
+            if (ctrl->len <= 1)
+            {
+                self.fail("end without a matching block", n->line);
+                return false;
+            }
+            out->pushByte(0x0b);
+            ctrl->len--;
+            return true;
+        }
+        if (m.equals("br") || m.equals("br_if"))
+        {
+            if (*ip + 1 >= body->len) { self.fail("branch needs a label", n->line); return false; }
+            str label = watVecAtom(body, *ip + 1);
+            if (label.len == 0) { self.fail("branch needs a label", n->line); return false; }
+            i32 d = self.labelDepth(ctrl, label);
+            if (d < 0) { self.fail("unknown branch label", n->line); return false; }
+            out->pushByte(m.equals("br") ? 0x0c : 0x0d);
+            self.emitU32(out, (u32)d);
+            *ip = *ip + 1;
+            return true;
+        }
+        if (m.equals("br_table"))
+        {
+            Vec<u32> depths = Vec<u32>::new();
+            usize j = *ip + 1;
+            while (j < body->len)
+            {
+                WatNode* t = body->data[j];
+                if (t == null || t->kind != WatNodeKind::Atom) break;
+                str a = t->atom;
+                if (!strStartsWithDollar(a) && !(a.len > 0 && a.ptr[0] >= (u8)'0' && a.ptr[0] <= (u8)'9')) break;
+                i32 d = self.labelDepth(ctrl, a);
+                if (d < 0) { self.fail("unknown branch label", t->line); return false; }
+                depths.push((u32)d);
+                j++;
+            }
+            if (depths.len == 0) { self.fail("br_table needs labels", n->line); return false; }
+            out->pushByte(0x0e);
+            self.emitU32(out, (u32)(depths.len - 1));
+            for (usize k = 0; k < depths.len - 1; k++) self.emitU32(out, depths.data[k]);
+            self.emitU32(out, depths.data[depths.len - 1]);
+            *ip = j - 1;
+            return true;
+        }
+        if (m.equals("return") || m.equals("unreachable") || m.equals("nop") || m.equals("drop") || m.equals("select"))
+        {
+            if (m.equals("return")) out->pushByte(0x0f);
+            else if (m.equals("unreachable")) out->pushByte(0x00);
+            else if (m.equals("nop")) out->pushByte(0x01);
+            else if (m.equals("drop")) out->pushByte(0x1a);
+            else out->pushByte(0x1b);
+            return true;
+        }
+        if (m.equals("call"))
+        {
+            if (*ip + 1 >= body->len) { self.fail("call needs a function", n->line); return false; }
+            u32 fi = 0;
+            if (!self.resolveIndex(watVecAtom(body, *ip + 1), true, &fi)) { self.fail("unknown function", n->line); return false; }
+            out->pushByte(0x10);
+            self.emitU32(out, fi);
+            *ip = *ip + 1;
+            return true;
+        }
+        if (m.equals("call_indirect"))
+        {
+            u32 ti = 0;
+            bool haveType = false;
+            if (*ip + 1 < body->len)
+            {
+                WatNode* t = body->data[*ip + 1];
+                if (watNodeIs(t, "type"))
+                {
+                    str tl = watAtomAt(t, 1);
+                    i32 l = self.findTypeLabel(tl);
+                    if (l >= 0) { ti = (u32)l; haveType = true; }
+                    else
+                    {
+                        bool ok = false;
+                        u64 v = watParseUnsigned(tl, &ok);
+                        if (ok) { ti = (u32)v; haveType = true; }
+                    }
+                    *ip = *ip + 1;
+                }
+            }
+            if (!haveType) { self.fail("call_indirect needs a type", n->line); return false; }
+            out->pushByte(0x11);
+            self.emitU32(out, ti);
+            out->pushByte(0x00);
+            return true;
+        }
+        if (m.equals("local.get") || m.equals("local.set") || m.equals("local.tee"))
+        {
+            if (*ip + 1 >= body->len) { self.fail("local instruction needs a slot", n->line); return false; }
+            i32 li = self.localIndex(fn, watVecAtom(body, *ip + 1));
+            if (li < 0) { self.fail("unknown local", n->line); return false; }
+            out->pushByte(m.equals("local.get") ? 0x20 : (m.equals("local.set") ? 0x21 : 0x22));
+            self.emitU32(out, (u32)li);
+            *ip = *ip + 1;
+            return true;
+        }
+        if (m.equals("global.get") || m.equals("global.set"))
+        {
+            if (*ip + 1 >= body->len) { self.fail("global instruction needs a slot", n->line); return false; }
+            u32 gi = 0;
+            if (!self.resolveIndex(watVecAtom(body, *ip + 1), false, &gi)) { self.fail("unknown global", n->line); return false; }
+            out->pushByte(m.equals("global.get") ? 0x23 : 0x24);
+            self.emitU32(out, gi);
+            *ip = *ip + 1;
+            return true;
+        }
+        if (m.equals("i32.const"))
+        {
+            if (*ip + 1 >= body->len) { self.fail("i32.const needs a value", n->line); return false; }
+            bool ok = false;
+            i64 v = watParseSigned(watVecAtom(body, *ip + 1), &ok);
+            if (!ok) { self.fail("invalid i32 constant", n->line); return false; }
+            out->pushByte(0x41);
+            self.emitS32(out, (i32)v);
+            *ip = *ip + 1;
+            return true;
+        }
+        if (m.equals("i64.const"))
+        {
+            if (*ip + 1 >= body->len) { self.fail("i64.const needs a value", n->line); return false; }
+            bool ok = false;
+            i64 v = watParseSigned(watVecAtom(body, *ip + 1), &ok);
+            if (!ok) { self.fail("invalid i64 constant", n->line); return false; }
+            out->pushByte(0x42);
+            self.emitS64(out, v);
+            *ip = *ip + 1;
+            return true;
+        }
+        if (m.equals("f32.const"))
+        {
+            if (*ip + 1 >= body->len) { self.fail("f32.const needs a value", n->line); return false; }
+            bool ok = false;
+            f64 v = parseF64(watVecAtom(body, *ip + 1), &ok);
+            if (!ok) { self.fail("invalid f32 constant", n->line); return false; }
+            out->pushByte(0x43);
+            self.emitF32(out, (f32)v);
+            *ip = *ip + 1;
+            return true;
+        }
+        if (m.equals("f64.const"))
+        {
+            if (*ip + 1 >= body->len) { self.fail("f64.const needs a value", n->line); return false; }
+            bool ok = false;
+            f64 v = parseF64(watVecAtom(body, *ip + 1), &ok);
+            if (!ok) { self.fail("invalid f64 constant", n->line); return false; }
+            out->pushByte(0x44);
+            self.emitF64(out, v);
+            *ip = *ip + 1;
+            return true;
+        }
+        if (m.equals("memory.size") || m.equals("memory.grow"))
+        {
+            out->pushByte(m.equals("memory.size") ? 0x3f : 0x40);
+            out->pushByte(0x00);
+            return true;
+        }
+        WasmMemOp mem = wasmMemoryOp(m);
+        if (mem.opcode != 0)
+        {
+            out->pushByte(mem.opcode);
+            return self.parseMemArg(fn, body, ip, out, m);
+        }
+        if (m.equals("ref.null"))
+        {
+            if (*ip + 1 >= body->len) { self.fail("ref.null needs a type", n->line); return false; }
+            str a = watVecAtom(body, *ip + 1);
+            out->pushByte(0xd0);
+            if (a.equals("func") || a.equals("funcref")) out->pushByte(0x70);
+            else if (a.equals("extern") || a.equals("externref")) out->pushByte(0x6f);
+            else { self.fail("unsupported reference type", n->line); return false; }
+            *ip = *ip + 1;
+            return true;
+        }
+        if (m.equals("ref.func"))
+        {
+            if (*ip + 1 >= body->len) { self.fail("ref.func needs a function", n->line); return false; }
+            u32 fi = 0;
+            if (!self.resolveIndex(watVecAtom(body, *ip + 1), true, &fi)) { self.fail("unknown function", n->line); return false; }
+            out->pushByte(0xd2);
+            self.emitU32(out, fi);
+            *ip = *ip + 1;
+            return true;
+        }
+        i32 op = self.simpleOpcode(m);
+        if (op >= 0)
+        {
+            out->pushByte((u8)op);
+            return true;
+        }
+        self.fail("unsupported instruction", n->line);
+        return false;
+    }
+
+    bool encodeFuncBody(WasmFunc* fn, String* out)
+    {
+        String body = String::new();
+        self.emitU32(&body, (u32)fn->locals.len);
+        for (usize i = 0; i < fn->locals.len; i++)
+        {
+            self.emitU32(&body, 1);
+            body.pushByte(fn->locals.data[i]);
+        }
+        Vec<WasmCtrl> ctrl = Vec<WasmCtrl>::new();
+        ctrl.push(WasmCtrl { .label = str::empty(), .kind = 0 });
+        usize ip = 0;
+        while (ip < fn->body.len)
+        {
+            if (!self.encodeInstr(fn, &fn->body, &ip, &body, &ctrl)) { body.free(); return false; }
+            if (!self.ok) { body.free(); return false; }
+            ip++;
+        }
+        if (ctrl.len != 1)
+        {
+            self.fail("unclosed block", fn->line);
+            body.free();
+            return false;
+        }
+        body.pushByte(0x0b);
+        self.emitU32(out, (u32)body.len);
+        out->pushView(body.asView());
+        body.free();
+        return true;
+    }
+
+    bool encodeModule()
+    {
+        String out = String::new();
+        u8[8] magic = { 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 };
+        for (usize i = 0; i < 8; i++) out.pushByte(magic[i]);
+        if (self.types.len > 0)
+        {
+            String p = String::new();
+            self.emitU32(&p, (u32)self.types.len);
+            for (usize i = 0; i < self.types.len; i++)
+            {
+                WasmType* t = &self.types.data[i];
+                p.pushByte(0x60);
+                self.emitU32(&p, (u32)t->params.len);
+                for (usize j = 0; j < t->params.len; j++) p.pushByte(t->params.data[j]);
+                self.emitU32(&p, (u32)t->results.len);
+                for (usize j = 0; j < t->results.len; j++) p.pushByte(t->results.data[j]);
+            }
+            self.emitSection(&out, 1, &p);
+            p.free();
+        }
+        u32 nimports = 0;
+        for (usize i = 0; i < self.funcs.len; i++) if (self.funcs.data[i].isImport) nimports++;
+        if (nimports > 0)
+        {
+            String p = String::new();
+            self.emitU32(&p, nimports);
+            for (usize i = 0; i < self.funcs.len; i++)
+            {
+                WasmFunc* f = &self.funcs.data[i];
+                if (!f->isImport) continue;
+                self.emitName(&p, f->importModule.asView());
+                self.emitName(&p, f->importName.asView());
+                p.pushByte(0x00);
+                self.emitU32(&p, f->typeIndex);
+            }
+            self.emitSection(&out, 2, &p);
+            p.free();
+        }
+        u32 ndefs = 0;
+        for (usize i = 0; i < self.funcs.len; i++) if (!self.funcs.data[i].isImport) ndefs++;
+        if (ndefs > 0)
+        {
+            String p = String::new();
+            self.emitU32(&p, ndefs);
+            for (usize i = 0; i < self.funcs.len; i++)
+                if (!self.funcs.data[i].isImport) self.emitU32(&p, self.funcs.data[i].typeIndex);
+            self.emitSection(&out, 3, &p);
+            p.free();
+        }
+        if (self.table.present)
+        {
+            String p = String::new();
+            self.emitU32(&p, 1);
+            p.pushByte(0x70);
+            self.emitU32(&p, self.table.hasMax ? 1 : 0);
+            self.emitU32(&p, self.table.minElems);
+            if (self.table.hasMax) self.emitU32(&p, self.table.maxElems);
+            self.emitSection(&out, 4, &p);
+            p.free();
+        }
+        if (self.memory.present)
+        {
+            String p = String::new();
+            self.emitU32(&p, 1);
+            self.emitU32(&p, self.memory.hasMax ? 1 : 0);
+            self.emitU32(&p, self.memory.minPages);
+            if (self.memory.hasMax) self.emitU32(&p, self.memory.maxPages);
+            self.emitSection(&out, 5, &p);
+            p.free();
+        }
+        if (self.globals.len > 0)
+        {
+            String p = String::new();
+            self.emitU32(&p, (u32)self.globals.len);
+            for (usize i = 0; i < self.globals.len; i++)
+            {
+                WasmGlobal* g = &self.globals.data[i];
+                p.pushByte(g->type);
+                p.pushByte(g->mut ? 1 : 0);
+                if (!self.encodeConstExpr(&p, g->init)) { p.free(); out.free(); return false; }
+            }
+            self.emitSection(&out, 6, &p);
+            p.free();
+        }
+        if (self.exports.len > 0)
+        {
+            String p = String::new();
+            self.emitU32(&p, (u32)self.exports.len);
+            for (usize i = 0; i < self.exports.len; i++)
+            {
+                WasmExport* e = &self.exports.data[i];
+                self.emitName(&p, e->name.asView());
+                p.pushByte(e->kind);
+                self.emitU32(&p, e->index);
+            }
+            self.emitSection(&out, 7, &p);
+            p.free();
+        }
+        if (self.startLabel.len > 0)
+        {
+            String p = String::new();
+            u32 fi = 0;
+            if (!self.resolveIndex(self.startLabel, true, &fi)) { self.fail("unknown start function", self.line); out.free(); return false; }
+            self.emitU32(&p, fi);
+            self.emitSection(&out, 8, &p);
+            p.free();
+        }
+        if (self.table.present && self.table.elems.len > 0)
+        {
+            String p = String::new();
+            self.emitU32(&p, 1);
+            p.pushByte(0x00);
+            if (!self.encodeConstExpr(&p, self.table.offset)) { p.free(); out.free(); return false; }
+            self.emitU32(&p, (u32)self.table.elems.len);
+            for (usize i = 0; i < self.table.elems.len; i++)
+            {
+                u32 fi = 0;
+                if (!self.resolveIndex(self.table.elems.data[i], true, &fi))
+                {
+                    self.fail("element segment refers to an unknown function", self.line);
+                    p.free();
+                    out.free();
+                    return false;
+                }
+                self.emitU32(&p, fi);
+            }
+            self.emitSection(&out, 9, &p);
+            p.free();
+        }
+        if (ndefs > 0)
+        {
+            String p = String::new();
+            self.emitU32(&p, ndefs);
+            for (usize i = 0; i < self.funcs.len; i++)
+            {
+                if (self.funcs.data[i].isImport) continue;
+                if (!self.encodeFuncBody(&self.funcs.data[i], &p)) { p.free(); out.free(); return false; }
+            }
+            self.emitSection(&out, 10, &p);
+            p.free();
+        }
+        if (self.data.len > 0)
+        {
+            String p = String::new();
+            self.emitU32(&p, (u32)self.data.len);
+            for (usize i = 0; i < self.data.len; i++)
+            {
+                WasmData* d = &self.data.data[i];
+                p.pushByte(0x00);
+                if (!self.encodeConstExpr(&p, d->offset)) { p.free(); out.free(); return false; }
+                self.emitU32(&p, (u32)d->bytes.len);
+                p.pushView(d->bytes.asView());
+            }
+            self.emitSection(&out, 11, &p);
+            p.free();
+        }
+        self.binaryOut = out;
+        return true;
+    }
+
+    bool assemble()
+    {
+        WatNode* root = self.parseNode();
+        if (!self.ok) return false;
+        self.skipSpace();
+        if (!self.ok) return false;
+        if (!self.atEnd()) { self.fail("trailing input after module", self.line); return false; }
+        if (!self.parseModule(root)) return false;
+        if (!self.assignIndices()) return false;
+        return self.encodeModule();
+    }
+}
+
+pub bool wasmAssemble(str wat, String* out, String* error, u32* errorLine)
+{
+    WasmAssembler a = WasmAssembler::new(wat);
+    bool ok = a.assemble();
+    if (!ok)
+    {
+        if (error != null)
+        {
+            error->clear();
+            error->pushView(a.error.asView());
+        }
+        if (errorLine != null) *errorLine = a.errLine;
+        return false;
+    }
+    if (out != null)
+    {
+        out->clear();
+        out->pushView(a.binaryOut.asView());
+    }
+    return true;
+}
