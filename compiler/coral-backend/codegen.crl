@@ -1408,6 +1408,56 @@ bool cgStrToPtr(Codegen* cg, Ty paramTy, NodeId argId)
     return e.kind.tag == TypeKind::Pointer;
 }
 
+/* array → slice decay: returns the slice type when paramTy is `T[]` and
+ * the arg is a `T[N]` array (0 otherwise; const/comptime stripped) */
+Ty cgArrayToSliceParam(Codegen* cg, Ty paramTy, NodeId argId)
+{
+    if (paramTy == 0) return 0;
+    Node* an = cgNode(cg, argId);
+    if (an.kind.tag != NodeKind::Expr) return 0;
+    Ty at = cgSubstTy(cg, an.kind.payload.Expr.value.resolvedType);
+    if (at == 0) return 0;
+    if ((cg.ctx->types + at)->kind.tag != TypeKind::Array) return 0;
+    Ty t = paramTy;
+    TypeEntry* e = cg.ctx->types + t;
+    while (e.kind.tag == TypeKind::Const || e.kind.tag == TypeKind::Comptime)
+    {
+        if (e.kind.tag == TypeKind::Const) t = e.kind.payload.Const.base;
+        else t = e.kind.payload.Comptime.base;
+        if (t == 0) return 0;
+        e = cg.ctx->types + t;
+    }
+    if (e.kind.tag != TypeKind::Slice) return 0;
+    return t;
+}
+
+/* `((Slice_T){ (elemTy*)(arr), N })` — the C lowering of an array value
+ * flowing into a slice slot (call args, casts). arrText is borrowed. */
+void cgEmitSliceFromArr(Codegen* cg, Ty sliceTy, Ty arrTy, Slice arrText)
+{
+    TypeEntry* se = cg.ctx->types + sliceTy;
+    TypeEntry* ae = cg.ctx->types + arrTy;
+    stP(&cg.ebuf, "((");
+    stPS(&cg.ebuf, tyStr(cg, sliceTy));
+    stP(&cg.ebuf, "){ (");
+    stPS(&cg.ebuf, tyStr(cg, se->kind.payload.Slice.base));
+    stP(&cg.ebuf, "*)(");
+    stPS(&cg.ebuf, arrText);
+    stP(&cg.ebuf, "), ");
+    if (ae->kind.payload.Array.sizeName == 0)
+        stU64(&cg.ebuf, (u64)ae->kind.payload.Array.len);
+    else
+    {
+        /* symbolic size `T data[N]`: derive from the value */
+        stP(&cg.ebuf, "sizeof(");
+        stPS(&cg.ebuf, arrText);
+        stP(&cg.ebuf, ")/sizeof((");
+        stPS(&cg.ebuf, arrText);
+        stP(&cg.ebuf, ")[0])");
+    }
+    stP(&cg.ebuf, " })");
+}
+
 /* variant decl behind a (possibly pointer/const-qualified) type plus the
  * ordinal of `variantName` within it; returns the decl or index 0 */
 NodeId cgFindVariantOfTy(Codegen* cg, Ty t, Str variantName, u32* outIdx)
@@ -2466,6 +2516,7 @@ extern("C") Slice cgLvalue(Codegen* cg, NodeId id);
 extern("C") Slice cgValBody(Codegen* cg, NodeId id);
 extern("C") void cgStmt(Codegen* cg, NodeId id);
 extern("C") Slice cgAddrOfValue(Codegen* cg, NodeId oid, Slice vtext);
+extern("C") Slice cgInitValue(Codegen* cg, NodeId v);
 
 Slice cgExpr(Codegen* cg, NodeId id)
 {
@@ -2853,6 +2904,27 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 if (cit != 0 && (cg.ctx->types + cit)->kind.tag == TypeKind::Void)
                     return cgExpr(cg, cin);
             }
+            /* `(T[])arr`: array → slice construction; a C cast of an
+             * array to the slice struct is invalid */
+            {
+                Ty cit = 0;
+                if (cn != null && cn->kind.tag == NodeKind::Expr)
+                    cit = cgSubstTy(cg, cn->kind.payload.Expr.value.resolvedType);
+                if (cit != 0 && (cg.ctx->types + cit)->kind.tag == TypeKind::Array)
+                {
+                    Ty ctt = e.kind.payload.Cast.targetType;
+                    while (ctt != 0 && ((cg.ctx->types + ctt)->kind.tag == TypeKind::Const ||
+                                        (cg.ctx->types + ctt)->kind.tag == TypeKind::Comptime))
+                        ctt = (cg.ctx->types + ctt)->kind.payload.Const.base;
+                    if (ctt != 0 && (cg.ctx->types + ctt)->kind.tag == TypeKind::Slice)
+                    {
+                        Slice ca = cgExpr(cg, cin);
+                        usize rs3 = cg.ebuf.len;
+                        cgEmitSliceFromArr(cg, ctt, cit, ca);
+                        return stTail(&cg.ebuf, rs3);
+                    }
+                }
+            }
             Slice c = cgExpr(cg, e.kind.payload.Cast.expr);
             usize rs = cg.ebuf.len;
             stP(&cg.ebuf, "((");
@@ -3176,6 +3248,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 while (i < argsLen && i < 16) {
                     bool skip = false;
                     bool dec = false;
+                    Ty sliceTy = 0;
                     if (fdecl.index != 0) {
                         Node* fdn = cgNode(cg, fdecl);
                         Decl* fd = &fdn.kind.payload.Decl.value;
@@ -3185,17 +3258,27 @@ Slice cgExpr(Codegen* cg, NodeId id)
                                 Param* pp = &pn.kind.payload.Param.value;
                                 if ((pp->flags & 8) != 0) skip = true;
                                 else dec = cgStrToPtr(cg, pp->typeNode, args[i]);
+                                if (!dec) sliceTy = cgArrayToSliceParam(cg, pp->typeNode, args[i]);
                             }
                         }
                     }
                     if (!skip) {
                         if (first) first = false;
                         else stP(&abuf, ", ");
-                        /* str→ptr decay borrows the buffer; a plain
-                         * by-value arg moves it */
-                        if (!dec) cgMoveArg(cg, args[i]);
-                        stPS(&abuf, cgExpr(cg, args[i]));
-                        if (dec) stP(&abuf, ".ptr");
+                        if (sliceTy != 0)
+                        {
+                            Node* san = cgNode(cg, args[i]);
+                            Ty sat = cgSubstTy(cg, san.kind.payload.Expr.value.resolvedType);
+                            cgEmitSliceFromArr(cg, sliceTy, sat, cgExpr(cg, args[i]));
+                        }
+                        else
+                        {
+                            /* str→ptr decay borrows the buffer; a plain
+                             * by-value arg moves it */
+                            if (!dec) cgMoveArg(cg, args[i]);
+                            stPS(&abuf, cgExpr(cg, args[i]));
+                            if (dec) stP(&abuf, ".ptr");
+                        }
                         n++;
                     }
                     i++;
@@ -3324,8 +3407,30 @@ Slice cgExpr(Codegen* cg, NodeId id)
                     if (nullStr) stP(&abuf, "(_coral_str){0}");
                     else
                     {
-                        cgMoveArg(cg, args[i]);
-                        stPS(&abuf, cgExpr(cg, args[i]));
+                        /* array → slice decay, as in plain calls */
+                        Ty msliceTy = 0;
+                        if (mdef.index != 0)
+                        {
+                            Node* mdn2 = cgNode(cg, mdef);
+                            if (mdn2.kind.tag == NodeKind::Decl &&
+                                i < mdn2.kind.payload.Decl.value.kind.payload.Func.paramsLen)
+                            {
+                                Node* mpn2 = cgNode(cg, mdn2.kind.payload.Decl.value.kind.payload.Func.params[i]);
+                                if (mpn2.kind.tag == NodeKind::Param)
+                                    msliceTy = cgArrayToSliceParam(cg, mpn2.kind.payload.Param.value.typeNode, args[i]);
+                            }
+                        }
+                        if (msliceTy != 0)
+                        {
+                            Node* san = cgNode(cg, args[i]);
+                            Ty sat = cgSubstTy(cg, san.kind.payload.Expr.value.resolvedType);
+                            cgEmitSliceFromArr(cg, msliceTy, sat, cgExpr(cg, args[i]));
+                        }
+                        else
+                        {
+                            cgMoveArg(cg, args[i]);
+                            stPS(&abuf, cgExpr(cg, args[i]));
+                        }
                     }
                     n++;
                     i++;
@@ -3485,7 +3590,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                     stPS(&vs, cgIdent(cg, e.kind.payload.StructLiteral.fieldNames[i]));
                     stP(&vs, " = ");
                 }
-                stPS(&vs, cgExpr(cg, e.kind.payload.StructLiteral.fieldValues[i]));
+                stPS(&vs, cgInitValue(cg, e.kind.payload.StructLiteral.fieldValues[i]));
                 i++;
             }
             if (fvLen > 256) cgError(cg, "too many struct fields (cap 256)");
@@ -3528,7 +3633,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
             while (i < alen) {
                 if (first) first = false;
                 else stP(&vs, ", ");
-                stPS(&vs, cgExpr(cg, e.kind.payload.ArrayLiteral.elems[i]));
+                stPS(&vs, cgInitValue(cg, e.kind.payload.ArrayLiteral.elems[i]));
                 i++;
             }
             if (alen > 16) cgError(cg, "too many array elements (cap 16)");
@@ -3550,7 +3655,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
             while (i < elen) {
                 if (first) first = false;
                 else stP(&vs, ", ");
-                stPS(&vs, cgExpr(cg, e.kind.payload.TupleExpr.elems[i]));
+                stPS(&vs, cgInitValue(cg, e.kind.payload.TupleExpr.elems[i]));
                 i++;
             }
             if (elen > 16) cgError(cg, "too many tuple elements (cap 16)");
@@ -3672,6 +3777,22 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 Node* tn = cgNode(cg, target);
                 Ty tt = 0;
                 if (tn.kind.tag == NodeKind::Expr) tt = tn.kind.payload.Expr.value.resolvedType;
+                /* C forbids array assignment: lower `x = {…}` / `a = b`
+                 * on arrays to a memcpy of the target's bytes */
+                if (tt != 0 && (cg.ctx->types + cgTyUnwrap(cg, tt))->kind.tag == TypeKind::Array)
+                {
+                    Stream ms = stNew(cg.arena, 64);
+                    stP(&ms, "((void)memcpy(&(");
+                    stPS(&ms, lv);
+                    stP(&ms, "), &(");
+                    stPS(&ms, rv);
+                    stP(&ms, "), sizeof(");
+                    stPS(&ms, lv);
+                    stP(&ms, ")))");
+                    usize cs = cg.ebuf.len;
+                    stPS(&cg.ebuf, stTail(&ms, 0));
+                    return stTail(&cg.ebuf, cs);
+                }
                 if (cgIntToPtrInit(cg, value, tt)) rv = cgWrapPtrCast(cg, tyStr(cg, tt), rv);
                 /* RAII move semantics `x = y;` on droppable locals: the
                  * overwritten value of x drops now and y's pending drop
@@ -4688,7 +4809,7 @@ void cgStmt(Codegen* cg, NodeId id)
                     u32 i = 0;
                     while (i < al.kind.payload.ArrayLiteral.elemsLen) {
                         if (i > 0) stP(&cg.body, ", ");
-                        Slice v = cgExpr(cg, al.kind.payload.ArrayLiteral.elems[i]);
+                        Slice v = cgInitValue(cg, al.kind.payload.ArrayLiteral.elems[i]);
                         stPS(&cg.body, v);
                         i++;
                     }
@@ -6031,6 +6152,34 @@ void cgEmitGlobalDeclarator(Codegen* cg, Ty cty, Slice name)
     stPS(&cg.defs, name);
 }
 
+/* initializer-position value. C forbids an array-typed expression inside
+ * an aggregate initializer ("array initialized from non-constant array
+ * expression"), so array literals lower as bare `{…}` braces here
+ * (recursing through nested braces) instead of the compound literal
+ * cgExpr emits in expression position; anything else falls back. */
+Slice cgInitValue(Codegen* cg, NodeId v)
+{
+    Node* n = cgNode(cg, v);
+    if (n.kind.tag == NodeKind::Expr && n.kind.payload.Expr.value.kind.tag == ExprKind::ArrayLiteral)
+    {
+        Expr* al = &n.kind.payload.Expr.value;
+        Stream vs = stNew(cg.arena, 64);
+        stP(&vs, "{");
+        u32 i = 0;
+        while (i < al.kind.payload.ArrayLiteral.elemsLen)
+        {
+            if (i > 0) stP(&vs, ", ");
+            stPS(&vs, cgInitValue(cg, al.kind.payload.ArrayLiteral.elems[i]));
+            i++;
+        }
+        stCh(&vs, '}');
+        usize cs = cg.ebuf.len;
+        stPS(&cg.ebuf, stTail(&vs, 0));
+        return stTail(&cg.ebuf, cs);
+    }
+    return cgExpr(cg, v);
+}
+
 /* file-scope initializer value: brace literals stay inline (temp
  * statements cannot be emitted at file scope) and recurse into
  * nested braces; anything else falls back to cgExpr. */
@@ -7319,9 +7468,11 @@ pub CodegenResult generateC(AstContext* ctx, File* file, MonoContext* mono, Aren
      * prototypes that coral also declares. */
     stP(&cg.out, "#include <stdint.h>\n#include <stddef.h>\n#include <stdbool.h>\n");
     stP(&cg.out, "#include <assert.h>\n\n");
-    /* memcmp for str/struct equality: a bare prototype, not a header
-       (generated C must not include system headers) */
-    stP(&cg.out, "extern int memcmp(const void*, const void*, size_t);\n\n");
+    /* memcmp for str/struct equality and memcpy for array assignment:
+       bare prototypes, not headers (generated C must not include system
+       headers) */
+    stP(&cg.out, "extern int memcmp(const void*, const void*, size_t);\n");
+    stP(&cg.out, "extern void* memcpy(void*, const void*, size_t);\n\n");
     /* limits.crl defines the same names: drop the stdint macros so the
        emitted constants win */
     stP(&cg.out, "#undef INT8_MIN\n#undef INT8_MAX\n#undef INT16_MIN\n#undef INT16_MAX\n");
