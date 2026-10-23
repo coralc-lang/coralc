@@ -2,7 +2,7 @@
 import(lib) wallvm::irtypes { IrContext, IrModule, IrFunc, IrBlock, IrInst, IrType, IrTypeKind, IrValue, IrValueKind, IrGlobal, IrStringConst, IrArrayConst, IrStructType };
 import(lib) wallvm::irOps { IrOpcode, IrICmpPred, IrFCmpPred, IrAtomicRmwOp, irOpcodeStr, irOpcodeIsTerminator };
 import(lib) std::mman { alloc, dealloc, copy };
-import(lib) std::text::string { String };
+import(lib) std::string { String };
 import(lib) platform::libc { write };
 
 // bit punning for float literals — I keep the pair beside the imports it needs
@@ -159,6 +159,13 @@ pub struct WasmEmitter
     str getOutput() { return self.output.asView(); }
 }
 
+struct WasmTySig
+{
+    IrType** params;
+    u32 nparams;
+    IrType* ret;
+}
+
 pub struct WasmCodeGen
 {
     IrContext* ctx;
@@ -205,6 +212,17 @@ pub struct WasmCodeGen
     u32 nbl;
     u32 cbl;
 
+    // unique function signatures for the type section
+    WasmTySig* tsig;
+    u32 ntsig;
+    u32 ctsig;
+
+    // true while emitting a function that owns a dynamic stack frame
+    bool frameActive;
+
+    // a single-use value left on the wasm operand stack for its only user
+    IrValue* stackPending;
+
     void init(IrContext* ctx, IrModule* modd)
     {
         self.ctx = ctx;
@@ -236,6 +254,11 @@ pub struct WasmCodeGen
         self.blki = null;
         self.nbl = 0;
         self.cbl = 0;
+        self.tsig = null;
+        self.ntsig = 0;
+        self.ctsig = 0;
+        self.frameActive = false;
+        self.stackPending = null;
     }
 
     void failOp(IrFunc* func, IrOpcode op)
@@ -270,14 +293,14 @@ pub struct WasmCodeGen
     u32 wasmSize(IrType* t)
     {
         if (t == null) return 0;
-        if (t->kind == IrTypeKind::Ptr) return 4;
+        if (t->kind == IrTypeKind::Ptr || t->kind == IrTypeKind::Func) return 4;
         return self.ctx->irTypeSizeOf(t);
     }
 
     u32 wasmAlign(IrType* t)
     {
         if (t == null) return 1;
-        if (t->kind == IrTypeKind::Ptr) return 4;
+        if (t->kind == IrTypeKind::Ptr || t->kind == IrTypeKind::Func) return 4;
         return self.ctx->irTypeAlignOf(t);
     }
 
@@ -458,30 +481,71 @@ pub struct WasmCodeGen
         }
     }
 
-    // emit the wasm type name for an indirect call; matched by interned
-    // pointer identity, since tyFunc/tyGetOrCreate intern signatures
-    bool emitCallTypeName(IrType* ct)
+    u32 internSig(IrType** params, u32 nparams, IrType* ret)
     {
-        for (u32 fi = 0; fi < self.modd->nfuncs; fi++)
+        for (u32 i = 0; i < self.ntsig; i++)
         {
-            IrFunc* f = self.modd->funcs[fi];
-            if (f != null && f->base.type == ct)
-            {
-                self.emitter.emit("$t");
-                self.emitter.emitU32(fi);
-                return true;
-            }
+            WasmTySig* s = &self.tsig[i];
+            if (s->nparams != nparams) continue;
+            bool same = irTypeEqual(s->ret, ret);
+            for (u32 j = 0; same && j < nparams; j++)
+                if (!irTypeEqual(s->params[j], params[j])) same = false;
+            if (same) return i;
+        }
+        if (self.ntsig >= self.ctsig)
+        {
+            u32 nc = self.ctsig != 0 ? self.ctsig * 2 : 8;
+            WasmTySig* ns = alloc<WasmTySig>((usize)nc);
+            for (u32 i = 0; i < self.ntsig; i++) ns[i] = self.tsig[i];
+            if (self.tsig) dealloc<WasmTySig>(self.tsig);
+            self.tsig = ns;
+            self.ctsig = nc;
+        }
+        WasmTySig sig = WasmTySig { .params = params, .nparams = nparams, .ret = ret };
+        self.tsig[self.ntsig] = sig;
+        self.ntsig = self.ntsig + 1;
+        return self.ntsig - 1;
+    }
+
+    u32 findSig(IrType** params, u32 nparams, IrType* ret)
+    {
+        for (u32 i = 0; i < self.ntsig; i++)
+        {
+            WasmTySig* s = &self.tsig[i];
+            if (s->nparams != nparams) continue;
+            bool same = irTypeEqual(s->ret, ret);
+            for (u32 j = 0; same && j < nparams; j++)
+                if (!irTypeEqual(s->params[j], params[j])) same = false;
+            if (same) return i;
+        }
+        return 0xFFFFFFFF;
+    }
+
+    void discoverTypes()
+    {
+        self.ntsig = 0;
+        for (u32 i = 0; i < self.modd->nfuncs; i++)
+        {
+            IrFunc* f = self.modd->funcs[i];
+            if (f != null) self.internSig(f->paramTypes, f->nparams, f->retType);
         }
         for (u32 i = 0; i < self.nic; i++)
         {
-            if (self.icT[i] == ct)
-            {
-                self.emitter.emit("$ic");
-                self.emitter.emitU32(i);
-                return true;
-            }
+            IrType* ct = self.icT[i];
+            if (ct != null) self.internSig(ct->params, ct->nparams, ct->ret);
         }
-        return false;
+    }
+
+    // emit the wasm type name for an indirect call; all signatures are
+    // deduped into the shared $t<k> table
+    bool emitCallTypeName(IrType* ct)
+    {
+        if (ct == null) return false;
+        u32 si = self.findSig(ct->params, ct->nparams, ct->ret);
+        if (si == 0xFFFFFFFF) return false;
+        self.emitter.emit("$t");
+        self.emitter.emitU32(si);
+        return true;
     }
 
     u32 tableIndexOf(IrValue* funcVal)
@@ -516,6 +580,18 @@ pub struct WasmCodeGen
         self.slv[self.nsl] = v;
         self.sls[self.nsl] = s;
         self.nsl = self.nsl + 1;
+    }
+
+    bool funcNeedsFrame(IrFunc* func)
+    {
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+                if (bb->insts[ii] != null && bb->insts[ii]->opcode == IrOpcode::Alloca)
+                    return true;
+        }
+        return false;
     }
 
     void slotAssign(IrFunc* func)
@@ -729,6 +805,11 @@ pub struct WasmCodeGen
     bool emitValuePush(IrValue* val)
     {
         if (val == null) return false;
+        if (val == self.stackPending)
+        {
+            self.stackPending = null;
+            return true;
+        }
         switch (val->kind)
         {
             IrValueKind::ConstInt => {
@@ -818,64 +899,109 @@ pub struct WasmCodeGen
         return true;
     }
 
+    u32 memAlign(IrType* ty)
+    {
+        if (ty == null) return 4;
+        switch (ty->kind)
+        {
+            IrTypeKind::Int => {
+                if (ty->width <= 8) return 1;
+                if (ty->width <= 16) return 2;
+                if (ty->width <= 32) return 4;
+                return 8;
+            },
+            IrTypeKind::Float => { return ty->width <= 32 ? 4 : 8; },
+            IrTypeKind::Ptr => { return 4; },
+            IrTypeKind::Vector => { return 16; },
+            else => { return 4; }
+        }
+    }
+
+    void emitMemOp(str op, u32 offset, u32 align)
+    {
+        self.emitter.emit(op);
+        if (offset != 0)
+        {
+            self.emitter.emit(" offset=");
+            self.emitter.emitU32(offset);
+        }
+        self.emitter.emit(" align=");
+        self.emitter.emitU32(align);
+        self.emitter.emitLine("");
+    }
+
     // the load op alone, no operand pushes, the atomics reuse it
     void emitLoadOnly(IrType* ty)
     {
-        if (ty == null) { self.emitter.emitLine("i32.load"); return; }
+        self.emitLoadMem(ty, 0);
+    }
+
+    void emitLoadMem(IrType* ty, u32 offset)
+    {
+        u32 a = self.memAlign(ty);
+        if (ty == null) { self.emitMemOp("i32.load", offset, a); return; }
         switch (ty->kind) {
             IrTypeKind::Int => {
-                if (ty->width <= 8) self.emitter.emitLine("i32.load8_s");
-                else if (ty->width <= 16) self.emitter.emitLine("i32.load16_s");
-                else if (ty->width <= 32) self.emitter.emitLine("i32.load");
-                else self.emitter.emitLine("i64.load");
+                if (ty->width <= 8) self.emitMemOp("i32.load8_s", offset, a);
+                else if (ty->width <= 16) self.emitMemOp("i32.load16_s", offset, a);
+                else if (ty->width <= 32) self.emitMemOp("i32.load", offset, a);
+                else self.emitMemOp("i64.load", offset, a);
             },
             IrTypeKind::Float => {
-                if (ty->width <= 32) self.emitter.emitLine("f32.load");
-                else self.emitter.emitLine("f64.load");
+                if (ty->width <= 32) self.emitMemOp("f32.load", offset, a);
+                else self.emitMemOp("f64.load", offset, a);
             },
-            IrTypeKind::Ptr => { self.emitter.emitLine("i32.load"); },
-            IrTypeKind::Vector => { self.emitter.emitLine("v128.load"); },
-            else => { self.emitter.emitLine("i32.load"); }
+            IrTypeKind::Ptr => { self.emitMemOp("i32.load", offset, a); },
+            IrTypeKind::Vector => { self.emitMemOp("v128.load", offset, a); },
+            else => { self.emitMemOp("i32.load", offset, a); }
         }
     }
 
     bool emitLoadType(IrInst* inst)
     {
-        if (inst->nops > 0 && !self.emitValuePush(inst->ops[0])) return false;
-        self.emitLoadOnly(inst->base.type);
+        u32 offset = 0;
+        if (inst->nops > 0 && !self.emitAddressPush(inst->ops[0], &offset)) return false;
+        self.emitLoadMem(inst->base.type, offset);
         return true;
     }
 
     void emitStoreOnly(IrType* ty)
     {
-        if (ty == null) { self.emitter.emitLine("i32.store"); return; }
+        self.emitStoreMem(ty, 0);
+    }
+
+    void emitStoreMem(IrType* ty, u32 offset)
+    {
+        u32 a = self.memAlign(ty);
+        if (ty == null) { self.emitMemOp("i32.store", offset, a); return; }
         switch (ty->kind)
         {
             IrTypeKind::Int =>
             {
-                if (ty->width <= 8) self.emitter.emitLine("i32.store8");
-                else if (ty->width <= 16) self.emitter.emitLine("i32.store16");
-                else if (ty->width <= 32) self.emitter.emitLine("i32.store");
-                else self.emitter.emitLine("i64.store");
+                if (ty->width <= 8) self.emitMemOp("i32.store8", offset, a);
+                else if (ty->width <= 16) self.emitMemOp("i32.store16", offset, a);
+                else if (ty->width <= 32) self.emitMemOp("i32.store", offset, a);
+                else self.emitMemOp("i64.store", offset, a);
             },
             IrTypeKind::Float =>
             {
-                if (ty->width <= 32) self.emitter.emitLine("f32.store");
-                else self.emitter.emitLine("f64.store");
+                if (ty->width <= 32) self.emitMemOp("f32.store", offset, a);
+                else self.emitMemOp("f64.store", offset, a);
             },
-            IrTypeKind::Ptr => { self.emitter.emitLine("i32.store"); },
-            IrTypeKind::Vector => { self.emitter.emitLine("v128.store"); },
-            else => { self.emitter.emitLine("i32.store"); }
+            IrTypeKind::Ptr => { self.emitMemOp("i32.store", offset, a); },
+            IrTypeKind::Vector => { self.emitMemOp("v128.store", offset, a); },
+            else => { self.emitMemOp("i32.store", offset, a); }
         }
     }
 
     bool emitStoreType(IrInst* inst)
     {
         // wasm wants [address, value], so the pointer operand goes first
-        if (inst->nops > 1 && !self.emitValuePush(inst->ops[1])) return false;
+        u32 offset = 0;
+        if (inst->nops > 1 && !self.emitAddressPush(inst->ops[1], &offset)) return false;
         if (inst->nops > 0 && !self.emitValuePush(inst->ops[0])) return false;
         IrType* ty = inst->nops > 0 && inst->ops[0] != null ? inst->ops[0]->type : null;
-        self.emitStoreOnly(ty);
+        self.emitStoreMem(ty, offset);
         return true;
     }
 
@@ -986,6 +1112,102 @@ pub struct WasmCodeGen
             if (j > 0) self.emitter.emitLine(is64 ? "i64.or" : "i32.or");
         }
         (void)w;
+        return true;
+    }
+
+    // constant byte offset of a gep from its base, or false when any
+    // index is dynamic or the descent is malformed
+    bool gepConstOffset(IrInst* inst, u32* offset)
+    {
+        if (inst == null || inst->opcode != IrOpcode::Gep || inst->nops == 0 ||
+            inst->ops[0] == null) return false;
+        IrType* tb = inst->ops[0]->type;
+        if (tb == null || tb->kind != IrTypeKind::Ptr) return false;
+        IrType* t = tb->elem;
+        u64 total = 0;
+        for (u32 i = 0; i + 1 < inst->nops; i++)
+        {
+            if (t == null) return false;
+            IrValue* ix = inst->ops[i + 1];
+            if (ix == null || ix->kind != IrValueKind::ConstInt) return false;
+            u32 size = 0;
+            bool isStruct = false;
+            switch (t->kind)
+            {
+                IrTypeKind::Array | IrTypeKind::Vector => {
+                    size = self.wasmSize(t->elem);
+                    t = t->elem;
+                },
+                IrTypeKind::Struct => {
+                    bool found = false;
+                    u32 field = (u32)ix->valData;
+                    for (u32 si = 0; si < self.modd->nstructs; si++)
+                    {
+                        IrStructType* st = self.modd->structs[si];
+                        if (st != null && st->irType == t)
+                        {
+                            if (field >= st->nfields) return false;
+                            size = st->offsets[field];
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) return false;
+                    if (field < t->nparams) t = t->params[field];
+                    else t = null;
+                    isStruct = true;
+                },
+                else => { return false; }
+            }
+            total += isStruct ? (u64)size : (u64)ix->valData * (u64)size;
+        }
+        *offset = (u32)total;
+        return true;
+    }
+
+    // a constant gep whose only use is as the address of a load or store
+    // can disappear: the access folds the offset into its memarg
+    bool isFoldedGepDepth(IrInst* inst, u32 depth)
+    {
+        if (depth > 64 || inst == null || inst->opcode != IrOpcode::Gep) return false;
+        u32 off = 0;
+        if (!self.gepConstOffset(inst, &off)) return false;
+        if (inst->base.nusers != 1 || inst->base.users == null ||
+            inst->base.users[0] == null) return false;
+        IrInst* user = inst->base.users[0];
+        switch (user->opcode)
+        {
+            IrOpcode::Load | IrOpcode::AtomicLoad => {
+                return user->nops > 0 && user->ops[0] == &inst->base;
+            },
+            IrOpcode::Store | IrOpcode::AtomicStore => {
+                return user->nops > 1 && user->ops[1] == &inst->base;
+            },
+            IrOpcode::Gep => { return self.isFoldedGepDepth(user, depth + 1); },
+            else => { return false; }
+        }
+    }
+
+    bool isFoldedGep(IrInst* inst)
+    {
+        return self.isFoldedGepDepth(inst, 0);
+    }
+
+    bool emitAddressPush(IrValue* addr, u32* offset)
+    {
+        u32 total = 0;
+        IrValue* cur = addr;
+        while (cur != null && cur->kind == IrValueKind::Inst && cur != self.stackPending)
+        {
+            IrInst* gi = (IrInst*)cur;
+            if (gi->opcode != IrOpcode::Gep) break;
+            u32 off = 0;
+            if (!self.gepConstOffset(gi, &off)) break;
+            total += off;
+            cur = gi->ops[0];
+        }
+        if (!self.emitValuePush(cur)) return false;
+        *offset = total;
         return true;
     }
 
@@ -1289,8 +1511,9 @@ pub struct WasmCodeGen
     }
 
     // alloca is type-only per IR.md, the byte size comes off the result's
-    // element type; the stack drops by the 16-aligned size and the old top
-    // is the fresh pointer
+    // element type; the stack drops by the 16-aligned size and the new top
+    // is the fresh pointer, so consecutive frames stay disjoint regardless
+    // of the order the IR walks them
     bool emitAlloca(IrInst* inst)
     {
         IrType* pt = inst->base.type;
@@ -1303,13 +1526,12 @@ pub struct WasmCodeGen
         sz = (sz + 15) / 16 * 16;
         if (sz == 0) sz = 16;
         self.emitter.emitLine("global.get $__stack_pointer");
-        self.emitter.emitLine("local.tee $allocaT");
         self.emitter.emit("i32.const ");
         self.emitter.emitU32(sz);
         self.emitter.emitLine("");
         self.emitter.emitLine("i32.sub");
         self.emitter.emitLine("global.set $__stack_pointer");
-        self.emitter.emitLine("local.get $allocaT");
+        self.emitter.emitLine("global.get $__stack_pointer");
         return true;
     }
 
@@ -1349,7 +1571,7 @@ pub struct WasmCodeGen
     bool emitAtomicRmw(IrInst* inst)
     {
         if (inst->nops < 2) return false;
-        bool is64 = inst->base.type != null && inst->base.type->width > 32;
+        bool is64 = self.isI64(inst->base.type);
         str so = is64 ? "$atO64" : "$atO32";
         str sn = is64 ? "$atN64" : "$atN32";
         str p = is64 ? "i64." : "i32.";
@@ -1424,7 +1646,7 @@ pub struct WasmCodeGen
     bool emitAtomicCmpXchg(IrInst* inst)
     {
         if (inst->nops < 3) return false;
-        bool is64 = inst->base.type != null && inst->base.type->width > 32;
+        bool is64 = self.isI64(inst->base.type);
         str so = is64 ? "$atO64" : "$atO32";
         self.emitter.emitLine(";; atomic cmpxchg lowered to plain ops");
         if (!self.emitValuePush(inst->ops[0])) return false;
@@ -1530,6 +1752,66 @@ pub struct WasmCodeGen
         // the unsigned backend contract the x86 lane loop honors
         self.emitter.emitLine(isFloat ? (isMin ? "min" : "max") : (isMin ? "min_u" : "max_u"));
         return true;
+    }
+
+    // the operand that reaches the wasm stack first for an instruction;
+    // null means the first stack slot is a synthetic value or nothing
+    IrValue* firstStackOperand(IrInst* inst)
+    {
+        if (inst == null) return null;
+        switch (inst->opcode)
+        {
+            IrOpcode::Neg => { return null; },
+            IrOpcode::Store | IrOpcode::AtomicStore => {
+                return inst->nops > 1 ? inst->ops[1] : null;
+            },
+            IrOpcode::Select => {
+                // wasm select is [true, false, condition]
+                return inst->nops > 2 ? inst->ops[1] : null;
+            },
+            IrOpcode::Call => {
+                return inst->nops > 1 ? inst->ops[1] : null;
+            },
+            IrOpcode::Ret => { return inst->nops > 0 ? inst->ops[0] : null; },
+            IrOpcode::Br | IrOpcode::CondBr | IrOpcode::Unreachable |
+            IrOpcode::Noret | IrOpcode::Phi | IrOpcode::Alloca => { return null; },
+            else => { return inst->nops > 0 ? inst->ops[0] : null; }
+        }
+    }
+
+    // a value with exactly one user can stay on the operand stack when
+    // that user is the next emitted instruction and consumes it first
+    bool stackifyAt(IrBlock* bb, u32 ii)
+    {
+        if (bb == null || ii >= bb->ninsts) return false;
+        IrInst* cur = bb->insts[ii];
+        if (cur == null || cur->base.type == null || cur->base.type->kind == IrTypeKind::Void) return false;
+        if (self.isFoldedGep(cur)) return false;
+        if (cur->base.nusers != 1 || cur->base.users == null || cur->base.users[0] == null) return false;
+        IrInst* user = cur->base.users[0];
+        if (self.isFoldedGep(user)) return false;
+        u32 ni = ii + 1;
+        while (ni < bb->ninsts && bb->insts[ni] != null && bb->insts[ni]->opcode == IrOpcode::Phi) ni++;
+        if (ni >= bb->ninsts || bb->insts[ni] != user) return false;
+        return self.firstStackOperand(user) == &cur->base;
+    }
+
+    bool valueFoldedGep(IrValue* val)
+    {
+        return val != null && val->kind == IrValueKind::Inst &&
+               self.isFoldedGep((IrInst*)val);
+    }
+
+    bool valueStackified(IrFunc* func, IrValue* val)
+    {
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+                if (bb->insts[ii] != null && &bb->insts[ii]->base == val)
+                    return self.stackifyAt(bb, ii);
+        }
+        return false;
     }
 
     bool emitInst(IrInst* inst)
@@ -1790,6 +2072,11 @@ pub struct WasmCodeGen
                 {
                     if (!self.emitValuePush(term->ops[0])) return false;
                 }
+                if (self.frameActive)
+                {
+                    self.emitter.emitLine("local.get $sp0");
+                    self.emitter.emitLine("global.set $__stack_pointer");
+                }
                 self.emitter.emitLine("return");
                 return true;
             },
@@ -1871,14 +2158,22 @@ pub struct WasmCodeGen
                 IrInst* inst = bb->insts[ii];
                 if (inst->opcode == IrOpcode::Phi) continue;
                 if (ii == bb->ninsts - 1 && irOpcodeIsTerminator(inst->opcode)) continue;
+                if (inst->opcode == IrOpcode::Gep && self.isFoldedGep(inst)) continue;
                 if (!self.emitInst(inst)) return false;
                 if (inst->base.type != null && inst->base.type->kind != IrTypeKind::Void)
                 {
-                    u32 s = self.slotOf(&inst->base);
-                    if (s == 0xFFFFFFFF) { self.failMsg(func, "value without a slot"); return false; }
-                    self.emitter.emit("local.set $v");
-                    self.emitter.emitU32(s);
-                    self.emitter.emitLine("");
+                    if (self.stackifyAt(bb, ii))
+                    {
+                        self.stackPending = &inst->base;
+                    }
+                    else
+                    {
+                        u32 s = self.slotOf(&inst->base);
+                        if (s == 0xFFFFFFFF) { self.failMsg(func, "value without a slot"); return false; }
+                        self.emitter.emit("local.set $v");
+                        self.emitter.emitU32(s);
+                        self.emitter.emitLine("");
+                    }
                 }
             }
             if (!self.emitTerminator(func, bb)) return false;
@@ -1948,24 +2243,13 @@ pub struct WasmCodeGen
         return true;
     }
 
-    bool emitTypeEntry(u32 fi)
+    bool emitTypeEntry(u32 k)
     {
-        IrFunc* f = self.modd->funcs[fi];
+        WasmTySig* s = &self.tsig[k];
         self.emitter.emit("(type $t");
-        self.emitter.emitU32(fi);
-        self.emitter.emit(" (func");
-        if (!self.emitSigInline(f->paramTypes, f->nparams, f->retType)) return false;
-        self.emitter.emitLine("))");
-        return true;
-    }
-
-    bool emitIcTypeEntry(u32 k)
-    {
-        IrType* ct = self.icT[k];
-        self.emitter.emit("(type $ic");
         self.emitter.emitU32(k);
         self.emitter.emit(" (func");
-        if (!self.emitSigInline(ct->params, ct->nparams, ct->ret)) return false;
+        if (!self.emitSigInline(s->params, s->nparams, s->ret)) return false;
         self.emitter.emitLine("))");
         return true;
     }
@@ -2006,21 +2290,76 @@ pub struct WasmCodeGen
         }
         self.emitter.emitLine("");
         self.emitter.emitLine("(local $pc i32)");
-        self.emitter.emitLine("(local $allocaT i32)");
-        self.emitter.emitLine("(local $absT i32)");
-        self.emitter.emitLine("(local $absT64 i64)");
-        self.emitter.emitLine("(local $bswapT i32)");
-        self.emitter.emitLine("(local $bswapT64 i64)");
-        self.emitter.emitLine("(local $atA i32)");
-        self.emitter.emitLine("(local $atO32 i32)");
-        self.emitter.emitLine("(local $atN32 i32)");
-        self.emitter.emitLine("(local $atO64 i64)");
-        self.emitter.emitLine("(local $atN64 i64)");
-        self.emitter.emitLine("(local $vecA v128)");
-        self.emitter.emitLine("(local $vecB v128)");
+        self.frameActive = self.funcNeedsFrame(func);
+        self.stackPending = null;
+        if (self.frameActive) self.emitter.emitLine("(local $sp0 i32)");
+        bool needAbs32 = false;
+        bool needAbs64 = false;
+        bool needBswap32 = false;
+        bool needBswap64 = false;
+        bool needAtA = false;
+        bool needAtO32 = false;
+        bool needAtN32 = false;
+        bool needAtO64 = false;
+        bool needAtN64 = false;
+        bool needVecA = false;
+        bool needVecB = false;
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst == null) continue;
+                switch (inst->opcode)
+                {
+                    IrOpcode::Abs => {
+                        if (self.isI64(inst->base.type)) needAbs64 = true;
+                        else needAbs32 = true;
+                    },
+                    IrOpcode::Bswap => {
+                        if (self.isI64(inst->base.type)) needBswap64 = true;
+                        else needBswap32 = true;
+                    },
+                    IrOpcode::AtomicRmw => {
+                        needAtA = true;
+                        if (self.isI64(inst->base.type)) { needAtO64 = true; needAtN64 = true; }
+                        else { needAtO32 = true; needAtN32 = true; }
+                    },
+                    IrOpcode::AtomicCmpXchg => {
+                        needAtA = true;
+                        if (self.isI64(inst->base.type)) needAtO64 = true;
+                        else needAtO32 = true;
+                    },
+                    IrOpcode::VecMin | IrOpcode::VecMax => {
+                        IrType* vt = inst->base.type;
+                        if (vt != null && vt->kind == IrTypeKind::Vector && vt->elem != null &&
+                            vt->elem->kind == IrTypeKind::Int && vt->elem->width == 64)
+                        {
+                            needVecA = true;
+                            needVecB = true;
+                        }
+                    },
+                    else => {}
+                }
+            }
+        }
+        if (needAbs32) self.emitter.emitLine("(local $absT i32)");
+        if (needAbs64) self.emitter.emitLine("(local $absT64 i64)");
+        if (needBswap32) self.emitter.emitLine("(local $bswapT i32)");
+        if (needBswap64) self.emitter.emitLine("(local $bswapT64 i64)");
+        if (needAtA) self.emitter.emitLine("(local $atA i32)");
+        if (needAtO32) self.emitter.emitLine("(local $atO32 i32)");
+        if (needAtN32) self.emitter.emitLine("(local $atN32 i32)");
+        if (needAtO64) self.emitter.emitLine("(local $atO64 i64)");
+        if (needAtN64) self.emitter.emitLine("(local $atN64 i64)");
+        if (needVecA) self.emitter.emitLine("(local $vecA v128)");
+        if (needVecB) self.emitter.emitLine("(local $vecB v128)");
         for (u32 i = 0; i < self.nsl; i++)
         {
             if (self.sls[i] < func->nargs) continue;
+            if (self.valueStackified(func, self.slv[i])) continue;
+            if (self.valueFoldedGep(self.slv[i])) continue;
             if (!self.slotTypeOk(self.slv[i]->type))
             {
                 self.failMsg(func, "value type has no wasm local form");
@@ -2028,11 +2367,39 @@ pub struct WasmCodeGen
             }
             self.emitSlotDecl(self.sls[i], self.slv[i]->type);
         }
+        if (self.frameActive)
+        {
+            self.emitter.emitLine("global.get $__stack_pointer");
+            self.emitter.emitLine("local.set $sp0");
+        }
         if (!self.emitFuncBody(func)) return false;
+        if (self.frameActive)
+        {
+            self.emitter.emitLine("local.get $sp0");
+            self.emitter.emitLine("global.set $__stack_pointer");
+        }
         if (func->retType != null && func->retType->kind != IrTypeKind::Void)
             self.emitter.emitLine("unreachable");
         self.emitter.emitLine(")");
         return true;
+    }
+
+    bool isExportableName(str name)
+    {
+        if (name.isEmpty() || name.equals("memory")) return false;
+        return true;
+    }
+
+    bool seenExportName(u32 fi, str name)
+    {
+        for (u32 i = 0; i < fi; i++)
+        {
+            IrFunc* prev = self.modd->funcs[i];
+            if (prev != null && !prev->isExtern &&
+                self.isExportableName(prev->base.name) &&
+                prev->base.name.equals(name)) return true;
+        }
+        return false;
     }
 
     bool emitModule()
@@ -2040,13 +2407,17 @@ pub struct WasmCodeGen
         self.discoverData();
         self.layoutAddresses();
         self.discoverIndirectTypes();
+        self.discoverTypes();
         // the function table is every function in module order, imports
         // included — a funcref may name an imported function
         self.ntab = 0;
         for (u32 i = 0; i < self.modd->nfuncs; i++)
             self.tabAdd(self.modd->funcs[i]);
         self.emitter.emitLine("(module");
-        // imports first, the spec orders them ahead of every definition
+        // types first so every import and function interns against the
+        // single deduped signature table
+        for (u32 i = 0; i < self.ntsig; i++)
+            if (!self.emitTypeEntry(i)) return false;
         for (u32 i = 0; i < self.modd->nfuncs; i++)
         {
             IrFunc* f = self.modd->funcs[i];
@@ -2055,10 +2426,6 @@ pub struct WasmCodeGen
                 if (!self.emitImport(f, i)) return false;
             }
         }
-        for (u32 i = 0; i < self.modd->nfuncs; i++)
-            if (!self.emitTypeEntry(i)) return false;
-        for (u32 i = 0; i < self.nic; i++)
-            if (!self.emitIcTypeEntry(i)) return false;
         // data at 0, stack above it, a megabyte of heap reserve past that
         u32 minPages = (self.stackTop + 1048576 + 65535) / 65536;
         self.emitter.emit("(memory $0 ");
@@ -2086,18 +2453,21 @@ pub struct WasmCodeGen
         }
         for (u32 i = 0; i < self.modd->nfuncs; i++)
             if (!self.emitFunc(self.modd->funcs[i])) return false;
-        // exact main, not a prefix (defect 15)
+        // every named definition is public; the wrapper and bindings
+        // generator consume the full export table, not just main
         for (u32 i = 0; i < self.modd->nfuncs; i++)
         {
             IrFunc* f = self.modd->funcs[i];
             if (f == null || f->isExtern) continue;
-            if (!f->base.name.isEmpty() && f->base.name.equals("main"))
-            {
-                self.emitter.emit("(export \"main\" (func $f");
-                self.emitter.emitU32(i);
-                self.emitter.emitLine("))");
-            }
+            str n = f->base.name;
+            if (!self.isExportableName(n) || self.seenExportName(i, n)) continue;
+            self.emitter.emit("(export \"");
+            self.emitStrEscaped(n);
+            self.emitter.emit("\" (func $f");
+            self.emitter.emitU32(i);
+            self.emitter.emitLine("))");
         }
+        self.emitter.emitLine("(export \"__heap_base\" (global $__heap_base))");
         self.emitData();
         self.emitter.emitLine(")");
         return true;

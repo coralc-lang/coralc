@@ -4,7 +4,7 @@ cd "$(dirname "$0")"
 WASTOOL="${WASTOOL:-./wastool}"
 CORALC="${CORALC:-coralc}"
 LEVELS="${LEVELS:-O0 O1 O2 O3}"
-TMP="${TMP:-/tmp/opencode/wallvm-wasm}"
+TMP="${TMP:-output_wasm/wallvm-wasm}"
 if [ -z "$TMP" ]; then
     echo "run_wasm.sh: TMP must not be empty" >&2
     exit 1
