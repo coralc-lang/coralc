@@ -1,0 +1,621 @@
+#[[no_drop_all]]
+import(lib) platform::win32 { CreateFileA, CloseHandle, ReadFile, WriteFile, CreateDirectoryA, RemoveDirectoryA, DeleteFileA, MoveFileA, GetFileAttributesA, SetFilePointerA, GetFileAttributesExA, FindFirstFileA, FindNextFileA, FindClose, GetLastError };
+import(lib) std::mman { alloc, dealloc, copy };
+import(lib) platform::libc { snprintf };
+import(lib) std::string { String };
+import(lib) std::result { Result };
+import(lib) std::option { Option };
+
+// Shared error type for the whole io subsystem (fs is the lowest module
+// everything else can import without a cycle).
+/// Shared error type for the whole io subsystem; an OS error, an
+/// unexpected EOF, or a caller-side usage problem.
+pub variant IoError
+{
+    // errno (linux) / GetLastError (windows) from the failing call
+    Os { i32 code; str op; },
+    // stream ended before the requested bytes
+    Eof { str op; },
+    // caller-side problem, no syscall was made (bad mode, bad ip, ...)
+    BadUsage { str msg; }
+}
+
+/// Constructors for IoError.
+pub extend IoError
+{
+    // last-error of the calling thread, captured right after a failed call
+/// Captures the calling thread's last OS error and tags it with `op`.
+    static IoError os(str op)
+    {
+        return IoError::Os { .code = (i32)GetLastError(), .op = op };
+    }
+}
+
+/// CreateFileA access flag: read access.
+pub const u32 GENERIC_READ = 0x80000000u;
+/// CreateFileA access flag: write access.
+pub const u32 GENERIC_WRITE = 0x40000000u;
+/// CreateFileA access flag: append data without write-data rights.
+pub const u32 FILE_APPEND_DATA = 0x4u;
+/// CreateFileA share flag: allow concurrent readers.
+pub const u32 FILE_SHARE_READ = 0x1u;
+/// CreateFileA share flag: allow concurrent writers.
+pub const u32 FILE_SHARE_WRITE = 0x2u;
+/// CreateFileA share flag: allow concurrent delete and rename.
+pub const u32 FILE_SHARE_DELETE = 0x4u;
+/// CreateFileA disposition: create a new file or overwrite an existing one.
+pub const u32 CREATE_ALWAYS = 2u;
+/// CreateFileA disposition: open only if the file already exists.
+pub const u32 OPEN_EXISTING = 3u;
+/// CreateFileA disposition: open if present, otherwise create it.
+pub const u32 OPEN_ALWAYS = 4u;
+/// CreateFileA attribute: no special attributes.
+pub const u32 FILE_ATTRIBUTE_NORMAL = 0x80u;
+/// file attribute bit set for directories.
+pub const u32 FILE_ATTRIBUTE_DIRECTORY = 0x10u;
+/// CreateFileA flag: allow opening directories.
+pub const u32 FILE_FLAG_BACKUP_SEMANTICS = 0x02000000u;
+// CreateFileA/FindFirstFileA failure handle ((rawptr)-1) - never valid.
+/// Failure sentinel handle returned by CreateFileA and FindFirstFileA.
+pub const rawptr INVALID_HANDLE_VALUE = (rawptr)-1;
+
+/// open() flag: open for reading only.
+pub const i32 O_RDONLY = 0;
+/// open() flag: open for writing only.
+pub const i32 O_WRONLY = 1;
+/// open() flag: open for reading and writing.
+pub const i32 O_RDWR = 2;
+/// open() flag: create the file if it does not exist.
+pub const i32 O_CREAT = 64;
+/// open() flag: truncate the file to zero length.
+pub const i32 O_TRUNC = 512;
+/// open() flag: writes always append at end of file.
+pub const i32 O_APPEND = 1024;
+/// owner rwx mode bits (0700).
+pub const i32 S_IRWXU = 448;
+/// owner read mode bit (0400).
+pub const i32 S_IRUSR = 256;
+/// owner write mode bit (0200).
+pub const i32 S_IWUSR = 128;
+/// owner execute mode bit (0100).
+pub const i32 S_IXUSR = 64;
+/// fileSeek whence: offset is absolute.
+pub const i32 SEEK_SET = 0;
+/// fileSeek whence: offset is relative to the current position.
+pub const i32 SEEK_CUR = 1;
+/// fileSeek whence: offset is relative to end of file.
+pub const i32 SEEK_END = 2;
+/// access() mode: test only for existence.
+pub const i32 F_OK = 0;
+/// access() mode: test for read permission.
+pub const i32 R_OK = 4;
+/// access() mode: test for write permission.
+pub const i32 W_OK = 2;
+/// access() mode: test for execute permission.
+pub const i32 X_OK = 1;
+
+// HANDLE now (an i32 fd can't hold one); failure INVALID_HANDLE_VALUE,
+// like open()'s -1.
+/// An open file, wrapping an OS file descriptor or handle.
+pub distinct File = rawptr;
+// heap DirIter, find handle + WIN32_FIND_DATAA block (the old DIR*
+// carried the same state).
+/// An open directory stream returned by openDir.
+pub distinct Dir = rawptr;
+
+// POSIX-shaped stat record, filled from Win32 metadata (st_dev/st_ino
+// have no equivalent here and stay 0).
+/// POSIX-shaped file metadata: size, mode, link count and timestamps.
+pub struct Stat
+{
+    u64 st_dev;
+    u64 st_ino;
+    u64 st_nlink;
+    u32 st_mode;
+    u32 st_uid;
+    u32 st_gid;
+    u32 pad0;
+    u64 st_rdev;
+    i64 st_size;
+    i64 st_blksize;
+    i64 st_blocks;
+    i64 st_atime;
+    i64 st_atimeNsec;
+    i64 st_mtime;
+    i64 st_mtimeNsec;
+    i64 st_ctime;
+    i64 st_ctimeNsec;
+    i64[3] reserved;
+}
+
+/// The kind of filesystem entry a Stat describes.
+pub enum FileType
+{
+    Unknown,
+    Regular,
+    Directory,
+    CharDevice,
+    BlockDevice,
+    Fifo,
+    Symlink,
+    Socket
+}
+
+/// Opens `path` with a stdio-style `mode` ("r", "w", "a", optional "+"); returns a File or IoError.
+pub Result<File, IoError> fileOpen(str path, str mode)
+{
+    u8[4096] pbuf;
+    usize plen = path.len < 4095 ? path.len : 4095;
+    copy<u8>(pbuf, (u8*)path.ptr, plen);
+    pbuf[plen] = 0;
+
+    u32 access = 0;
+    u32 disp = OPEN_EXISTING;
+    if (mode.len >= 1)
+    {
+        if (mode.ptr[0] == 'r') access = GENERIC_READ;
+        else if (mode.ptr[0] == 'w') { access = GENERIC_WRITE; disp = CREATE_ALWAYS; }
+        else if (mode.ptr[0] == 'a') {
+            // O_APPEND, FILE_APPEND_DATA without FILE_WRITE_DATA = every
+            // WriteFile at EOF; GENERIC_WRITE would grant FILE_WRITE_DATA
+            // and defeat it.
+            access = FILE_APPEND_DATA;
+            disp = OPEN_ALWAYS;
+        }
+    }
+    if (access == 0) return Result<File, IoError>::Err { .error = IoError::BadUsage { .msg = "invalid open mode" } };
+    for (usize i = 1; i < mode.len; i++) {
+        // '+' widens to O_RDWR on the same handle.
+        if (mode.ptr[i] == '+') access |= GENERIC_READ | GENERIC_WRITE;
+    }
+    // request all three share bits, POSIX lets processes share, and an
+    // open file must stay renamable/deletable here.
+    rawptr h = CreateFileA((const cchar*)pbuf, access,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           null, disp, FILE_ATTRIBUTE_NORMAL, null);
+    if (h == INVALID_HANDLE_VALUE) return Result<File, IoError>::Err { .error = IoError::os("CreateFileA") };
+    return Result<File, IoError>::Ok { .value = (File)h };
+}
+
+/// Closes an open File.
+pub void fileClose(File f)
+{
+    CloseHandle((rawptr)f);
+}
+
+/// Reads up to `count` bytes from `f` into `buf`; returns the byte count or IoError.
+pub Result<isize, IoError> fileRead(File f, u8* buf, usize count)
+{
+    // one ReadFile per call, like read(2), 0 at EOF.
+    u64 remain = (u64)count;
+    u32 want = remain > 0xFFFFFFFFu ? 0xFFFFFFFFu : (u32)remain;
+    u32 got = 0;
+    if (!ReadFile((rawptr)f, (cchar*)buf, want, &got, null))
+        return Result<isize, IoError>::Err { .error = IoError::os("ReadFile") };
+    return Result<isize, IoError>::Ok { .value = (isize)got };
+}
+
+/// Writes `count` bytes from `buf` to `f`; returns the byte count or IoError.
+pub Result<isize, IoError> fileWrite(File f, const u8* buf, usize count)
+{
+    u64 remain = (u64)count;
+    u32 want = remain > 0xFFFFFFFFu ? 0xFFFFFFFFu : (u32)remain;
+    u32 put = 0;
+    if (!WriteFile((rawptr)f, (const cchar*)buf, want, &put, null))
+        return Result<isize, IoError>::Err { .error = IoError::os("WriteFile") };
+    return Result<isize, IoError>::Ok { .value = (isize)put };
+}
+
+/// Moves the offset of `f` by `offset` according to `whence`; returns the new offset or IoError.
+pub Result<isize, IoError> fileSeek(File f, isize offset, i32 whence)
+{
+    // SEEK_*/FILE_* share the same values - whence passes through;
+    // full 64-bit via lpDistanceToMoveHigh.
+    i32 high = (i32)(((i64)offset) >> 32);
+    u32 low = SetFilePointerA((rawptr)f, (i32)(((u64)offset) & 0xFFFFFFFFu), &high, (u32)whence);
+    if (low == 0xFFFFFFFFu && GetLastError() != 0u)
+        return Result<isize, IoError>::Err { .error = IoError::os("SetFilePointerA") };
+    return Result<isize, IoError>::Ok { .value = (isize)(((i64)high << (i64)32) | (i64)low) };
+}
+
+/// Returns true if `path` exists.
+pub bool fileExists(str path)
+{
+    u8[4096] pbuf;
+    usize plen = path.len < 4095 ? path.len : 4095;
+    copy<u8>(pbuf, (u8*)path.ptr, plen);
+    pbuf[plen] = 0;
+    // GetFileAttributesA reports failure as INVALID_FILE_ATTRIBUTES.
+    return GetFileAttributesA((const cchar*)pbuf) != 0xFFFFFFFFu;
+}
+
+// WIN32_FILE_ATTRIBUTE_DATA out of the opaque buffer (FLAG, real struct
+// is 36B, buffer oversized), attributes@0, created@4, accessed@12,
+// written@20, sizeHigh@28, sizeLow@32. Reads are 4-byte aligned.
+
+u32 _u32At(const u8* b, usize off) { return *(const u32*)(b + off); }
+
+u64 _u64At(const u8* b, usize off)
+{
+    u32 lo = *(const u32*)(b + off);
+    u32 hi = *(const u32*)(b + off + 4);
+    return (u64)lo | ((u64)hi << 32);
+}
+
+// FILETIME, 100ns ticks since 1601; Unix epoch = 116444736000000000
+// ticks. Pre-epoch clamps to 0.
+i64 _ftSec(u64 ft)
+{
+    if (ft < 116444736000000000u) return 0;
+    return (i64)((ft - 116444736000000000u) / 10000000u);
+}
+
+i64 _ftNsec(u64 ft)
+{
+    if (ft < 116444736000000000u) return 0;
+    return (i64)((ft - 116444736000000000u) % 10000000u) * 100;
+}
+
+// None when the path does not stat — ENOENT (absence) is the common
+// answer here; `out` is filled only on Some.
+/// Stats `path`; returns Some(true) on success and None if it cannot be statted.
+pub Option<bool> statPath(str path, Stat* out)
+{
+    u8[4096] pbuf;
+    usize plen = path.len < 4095 ? path.len : 4095;
+    copy<u8>(pbuf, (u8*)path.ptr, plen);
+    pbuf[plen] = 0;
+
+    // stat(), GetFileAttributesExA level 0 (GetFileExInfoStandard).
+    u8[64] info;
+    if (!GetFileAttributesExA((const cchar*)pbuf, 0u, (rawptr)info))
+        return Option<bool>::None;
+
+    u32 attrs = _u32At(info, 0);
+    u64 created = _u64At(info, 4);
+    u64 accessed = _u64At(info, 12);
+    u64 modified = _u64At(info, 20);
+    u64 size = ((u64)_u32At(info, 28) << 32) | (u64)_u32At(info, 32);
+    bool isDir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+
+    // synthesized st_mode, getFileType() only switches on the 0xF000
+    // nibble (S_IFDIR/S_IFREG) - fill that + rwx (0755 dirs, 0644 files).
+    u32 mode = isDir ? (0x4000u | 493u) : (0x8000u | 420u);
+
+    // fill every member incl. the reserved tail - fully determined.
+    out->st_dev = 0;
+    out->st_ino = 0;
+    out->st_nlink = 1;
+    out->st_mode = mode;
+    out->st_uid = 0;
+    out->st_gid = 0;
+    out->pad0 = 0;
+    out->st_rdev = 0;
+    out->st_size = (i64)size;
+    out->st_blksize = 4096;
+    out->st_blocks = (i64)((size + 511u) / 512u);
+    out->st_atime = _ftSec(accessed);
+    out->st_atimeNsec = _ftNsec(accessed);
+    out->st_mtime = _ftSec(modified);
+    out->st_mtimeNsec = _ftNsec(modified);
+    out->st_ctime = _ftSec(created);
+    out->st_ctimeNsec = _ftNsec(created);
+    out->reserved[0] = 0;
+    out->reserved[1] = 0;
+    out->reserved[2] = 0;
+    return Option<bool>::Some { .value = true };
+}
+
+/// Classifies a Stat's mode into a FileType.
+pub FileType getFileType(const Stat* s)
+{
+    u32 mode = s->st_mode;
+    if ((mode & 0xF000) == 0x8000) return FileType::Regular;
+    if ((mode & 0xF000) == 0x4000) return FileType::Directory;
+    if ((mode & 0xF000) == 0x2000) return FileType::CharDevice;
+    if ((mode & 0xF000) == 0x6000) return FileType::BlockDevice;
+    if ((mode & 0xF000) == 0x1000) return FileType::Fifo;
+    if ((mode & 0xF000) == 0xA000) return FileType::Symlink;
+    if ((mode & 0xF000) == 0xC000) return FileType::Socket;
+    return FileType::Unknown;
+}
+
+/// Creates directory `path` with permission bits `mode`.
+pub Result<bool, IoError> createDir(str path, i32 mode)
+{
+    u8[4096] pbuf;
+    usize plen = path.len < 4095 ? path.len : 4095;
+    copy<u8>(pbuf, (u8*)path.ptr, plen);
+    pbuf[plen] = 0;
+    // mode is POSIX bits; Win32 permissions come from the inherited ACL
+    // - not applicable.
+    if (!CreateDirectoryA((const cchar*)pbuf, null))
+        return Result<bool, IoError>::Err { .error = IoError::os("CreateDirectoryA") };
+    return Result<bool, IoError>::Ok { .value = true };
+}
+
+/// Removes the empty directory `path`.
+pub Result<bool, IoError> removeDir(str path)
+{
+    u8[4096] pbuf;
+    usize plen = path.len < 4095 ? path.len : 4095;
+    copy<u8>(pbuf, (u8*)path.ptr, plen);
+    pbuf[plen] = 0;
+    if (!RemoveDirectoryA((const cchar*)pbuf))
+        return Result<bool, IoError>::Err { .error = IoError::os("RemoveDirectoryA") };
+    return Result<bool, IoError>::Ok { .value = true };
+}
+
+/// Deletes the file `path`.
+pub Result<bool, IoError> deleteFile(str path)
+{
+    u8[4096] pbuf;
+    usize plen = path.len < 4095 ? path.len : 4095;
+    copy<u8>(pbuf, (u8*)path.ptr, plen);
+    pbuf[plen] = 0;
+    if (!DeleteFileA((const cchar*)pbuf))
+        return Result<bool, IoError>::Err { .error = IoError::os("DeleteFileA") };
+    return Result<bool, IoError>::Ok { .value = true };
+}
+
+/// Renames `oldPath` to `newPath`.
+pub Result<bool, IoError> renameFile(str oldPath, str newPath)
+{
+    u8[4096] oldBuf;
+    u8[4096] newBuf;
+    usize olen = oldPath.len < 4095 ? oldPath.len : 4095;
+    usize nlen = newPath.len < 4095 ? newPath.len : 4095;
+    copy<u8>(oldBuf, (u8*)oldPath.ptr, olen);
+    copy<u8>(newBuf, (u8*)newPath.ptr, nlen);
+    oldBuf[olen] = 0; newBuf[nlen] = 0;
+    if (!MoveFileA((const cchar*)oldBuf, (const cchar*)newBuf))
+        return Result<bool, IoError>::Err { .error = IoError::os("MoveFileA") };
+    return Result<bool, IoError>::Ok { .value = true };
+}
+
+/// Returns true if `path` is accessible with mode `mode` (F_OK/R_OK/W_OK/X_OK).
+pub bool canAccess(str path, i32 mode)
+{
+    u8[4096] pbuf;
+    usize plen = path.len < 4095 ? path.len : 4095;
+    copy<u8>(pbuf, (u8*)path.ptr, plen);
+    pbuf[plen] = 0;
+
+    u32 attrs = GetFileAttributesA((const cchar*)pbuf);
+    if (attrs == 0xFFFFFFFFu) return false;
+    if (mode == F_OK) return true;
+
+    // R_OK/W_OK, no direct query - probe by opening (the flag lets the
+    // probe cover directories too).
+    if ((mode & R_OK) != 0 || (mode & W_OK) != 0)
+    {
+        u32 access = 0;
+        if ((mode & R_OK) != 0) access |= GENERIC_READ;
+        if ((mode & W_OK) != 0) access |= GENERIC_WRITE;
+        rawptr h = CreateFileA((const cchar*)pbuf, access,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               null, OPEN_EXISTING,
+                               FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, null);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        CloseHandle(h);
+    }
+    // X_OK, no execute permission for ordinary files (.exe is
+    // "executable" by extension) - existence is the closest equivalent.
+    return true;
+}
+
+// Dirent keeps the glibc x86-64 layout for source compat; readDir()
+// synthesizes it from WIN32_FIND_DATAA instead of a kernel dirent.
+/// A glibc-shaped directory entry, one row of a directory listing.
+pub struct Dirent
+{
+    u64 d_ino;
+    i64 d_off;
+    u16 d_reclen;
+    u8 d_type;
+    u8[256] d_name;
+}
+
+// opaque iterator, find handle + find-data block (cFileName@44, 260B).
+// FLAG sizes, WIN32_FIND_DATAA is 318B (padded 320); buffer is 1024.
+struct DirIter
+{
+    rawptr findHandle;
+    u8[1024] findData;
+    bool first;
+    bool done;
+    u64 seq;
+    Dirent entry;
+}
+
+/// Opens directory `path` for iteration; returns a Dir or IoError.
+pub Result<Dir, IoError> openDir(str path)
+{
+    // opendir() -> FindFirstFileA("<path>\*").
+    u8[4096] pbuf;
+    usize plen = path.len < 4094 ? path.len : 4094;
+    copy<u8>(pbuf, (u8*)path.ptr, plen);
+    if (plen > 0 && (path.ptr[plen - 1] == '/' || path.ptr[plen - 1] == '\\'))
+    {
+        pbuf[plen] = '*';
+        pbuf[plen + 1] = 0;
+    }
+    else
+    {
+        pbuf[plen] = '\\';
+        pbuf[plen + 1] = '*';
+        pbuf[plen + 2] = 0;
+    }
+
+    DirIter* it = alloc<DirIter>(1);
+    if (it == null) return Result<Dir, IoError>::Err { .error = IoError::BadUsage { .msg = "out of memory" } };
+    it->first = true;
+    it->done = false;
+    it->seq = 0;
+    rawptr h = FindFirstFileA((const cchar*)pbuf, (rawptr)it->findData);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        dealloc<DirIter>(it);
+        return Result<Dir, IoError>::Err { .error = IoError::os("FindFirstFileA") };
+    }
+    it->findHandle = h;
+    return Result<Dir, IoError>::Ok { .value = (Dir)((rawptr)it) };
+}
+
+// pointer into the iterator's Dirent (valid until next read/close),
+// null at end of stream - same contract as glibc readdir.
+/// Returns the next raw directory entry, or null at end of stream.
+pub rawptr readDir(Dir dir)
+{
+    rawptr raw = (rawptr)dir;
+    DirIter* it = (DirIter*)raw;
+    if (it == null) return null;
+    if (it->done) return null;
+    if (!it->first)
+    {
+        if (!FindNextFileA(it->findHandle, (rawptr)it->findData))
+        {
+            it->done = true;
+            return null;
+        }
+    }
+    it->first = false;
+
+    // fill the glibc-shaped Dirent, d_ino 0 (no Win32 counterpart),
+    // d_off our step, d_type DT_* (4/8), d_name cFileName@44.
+    const u8* fname = it->findData + 44;
+    u32 attrs = _u32At(it->findData, 0);
+    it->entry.d_ino = 0;
+    it->entry.d_off = (i64)it->seq;
+    it->seq++;
+    it->entry.d_reclen = (u16)@sizeof(Dirent);
+    it->entry.d_type = (u8)((attrs & FILE_ATTRIBUTE_DIRECTORY) != 0 ? 4 : 8);
+    for (usize i = 0; i < 256; i++) it->entry.d_name[i] = 0;
+    usize n = 0;
+    while (n < 255 && fname[n] != 0)
+    {
+        it->entry.d_name[n] = fname[n];
+        n++;
+    }
+    return (rawptr)&it->entry;
+}
+
+/// Closes a Dir and releases its resources.
+pub void closeDir(Dir dir)
+{
+    // closedir() -> FindClose + free.
+    rawptr raw = (rawptr)dir;
+    DirIter* it = (DirIter*)raw;
+    if (it == null) return;
+    if (it->findHandle != null && it->findHandle != INVALID_HANDLE_VALUE)
+        FindClose(it->findHandle);
+    dealloc<DirIter>(it);
+}
+
+/// Reads the entire file at `path` into a String or IoError.
+pub Result<String, IoError> readFileToString(str path)
+{
+    Result<File, IoError> fo = fileOpen(path, "r");
+    if (fo.isErr()) return Result<String, IoError>::Err { .error = fo.unwrapErr() };
+    File f = fo.unwrap();
+    String out = String::new();
+    u8[4096] chunk;
+    while (true)
+    {
+        Result<isize, IoError> rr = fileRead(f, (u8*)chunk, 4096);
+        if (rr.isErr())
+        {
+            fileClose(f);
+            out.free();
+            return Result<String, IoError>::Err { .error = rr.unwrapErr() };
+        }
+        isize n = rr.unwrap();
+        if (n <= 0) break;
+        out.appendView(str::fromParts(chunk, (usize)n));
+    }
+    fileClose(f);
+    return Result<String, IoError>::Ok { .value = out };
+}
+
+// next directory entry; false at end of stream.
+/// Copies the next directory entry into `out`; false at end of stream.
+pub bool readDirEntry(Dir dir, Dirent* out)
+{
+    rawptr raw = readDir(dir);
+    if (raw == null) return false;
+    copy<u8>((u8*)out, (u8*)raw, (usize)@sizeof(Dirent));
+    return true;
+}
+
+// mkdir -p, create every missing component (mode 0755 -> 493u).
+/// Creates `path` and any missing parent directories (mkdir -p).
+pub Result<bool, IoError> createDirRecursive(str path, i32 mode)
+{
+    if (path.len == 0) return Result<bool, IoError>::Err { .error = IoError::BadUsage { .msg = "empty path" } };
+    Stat st;
+    if (statPath(path, &st).isSome()) return Result<bool, IoError>::Ok { .value = true }; // already exists
+    // find parent and recurse first
+    u32 lastSlash = 0;
+    bool hasSlash = false;
+    for (usize i = 0; i < path.len; i++)
+        if (path.ptr[i] == '/') { lastSlash = (u32)i; hasSlash = true; }
+    if (hasSlash && lastSlash > 0)
+    {
+        Result<bool, IoError> parent = createDirRecursive(str::fromParts(path.ptr, (usize)lastSlash), mode);
+        if (parent.isErr()) return parent;
+    }
+    return createDir(path, mode);
+}
+
+// write an entire String to path (truncates).
+/// Writes the contents of `data` to `path`, truncating it first.
+pub Result<bool, IoError> writeFileFromString(str path, const String* data)
+{
+    Result<File, IoError> fo = fileOpen(path, "w");
+    if (fo.isErr()) return Result<bool, IoError>::Err { .error = fo.unwrapErr() };
+    File f = fo.unwrap();
+    usize off = 0;
+    while (off < data->len)
+    {
+        Result<isize, IoError> wr = fileWrite(f, data->ptr + off, data->len - off);
+        if (wr.isErr())
+        {
+            fileClose(f);
+            return Result<bool, IoError>::Err { .error = wr.unwrapErr() };
+        }
+        isize put = wr.unwrap();
+        if (put <= 0)
+        {
+            fileClose(f);
+            return Result<bool, IoError>::Err { .error = IoError::Os { .code = 0, .op = "write" } };
+        }
+        off += (usize)put;
+    }
+    fileClose(f);
+    return Result<bool, IoError>::Ok { .value = true };
+}
+
+pub extend Stat : @toStr
+{
+    str toStr()
+    {
+        u8[256] buf;
+        i32 len = snprintf(buf, 256u,
+            C"Stat { size: %lld, mode: 0o%o, nlink: %llu, ino: %llu, uid: %u, gid: %u, mtime: %lld }",
+            self.st_size, (u64)self.st_mode, self.st_nlink, self.st_ino,
+            (u32)self.st_uid, (u32)self.st_gid, self.st_mtime);
+        if (len < 0) len = 0;
+        if (len > 255) len = 255;
+        return String::from(str::fromParts((const u8*)buf, (usize)len)).asView();
+    }
+}
+
+pub extend Dirent : @toStr
+{
+    str toStr()
+    {
+        usize n = 0;
+        while (n < 256u && self.d_name[n] != 0u) n++;
+        return String::from(str::fromParts((const u8*)self.d_name, n)).asView();
+    }
+}
