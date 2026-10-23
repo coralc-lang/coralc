@@ -2,9 +2,11 @@
 .globl fib
 .type fib, @function
 fib:
-	pushq %rbp
-	movq %rsp, %rbp
-	subq $48, %rsp
+	pushq %rbx
+	pushq %r12
+	pushq %r13
+	pushq %r15
+	subq $8, %rsp
 	subq $176, %rsp
 	movq %rdi, 0(%rsp)
 	movq 0(%rsp), %rdi
@@ -19,56 +21,66 @@ fib:
 	jmp .Lfib_rec_5
 .Lfib_base_4:
 	movq %rdi, %rax
-	addq $48, %rsp
-	leave
+	addq $8, %rsp
+	popq %r15
+	popq %r13
+	popq %r12
+	popq %rbx
 	ret
 .Lfib_rec_5:
-	movq %rdi, -16(%rbp)
-	decq -16(%rbp)
-	movq %rdi, %r10
-	subq $0x0000000000000002, %r10
-	movq %r10, -32(%rbp)
-	movq -16(%rbp), %rdi
+	movq %rdi, %rbx
+	decq %rbx
+	movq %rdi, %r12
+	subq $0x0000000000000002, %r12
+	movq %rbx, %rdi
 	call fib
-	movq %rax, -48(%rbp)
-	movq -32(%rbp), %rdi
+	movq %rax, %r13
+	movq %r12, %rdi
 	call fib
 	movq %rax, %rsi
-	movq -48(%rbp), %rdi
+	movq %r13, %rdi
 	addq %rsi, %rdi
 	movq %rdi, %rax
-	addq $48, %rsp
-	leave
+	addq $8, %rsp
+	popq %r15
+	popq %r13
+	popq %r12
+	popq %rbx
 	ret
 .globl main
 .type main, @function
 main:
 	pushq %rbp
 	movq %rsp, %rbp
-	subq $64, %rsp
+	pushq %rbx
+	pushq %r12
+	pushq %r13
+	pushq %r15
+	subq $16, %rsp
 .Lmain_entry_18:
-	leaq -64(%rbp), %r10
-	movq %r10, -16(%rbp)
+	leaq -16(%rbp), %rbx
 	jmp .Lmain_inl25_3_29
 .Lmain_inl25_0_26:
-	movl %esi, -32(%rbp)
-	movq -32(%rbp), %rax
-	addq $64, %rsp
+	movl %esi, %r12d
+	movq %r12, %rax
+	addq $16, %rsp
+	popq %r15
+	popq %r13
+	popq %r12
+	popq %rbx
 	leave
 	ret
 .Lmain_inl25_3_29:
 	movq $0x0000000000000009, %rdi
 	call fib
-	movq %rax, -48(%rbp)
+	movq %rax, %r13
 	movq $0x0000000000000008, %rdi
 	call fib
 	movq %rax, %rsi
-	movq -48(%rbp), %rdi
+	movq %r13, %rdi
 	addq %rsi, %rdi
-	movq -16(%rbp), %r11
-	movq %rdi, (%r11)
+	movq %rdi, (%rbx)
 	jmp .Lmain_inl25_4_40
 .Lmain_inl25_4_40:
-	movq -16(%rbp), %r11
-	movq (%r11), %rsi
+	movq (%rbx), %rsi
 	jmp .Lmain_inl25_0_26
