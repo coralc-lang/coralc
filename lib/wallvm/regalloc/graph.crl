@@ -92,6 +92,13 @@ pub struct GraphRegAlloc
     IrContext* ctx;
     u32 numRegs;
     u32 numFloatRegs;
+    // Colors below numCallerSave are caller-save registers; a vreg whose
+    // interval is live across a call may only take colors >= this.
+    u32 numCallerSave;
+    // Per-vreg OR of its intervals' spansCall flags, sized numVregs and
+    // built in buildInterferenceGraph.
+    bool* nodeSpansCall;
+
     InterferenceGraph graph;
     u32* spillSlots;
     u32 numSpillSlots;
@@ -103,6 +110,8 @@ pub struct GraphRegAlloc
             .ctx = ctx,
             .numRegs = numIntRegs,
             .numFloatRegs = numFloatRegs,
+            .numCallerSave = 0,
+            .nodeSpansCall = null,
             .spillSlots = null,
             .numSpillSlots = 0,
             .capSpillSlots = 0
@@ -112,12 +121,14 @@ pub struct GraphRegAlloc
     void destroy()
     {
         self.graph.free();
+        if (self.nodeSpansCall != null) dealloc<bool>(self.nodeSpansCall);
         if (self.spillSlots != null) dealloc<u32>(self.spillSlots);
     }
 
     bool allocate(IrFunc* func, LinearScanRegAlloc* lsra)
     {
         if (func == null || lsra == null) return false;
+        if (lsra->numVregs == 0) return true;
 
         // Build interference graph from LSRA's interval data
         if (!self.buildInterferenceGraph(func, lsra)) return false;
@@ -140,6 +151,9 @@ pub struct GraphRegAlloc
 
         self.graph.init(numVregs);
 
+        self.nodeSpansCall = alloc<bool>((usize)numVregs);
+        for (u32 i = 0; i < numVregs; i++) self.nodeSpansCall[i] = false;
+
         // Build interference from overlapping intervals (integer vregs only —
         // the graph allocator uses lsra.numRegs colors, which is the integer
         // register count)
@@ -147,6 +161,8 @@ pub struct GraphRegAlloc
         {
             LiveInterval* a = &lsra->intervals[i];
             if (a->isFloat) continue;
+            if (a->spansCall && a->vreg < numVregs)
+                self.nodeSpansCall[a->vreg] = true;
             for (u32 j = i + 1; j < lsra->numIntervals; j++)
             {
                 LiveInterval* b = &lsra->intervals[j];
@@ -181,45 +197,51 @@ pub struct GraphRegAlloc
     {
         u32 k = self.numRegs; // number of available colors
         u32 n = self.graph.numNodes;
+        if (n == 0 || k == 0) return n == 0;
 
-        // Simplify — remove nodes with degree < k
+        // Degree among nodes not yet on the stack. Simplify must NOT
+        // destroy the adjacency matrix (the old removeNode approach zeroed
+        // every edge before select ran, so each node saw no colored
+        // neighbor and they all took color 0) — removal is tracked with
+        // the flags and the intact edges drive both phases.
         u32* stack = alloc<u32>((usize)n);
         u32 stackTop = 0;
         bool* removed = alloc<bool>((usize)n);
         for (u32 i = 0; i < n; i++) removed[i] = false;
 
-        bool changed = true;
-        while (changed)
+        // Simplify — push nodes with live degree < k; when stuck, spill the
+        // cheapest remaining node (push it too — select still tries to
+        // color it, and an uncolorable node surfaces as NO_REG below) and
+        // keep going until every node is stacked.
+        while (true)
         {
-            changed = false;
-            for (u32 i = 0; i < n; i++)
+            bool changed = true;
+            while (changed)
             {
-                if (removed[i]) continue;
-                if (self.graph.getDegree(i) < k)
+                changed = false;
+                for (u32 i = 0; i < n; i++)
                 {
-                    stack[stackTop++] = i;
-                    removed[i] = true;
-                    self.graph.removeNode(i);
-                    changed = true;
+                    if (removed[i]) continue;
+                    u32 deg = 0;
+                    for (u32 j = 0; j < n; j++)
+                        if (j != i && !removed[j] && self.graph.hasEdge(i, j)) deg++;
+                    if (deg < k)
+                    {
+                        stack[stackTop++] = i;
+                        removed[i] = true;
+                        changed = true;
+                    }
                 }
             }
-        }
 
-        // Check if all nodes were simplified (no spill needed)
-        bool allSimplified = true;
-        for (u32 i = 0; i < n; i++)
-        {
-            if (!removed[i])
+            bool allRemoved = true;
+            for (u32 i = 0; i < n; i++)
             {
-                allSimplified = false;
-                break;
+                if (!removed[i]) { allRemoved = false; break; }
             }
-        }
+            if (allRemoved) break;
 
-        // If not all simplified, we need to spill
-        if (!allSimplified)
-        {
-            // Find the node with lowest spill cost to spill
+            // Stuck: spill the cheapest remaining node and simplify again.
             u32 bestSpill = NO_REG;
             u32 bestCost = 0xFFFFFFFF;
             for (u32 i = 0; i < n; i++)
@@ -230,35 +252,12 @@ pub struct GraphRegAlloc
                     bestSpill = i;
                 }
             }
-
-            if (bestSpill != NO_REG)
-            {
-                // Add to stack and continue
-                stack[stackTop++] = bestSpill;
-                removed[bestSpill] = true;
-                self.graph.removeNode(bestSpill);
-
-                // Try to simplify again
-                changed = true;
-                while (changed)
-                {
-                    changed = false;
-                    for (u32 i = 0; i < n; i++)
-                    {
-                        if (removed[i]) continue;
-                        if (self.graph.getDegree(i) < k)
-                        {
-                            stack[stackTop++] = i;
-                            removed[i] = true;
-                            self.graph.removeNode(i);
-                            changed = true;
-                        }
-                    }
-                }
-            }
+            if (bestSpill == NO_REG) break;
+            stack[stackTop++] = bestSpill;
+            removed[bestSpill] = true;
         }
 
-        // Select — assign colors from stack
+        // Select — assign colors from stack, edges intact
         bool success = true;
         bool* usedColors = alloc<bool>((usize)k);
         for (u32 si = stackTop; si > 0; si--)
@@ -279,9 +278,14 @@ pub struct GraphRegAlloc
                 }
             }
 
-            // Find first available color
+            // Find first available color. A value live across a call may
+            // only take callee-save colors (caller-saves are clobbered by
+            // the call), matching lsra's scanClass searchStart rule.
             u32 color = NO_REG;
-            for (u32 c = 0; c < k; c++)
+            u32 cStart = 0;
+            if (self.nodeSpansCall != null && self.nodeSpansCall[node])
+                cStart = self.numCallerSave;
+            for (u32 c = cStart; c < k; c++)
             {
                 if (!usedColors[c])
                 {
@@ -326,28 +330,44 @@ pub bool irGraphRegAlloc(IrFunc* func, rawptr userdata, ABIRules* abi, RegAllocC
 
     // Then run graph coloring to refine
     GraphRegAlloc graphAlloc = GraphRegAlloc::new(ctx, lsra.numRegs, lsra.numFloatRegs);
+    graphAlloc.numCallerSave = lsra.numCallerSave;
     graphAlloc.allocate(func, &lsra);
 
-    // Apply coloring results to LSRA (integer vregs only — the graph
-    // allocator uses lsra.numRegs as its color count, which maps to
-    // LSRA's intRegNames ordering)
-    for (u32 i = 0; i < lsra.numIntervals; i++)
+    // Apply the coloring only when EVERY integer interval got a usable
+    // color (and a spans-call interval got a callee-save one). Applying a
+    // partial coloring is unsound: an uncolored node keeps lsra's physReg,
+    // which the colored nodes never saw when choosing their own colors,
+    // so the two can collide on the same register. On any gap we keep
+    // lsra's published assignment wholesale.
+    bool allColored = true;
+    for (u32 i = 0; i < lsra.numIntervals && allColored; i++)
     {
         LiveInterval* interval = &lsra.intervals[i];
         if (interval->isFloat) continue;
         u32 color = graphAlloc.getColor(interval->vreg);
-        if (color != NO_REG)
-        {
-            interval->physReg = color;
-        }
+        if (color == NO_REG) { allColored = false; break; }
+        if (interval->spansCall && color < lsra.numCallerSave) { allColored = false; break; }
     }
 
-    // Rewrite spills if needed
-    if (graphAlloc.numSpillSlots > 0)
+    if (allColored)
     {
-        // Spill slot count is informational; LSRA handles actual spill
-        // rewriting (load/store insertion) after graph coloring results
-        // are applied.
+        // Commit: interval colors become the vreg's assignment. Clearing
+        // slotForVreg un-spills anything lsra had parked in memory (graph
+        // coloring proved it fits), and re-running lsra.rewrite republishes
+        // every valData so the backend decodes the new homes.
+        for (u32 i = 0; i < lsra.numIntervals; i++)
+        {
+            LiveInterval* interval = &lsra.intervals[i];
+            if (interval->isFloat) continue;
+            u32 color = graphAlloc.getColor(interval->vreg);
+            interval->physReg = color;
+            if (interval->vreg < lsra.numVregs)
+            {
+                lsra.regForVreg[interval->vreg] = color;
+                lsra.slotForVreg[interval->vreg] = NO_SLOT;
+            }
+        }
+        lsra.rewrite(func);
     }
 
     graphAlloc.destroy();

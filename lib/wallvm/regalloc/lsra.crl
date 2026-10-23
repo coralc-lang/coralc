@@ -97,6 +97,15 @@ pub struct LinearScanRegAlloc
     IrInst** linearInsts;
     bool* instIsCall;
 
+    // Live-out sets kept from the interval fixpoint, flat [block*numVregs + vreg].
+    // Two-address coalescing uses them to confirm that an operand dying at its
+    // last use (end == def position) is not live-out of that block — a
+    // loop-carried value crossing a backedge can have end == last-use yet still
+    // be read on the next iteration, so the interval end alone is not a sound
+    // "dead here" signal.
+    bool* liveOutSets;
+    u32 numLiveOutBlocks;
+
     u32* active;
     u32 numActive;
 
@@ -208,6 +217,8 @@ pub struct LinearScanRegAlloc
         r.paramVals = null;
         r.numParams = 0;
         r.capParams = 0;
+        r.liveOutSets = null;
+        r.numLiveOutBlocks = 0;
         return r;
     }
 
@@ -585,24 +596,46 @@ pub struct LinearScanRegAlloc
                     liveIn[i] = 0;
                     liveOut[i] = 0;
                 }
+                bool* localDef = alloc<bool>((usize)nv);
                 for (u32 b = 0; b < nb; b++)
                 {
                     IrBlock* bb = self.blocks[b];
                     usize bo = (usize)b * (usize)nv;
+                    for (u32 v = 0; v < nv; v++) localDef[v] = 0;
                     for (u32 i = 0; i < bb->ninsts; i++)
                     {
                         IrInst* inst = bb->insts[i];
+                        // Phi value operands are read at the end of each
+                        // predecessor, not here; counting them against this block
+                        // is the conservative model that makes the predecessor
+                        // live-out of itself (carrying the operand to the phi),
+                        // matching the interval use-walk. Keep that behaviour.
+                        bool isPhi = inst->opcode == IrOpcode::Phi;
                         for (u32 j = 0; j < inst->nops; j++)
                         {
                             IrValue* op = inst->ops[j];
                             if (op == null || op->kind != IrValueKind::Inst) continue;
                             u32 v = (u32)op->valData;
-                            if (v < nv) useSet[bo + (usize)v] = 1;
+                            if (v >= nv) continue;
+                            // A read makes the value live-in to this block ONLY if
+                            // it precedes the value's def here. A read after a
+                            // local def consumes that def, not an incoming value.
+                            // Marking every read (the old behaviour) over-stated
+                            // liveIn for loop-local values (a GEP feeding one load),
+                            // which then propagated around the backedge into a false
+                            // liveOut and over-extended their interval to blockEnd —
+                            // inflating interference and evicting/spilling them.
+                            if (isPhi || !localDef[v]) useSet[bo + (usize)v] = 1;
                         }
                         u32 dv = self.instVreg[self.blockStartInst[b] + i];
-                        if (dv != NO_REG && dv < nv) defSet[bo + (usize)dv] = 1;
+                        if (dv != NO_REG && dv < nv)
+                        {
+                            defSet[bo + (usize)dv] = 1;
+                            localDef[dv] = 1;
+                        }
                     }
                 }
+                dealloc<bool>(localDef);
                 loop {
                    bool changed = false;
                     for (u32 b = nb; b-- > 0; )
@@ -648,7 +681,16 @@ pub struct LinearScanRegAlloc
                     usize bo = (usize)b * (usize)nv;
                     for (u32 v = 0; v < nv; v++)
                     {
-                        if (!liveIn[bo + (usize)v]) continue;
+                        // Extend only values that are live-Out of the block —
+                        // these cross the backedge (or a forward edge) and must
+                        // survive to blockEnd. A value merely *used* in the block
+                        // (liveIn, over-approximated because the per-block use set
+                        // ignores intra-block def order) dies at its last use and
+                        // must NOT be extended: doing so over-extends loop-local
+                        // values (e.g. a GEP feeding one load) to the whole block,
+                        // inflating their interval and causing needless
+                        // eviction/spill of critical short-lived values.
+                        if (!liveOut[bo + (usize)v]) continue;
                         for (u32 k = 0; k < self.numIntervals; k++)
                         {
                             if (self.intervals[k].vreg == v)
@@ -663,7 +705,9 @@ pub struct LinearScanRegAlloc
                 dealloc<bool>(useSet);
                 dealloc<bool>(defSet);
                 dealloc<bool>(liveIn);
-                dealloc<bool>(liveOut);
+                // Keep liveOut for two-address coalescing's live-out guard.
+                self.liveOutSets = liveOut;
+                self.numLiveOutBlocks = nb;
             }
         }
 
@@ -775,6 +819,42 @@ pub struct LinearScanRegAlloc
         }
     }
 
+    static bool isTwoAddressOp(IrOpcode op)
+    {
+        // Ops the backend emits as `dst = dst OP src` (x86 two-address form),
+        // i.e. the ones routed through emitBinOp / emitFloatBinOp that must
+        // materialise operand 0 into the destination before the ALU op. When
+        // operand 0 dies at the op the result can reuse its register and the
+        // backend skips the copy. Div/rem are excluded — they use the fixed
+        // rax/rdx (or xmm0) scratch convention, not a free dst register.
+        return op == IrOpcode::Add || op == IrOpcode::Sub || op == IrOpcode::Mul
+            || op == IrOpcode::And || op == IrOpcode::Or || op == IrOpcode::Xor
+            || op == IrOpcode::Shl || op == IrOpcode::Ashr || op == IrOpcode::Lshr
+            || op == IrOpcode::FAdd || op == IrOpcode::FSub
+            || op == IrOpcode::FMul || op == IrOpcode::FDiv;
+    }
+
+    u32 blockOfLinear(u32 pos)
+    {
+        for (u32 b = 0; b < self.numBlocks; b++)
+        {
+            u32 start = self.blockStartInst[b];
+            u32 end = start + self.blocks[b]->ninsts;
+            if (pos >= start && pos < end) return b;
+        }
+        return ~0u;
+    }
+
+    bool valueLiveOutAt(u32 blockIdx, u32 vreg)
+    {
+        // No live-out info (empty function) — be conservative and report
+        // live-out so coalescing stays off.
+        if (self.liveOutSets == null || blockIdx == ~0u) return true;
+        if (blockIdx >= self.numLiveOutBlocks) return true;
+        usize idx = (usize)blockIdx * (usize)self.numVregs + (usize)vreg;
+        return self.liveOutSets[idx];
+    }
+
     void scanClass(LiveInterval* cur,
                    u32* freeSet,
                    u32* activeList,
@@ -783,6 +863,52 @@ pub struct LinearScanRegAlloc
                    u32 calleeStart)
     {
         u32 numActive = *numActivePtr;
+
+        // Two-address coalescing. If cur is the result of a two-address op
+        // (add/sub/... emitted as `dst = dst OP src`) and operand 0 dies at
+        // this instruction — its interval ends exactly here and it is not
+        // live-out of the block — then cur can reuse operand 0's register and
+        // the backend skips the `movq src1, dst` copy. The live-out guard is
+        // required: a loop-carried operand crossing a backedge can have
+        // end == last-use yet still be read on the next iteration (the
+        // interval fixpoint only extends end to a live-in block's last
+        // instruction, which for a loop tail equals the use position).
+        u32 coalesceVreg = NO_REG;
+        u32 coalescePhysReg = NO_REG;
+        {
+            u32 defPos = cur->start;
+            if (defPos < self.totalInsts && self.instVreg[defPos] == cur->vreg)
+            {
+                IrInst* defInst = self.linearInsts[defPos];
+                if (defInst != null && self.isTwoAddressOp(defInst->opcode) && defInst->nops > 0)
+                {
+                    IrValue* op0 = defInst->ops[0];
+                    if (op0 != null && op0->kind == IrValueKind::Inst)
+                    {
+                        u32 op0Vreg = (u32)op0->valData;
+                        if (op0Vreg != cur->vreg)
+                        {
+                            for (u32 k = 0; k < self.numIntervals; k++)
+                            {
+                                if (self.intervals[k].vreg == op0Vreg)
+                                {
+                                    LiveInterval* op0I = &self.intervals[k];
+                                    if (op0I->isFloat == cur->isFloat &&
+                                        op0I->end == defPos && op0I->physReg != NO_REG &&
+                                        !self.valueLiveOutAt(self.blockOfLinear(defPos), op0Vreg))
+                                    {
+                                        coalesceVreg = op0Vreg;
+                                        coalescePhysReg = op0I->physReg;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         u32 newActive = 0;
         for (u32 j = 0; j < numActive; j++)
         {
@@ -808,21 +934,61 @@ pub struct LinearScanRegAlloc
         }
         numActive = newActive;
 
+            if (gLsraVerbose)
+            {
+                eprintln("    scan vreg={} start={} spansCall={} active:", cur->vreg, cur->start, cur->spansCall);
+                for (u32 j = 0; j < numActive; j++)
+                {
+                    u32 av = activeList[j];
+                    for (u32 k = 0; k < self.numIntervals; k++)
+                        if (self.intervals[k].vreg == av)
+                        { eprintln("      active vreg={} [{}..{}] reg={}", av, self.intervals[k].start, self.intervals[k].end, self.intervals[k].physReg); break; }
+                }
+                for (u32 r = 0; r < regCount; r++)
+                    if (freeSet[r]) eprintln("      free reg={}", r);
+            }
+
+        // If two-address coalescing applies, expire operand 0 now (it dies at
+        // cur->start) and remember its register as the preferred assignment.
+        if (coalesceVreg != NO_REG)
+        {
+            for (u32 j = 0; j < numActive; j++)
+            {
+                if (activeList[j] == coalesceVreg)
+                {
+                    freeSet[coalescePhysReg] = 1;
+                    for (u32 s = j; s + 1 < numActive; s++) activeList[s] = activeList[s + 1];
+                    numActive--;
+                    break;
+                }
+            }
+        }
+
         // An interval live across a call can only use callee-save regs.
         u32 searchStart = cur->spansCall ? calleeStart : 0;
 
         u32 freeReg = NO_REG;
-        for (u32 r = searchStart; r < regCount; r++)
+        if (coalescePhysReg != NO_REG && freeSet[coalescePhysReg] &&
+            (!cur->spansCall || coalescePhysReg >= calleeStart))
         {
-            if (freeSet[r])
+            // Take the dying operand's register so the backend skips the copy.
+            freeReg = coalescePhysReg;
+        }
+        else
+        {
+            for (u32 r = searchStart; r < regCount; r++)
             {
-                freeReg = r;
-                break;
+                if (freeSet[r])
+                {
+                    freeReg = r;
+                    break;
+                }
             }
         }
 
         if (freeReg != NO_REG)
         {
+            if (gLsraVerbose) eprintln("      -> assign vreg={} reg={}", cur->vreg, freeReg);
             cur->physReg = freeReg;
             freeSet[freeReg] = 0;
             activeList[numActive++] = cur->vreg;
@@ -909,6 +1075,7 @@ pub struct LinearScanRegAlloc
                 self.slotForVreg[cur->vreg] = cur->spillSlot;
                 if (self.nextSpillSlot > 0x7FFFFFFF)
                     self.nextSpillSlot = 0x7FFFFFFF;
+                if (gLsraVerbose) eprintln("      -> SPILL vreg={} (no free reg, freeReg={}) slot={}", cur->vreg, freeReg, cur->spillSlot);
             }
         }
         *numActivePtr = numActive;
@@ -985,6 +1152,15 @@ pub struct LinearScanRegAlloc
         self.numFloatActive = 0;
 
         self.sortIntervals(self.intervals, self.numIntervals);
+
+        if (gLsraVerbose)
+        {
+            eprintln("; scan order ({} intervals):", self.numIntervals);
+            for (u32 i = 0; i < self.numIntervals; i++)
+                eprintln("  [{}] vreg={} start={} end={} isFloat={} physReg={}",
+                    i, self.intervals[i].vreg, self.intervals[i].start,
+                    self.intervals[i].end, self.intervals[i].isFloat, self.intervals[i].physReg);
+        }
 
         for (u32 i = 0; i < self.numIntervals; i++)
         {
@@ -1279,6 +1455,7 @@ pub struct LinearScanRegAlloc
         if (self.floatActive != null) dealloc<u32>(self.floatActive);
         if (self.slotAllocas != null) dealloc<IrValue*>(self.slotAllocas);
         if (self.paramVals != null) dealloc<IrValue*>(self.paramVals);
+        if (self.liveOutSets != null) { dealloc<bool>(self.liveOutSets); self.liveOutSets = null; }
 
         return true;
     }

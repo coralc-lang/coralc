@@ -8,11 +8,10 @@ main:
 	pushq %r12
 	pushq %r13
 	pushq %r14
-	pushq %r15
-	subq $104, %rsp
+	subq $48, %rsp
 .Lmain_entry_2:
-	leaq -72(%rbp), %rsi
-	leaq -88(%rbp), %rdi
+	leaq -16(%rbp), %rsi
+	leaq -32(%rbp), %rdi
 	movabsq $0x0000000000000000, %r10
 	movq %r10, (%rsi)
 	movabsq $0x0000000000000000, %r10
@@ -28,47 +27,37 @@ main:
 	jne .Lmain_inner_pre_4
 	jmp .Lmain_done_8
 .Lmain_inner_pre_4:
-	leaq -104(%rbp), %rbx
+	leaq -48(%rbp), %r9
 	movabsq $0x0000000000000000, %r10
-	movq %r10, (%rbx)
+	movq %r10, (%r9)
 	jmp .Lmain_inner_5
 .Lmain_inner_5:
-	movq (%rbx), %r12
+	movq (%r9), %rbx
 	movabsq $0x0000000000000003, %r11
-	cmpq %r11, %r12
+	cmpq %r11, %rbx
 	setl %r11b
-	movzbq %r11b, %r13
-	testq %r13, %r13
+	movzbq %r11b, %r12
+	testq %r12, %r12
 	jne .Lmain_inner_body_6
 	jmp .Lmain_inner_done_7
 .Lmain_inner_body_6:
-	movq %r8, %r10
-	imulq %r12, %r10
-	movq %r10, -16(%rbp)
-	movq (%rdi), %r10
-	movq %r10, -32(%rbp)
-	movq -16(%rbp), %r10
-	addq -32(%rbp), %r10
-	movq %r10, -48(%rbp)
-	movq -48(%rbp), %r10
-	movq %r10, (%rdi)
-	movq %r12, %r15
-	incq %r15
-	movq %rbx, %r10
-	addq $0x0000000000000001, (%r10)
+	movq %r8, %r12
+	imulq %rbx, %r12
+	movq (%rdi), %r13
+	addq %r13, %r12
+	movq %r12, (%rdi)
+	incq %rbx
+	addq $0x0000000000000001, (%r9)
 	jmp .Lmain_inner_5
 .Lmain_inner_done_7:
-	movq %r8, %r14
-	incq %r14
-	movq %rsi, %r10
-	addq $0x0000000000000001, (%r10)
+	incq %r8
+	addq $0x0000000000000001, (%rsi)
 	jmp .Lmain_outer_3
 .Lmain_done_8:
 	movq (%rdi), %rsi
-	movl %esi, %r8d
-	movq %r8, %rax
-	addq $104, %rsp
-	popq %r15
+	movl %esi, %edi
+	movq %rdi, %rax
+	addq $48, %rsp
 	popq %r14
 	popq %r13
 	popq %r12

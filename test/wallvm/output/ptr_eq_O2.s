@@ -16,8 +16,8 @@ main:
 	cmpq %rdi, %rsi
 	sete %r11b
 	movzbq %r11b, %r8
-	movq %r8, %r9
-	movq %r9, %rax
+	movq %r8, %rsi
+	movq %rsi, %rax
 	addq $40, %rsp
 	popq %r13
 	leave

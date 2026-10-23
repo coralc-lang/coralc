@@ -7,71 +7,63 @@ main:
 	pushq %rbx
 	pushq %r12
 	pushq %r13
-	pushq %r14
-	pushq %r15
-	subq $104, %rsp
+	subq $88, %rsp
 .Lmain_entry_2:
-	leaq -40(%rbp), %rsi
-	leaq -88(%rbp), %rdi
+	leaq -24(%rbp), %r9
+	leaq -72(%rbp), %r8
 	movabsq $0x0000000000000000, %r10
-	movq %r10, (%rsi)
+	movq %r10, (%r9)
 	jmp .Lmain_fill_3
 .Lmain_fill_3:
-	movq (%rsi), %r8
+	movq (%r9), %rbx
 	movabsq $0x0000000000000005, %r11
-	cmpq %r11, %r8
+	cmpq %r11, %rbx
 	setl %r11b
-	movzbq %r11b, %r9
-	testq %r9, %r9
+	movzbq %r11b, %rsi
+	testq %rsi, %rsi
 	jne .Lmain_fill_body_4
 	jmp .Lmain_sum_pre_5
 .Lmain_fill_body_4:
-	movq %rdi, %r10
-	movq %r8, %r11
-	leaq (%r10, %r11, 8), %rbx
-	movq $0x0000000000000001, %r12
-	addq %r8, %r12
-	movq %r12, (%rbx)
-	movq %r12, (%rsi)
+	movq %rbx, %r11
+	leaq (%r8, %r11, 8), %rdi
+	movq $0x0000000000000001, %rsi
+	addq %rbx, %rsi
+	movq %rsi, (%rdi)
+	movq %rsi, (%r9)
 	jmp .Lmain_fill_3
 .Lmain_sum_pre_5:
 	movabsq $0x0000000000000000, %r10
-	movq %r10, (%rsi)
-	leaq -104(%rbp), %r8
+	movq %r10, (%r9)
+	leaq -88(%rbp), %rdi
 	movabsq $0x0000000000000000, %r10
-	movq %r10, (%r8)
+	movq %r10, (%rdi)
 	jmp .Lmain_sum_6
 .Lmain_sum_6:
-	movq (%rsi), %r9
+	movq (%r9), %rsi
 	movabsq $0x0000000000000005, %r11
-	cmpq %r11, %r9
+	cmpq %r11, %rsi
 	setl %r11b
 	movzbq %r11b, %rbx
 	testq %rbx, %rbx
 	jne .Lmain_sum_body_7
 	jmp .Lmain_done_8
 .Lmain_sum_body_7:
-	movq %rdi, %r10
-	movq %r9, %r11
-	leaq (%r10, %r11, 8), %r10
-	movq %r10, -16(%rbp)
-	movq -16(%rbp), %r11
-	movq (%r11), %r13
-	movq (%r8), %r14
-	movq %r13, %r15
-	addq %r14, %r15
-	movq %r15, (%r8)
-	movq $0x0000000000000001, %r12
-	addq %r9, %r12
-	movq %r12, (%rsi)
+	movq %rsi, %r11
+	leaq (%r8, %r11, 8), %rbx
+	movq (%rbx), %r13
+	movq (%rdi), %r12
+	movq %r13, %rbx
+	addq %r12, %rbx
+	movq %rbx, (%rdi)
+	movq $0x0000000000000001, %rbx
+	addq %rsi, %rbx
+	movq %rbx, (%r9)
 	jmp .Lmain_sum_6
 .Lmain_done_8:
-	movq (%r8), %rsi
-	movl %esi, %edi
-	movq %rdi, %rax
-	addq $104, %rsp
-	popq %r15
-	popq %r14
+	movq (%rdi), %r8
+	movl %r8d, %esi
+	movq %rsi, %rax
+	addq $88, %rsp
 	popq %r13
 	popq %r12
 	popq %rbx

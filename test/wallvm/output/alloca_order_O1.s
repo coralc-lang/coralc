@@ -12,9 +12,9 @@ main:
 	movq %r10, (%rsi)
 	movabsq $0x0000000000000003, %r10
 	movq %r10, (%rdi)
-	movq (%rdi), %r8
-	movl %r8d, %r9d
-	movq %r9, %rax
+	movq (%rdi), %rsi
+	movl %esi, %edi
+	movq %rdi, %rax
 	addq $64, %rsp
 	leave
 	ret

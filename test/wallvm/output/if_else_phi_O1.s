@@ -20,21 +20,20 @@ main:
 	jmp .Lmain_els_4
 .Lmain_then_3:
 	movq (%rsi), %r8
-	movq %r8, %r9
 	movq $0x0000000000000001, %rcx
-	shlq %cl, %r9
-	movq %r9, (%rdi)
+	shlq %cl, %r8
+	movq %r8, (%rdi)
 	jmp .Lmain_merge_5
 .Lmain_els_4:
 	movq (%rsi), %r8
-	movq %r8, %r9
-	negq %r9
-	movq %r9, (%rdi)
+	movq %r8, %rsi
+	negq %rsi
+	movq %rsi, (%rdi)
 	jmp .Lmain_merge_5
 .Lmain_merge_5:
 	movq (%rdi), %rsi
-	movl %esi, %r8d
-	movq %r8, %rax
+	movl %esi, %edi
+	movq %rdi, %rax
 	addq $32, %rsp
 	leave
 	ret

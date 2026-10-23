@@ -8,65 +8,59 @@ main:
 	pushq %r12
 	pushq %r13
 	pushq %r14
-	pushq %r15
-	subq $104, %rsp
+	subq $48, %rsp
 .Lmain_entry_2:
-	leaq -72(%rbp), %rsi
-	leaq -88(%rbp), %rdi
+	leaq -16(%rbp), %rbx
+	leaq -32(%rbp), %r9
 	movabsq $0x0000000000000000, %r10
-	movq %r10, (%rdi)
+	movq %r10, (%r9)
 	movabsq $0x0000000000000000, %r10
-	movq %r10, (%rsi)
+	movq %r10, (%rbx)
 	jmp .Lmain_outer_3
 .Lmain_outer_3:
-	movq (%rdi), %r8
+	movq (%r9), %r8
 	movabsq $0x0000000000000004, %r11
 	cmpq %r11, %r8
 	setl %r11b
-	movzbq %r11b, %r9
-	testq %r9, %r9
+	movzbq %r11b, %rsi
+	testq %rsi, %rsi
 	jne .Lmain_inner_pre_4
 	jmp .Lmain_done_8
 .Lmain_inner_pre_4:
-	leaq -104(%rbp), %rbx
+	leaq -48(%rbp), %rdi
 	movabsq $0x0000000000000000, %r10
-	movq %r10, (%rbx)
+	movq %r10, (%rdi)
 	jmp .Lmain_inner_5
 .Lmain_inner_5:
-	movq (%rbx), %r12
+	movq (%rdi), %rsi
 	movabsq $0x0000000000000003, %r11
-	cmpq %r11, %r12
+	cmpq %r11, %rsi
 	setl %r11b
-	movzbq %r11b, %r13
-	testq %r13, %r13
+	movzbq %r11b, %r12
+	testq %r12, %r12
 	jne .Lmain_inner_body_6
-	jmp .Lmain_inner_done_3206437840
+	jmp .Lmain_inner_done_1043225864
 .Lmain_inner_body_6:
-	movq %r8, %r10
-	imulq %r12, %r10
-	movq %r10, -16(%rbp)
-	movq (%rsi), %r10
-	movq %r10, -32(%rbp)
-	movq -16(%rbp), %r10
-	addq -32(%rbp), %r10
-	movq %r10, -48(%rbp)
-	movq -48(%rbp), %r10
-	movq %r10, (%rsi)
-	movq $0x0000000000000001, %r15
-	addq %r12, %r15
-	movq %r15, (%rbx)
+	movq %r8, %r14
+	imulq %rsi, %r14
+	movq (%rbx), %r13
+	movq %r14, %r12
+	addq %r13, %r12
+	movq %r12, (%rbx)
+	movq $0x0000000000000001, %r12
+	addq %rsi, %r12
+	movq %r12, (%rdi)
 	jmp .Lmain_inner_5
-.Lmain_inner_done_3206437840:
-	movq $0x0000000000000001, %r14
-	addq %r8, %r14
-	movq %r14, (%rdi)
+.Lmain_inner_done_1043225864:
+	movq $0x0000000000000001, %rsi
+	addq %r8, %rsi
+	movq %rsi, (%r9)
 	jmp .Lmain_outer_3
 .Lmain_done_8:
-	movq (%rsi), %rdi
-	movl %edi, %r8d
-	movq %r8, %rax
-	addq $104, %rsp
-	popq %r15
+	movq (%rbx), %rdi
+	movl %edi, %esi
+	movq %rsi, %rax
+	addq $48, %rsp
 	popq %r14
 	popq %r13
 	popq %r12

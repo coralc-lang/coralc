@@ -5,44 +5,39 @@ main:
 	pushq %rbp
 	movq %rsp, %rbp
 	pushq %rbx
-	pushq %r12
-	pushq %r13
 	pushq %r14
 	subq $32, %rsp
 .Lmain_entry_2:
-	leaq -16(%rbp), %r13
-	leaq -32(%rbp), %r12
+	leaq -16(%rbp), %rbx
+	leaq -32(%rbp), %r9
 	movabsq $0x000000000000000a, %r10
-	movq %r10, (%r12)
+	movq %r10, (%r9)
 	movabsq $0x0000000000000000, %r10
-	movq %r10, (%r13)
+	movq %r10, (%rbx)
 	jmp .Lmain_loop_3
 .Lmain_loop_3:
-	movq (%r12), %rbx
-	testq %rbx, %rbx
+	movq (%r9), %r8
+	testq %r8, %r8
 	setg %r11b
-	movzbq %r11b, %r9
-	testq %r9, %r9
+	movzbq %r11b, %rsi
+	testq %rsi, %rsi
 	jne .Lmain_body_4
 	jmp .Lmain_done_5
 .Lmain_body_4:
-	movq (%r13), %r8
-	movq %rbx, %rdi
-	addq %r8, %rdi
-	movq %rdi, (%r13)
-	movq %rbx, %rsi
+	movq (%rbx), %rdi
+	movq %r8, %rsi
+	addq %rdi, %rsi
+	movq %rsi, (%rbx)
+	movq %r8, %rsi
 	decq %rsi
-	movq %r12, %r10
-	subq $0x0000000000000001, (%r10)
+	subq $0x0000000000000001, (%r9)
 	jmp .Lmain_loop_3
 .Lmain_done_5:
-	movq (%r13), %rdi
+	movq (%rbx), %rdi
 	movl %edi, %esi
 	movq %rsi, %rax
 	addq $32, %rsp
 	popq %r14
-	popq %r13
-	popq %r12
 	popq %rbx
 	leave
 	ret

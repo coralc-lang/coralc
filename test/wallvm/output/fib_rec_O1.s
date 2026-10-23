@@ -34,9 +34,8 @@ fib:
 	movq %r12, %rdi
 	call fib
 	movq %rax, %rsi
-	movq %r13, %rdi
-	addq %rsi, %rdi
-	movq %rdi, %rax
+	addq %rsi, %r13
+	movq %r13, %rax
 	popq %r13
 	popq %r12
 	popq %rbx

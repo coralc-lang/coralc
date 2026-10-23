@@ -38,9 +38,8 @@ fib:
 	movq %r12, %rdi
 	call fib
 	movq %rax, %rsi
-	movq %r13, %rdi
-	addq %rsi, %rdi
-	movq %rdi, %rax
+	addq %rsi, %r13
+	movq %r13, %rax
 	addq $8, %rsp
 	popq %r15
 	popq %r13
@@ -61,8 +60,8 @@ main:
 	leaq -16(%rbp), %rbx
 	jmp .Lmain_inl25_3_29
 .Lmain_inl25_0_26:
-	movl %esi, %r12d
-	movq %r12, %rax
+	movl %esi, %esi
+	movq %rsi, %rax
 	addq $16, %rsp
 	popq %r15
 	popq %r13
@@ -73,13 +72,12 @@ main:
 .Lmain_inl25_3_29:
 	movq $0x0000000000000009, %rdi
 	call fib
-	movq %rax, %r13
+	movq %rax, %r12
 	movq $0x0000000000000008, %rdi
 	call fib
 	movq %rax, %rsi
-	movq %r13, %rdi
-	addq %rsi, %rdi
-	movq %rdi, (%rbx)
+	addq %rsi, %r12
+	movq %r12, (%rbx)
 	jmp .Lmain_inl25_4_40
 .Lmain_inl25_4_40:
 	movq (%rbx), %rsi
