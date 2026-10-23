@@ -39,7 +39,7 @@ main:
 	movzbq %r11b, %r12
 	testq %r12, %r12
 	jne .Lmain_inner_body_6
-	jmp .Lmain_inner_done_994827624
+	jmp .Lmain_inner_done_1390423424
 .Lmain_inner_body_6:
 	movq %r8, %r14
 	imulq %rsi, %r14
@@ -51,7 +51,7 @@ main:
 	addq %rsi, %r12
 	movq %r12, (%rdi)
 	jmp .Lmain_inner_5
-.Lmain_inner_done_994827624:
+.Lmain_inner_done_1390423424:
 	movq $0x0000000000000001, %rsi
 	addq %r8, %rsi
 	movq %rsi, (%r9)

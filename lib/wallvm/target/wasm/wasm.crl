@@ -812,6 +812,34 @@ pub struct WasmCodeGen
         }
         switch (val->kind)
         {
+            IrValueKind::ConstArray => {
+                if (val->type == null || val->type->kind != IrTypeKind::Vector) return false;
+                str sh = self.vecShape(val->type);
+                if (sh.len == 0) return false;
+                IrArrayConst* ac = (IrArrayConst*)val;
+                if (ac->nelems != val->type->count) return false;
+                self.emitter.emit("v128.const ");
+                self.emitter.emitLine(sh);
+                for (u32 i = 0; i < ac->nelems; i++)
+                {
+                    IrValue* e = ac->elems[i];
+                    if (e == null) return false;
+                    self.emitter.emit(" ");
+                    if (e->kind == IrValueKind::ConstInt)
+                    {
+                        self.emitter.emitI64((i64)e->valData);
+                    }
+                    else if (e->kind == IrValueKind::ConstFloat)
+                    {
+                        bool is64 = e->type != null && e->type->kind == IrTypeKind::Float && e->type->width > 32;
+                        if (is64) self.emitter.emitDoubleLiteral(f64OfU64(e->valData));
+                        else self.emitter.emitDoubleLiteral((f64)f32OfU32((u32)(e->valData & 0xFFFFFFFF)));
+                    }
+                    else return false;
+                }
+                self.emitter.emitLine("");
+                return true;
+            },
             IrValueKind::ConstInt => {
                 bool is64 = self.isI64(val->type);
                 self.emitter.emit(is64 ? "i64.const " : "i32.const ");
@@ -1566,106 +1594,216 @@ pub struct WasmCodeGen
         return true;
     }
 
-    // single-threaded wasm, the rmw is a plain load/op/store and the
-    // ordering is unobservable; the result is the OLD value
+    u32 atomicBits(IrType* ty)
+    {
+        if (ty == null) return 32;
+        if (ty->kind == IrTypeKind::Ptr || ty->kind == IrTypeKind::Func) return 32;
+        if (ty->kind == IrTypeKind::Float) return ty->width <= 32 ? 32 : 64;
+        if (ty->kind == IrTypeKind::Int)
+        {
+            if (ty->width <= 8) return 8;
+            if (ty->width <= 16) return 16;
+            if (ty->width <= 32) return 32;
+            return 64;
+        }
+        return 32;
+    }
+
+    bool atomicWide(IrType* ty)
+    {
+        return ty != null && ty->kind == IrTypeKind::Int && ty->width > 32;
+    }
+
+    str atomicLoadName(u32 bits, bool is64)
+    {
+        if (is64)
+        {
+            if (bits == 64) return "i64.atomic.load";
+            if (bits == 32) return "i64.atomic.load32_u";
+            if (bits == 16) return "i64.atomic.load16_u";
+            return "i64.atomic.load8_u";
+        }
+        if (bits == 32) return "i32.atomic.load";
+        if (bits == 16) return "i32.atomic.load16_u";
+        return "i32.atomic.load8_u";
+    }
+
+    str atomicStoreName(u32 bits, bool is64)
+    {
+        if (is64)
+        {
+            if (bits == 64) return "i64.atomic.store";
+            if (bits == 32) return "i64.atomic.store32";
+            if (bits == 16) return "i64.atomic.store16";
+            return "i64.atomic.store8";
+        }
+        if (bits == 32) return "i32.atomic.store";
+        if (bits == 16) return "i32.atomic.store16";
+        return "i32.atomic.store8";
+    }
+
+    void emitAtomicRmwMem(u32 bits, bool is64, str op, u32 off, u32 align)
+    {
+        String r = String::new();
+        if (is64)
+        {
+            if (bits == 64) { r.pushView("i64.atomic.rmw."); r.pushView(op); }
+            else if (bits == 32) { r.pushView("i64.atomic.rmw32."); r.pushView(op); r.pushView("_u"); }
+            else if (bits == 16) { r.pushView("i64.atomic.rmw16."); r.pushView(op); r.pushView("_u"); }
+            else { r.pushView("i64.atomic.rmw8."); r.pushView(op); r.pushView("_u"); }
+        }
+        else
+        {
+            if (bits == 32) { r.pushView("i32.atomic.rmw."); r.pushView(op); }
+            else if (bits == 16) { r.pushView("i32.atomic.rmw16."); r.pushView(op); r.pushView("_u"); }
+            else { r.pushView("i32.atomic.rmw8."); r.pushView(op); r.pushView("_u"); }
+        }
+        self.emitMemOp(r.asView(), off, align);
+    }
+
+    str atomicSignExtend(u32 bits, bool is64)
+    {
+        if (bits == 8) return is64 ? "i64.extend8_s" : "i32.extend8_s";
+        if (bits == 16) return is64 ? "i64.extend16_s" : "i32.extend16_s";
+        if (bits == 32 && is64) return "i64.extend32_s";
+        return "";
+    }
+
+    bool emitAtomicLoad(IrInst* inst)
+    {
+        if (inst->nops < 1) return false;
+        u32 off = 0;
+        if (!self.emitAddressPush(inst->ops[0], &off)) return false;
+        u32 bits = self.atomicBits(inst->base.type);
+        bool is64 = self.atomicWide(inst->base.type);
+        self.emitMemOp(self.atomicLoadName(bits, is64), off, self.memAlign(inst->base.type));
+        if (inst->base.type != null && inst->base.type->kind == IrTypeKind::Float)
+        {
+            self.emitter.emitLine(bits == 64 ? "f64.reinterpret_i64" : "f32.reinterpret_i32");
+        }
+        else
+        {
+            str se = self.atomicSignExtend(bits, is64);
+            if (se.len > 0) self.emitter.emitLine(se);
+        }
+        return true;
+    }
+
+    bool emitAtomicStore(IrInst* inst)
+    {
+        if (inst->nops < 2) return false;
+        u32 off = 0;
+        if (!self.emitAddressPush(inst->ops[1], &off)) return false;
+        if (!self.emitValuePush(inst->ops[0])) return false;
+        IrType* vt = inst->ops[0] != null ? inst->ops[0]->type : null;
+        u32 bits = self.atomicBits(vt);
+        bool is64 = self.atomicWide(vt);
+        if (vt != null && vt->kind == IrTypeKind::Float)
+            self.emitter.emitLine(bits == 64 ? "i64.reinterpret_f64" : "i32.reinterpret_f32");
+        self.emitMemOp(self.atomicStoreName(bits, is64), off, self.memAlign(vt));
+        return true;
+    }
+
     bool emitAtomicRmw(IrInst* inst)
     {
         if (inst->nops < 2) return false;
-        bool is64 = self.isI64(inst->base.type);
-        str so = is64 ? "$atO64" : "$atO32";
-        str sn = is64 ? "$atN64" : "$atN32";
-        str p = is64 ? "i64." : "i32.";
-        self.emitter.emitLine(";; atomic rmw lowered to plain ops");
-        if (!self.emitValuePush(inst->ops[0])) return false;
-        self.emitter.emitLine("local.tee $atA");
-        self.emitLoadOnly(inst->base.type);
-        self.emitter.emit("local.tee ");
-        self.emitter.emitLine(so);
-        switch ((IrAtomicRmwOp)inst->fcmpPred)
+        u32 bits = self.atomicBits(inst->base.type);
+        bool is64 = self.atomicWide(inst->base.type);
+        IrAtomicRmwOp op = (IrAtomicRmwOp)inst->icmpPred;
+        u32 off = 0;
+        if (op == IrAtomicRmwOp::Xchg || op == IrAtomicRmwOp::Add ||
+            op == IrAtomicRmwOp::Sub || op == IrAtomicRmwOp::And ||
+            op == IrAtomicRmwOp::Or || op == IrAtomicRmwOp::Xor)
         {
-            IrAtomicRmwOp::Xchg => {
-                if (!self.emitValuePush(inst->ops[1])) return false;
-            },
-            IrAtomicRmwOp::Add | IrAtomicRmwOp::Sub | IrAtomicRmwOp::And |
-            IrAtomicRmwOp::Or | IrAtomicRmwOp::Xor => {
-                self.emitter.emit("local.get ");
-                self.emitter.emitLine(so);
-                if (!self.emitValuePush(inst->ops[1])) return false;
-                self.emitter.emit(p);
-                switch ((IrAtomicRmwOp)inst->fcmpPred)
-                {
-                    IrAtomicRmwOp::Add => { self.emitter.emitLine("add"); },
-                    IrAtomicRmwOp::Sub => { self.emitter.emitLine("sub"); },
-                    IrAtomicRmwOp::And => { self.emitter.emitLine("and"); },
-                    IrAtomicRmwOp::Or => { self.emitter.emitLine("or"); },
-                    else => { self.emitter.emitLine("xor"); }
-                }
-            },
+            if (!self.emitAddressPush(inst->ops[0], &off)) return false;
+            if (!self.emitValuePush(inst->ops[1])) return false;
+            self.emitAtomicRmwMem(bits, is64, irAtomicRmwOpStr(op), off, self.memAlign(inst->base.type));
+            str se = self.atomicSignExtend(bits, is64);
+            if (se.len > 0) self.emitter.emitLine(se);
+            return true;
+        }
+        // no wasm direct op for nand/min/max; retry a cmpxchg loop
+        str a = is64 ? "$atO64" : "$atO32";
+        str v = is64 ? "$atV64" : "$atV32";
+        str n = is64 ? "$atN64" : "$atN32";
+        str r = is64 ? "$atR64" : "$atR32";
+        str p = is64 ? "i64." : "i32.";
+        if (!self.emitAddressPush(inst->ops[0], &off)) return false;
+        self.emitter.emitLine("local.tee $atA");
+        self.emitMemOp(self.atomicLoadName(bits, is64), off, self.memAlign(inst->base.type));
+        self.emitter.emit("local.set ");
+        self.emitter.emitLine(a);
+        if (!self.emitValuePush(inst->ops[1])) return false;
+        self.emitter.emit("local.set ");
+        self.emitter.emitLine(v);
+        self.emitter.emitLine("loop $rmw");
+        self.emitter.emit("local.get ");
+        self.emitter.emitLine(a);
+        self.emitter.emit("local.get ");
+        self.emitter.emitLine(v);
+        switch (op)
+        {
             IrAtomicRmwOp::Nand => {
-                self.emitter.emit("local.get ");
-                self.emitter.emitLine(so);
-                if (!self.emitValuePush(inst->ops[1])) return false;
-                self.emitter.emit(p);
-                self.emitter.emitLine("and");
-                self.emitter.emit(p);
-                self.emitter.emitLine("const -1");
-                self.emitter.emit(p);
-                self.emitter.emitLine("xor");
+                self.emitter.emit(p); self.emitter.emitLine("and");
+                self.emitter.emit(p); self.emitter.emitLine("const -1");
+                self.emitter.emit(p); self.emitter.emitLine("xor");
             },
-            IrAtomicRmwOp::Max | IrAtomicRmwOp::Min | IrAtomicRmwOp::UMax | IrAtomicRmwOp::UMin => {
-                // old, v, old, v, compare, select
+            IrAtomicRmwOp::Max | IrAtomicRmwOp::Min |
+            IrAtomicRmwOp::UMax | IrAtomicRmwOp::UMin => {
+                // [old, v, old, v] then compare and select
                 self.emitter.emit("local.get ");
-                self.emitter.emitLine(so);
-                if (!self.emitValuePush(inst->ops[1])) return false;
+                self.emitter.emitLine(a);
                 self.emitter.emit("local.get ");
-                self.emitter.emitLine(so);
-                if (!self.emitValuePush(inst->ops[1])) return false;
+                self.emitter.emitLine(v);
                 self.emitter.emit(p);
-                switch ((IrAtomicRmwOp)inst->fcmpPred)
-                {
-                    IrAtomicRmwOp::Max => { self.emitter.emitLine("gt_s"); },
-                    IrAtomicRmwOp::Min => { self.emitter.emitLine("lt_s"); },
-                    IrAtomicRmwOp::UMax => { self.emitter.emitLine("gt_u"); },
-                    else => { self.emitter.emitLine("lt_u"); }
-                }
+                if (op == IrAtomicRmwOp::Max) self.emitter.emitLine("gt_s");
+                else if (op == IrAtomicRmwOp::Min) self.emitter.emitLine("lt_s");
+                else if (op == IrAtomicRmwOp::UMax) self.emitter.emitLine("gt_u");
+                else self.emitter.emitLine("lt_u");
                 self.emitter.emitLine("select");
             },
             else => { self.failOp(null, inst->opcode); return false; }
         }
         self.emitter.emit("local.set ");
-        self.emitter.emitLine(sn);
+        self.emitter.emitLine(n);
         self.emitter.emitLine("local.get $atA");
         self.emitter.emit("local.get ");
-        self.emitter.emitLine(sn);
-        self.emitStoreOnly(inst->base.type);
+        self.emitter.emitLine(a);
         self.emitter.emit("local.get ");
-        self.emitter.emitLine(so);
+        self.emitter.emitLine(n);
+        self.emitAtomicRmwMem(bits, is64, "cmpxchg", off, self.memAlign(inst->base.type));
+        self.emitter.emit("local.tee ");
+        self.emitter.emitLine(r);
+        self.emitter.emit("local.get ");
+        self.emitter.emitLine(a);
+        self.emitter.emitLine(is64 ? "i64.ne" : "i32.ne");
+        self.emitter.emitLine("if");
+        self.emitter.emit("local.get ");
+        self.emitter.emitLine(r);
+        self.emitter.emit("local.set ");
+        self.emitter.emitLine(a);
+        self.emitter.emitLine("br $rmw");
+        self.emitter.emitLine("end");
+        self.emitter.emitLine("end");
+        self.emitter.emit("local.get ");
+        self.emitter.emitLine(a);
+        str se = self.atomicSignExtend(bits, is64);
+        if (se.len > 0) self.emitter.emitLine(se);
         return true;
     }
 
     bool emitAtomicCmpXchg(IrInst* inst)
     {
         if (inst->nops < 3) return false;
-        bool is64 = self.isI64(inst->base.type);
-        str so = is64 ? "$atO64" : "$atO32";
-        self.emitter.emitLine(";; atomic cmpxchg lowered to plain ops");
-        if (!self.emitValuePush(inst->ops[0])) return false;
-        self.emitter.emitLine("local.tee $atA");
-        self.emitLoadOnly(inst->base.type);
-        self.emitter.emit("local.tee ");
-        self.emitter.emitLine(so);
-        self.emitter.emitLine("local.get $atA");
-        self.emitter.emit("local.get ");
-        self.emitter.emitLine(so);
+        u32 bits = self.atomicBits(inst->base.type);
+        bool is64 = self.atomicWide(inst->base.type);
+        u32 off = 0;
+        if (!self.emitAddressPush(inst->ops[0], &off)) return false;
         if (!self.emitValuePush(inst->ops[1])) return false;
-        self.emitter.emitLine(is64 ? "i64.eq" : "i32.eq");
-        self.emitter.emitLine("if");
-        self.emitter.emitLine("local.get $atA");
         if (!self.emitValuePush(inst->ops[2])) return false;
-        self.emitStoreOnly(inst->base.type);
-        self.emitter.emitLine("end");
-        self.emitter.emit("local.get ");
-        self.emitter.emitLine(so);
+        self.emitAtomicRmwMem(bits, is64, "cmpxchg", off, self.memAlign(inst->base.type));
+        str se = self.atomicSignExtend(bits, is64);
+        if (se.len > 0) self.emitter.emitLine(se);
         return true;
     }
 
@@ -1707,6 +1845,31 @@ pub struct WasmCodeGen
         self.emitter.emit(".");
         self.emitter.emitLine(suffix);
         return true;
+    }
+
+    bool emitVecMul(IrInst* inst)
+    {
+        if (inst->base.type != null && self.vecShape(inst->base.type).equals("i8x16"))
+        {
+            if (inst->nops < 2) return false;
+            if (!self.emitValuePush(inst->ops[0])) return false;
+            self.emitter.emitLine("local.set $vecA");
+            if (!self.emitValuePush(inst->ops[1])) return false;
+            self.emitter.emitLine("local.set $vecB");
+            self.emitter.emitLine("local.get $vecA");
+            self.emitter.emitLine("local.get $vecB");
+            self.emitter.emitLine("i16x8.extmul_low_i8x16_s");
+            self.emitter.emitLine("v128.const i16x8 255 255 255 255 255 255 255 255");
+            self.emitter.emitLine("v128.and");
+            self.emitter.emitLine("local.get $vecA");
+            self.emitter.emitLine("local.get $vecB");
+            self.emitter.emitLine("i16x8.extmul_high_i8x16_s");
+            self.emitter.emitLine("v128.const i16x8 255 255 255 255 255 255 255 255");
+            self.emitter.emitLine("v128.and");
+            self.emitter.emitLine("i8x16.narrow_i16x8_u");
+            return true;
+        }
+        return self.emitVecOp(inst, "mul", false);
     }
 
     bool emitVecMinMax(IrInst* inst, bool isMin)
@@ -1751,6 +1914,36 @@ pub struct WasmCodeGen
         // min_u/max_u for the int lanes, the signed suffixes would break
         // the unsigned backend contract the x86 lane loop honors
         self.emitter.emitLine(isFloat ? (isMin ? "min" : "max") : (isMin ? "min_u" : "max_u"));
+        return true;
+    }
+
+    bool emitShuffleVector(IrInst* inst)
+    {
+        if (inst->nops < 2 || inst->base.type == null) return false;
+        IrType* vt = inst->base.type;
+        str sh = self.vecShape(vt);
+        if (sh.len == 0 || vt->elem == null) return false;
+        u32 w = vt->elem->width;
+        u32 lanes = vt->count;
+        u32 bytes = w / 8;
+        if (lanes * bytes != 16 || inst->nops != lanes + 2) return false;
+        if (!self.emitValuePush(inst->ops[0])) return false;
+        if (!self.emitValuePush(inst->ops[1])) return false;
+        self.emitter.emit("i8x16.shuffle");
+        for (u32 i = 0; i < lanes; i++)
+        {
+            IrValue* ix = inst->ops[i + 2];
+            if (ix == null || ix->kind != IrValueKind::ConstInt) return false;
+            u32 s = (u32)ix->valData;
+            if (s >= lanes * 2) return false;
+            u32 src = (s < lanes ? 0 : 16) + (s % lanes) * bytes;
+            for (u32 b = 0; b < bytes; b++)
+            {
+                self.emitter.emit(" ");
+                self.emitter.emitU32(src + b);
+            }
+        }
+        self.emitter.emitLine("");
         return true;
     }
 
@@ -1937,18 +2130,12 @@ pub struct WasmCodeGen
             },
             IrOpcode::Phi => { return true; },
             IrOpcode::Call => { return self.emitCall(inst); },
-            IrOpcode::AtomicLoad => {
-                self.emitter.emitLine(";; atomic load lowered to plain load");
-                return self.emitLoadType(inst);
-            },
-            IrOpcode::AtomicStore => {
-                self.emitter.emitLine(";; atomic store lowered to plain store");
-                return self.emitStoreType(inst);
-            },
+            IrOpcode::AtomicLoad => { return self.emitAtomicLoad(inst); },
+            IrOpcode::AtomicStore => { return self.emitAtomicStore(inst); },
             IrOpcode::AtomicRmw => { return self.emitAtomicRmw(inst); },
             IrOpcode::AtomicCmpXchg => { return self.emitAtomicCmpXchg(inst); },
             IrOpcode::Fence => {
-                self.emitter.emitLine(";; fence, no-op on single threaded wasm");
+                self.emitter.emitLine("atomic.fence");
                 return true;
             },
             IrOpcode::Noret | IrOpcode::Unreachable => {
@@ -1965,7 +2152,7 @@ pub struct WasmCodeGen
             },
             IrOpcode::VecAdd => { return self.emitVecOp(inst, "add", false); },
             IrOpcode::VecSub => { return self.emitVecOp(inst, "sub", false); },
-            IrOpcode::VecMul => { return self.emitVecOp(inst, "mul", false); },
+            IrOpcode::VecMul => { return self.emitVecMul(inst); },
             IrOpcode::VecDiv => { return self.emitVecOp(inst, "div", true); },
             IrOpcode::VecFAdd => { return self.emitVecOp(inst, "add", true); },
             IrOpcode::VecFSub => { return self.emitVecOp(inst, "sub", true); },
@@ -2016,8 +2203,8 @@ pub struct WasmCodeGen
                 self.emitter.emitLine("");
                 return true;
             },
-            IrOpcode::ShuffleVector | IrOpcode::ExtractValue | IrOpcode::InsertValue |
-            IrOpcode::InlineAsm => {
+            IrOpcode::ShuffleVector => { return self.emitShuffleVector(inst); },
+            IrOpcode::ExtractValue | IrOpcode::InsertValue | IrOpcode::InlineAsm => {
                 self.failOp(null, inst->opcode);
                 return false;
             },
@@ -2302,6 +2489,10 @@ pub struct WasmCodeGen
         bool needAtN32 = false;
         bool needAtO64 = false;
         bool needAtN64 = false;
+        bool needAtV32 = false;
+        bool needAtV64 = false;
+        bool needAtR32 = false;
+        bool needAtR64 = false;
         bool needVecA = false;
         bool needVecB = false;
         for (u32 bi = 0; bi < func->nblocks; bi++)
@@ -2322,19 +2513,30 @@ pub struct WasmCodeGen
                         else needBswap32 = true;
                     },
                     IrOpcode::AtomicRmw => {
-                        needAtA = true;
-                        if (self.isI64(inst->base.type)) { needAtO64 = true; needAtN64 = true; }
-                        else { needAtO32 = true; needAtN32 = true; }
-                    },
-                    IrOpcode::AtomicCmpXchg => {
-                        needAtA = true;
-                        if (self.isI64(inst->base.type)) needAtO64 = true;
-                        else needAtO32 = true;
+                        IrAtomicRmwOp op = (IrAtomicRmwOp)inst->icmpPred;
+                        if (op == IrAtomicRmwOp::Nand || op == IrAtomicRmwOp::Max ||
+                            op == IrAtomicRmwOp::Min || op == IrAtomicRmwOp::UMax ||
+                            op == IrAtomicRmwOp::UMin)
+                        {
+                            needAtA = true;
+                            if (self.atomicWide(inst->base.type)) {
+                                needAtO64 = true; needAtN64 = true; needAtV64 = true; needAtR64 = true;
+                            } else {
+                                needAtO32 = true; needAtN32 = true; needAtV32 = true; needAtR32 = true;
+                            }
+                        }
                     },
                     IrOpcode::VecMin | IrOpcode::VecMax => {
                         IrType* vt = inst->base.type;
                         if (vt != null && vt->kind == IrTypeKind::Vector && vt->elem != null &&
                             vt->elem->kind == IrTypeKind::Int && vt->elem->width == 64)
+                        {
+                            needVecA = true;
+                            needVecB = true;
+                        }
+                    },
+                    IrOpcode::VecMul => {
+                        if (inst->base.type != null && self.vecShape(inst->base.type).equals("i8x16"))
                         {
                             needVecA = true;
                             needVecB = true;
@@ -2353,6 +2555,10 @@ pub struct WasmCodeGen
         if (needAtN32) self.emitter.emitLine("(local $atN32 i32)");
         if (needAtO64) self.emitter.emitLine("(local $atO64 i64)");
         if (needAtN64) self.emitter.emitLine("(local $atN64 i64)");
+        if (needAtV32) self.emitter.emitLine("(local $atV32 i32)");
+        if (needAtV64) self.emitter.emitLine("(local $atV64 i64)");
+        if (needAtR32) self.emitter.emitLine("(local $atR32 i32)");
+        if (needAtR64) self.emitter.emitLine("(local $atR64 i64)");
         if (needVecA) self.emitter.emitLine("(local $vecA v128)");
         if (needVecB) self.emitter.emitLine("(local $vecB v128)");
         for (u32 i = 0; i < self.nsl; i++)
