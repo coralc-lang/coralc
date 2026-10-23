@@ -28,7 +28,6 @@ main:
 	incq %r8
 	movq %r8, (%r9)
 	movq (%rdi), %r8
-	incq %r8
 	addq $0x0000000000000001, (%rdi)
 	jmp .Lmain_fill_3
 .Lmain_sum_pre_5:
@@ -56,7 +55,6 @@ main:
 	addq %rbx, %r9
 	movq %r9, (%r8)
 	movq (%rdi), %r9
-	incq %r9
 	addq $0x0000000000000001, (%rdi)
 	jmp .Lmain_sum_6
 .Lmain_done_8:

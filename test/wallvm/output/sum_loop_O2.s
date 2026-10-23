@@ -4,8 +4,6 @@
 main:
 	pushq %rbp
 	movq %rsp, %rbp
-	pushq %rbx
-	pushq %r14
 	subq $32, %rsp
 .Lmain_entry_2:
 	leaq -16(%rbp), %rsi
@@ -26,10 +24,8 @@ main:
 	jmp .Lmain_done_5
 .Lmain_body_4:
 	movq (%rdi), %r9
-	movq %r8, %rbx
-	addq %r9, %rbx
-	movq %rbx, (%rdi)
-	incq %r8
+	addq %r8, %r9
+	movq %r9, (%rdi)
 	addq $0x0000000000000001, (%rsi)
 	jmp .Lmain_loop_3
 .Lmain_done_5:
@@ -37,7 +33,5 @@ main:
 	movl %esi, %edi
 	movq %rdi, %rax
 	addq $32, %rsp
-	popq %r14
-	popq %rbx
 	leave
 	ret

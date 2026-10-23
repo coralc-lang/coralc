@@ -45,12 +45,10 @@ main:
 	addq %rbx, %r9
 	movq %r9, (%rdi)
 	movq (%r8), %r9
-	incq %r9
 	addq $0x0000000000000001, (%r8)
 	jmp .Lmain_inner_5
 .Lmain_inner_done_7:
 	movq (%rsi), %r8
-	incq %r8
 	addq $0x0000000000000001, (%rsi)
 	jmp .Lmain_outer_3
 .Lmain_done_8:

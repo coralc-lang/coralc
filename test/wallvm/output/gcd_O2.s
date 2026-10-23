@@ -5,11 +5,10 @@ main:
 	pushq %rbp
 	movq %rsp, %rbp
 	pushq %rbx
-	pushq %r14
-	subq $32, %rsp
+	subq $40, %rsp
 .Lmain_entry_2:
-	leaq -16(%rbp), %rsi
-	leaq -32(%rbp), %rdi
+	leaq -24(%rbp), %rsi
+	leaq -40(%rbp), %rdi
 	movabsq $0x0000000000000030, %r10
 	movq %r10, (%rsi)
 	movabsq $0x0000000000000012, %r10
@@ -36,8 +35,7 @@ main:
 	movq (%rsi), %rdi
 	movl %edi, %esi
 	movq %rsi, %rax
-	addq $32, %rsp
-	popq %r14
+	addq $40, %rsp
 	popq %rbx
 	leave
 	ret

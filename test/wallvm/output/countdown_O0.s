@@ -27,7 +27,6 @@ main:
 	addq %r8, %r9
 	movq %r9, (%rdi)
 	movq (%rsi), %r8
-	decq %r8
 	subq $0x0000000000000001, (%rsi)
 	jmp .Lmain_loop_3
 .Lmain_done_5:

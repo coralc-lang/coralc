@@ -24,10 +24,8 @@ main:
 	jmp .Lmain_done_5
 .Lmain_body_4:
 	movq (%rdi), %r8
-	addq $0x0000000000000015, %r8
 	addq $0x0000000000000015, (%rdi)
 	movq (%rsi), %r8
-	incq %r8
 	addq $0x0000000000000001, (%rsi)
 	jmp .Lmain_loop_3
 .Lmain_done_5:

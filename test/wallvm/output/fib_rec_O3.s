@@ -5,8 +5,6 @@ fib:
 	pushq %rbx
 	pushq %r12
 	pushq %r13
-	pushq %r15
-	subq $8, %rsp
 	subq $176, %rsp
 	movq %rdi, 0(%rsp)
 	movq 0(%rsp), %rdi
@@ -21,8 +19,6 @@ fib:
 	jmp .Lfib_rec_5
 .Lfib_base_4:
 	movq %rdi, %rax
-	addq $8, %rsp
-	popq %r15
 	popq %r13
 	popq %r12
 	popq %rbx
@@ -40,8 +36,6 @@ fib:
 	movq %rax, %rsi
 	addq %rsi, %r13
 	movq %r13, %rax
-	addq $8, %rsp
-	popq %r15
 	popq %r13
 	popq %r12
 	popq %rbx
@@ -53,8 +47,6 @@ main:
 	movq %rsp, %rbp
 	pushq %rbx
 	pushq %r12
-	pushq %r13
-	pushq %r15
 	subq $16, %rsp
 .Lmain_entry_18:
 	leaq -16(%rbp), %rbx
@@ -63,8 +55,6 @@ main:
 	movl %esi, %esi
 	movq %rsi, %rax
 	addq $16, %rsp
-	popq %r15
-	popq %r13
 	popq %r12
 	popq %rbx
 	leave

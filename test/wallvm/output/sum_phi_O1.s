@@ -27,7 +27,6 @@ main:
 .Lmain_body_4:
 	movq %r8, %rbx
 	addq %r9, %rbx
-	incq %r8
 	addq $0x0000000000000001, (%rsi)
 	movq %rbx, (%rdi)
 	jmp .Lmain_loop_3

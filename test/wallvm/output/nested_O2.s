@@ -7,11 +7,10 @@ main:
 	pushq %rbx
 	pushq %r12
 	pushq %r13
-	pushq %r14
-	subq $48, %rsp
+	subq $56, %rsp
 .Lmain_entry_2:
-	leaq -16(%rbp), %rsi
-	leaq -32(%rbp), %rdi
+	leaq -24(%rbp), %rsi
+	leaq -40(%rbp), %rdi
 	movabsq $0x0000000000000000, %r10
 	movq %r10, (%rsi)
 	movabsq $0x0000000000000000, %r10
@@ -27,7 +26,7 @@ main:
 	jne .Lmain_inner_pre_4
 	jmp .Lmain_done_8
 .Lmain_inner_pre_4:
-	leaq -48(%rbp), %r9
+	leaq -56(%rbp), %r9
 	movabsq $0x0000000000000000, %r10
 	movq %r10, (%r9)
 	jmp .Lmain_inner_5
@@ -46,19 +45,16 @@ main:
 	movq (%rdi), %r13
 	addq %r13, %r12
 	movq %r12, (%rdi)
-	incq %rbx
 	addq $0x0000000000000001, (%r9)
 	jmp .Lmain_inner_5
 .Lmain_inner_done_7:
-	incq %r8
 	addq $0x0000000000000001, (%rsi)
 	jmp .Lmain_outer_3
 .Lmain_done_8:
 	movq (%rdi), %rsi
 	movl %esi, %edi
 	movq %rdi, %rax
-	addq $48, %rsp
-	popq %r14
+	addq $56, %rsp
 	popq %r13
 	popq %r12
 	popq %rbx
