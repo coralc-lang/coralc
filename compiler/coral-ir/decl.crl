@@ -1,12 +1,21 @@
 #[[no_drop_all]]
 /* coral-ir/decl.crl — mangling, function shells, extern protos
  *
- * Mirrors codegen cgMangle/cgMangleS/cgIsCrtFn/cgEmitFuncCommon for the
- * wallvm backend. Extern decls and CRT/main names keep their raw C name;
- * everything else gets crl__loc__<parentdir>__<stem>__<name> (or
- * crl__lib__<path>__<name> for lib files). */
-import lower { Wv };
-import types { wvTy, wvStr, wvSlice };
+ * Mangling follows docs/mangle_asm.md: crl$<scope>$<segment>$…$<name>.
+ * The scope is `loc` (local project files) or `lib` (`import(lib)`
+ * packages). Segments are the declaring file's path components — for
+ * `loc`, the parent directory and file stem; for `lib`, every component
+ * after the `lib/` root. `$` separates fields, and each segment is
+ * sanitized to [A-Za-z0-9_] (leading digits prefixed with `_`).
+ *
+ * Exempt from mangling (raw source name): `main`, `extern` decls of any
+ * form (`extern`, `extern("C")`, `extern("kernel32")` — detected by the
+ * isExtern flag bit, not by convention string), and `#[[no_mangle]]`
+ * decls. The C backend uses `__` instead of `$` (its C-text emission
+ * cannot spell `$` in identifiers); the two backends intentionally
+ * diverge — wallvm emits asm directly. */
+import lower { Wv, wvNode, wvStr, wvMbReset, wvMbCh, wvMbP, wvMbSeg, wvMbStr };
+import types { wvTy };
 import context::context { AstContext, InternEntry };
 import mono::mono { MonoInstance };
 import ast {
@@ -15,39 +24,60 @@ import ast {
     node { Node, NodeKind },
     expr { Expr, ExprKind },
     stmt { Stmt, StmtKind },
-    decl { Decl, DeclKind, File, Param }
+    decl { Decl, DeclKind, File, Param, Attribute }
 };
 import common::slice { Slice };
 import(lib) wallvm::irtypes { IrContext, IrModule, IrFunc, IrValue, IrType, IrValueKind };
 
-/* exempt from mangling: `main` (the entry point) and `extern` decls
- * (flag bit 2) — extern("C") declarations keep their raw C name, which
- * covers libc and any other C library the user declares. A future
- * #[[no_mangle]] attribute adds a third exemption here. */
-bool wvMangleExempt(Wv* w, NodeId declId, str name)
+/* does the decl carry the named attribute? */
+bool wvHasAttr(Wv* w, Decl* d, str attrName)
 {
-    if (name.len == 0) return true;
-    if (name.equals("main")) return true;
-    if (declId.index != 0)
+    if (d->attrsLen == 0 || d->attrs == null) return false;
+    u32 want = w->ctx->intern(attrName);
+    u32 i = 0;
+    while (i < d->attrsLen)
     {
-        Node* n = wvNode(w, declId);
-        if (n->kind.tag == NodeKind::Decl)
-        {
-            Decl* d = &n->kind.payload.Decl.value;
-            if (d->kind.tag == DeclKind::Func && (d->kind.payload.Func.flags & 2) != 0) return true;
-            if (d->kind.tag == DeclKind::Constant && (d->kind.payload.Constant.flags & 2) != 0) return true;
-        }
+        if (d->attrs[i].name == want) return true;
+        i++;
     }
     return false;
 }
 
+/* exempt from mangling: `main` (entry point), `extern` decls (flag bit 2
+ * — any convention, incl. bare `extern` and `extern("kernel32")`), and
+ * `#[[no_mangle]]` decls. All keep their raw source name. */
+bool wvMangleExempt(Wv* w, NodeId declId, str name)
+{
+    if (name.len == 0) return true;
+    if (name.equals("main")) return true;
+    if (declId.index == 0) return false;
+    Node* n = wvNode(w, declId);
+    if (n->kind.tag != NodeKind::Decl) return false;
+    Decl* d = &n->kind.payload.Decl.value;
+    if (d->kind.tag == DeclKind::Func)
+    {
+        if ((d->kind.payload.Func.flags & 2) != 0) return true; // isExtern
+        if (wvHasAttr(w, d, "no_mangle")) return true;
+    }
+    else if (d->kind.tag == DeclKind::Constant)
+    {
+        if ((d->kind.payload.Constant.flags & 2) != 0) return true; // isExtern
+        if (wvHasAttr(w, d, "no_mangle")) return true;
+    }
+    return false;
+}
+
+/* compute the final linker name for a decl: raw for exempt decls, else
+ * crl$<scope>$<segments>$<name>. The result is owned by the reusable
+ * mangle buffer — copy it (via createFunc's irDupStr) before the next
+ * wvMangle call. */
 str wvMangle(Wv* w, NodeId declId, Str name)
 {
     if (name == 0) return str::empty();
     str nm = wvStr(w, name);
     if (wvMangleExempt(w, declId, nm)) return nm;
 
-    /* declaring file path for the prefix */
+    /* declaring file path for the scope/segments */
     u8* path = null;
     usize pathLen = 0;
     if (declId.index != 0 && w->sema != null && w->sema.diag != null)
@@ -64,13 +94,15 @@ str wvMangle(Wv* w, NodeId declId, Str name)
             }
         }
     }
+    /* drop a trailing ".crl" */
     if (pathLen >= 4 && path[pathLen - 4] == 46 && path[pathLen - 3] == 99 &&
         path[pathLen - 2] == 114 && path[pathLen - 1] == 108)
         pathLen -= 4;
 
     wvMbReset(w);
-    wvMbP(w, "crl__");
+    wvMbP(w, "crl$");
 
+    /* locate the lib/ root (leading "lib/" or any "/lib/") */
     bool isLib = false;
     usize libPos = 0;
     if (pathLen >= 4 && path[0] == 108 && path[1] == 105 && path[2] == 98 && path[3] == 47)
@@ -89,9 +121,11 @@ str wvMangle(Wv* w, NodeId declId, Str name)
         }
         q++;
     }
+
     if (isLib)
     {
-        wvMbP(w, "lib__");
+        /* crl$lib$<seg>$<seg>$…$<name> — every path component after lib/ */
+        wvMbP(w, "lib$");
         usize i = libPos;
         usize segStart = i;
         bool firstSeg = true;
@@ -101,7 +135,7 @@ str wvMangle(Wv* w, NodeId declId, Str name)
             {
                 if (i > segStart)
                 {
-                    if (!firstSeg) { wvMbCh(w, 95); wvMbCh(w, 95); }
+                    if (!firstSeg) wvMbCh(w, 36); // '$'
                     wvMbSeg(w, path + segStart, i - segStart);
                     firstSeg = false;
                 }
@@ -112,7 +146,8 @@ str wvMangle(Wv* w, NodeId declId, Str name)
     }
     else
     {
-        wvMbP(w, "loc__");
+        /* crl$loc$<parentdir>$<stem>$<name> */
+        wvMbP(w, "loc$");
         usize lastSlash = pathLen;
         usize i = 0;
         while (i < pathLen)
@@ -137,12 +172,11 @@ str wvMangle(Wv* w, NodeId declId, Str name)
         if (lastSlash < pathLen) stemStart = lastSlash + 1;
         if (pathLen > stemStart)
         {
-            if (!firstSeg) { wvMbCh(w, 95); wvMbCh(w, 95); }
+            if (!firstSeg) wvMbCh(w, 36); // '$'
             wvMbSeg(w, path + stemStart, pathLen - stemStart);
         }
     }
-    wvMbCh(w, 95);
-    wvMbCh(w, 95);
+    wvMbCh(w, 36); // '$'
     wvMbSeg(w, nm.ptr, nm.len);
     return wvMbStr(w);
 }

@@ -1,1 +1,354 @@
-# placeholder — being scaffolded for the wallvm backend
+#[[no_drop_all]]
+/* coral-ir/wallvm.crl — wallvm backend entry point
+ *
+ * generateWallVm: analyzed AST → wallvm IR → pipeline → asm. Mirrors
+ * generateC's shape but builds IR directly (no text streams). Phase 1:
+ * one collection pass that mangles each symbol exactly once, detects
+ * raw-name collisions at compile time, declares IrFunc shells (externs
+ * + definitions), then lowers definition bodies. */
+import lower { Wv, WallVmResult, wvNode, wvErr, wvStr, wvResolved, wvPushLocal,
+               wvBlock, wvSetBlock, wvTerm, wvPos, wvFnMapInit, wvFnMapPut };
+import types { wvTy };
+import decl { wvMangle, wvMangleExempt, wvDeclareFunc };
+import stmt { wvStmt };
+import expr { wvExpr };
+import context::context { AstContext, InternEntry };
+import build::arena { Arena };
+import mono::mono { MonoContext, MonoInstance, MonoInstanceKind };
+import diag::code { ErrorCode };
+import sem::sema { Sema };
+import ast {
+    id { Str, NodeId, locFile },
+    types { Ty, TypeEntry, TypeKind },
+    node { Node, NodeKind },
+    expr { Expr, ExprKind },
+    stmt { Stmt, StmtKind },
+    decl { Decl, DeclKind, File, Param }
+};
+import common::slice { Slice };
+import(lib) wallvm::irtypes { IrContext, IrModule, IrFunc, IrBlock, IrValue, IrValueKind, IrType, IrTypeKind, irCtxCreate, irCtxDestroy };
+import(lib) wallvm::irOps { IrICmpPred };
+import(lib) wallvm::irBuilder { IrBuilder };
+import(lib) wallvm::irPrinter { IrPrinter };
+import(lib) wallvm::passes::validate { IrValidator };
+import(lib) wallvm::wallvm { irCompileAsm, gUnrollEnabled };
+import(lib) wallvm::rules::asm_rules { CallingConvention };
+import(lib) std::mman { alloc, dealloc };
+import(lib) std::string { String };
+import(lib) platform::libc { printf };
+
+/* ── name → first-decl collision table (open-addressed) ─────── */
+
+struct WvNameEnt
+{
+    str name;        // stable (owned by IrFunc) or empty = empty slot
+    u32 declIdx;     // declId.index of the first decl seen
+    bool isDefn;     // first decl had a body
+    IrFunc* f;
+}
+
+struct WvNames
+{
+    WvNameEnt* ents;
+    u32 cap;         // power of two
+}
+
+u32 wvHashStr(str s)
+{
+    u32 h = 2166136261;
+    usize i = 0;
+    while (i < s.len) { h = (h ^ (u32)s.ptr[i]) * 16777619; i++; }
+    return h;
+}
+
+bool wvNamesInit(WvNames* t, u32 capPow2)
+{
+    t->cap = capPow2;
+    t->ents = alloc<WvNameEnt>((usize)capPow2);
+    if (t->ents == null) { t->cap = 0; return false; }
+    u32 i = 0;
+    while (i < capPow2) { t->ents[i].name = str::empty(); t->ents[i].f = null; i++; }
+    return true;
+}
+
+/* look up a name; returns the entry or null */
+WvNameEnt* wvNamesFind(WvNames* t, str name)
+{
+    if (t->cap == 0) return null;
+    u32 slot = wvHashStr(name) & (t->cap - 1);
+    while (t->ents[slot].name.len != 0)
+    {
+        if (t->ents[slot].name.equals(name)) return t->ents + slot;
+        slot = (slot + 1) & (t->cap - 1);
+    }
+    return null;
+}
+
+/* claim a slot for a new name; returns the entry */
+WvNameEnt* wvNamesInsert(WvNames* t, str name)
+{
+    if (t->cap == 0) return null;
+    u32 slot = wvHashStr(name) & (t->cap - 1);
+    while (t->ents[slot].name.len != 0)
+    {
+        if (t->ents[slot].name.equals(name)) return t->ents + slot;
+        slot = (slot + 1) & (t->cap - 1);
+    }
+    t->ents[slot].name = name;
+    return t->ents + slot;
+}
+
+/* ── opt-level mapping (mirror of runGcc's C flags) ─────────── */
+
+u32 wvOptLevel(str opt)
+{
+    if (opt.len == 7 && opt.ptr[0] == 114) return 2; // "release"
+    if (opt.len == 4 && opt.ptr[0] == 115) return 1; // "size"
+    if (opt.len == 2 && opt.ptr[0] == 79) return 3;  // "O3"
+    return 0; // debug
+}
+
+/* ── body lowering ──────────────────────────────────────────── */
+
+void wvLowerBody(Wv* w, NodeId declId, Decl* d, IrFunc* f)
+{
+    w->fn = f;
+    w->retTy = d->kind.payload.Func.returnType;
+    w->locLen = 0;
+    w->term = false;
+    w->breakT = null;
+    w->contT = null;
+    w->loopDepth = 0;
+
+    IrBlock* entry = wvBlock(w, "entry");
+    wvSetBlock(w, entry);
+
+    /* bind params: create arg values, alloca slots, store args in */
+    u32 np = d->kind.payload.Func.paramsLen;
+    u32 i = 0;
+    while (i < np)
+    {
+        Node* pn = wvNode(w, d->kind.payload.Func.params[i]);
+        if (pn->kind.tag == NodeKind::Param)
+        {
+            Param* pp = &pn->kind.payload.Param.value;
+            if ((pp->flags & 16) == 0) // not variadic
+            {
+                IrType* at = wvTy(w->ctx, w->file, w->ir, pp->typeNode, 0);
+                IrValue* av = alloc<IrValue>((usize)1);
+                if (av == null) { wvErr(w, declId, "out of memory binding param"); return; }
+                *av = IrValue { IrValueKind::Arg, at, w->ir->nextValueId(), 0,
+                                wvStr(w, pp->name), null, 0, 0 };
+                f->addArg(av);
+                if (at != null && at->kind != IrTypeKind::Void)
+                {
+                    IrValue* slot = wvV(w->b.alloca(at));
+                    if (slot != null)
+                    {
+                        w->b.store(av, slot);
+                        wvPushLocal(w, pp->name, slot);
+                    }
+                }
+            }
+        }
+        i++;
+    }
+
+    /* lower the body block */
+    wvStmt(w, d->kind.payload.Func.body);
+
+    /* implicit terminator on fallthrough */
+    if (!w->term)
+    {
+        IrType* rt = wvTy(w->ctx, w->file, w->ir, wvResolved(w, w->retTy), 0);
+        if (rt == null || rt->kind == IrTypeKind::Void) w->b.retVoid();
+        else w->b.ret(w->ir->constInt(rt, 0));
+        wvTerm(w);
+    }
+}
+
+/* declare + collect one function decl; returns the IrFunc for the
+ * definition (or null for extern-only / generic / collision-skipped) */
+IrFunc* wvCollectFunc(Wv* w, WvNames* names, NodeId declId, Decl* d)
+{
+    /* skip generics (Phase 2) */
+    if (w->mono != null && w->mono.genericCount(declId) != 0) return null;
+
+    str name = wvMangle(w, declId, d->kind.payload.Func.name);
+    bool isExtern = (d->kind.payload.Func.flags & 2) != 0;
+    bool isDefn = (d->kind.payload.Func.flags & 8) != 0 && !isExtern;
+
+    WvNameEnt* ent = wvNamesFind(names, name);
+    if (ent != null)
+    {
+        /* collision: two definitions of the same final name = error */
+        if (ent->isDefn && isDefn)
+        {
+            w->errors++;
+            w->sema.semaErrorNode(ErrorCode::CodegenInternal, declId,
+                "duplicate definition of unmangled symbol (no_mangle/extern collision)");
+            return null;
+        }
+        /* existing definition + new extern: keep the definition */
+        if (ent->isDefn && !isDefn) return null;
+        /* existing extern + new definition: promote the shell to a definition */
+        if (!ent->isDefn && isDefn)
+        {
+            ent->isDefn = true;
+            ent->f->isExtern = false;
+            wvFnMapPut(w, declId.index, ent->f);
+            return ent->f;
+        }
+        /* two externs (or extern seen twice): dedup, keep the first */
+        return null;
+    }
+
+    /* new name: declare the shell and claim the slot */
+    IrFunc* f = wvDeclareFunc(w, declId, d);
+    if (f == null) return null;
+    if (!isExtern) w->mod.addFunc(f);
+    else if (f->isExtern) w->mod.addFunc(f); // externs are in the module (skipped by the pipeline)
+    ent = wvNamesInsert(names, name);
+    if (ent != null)
+    {
+        ent->declIdx = declId.index;
+        ent->isDefn = isDefn;
+        ent->f = f;
+    }
+    if (isDefn) wvFnMapPut(w, declId.index, f);
+    return isDefn ? f : null;
+}
+
+/* ── entry point ────────────────────────────────────────────── */
+
+pub WallVmResult generateWallVm(AstContext* ctx, File* file, MonoContext* mono, Arena* arena, str opt)
+{
+    WallVmResult result;
+    result.asm = Slice::from(null, 0);
+    result.irText = Slice::from(null, 0);
+    result.errors = 0;
+
+    gUnrollEnabled = false;
+
+    Wv w;
+    w.ctx = ctx;
+    w.file = file;
+    w.mono = mono;
+    w.sema = null;
+    if (mono != null) w.sema = mono.sema;
+    w.errors = 0;
+    w.locNames = null;
+    w.locSlots = null;
+    w.locLen = 0;
+    w.locCap = 0;
+    w.fn = null;
+    w.block = null;
+    w.term = false;
+    w.retTy = 0;
+    w.breakT = null;
+    w.contT = null;
+    w.loopDepth = 0;
+    w.mb = String::new();
+    w.fnKeys = null;
+    w.fnVals = null;
+    w.fnCap = 0;
+    w.subs = null;
+    w.subsLen = 0;
+
+    w.ir = irCtxCreate();
+    if (w.ir == null) { result.errors = 1; return result; }
+    w.mod = w.ir->createModule("coral");
+    w.b = IrBuilder::new(w.ir);
+    wvFnMapInit(&w, 1024);
+
+    WvNames names;
+    bool namesOk = wvNamesInit(&names, 1024);
+
+    /* collect + declare every function (externs + non-generic defs) */
+    IrFunc** bodies = null;
+    NodeId* bodyDecls = null;
+    u32 bodiesLen = 0;
+    u32 bodiesCap = file->declsLen + 64;
+    if (bodiesCap > 0)
+    {
+        bodies = alloc<IrFunc*>((usize)bodiesCap);
+        bodyDecls = alloc<NodeId>((usize)bodiesCap);
+    }
+    u32 i = 0;
+    while (i < file->declsLen)
+    {
+        NodeId did = file->decls[i];
+        Node* n = wvNode(&w, did);
+        if (n->kind.tag == NodeKind::Decl)
+        {
+            Decl* d = &n->kind.payload.Decl.value;
+            if (d->kind.tag == DeclKind::Func)
+            {
+                IrFunc* f = wvCollectFunc(&w, &names, did, d);
+                if (f != null && bodiesLen < bodiesCap)
+                {
+                    bodies[bodiesLen] = f;
+                    bodyDecls[bodiesLen] = did;
+                    bodiesLen++;
+                }
+            }
+        }
+        i++;
+    }
+
+    /* lower definition bodies */
+    i = 0;
+    while (i < bodiesLen && w.errors == 0)
+    {
+        Node* n = wvNode(&w, bodyDecls[i]);
+        Decl* d = &n->kind.payload.Decl.value;
+        wvLowerBody(&w, bodyDecls[i], d, bodies[i]);
+        i++;
+    }
+
+    /* validate every function in the module */
+    if (w.errors == 0)
+    {
+        IrValidator v = IrValidator::new(w.ir);
+        u32 fi = 0;
+        while (fi < w.mod->nfuncs)
+        {
+            IrFunc* f = w.mod->funcs[fi];
+            if (f != null && !f->isExtern && !v.validateFunc(f))
+            {
+                w.errors++;
+                printf(C"error: IR validation failed in %.*s: %.*s\n",
+                       (i32)f->base.name.len, (const cchar*)f->base.name.ptr,
+                       (i32)v.lastError.len, (const cchar*)v.lastError.ptr);
+            }
+            fi++;
+        }
+    }
+
+    /* compile to asm */
+    if (w.errors == 0)
+    {
+        str asmText = irCompileAsm(w.mod, w.ir, CallingConvention::SystemV, wvOptLevel(opt));
+        if (asmText.ptr != null && asmText.len > 0)
+            result.asm = Slice::from(asmText.ptr, asmText.len);
+        else
+        {
+            w.errors++;
+            printf(C"error: wallvm asm generation failed\n");
+        }
+    }
+
+    result.errors = w.errors;
+
+    /* cleanup */
+    if (bodies != null) dealloc<IrFunc*>(bodies);
+    if (bodyDecls != null) dealloc<NodeId>(bodyDecls);
+    if (names.ents != null) dealloc<WvNameEnt>(names.ents);
+    if (w.fnKeys != null) dealloc<u32>(w.fnKeys);
+    if (w.fnVals != null) dealloc<IrFunc*>(w.fnVals);
+    w.mb.free();
+    if (w.locNames != null) dealloc<Str>(w.locNames);
+    if (w.locSlots != null) dealloc<IrValue*>(w.locSlots);
+    irCtxDestroy(w.ir);
+    return result;
+}

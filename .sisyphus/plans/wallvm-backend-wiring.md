@@ -21,6 +21,26 @@
 
 ### Known wallvm gaps relevant to this roadmap (verify in code — docs stale)
 
+- **Extern lib name is discarded today.** `extern("libname") T name(args);` —
+  the parser (`coral-parser/decl.crl:403-409`) accepts the string literal
+  but throws it away (`self.expect(TokenKind::String)`); the AST's
+  `DeclKind::Func` payload has no lib-name field, only the isExtern flag
+  (bit 1). The C backend links everything against libc. For wallvm, the
+  lib name must be honoured: `IrFunc.isExtern` + `externLib`/`externSym`
+  (see `lib/wallvm/ffi/extern.crl ExternLib`/`FfiCtx`) drive per-symbol
+  linker directives (`-l<lib>`). This needs (a) an AST field to carry the
+  lib name, (b) lowering into wallvm's FfiCtx, (c) `runGcc` passing the
+  collected `-l` flags. Phase 3+ concern.
+- **Struct layout attributes are parsed but never honoured.**
+  `#[[packed]]` and `#[[reorder]]` (`#[[reorder, packed]]` composite) are
+  in the attribute list (`coral-ast/decl.crl:23-27`) but the C backend
+  ignores them (no `__attribute__((packed))` emission, no field
+  reordering). wallvm's `createStructType` (`irtypes.crl:793`) is already
+  alignment-aware (computes offsets/alignment); honouring these becomes
+  possible: `packed` = 1-byte alignment for all fields, `reorder` = sort
+  fields by descending alignment (best memory layout). Phase 3 concern.
+
+
 - **G29** no module data emission on native targets; `dataSection` never flushed (`x86_64_base.crl getOutput:153`); zero `Global`/`StringConst` handling in `target/x86_64/`.
 - **G37** absolute symbol refs / no PIC → `-no-pie` interim, RIP-relative folds into G29 fix.
 - **G40** `InlineAsm` silently dropped on every native backend.
