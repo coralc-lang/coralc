@@ -1,0 +1,247 @@
+#[[no_drop_all]]
+/* coral-ir/lower.crl — wallvm lowering state and helpers
+ *
+ * Wv is the wallvm analog of Codegen: the same AstContext/File/MonoContext
+ * /Sema inputs, but targeting wallvm IrContext/IrModule/IrBuilder instead
+ * of C text. Phase 1 scope: extern protos, non-generic function bodies,
+ * integer literals/arithmetic/comparisons, locals (alloca+load/store),
+ * direct calls, if/while, return. */
+import context::context { AstContext };
+import mono::mono { MonoContext, MonoSubstitution };
+import diag::code { ErrorCode };
+import sem::sema { Sema };
+import ast {
+    id { Str, SourceLoc, NodeId, locFile },
+    types { Ty, TypeEntry, TypeKind },
+    node { Node, NodeKind },
+    expr { Expr, ExprKind },
+    stmt { Stmt, StmtKind },
+    decl { Decl, DeclKind, File, Param }
+};
+import(common) common::slice { Slice };
+import(lib) wallvm::irtypes { IrContext, IrModule, IrFunc, IrBlock, IrValue, IrType };
+import(lib) wallvm::irBuilder { IrBuilder };
+import(lib) std::mman { alloc, dealloc, realloc };
+
+pub struct Wv
+{
+    AstContext* ctx;
+    File* file;
+    MonoContext* mono;
+    Sema* sema;
+    IrContext* ir;
+    IrModule* mod;
+    IrBuilder b;
+    u32 errors;
+
+    /* local slots: name → alloca ptr (pushed per function / per scope) */
+    Str* locNames;
+    IrValue** locSlots;
+    u32 locLen;
+    u32 locCap;
+
+    /* per-function lowering state */
+    IrFunc* fn;
+    IrBlock* block;
+    bool term;          // current block already has a terminator
+    Ty retTy;           // current function return type (for implicit void ret)
+
+    /* loop targets */
+    IrBlock* breakT;
+    IrBlock* contT;
+    u32 loopDepth;
+
+    /* reusable name buffer for mangling (wallvm dups names on create) */
+    u8* nameBuf;
+    usize nameCap;
+    usize nameLen;
+
+    /* monomorphisation substitution for the current instance */
+    MonoSubstitution* subs;
+    u32 subsLen;
+}
+
+pub struct WallVmResult
+{
+    Slice asm;
+    Slice irText;
+    u32 errors;
+}
+
+/* ── small helpers ──────────────────────────────────────────── */
+
+Node* wvNode(Wv* w, NodeId id) { return w->ctx->nodes + id.index; }
+
+void wvErr(Wv* w, NodeId id, str msg)
+{
+    w->errors++;
+    w->sema.semaErrorNode(ErrorCode::CodegenUnsupported, id, msg);
+}
+
+/* intern Str → str */
+str wvStr(Wv* w, Str s)
+{
+    if (s == 0) return str::empty();
+    InternEntry* e = w->ctx->interns + s;
+    return str { .ptr = (const u8*)e.ptr, .len = e.len };
+}
+
+Slice wvSlice(Wv* w, Str s)
+{
+    if (s == 0) return Slice::from(null, 0);
+    InternEntry* e = w->ctx->interns + s;
+    return Slice::from(e.ptr, e.len);
+}
+
+/* ensure the builder points at w->block (skips dead code after a
+ * terminator by starting a fresh unreachable block) */
+void wvPos(Wv* w)
+{
+    if (w->block == null) return;
+    w->b.pos(w->block, null);
+}
+
+/* current-block tracking: mark terminator emitted */
+void wvTerm(Wv* w)
+{
+    w->term = true;
+}
+
+IrBlock* wvBlock(Wv* w, str name)
+{
+    IrBlock* bb = w->ir->createBlock(name);
+    w->fn->addBlock(bb);
+    return bb;
+}
+
+/* switch to a (possibly new) block for continued emission */
+void wvSetBlock(Wv* w, IrBlock* bb)
+{
+    w->block = bb;
+    w->term = false;
+    wvPos(w);
+}
+
+/* resolve a type through the current instance's substitutions (mirror
+ * of codegen cgSubstTy) */
+Ty wvSubstTy(Wv* w, Ty t)
+{
+    if (t == 0 || w->subsLen == 0 || w->subs == null) return t;
+    TypeEntry* e = w->ctx->types + t;
+    if (e.kind.tag == TypeKind::TypeParam)
+    {
+        u32 i = 0;
+        while (i < w->subsLen)
+        {
+            if (w->subs[i].index == e.kind.payload.TypeParam.index ||
+                w->subs[i].parameter == e.kind.payload.TypeParam.name)
+                return w->subs[i].typeNode;
+            i++;
+        }
+    }
+    return t;
+}
+
+/* strip Const/Comptime wrappers around a resolved type */
+Ty wvResolved(Wv* w, Ty t)
+{
+    Ty rt = t != 0 ? wvSubstTy(w, t) : 0;
+    while (rt != 0)
+    {
+        TypeEntry* te = w->ctx->types + rt;
+        if (te.kind.tag == TypeKind::Const) rt = te.kind.payload.Const.base;
+        else if (te.kind.tag == TypeKind::Comptime) rt = te.kind.payload.Comptime.base;
+        else break;
+    }
+    return rt;
+}
+
+/* local-slot stack push/pop */
+void wvPushLocal(Wv* w, Str name, IrValue* slot)
+{
+    if (w->locLen >= w->locCap)
+    {
+        u32 nc = w->locCap == 0 ? 8 : w->locCap * 2;
+        Str* nn = alloc<Str>((usize)nc);
+        IrValue** ns = alloc<IrValue*>((usize)nc);
+        if (nn == null || ns == null) { wvErr(w, NodeId{}, "out of memory in local table"); return; }
+        u32 i = 0;
+        while (i < w->locLen) { nn[i] = w->locNames[i]; ns[i] = w->locSlots[i]; i++; }
+        if (w->locNames != null) dealloc<Str>(w->locNames);
+        if (w->locSlots != null) dealloc<IrValue*>(w->locSlots);
+        w->locNames = nn;
+        w->locSlots = ns;
+        w->locCap = nc;
+    }
+    w->locNames[w->locLen] = name;
+    w->locSlots[w->locLen] = slot;
+    w->locLen++;
+}
+
+IrValue* wvFindLocal(Wv* w, Str name)
+{
+    u32 i = w->locLen;
+    while (i > 0)
+    {
+        i--;
+        if (w->locNames[i] == name) return w->locSlots[i];
+    }
+    return null;
+}
+
+/* ── reusable mangle buffer ─────────────────────────────────── */
+
+void wvMbEnsure(Wv* w, usize need)
+{
+    if (w->nameCap >= need) return;
+    usize nc = w->nameCap == 0 ? 96 : w->nameCap;
+    while (nc < need) nc *= 2;
+    u8* nb = realloc<w_ubyte_alias>(w->nameBuf, nc);
+    if (nb == null) { w->nameBuf = null; w->nameCap = 0; w->nameLen = 0; return; }
+    w->nameBuf = nb;
+    w->nameCap = nc;
+}
+
+void wvMbReset(Wv* w) { w->nameLen = 0; }
+
+void wvMbCh(Wv* w, u8 c)
+{
+    wvMbEnsure(w, w->nameLen + 1);
+    if (w->nameBuf == null) return;
+    w->nameBuf[w->nameLen] = c;
+    w->nameLen++;
+}
+
+void wvMbSeg(Wv* w, const u8* p, usize n)
+{
+    usize i = 0;
+    bool first = true;
+    while (i < n)
+    {
+        u8 c = p[i];
+        bool ok = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) ||
+                  (c >= 48 && c <= 57) || c == 95;
+        if (!ok) c = 95;
+        if (first && c >= 48 && c <= 57) wvMbCh(w, 95);
+        wvMbCh(w, c);
+        first = false;
+        i++;
+    }
+}
+
+void wvMbP(Wv* w, str s)
+{
+    if (s.ptr == null) return;
+    wvMbSeg(w, s.ptr, s.len);
+}
+
+str wvMbStr(Wv* w)
+{
+    wvMbEnsure(w, w->nameLen + 1);
+    if (w->nameBuf == null) return str::empty();
+    w->nameBuf[w->nameLen] = 0;
+    return str { .ptr = (const u8*)w->nameBuf, .len = w->nameLen };
+}
+
+/* the decl→wallvm entry, defined in decl.crl */
+pub str wvMangle(Wv* w, NodeId declId, Str name);
