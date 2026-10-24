@@ -67,6 +67,9 @@ struct MiPage
     u64 xthreadFreeCount;
     bool inFull;             // currently linked into heap->fullPages
     MiSegment* segment;
+    MiHeap* owner;           // owning heap (set at creation); huge pages have
+                             // segment == null and rely on this so a cross-thread
+                             // free unlinks from the right heap's hugePages
     u32 pageIdx;
     bool retired;
     u32 retireCount;         // retirement expiry counter
@@ -324,12 +327,19 @@ void _miMapRemoveChain(MiSegmentMap* map, u32 idx, u8* pageBase)
     }
 }
 
-// Segment map operations. A page is indexed once per 4 MiB window it
-// touches so lookups by any interior pointer resolve to it.
+// Segment map operations. A page is indexed once per 4 MiB window its
+// full reserved extent touches, so lookups by any interior pointer ever
+// handed out resolve to it. Upstream mimalloc gets this for free:
+// segments are aligned to their size, so `_mi_ptr_segment(p)` masks the
+// pointer to the segment base and covers every interior address by
+// construction (src/segment-map.c). The port's segments are carved from
+// 64 KiB arena slices and cannot mask, so the hash-chain must cover the
+// page's whole lifetime extent up front — capacity grows via
+// _miPageExtend, but reserved never changes after page creation.
 void _miSegmentMapInsert(MiSegmentMap* map, u8* pageBase, MiPage* page)
 {
     _miLockAcquire(&_miMapLockWord);
-    usize size = page->capacity * page->blockSize;
+    usize size = page->reserved * page->blockSize;
     if (size == 0) size = 1;
     u64 start = (u64)pageBase & ~(u64)0x3FFFFF;
     u64 end = ((u64)pageBase + (u64)size - 1) & ~(u64)0x3FFFFF;
@@ -543,6 +553,7 @@ MiPage* _miPageAlloc(MiHeap* heap, u32 sc)
     page->xthreadFreeCount = 0;
     page->inFull = false;
     page->segment = seg;
+    page->owner = heap;
     page->pageIdx = 0;
     page->retired = false;
     page->retireCount = 0;
@@ -597,8 +608,8 @@ bool _miPageExtend(MiHeap* heap, MiPage* page)
 
 void _miPageFree(MiHeap* heap, MiPage* page, u32 sc)
 {
-    // Remove from segment map
-    _miSegmentMapRemove(&_miGlobalPages, page->base, page->capacity * page->blockSize);
+    // Remove from segment map (same full reserved extent insert used)
+    _miSegmentMapRemove(&_miGlobalPages, page->base, page->reserved * page->blockSize);
 
     // Unlink from heap
     if (page->prev != null) page->prev->next = page->next;
@@ -633,6 +644,10 @@ void _miPageMaybeRetire(MiHeap* heap, MiPage* page, u32 sc)
     heap->pageCounts[sc]--;
 
     page->next = heap->freePages[sc];
+    page->prev = null;           // must be null: reuse re-links this page as
+                                 // a list head, and a stale prev would make
+                                 // the next _miPageMoveToFull splice through
+                                 // a foreign page's next/prev
     heap->freePages[sc] = page;
     page->retired = true;
 }
@@ -967,6 +982,7 @@ pub struct MiAlloc
             page->xthreadFree = null;
             page->xthreadFreeCount = 0;
             page->segment = null;
+            page->owner = &self.heap;
             page->pageIdx = 0;
             page->retired = false;
             page->retireCount = 0;
@@ -1045,6 +1061,11 @@ pub struct MiAlloc
                     page->used++;
                     page->freeCount--;
                     self.heap.totalAllocated += _miBlockSize(sc);
+
+                    // Same fullPages rule as the fast path
+                    if (page->freeCount == 0 && page->capacity >= page->reserved)
+                        _miPageMoveToFull(&self.heap, page, sc);
+
                     return (rawptr)block;
                 }
             }
@@ -1057,12 +1078,34 @@ pub struct MiAlloc
         {
             self.heap.freePages[sc] = page->next;
             page->next = null;
+            page->prev = null;
             page->retired = false;
+            page->retireCount = 0;
 
-            // Rebuild free list from localFree
+            // Merge localFree into free — a retired page (used == 0) had
+            // its blocks split between both lists; overwriting free with
+            // localFree silently drops the free chain and permanently
+            // shrinks the page. Mirrors real mimalloc's list merge on
+            // page reuse (_mi_page_free_collect style: empty list takes
+            // the other, else append).
             if (page->localFree != null)
             {
-                page->free = page->localFree;
+                if (page->free == null)
+                {
+                    page->free = page->localFree;
+                }
+                else
+                {
+                    MiBlock* tail = page->localFree;
+                    while (true)
+                    {
+                        MiBlock* nxt = _miFreeBlockDecode(tail, page);
+                        if (nxt == null) break;
+                        tail = nxt;
+                    }
+                    _miFreeBlockEncode(tail, page->free, page);
+                    page->free = page->localFree;
+                }
                 page->localFree = null;
             }
 
@@ -1108,8 +1151,16 @@ pub struct MiAlloc
         // Handle huge page deallocation (single mmap-backed page)
         if (page->segment == null)
         {
-            // Unlink from hugePages
-            MiPage** pp = &self.heap.hugePages;
+            // Unlink from the OWNING heap's hugePages — this heap may be a
+            // different thread's allocator, and walking its own hugePages
+            // would leave a dangling MiPage* on the owner's list (UAF on
+            // the next huge-page walk). Upstream mimalloc keys huge pages
+            // by segment owner (src/page.c / segment kind MI_SEGMENT_HUGE);
+            // the port's huge pages have no segment, so the owner pointer
+            // on the page plays that role.
+            MiHeap* ownerHeap = page->owner;
+            if (ownerHeap == null) ownerHeap = &self.heap;
+            MiPage** pp = &ownerHeap->hugePages;
             while (*pp != null)
             {
                 if (*pp == page)
@@ -1123,7 +1174,7 @@ pub struct MiAlloc
             _miSegmentMapRemove(&_miGlobalPages, page->base, allocSize);
             munmap((rawptr)page, @sizeof(MiPage));
             munmap(ptr, allocSize);
-            self.heap.totalFreed += allocSize;
+            ownerHeap->totalFreed += allocSize;
             return;
         }
 
