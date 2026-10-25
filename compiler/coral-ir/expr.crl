@@ -9,7 +9,7 @@
  * per-reference re-mangling, no linear decl scans. */
 import lower { Wv, wvNode, wvErr, wvStr, wvResolved, wvSubstTy, wvFindLocal,
                wvPushLocal, wvFnMapGet, wvBlock, wvSetBlock, wvTerm, wvPos };
-import types { wvTy };
+import types { wvTy, wvFindTypeDecl };
 import decl { wvMangle, wvDeclareFunc };
 import context::context { AstContext };
 import mono::mono { MonoContext, MonoInstance };
@@ -20,13 +20,15 @@ import ast {
     node { Node, NodeKind },
     expr { Expr, ExprKind },
     stmt { Stmt, StmtKind },
-    decl { Decl, DeclKind, Param }
+    decl { Decl, DeclKind, Field, Param }
 };
 import common::slice { Slice };
 import(lib) wallvm::irtypes { IrContext, IrModule, IrFunc, IrValue, IrValueKind, IrType, IrTypeKind, IrInst };
 import(lib) wallvm::irOps { IrICmpPred, IrFCmpPred };
 import(lib) wallvm::irBuilder { IrBuilder };
 import(lib) std::mman { alloc, dealloc };
+import(lib) platform::libc { strtod };
+import(lib) core::cchar { cchar };
 
 /* builder ops return IrInst*; the SSA value is the instruction's base */
 pub IrValue* wvV(IrInst* inst) { return inst != null ? &inst->base : null; }
@@ -49,7 +51,6 @@ pub bool wvTyUnsigned(Wv* w, Ty t)
 
 pub IrValue* wvExpr(Wv* w, NodeId id);
 
-/* ── callee resolution ──────────────────────────────────────── */
 
 /* resolve a bare-name call target: sema scope lookup → declId → the
  * pre-declared IrFunc from the collection pass. Falls back to declaring
@@ -111,7 +112,6 @@ pub IrValue* wvPromoteVararg(Wv* w, IrValue* v, Ty coralTy)
     }
 }
 
-/* ── calls ──────────────────────────────────────────────────── */
 
 pub IrValue* wvCall(Wv* w, Expr* e, NodeId id)
 {
@@ -158,12 +158,12 @@ pub IrValue* wvCall(Wv* w, Expr* e, NodeId id)
     return res;
 }
 
-/* ── arithmetic / comparison ────────────────────────────────── */
 
-pub IrValue* wvBinaryArith(Wv* w, ExprKind k, NodeId lid, NodeId rid, NodeId id, Ty ct)
+/* value-level arithmetic: l and r are already evaluated. Shared by
+ * binary expressions and compound assignment (`x += e` = load, apply,
+ * store). */
+pub IrValue* wvArithVals(Wv* w, ExprKind k, IrValue* l, IrValue* r, NodeId id, Ty ct)
 {
-    IrValue* l = wvExpr(w, lid);
-    IrValue* r = wvExpr(w, rid);
     if (l == null || r == null) return null;
     Ty rt = wvResolved(w, ct);
     bool isFloat = false;
@@ -195,10 +195,16 @@ pub IrValue* wvBinaryArith(Wv* w, ExprKind k, NodeId lid, NodeId rid, NodeId id,
     }
 }
 
-pub IrValue* wvCompare(Wv* w, ExprKind k, NodeId lid, NodeId rid, NodeId id, Ty ct)
+pub IrValue* wvBinaryArith(Wv* w, ExprKind k, NodeId lid, NodeId rid, NodeId id, Ty ct)
 {
     IrValue* l = wvExpr(w, lid);
     IrValue* r = wvExpr(w, rid);
+    return wvArithVals(w, k, l, r, id, ct);
+}
+
+/* value-level comparison (see wvArithVals) */
+pub IrValue* wvCompareVals(Wv* w, ExprKind k, IrValue* l, IrValue* r, NodeId id, Ty ct)
+{
     if (l == null || r == null) return null;
     Ty rt = wvResolved(w, ct);
     bool isFloat = false;
@@ -236,6 +242,13 @@ pub IrValue* wvCompare(Wv* w, ExprKind k, NodeId lid, NodeId rid, NodeId id, Ty 
         },
         else => { wvErr(w, id, "unhandled comparison"); return null; },
     }
+}
+
+pub IrValue* wvCompare(Wv* w, ExprKind k, NodeId lid, NodeId rid, NodeId id, Ty ct)
+{
+    IrValue* l = wvExpr(w, lid);
+    IrValue* r = wvExpr(w, rid);
+    return wvCompareVals(w, k, l, r, id, ct);
 }
 
 /* short-circuit And/Or via result alloca + condBr (no phis) */
@@ -295,7 +308,424 @@ pub IrValue* wvCast(Wv* w, IrValue* v, IrType* st, IrType* dt, bool srcUnsigned,
     return wvV(w->b.bitcast(v, dt));
 }
 
-/* ── the main expression dispatch ───────────────────────────── */
+
+/* coerce any expression value to an i1 condition: i1 passes through,
+ * other ints compare against 1, floats against 0.0, pointers against
+ * null. Returns null on failure. */
+pub IrValue* wvCond(Wv* w, IrValue* v)
+{
+    if (v == null || v->type == null) return null;
+    if (v->type->kind == IrTypeKind::Int && v->type->width == 1) return v;
+    if (v->type->kind == IrTypeKind::Float)
+        return wvV(w->b.fcmp(IrFCmpPred::One, v, w->ir->constFloat(v->type, 0.0)));
+    if (v->type->kind == IrTypeKind::Ptr)
+        return wvV(w->b.icmp(IrICmpPred::Ne, v, w->ir->constInt(v->type, 0)));
+    return wvV(w->b.icmp(IrICmpPred::Ne, v, w->ir->constInt(v->type, 1)));
+}
+
+pub IrValue* wvAddrOf(Wv* w, NodeId id);
+
+/* strip Const/Comptime wrappers; Named alias/distinct unwrapping happens
+ * where the decl is needed */
+pub Ty wvUnwrapTy(Wv* w, Ty t)
+{
+    u32 guard = 0;
+    while (t != 0 && guard < 8)
+    {
+        TypeEntry* e = w->ctx->types + t;
+        if (e->kind.tag == TypeKind::Const) t = e->kind.payload.Const.base;
+        else if (e->kind.tag == TypeKind::Comptime) t = e->kind.payload.Comptime.base;
+        else return t;
+        guard++;
+    }
+    return t;
+}
+
+/* is this IR type an aggregate (address-copied, never register-loaded)? */
+pub bool wvIsAgg(IrType* t)
+{
+    return t != null && (t->kind == IrTypeKind::Struct ||
+                         t->kind == IrTypeKind::Array ||
+                         t->kind == IrTypeKind::Vector);
+}
+
+/* declaration-order field index of `name` in struct type `t` — the same
+ * order wvStructTy feeds createStructType, which is the order wallvm's
+ * emitGep walks for field offsets. Str/Slice expose the fixed {ptr,len}
+ * pair. 0xFFFFFFFF when the field is unknown. */
+pub u32 wvFieldIdx(Wv* w, Ty t, Str name)
+{
+    u32 none = 0xFFFFFFFF;
+    if (name == 0) return none;
+    str sn = wvStr(w, name);
+    t = wvUnwrapTy(w, t);
+    u32 guard = 0;
+    while (t != 0 && guard < 8)
+    {
+        guard++;
+        TypeEntry* e = w->ctx->types + t;
+        if (e->kind.tag == TypeKind::Str || e->kind.tag == TypeKind::Slice)
+        {
+            if (sn.equals("ptr")) return 0;
+            if (sn.equals("len")) return 1;
+            return none;
+        }
+        if (e->kind.tag != TypeKind::Named) return none;
+        NodeId td = wvFindTypeDecl(w->file, w->ctx, e->kind.payload.Named.name);
+        if (td.index == 0) return none;
+        Node* dn = wvNode(w, td);
+        if (dn->kind.tag != NodeKind::Decl) return none;
+        Decl* dd = &dn->kind.payload.Decl.value;
+        if (dd->kind.tag == DeclKind::Struct)
+        {
+            u32 i = 0;
+            while (i < dd->kind.payload.Struct.fieldsLen)
+            {
+                Node* fn = wvNode(w, dd->kind.payload.Struct.fields[i]);
+                if (fn->kind.tag == NodeKind::Field &&
+                    fn->kind.payload.Field.value.name == name) return i;
+                i++;
+            }
+            return none;
+        }
+        if (dd->kind.tag == DeclKind::TypeAlias)
+            { t = wvUnwrapTy(w, dd->kind.payload.TypeAlias.target); continue; }
+        if (dd->kind.tag == DeclKind::Distinct)
+            { t = wvUnwrapTy(w, dd->kind.payload.Distinct.baseType); continue; }
+        return none;
+    }
+    return none;
+}
+
+/* address of element `idx` reached through `base`.
+ *
+ * byElement: base already points INTO an array (a local array slot or a
+ * ptr-to-array's interior) — a plain gep strides by the array element
+ * size, which wallvm's emitGep walks correctly.
+ *
+ * otherwise base points AT `pointee` (T*, a struct*, a slice's data
+ * pointer): wallvm's emitGep silently DROPS the index when the pointee is
+ * a scalar (the walk breaks out with offset 0). Retype the base as
+ * [0 x pointee]* first, so the stride becomes sizeOf(pointee) — plain C
+ * pointer arithmetic — and cast the result back to pointee*. */
+pub IrValue* wvIndexAddr(Wv* w, IrValue* base, IrType* pointee, IrValue* idx, bool byElement)
+{
+    if (base == null || pointee == null || idx == null) return null;
+    IrValue*[1] idxs;
+    idxs[0] = idx;
+    if (byElement) return wvV(w->b.gep(base, idxs, 1));
+    IrType* arrT = w->ir->tyArray(pointee, 0);
+    IrValue* bc = wvV(w->b.bitcast(base, w->ir->tyPtr(arrT)));
+    if (bc == null) return null;
+    IrValue* g = wvV(w->b.gep(bc, idxs, 1));
+    if (g == null) return null;
+    return wvV(w->b.bitcast(g, w->ir->tyPtr(pointee)));
+}
+
+/* gep to struct field `fi` of the aggregate at `base` */
+pub IrValue* wvGepField(Wv* w, IrValue* base, u32 fi)
+{
+    if (base == null) return null;
+    IrValue*[1] idxs;
+    idxs[0] = w->ir->constInt(w->ir->tyInt(32), (u64)fi);
+    return wvV(w->b.gep(base, idxs, 1));
+}
+
+/* the address of an lvalue expression: local slot, deref pointee, or a
+ * gep chain (field / tuple field / index). Used by plain assignment,
+ * compound assignment and aggregate copies alike. */
+pub IrValue* wvAddrOf(Wv* w, NodeId id)
+{
+    if (id.index == 0) return null;
+    Node* n = wvNode(w, id);
+    if (n->kind.tag != NodeKind::Expr) { wvErr(w, id, "not an lvalue"); return null; }
+    Expr* e = &n->kind.payload.Expr.value;
+    switch (e->kind.tag)
+    {
+        ExprKind::Ident => {
+            IrValue* slot = wvFindLocal(w, e->kind.payload.Ident.name);
+            if (slot == null)
+                wvErr(w, id, "cannot assign to a non-local name (globals: Phase 2)");
+            return slot;
+        },
+        ExprKind::Deref => { return wvExpr(w, e->kind.payload.Deref.expr); },
+        ExprKind::Field | ExprKind::DerefField => {
+            NodeId obj; Str fname;
+            if (e->kind.tag == ExprKind::Field)
+                { obj = e->kind.payload.Field.obj; fname = e->kind.payload.Field.field; }
+            else
+                { obj = e->kind.payload.DerefField.obj; fname = e->kind.payload.DerefField.field; }
+            Node* on = wvNode(w, obj);
+            if (on->kind.tag != NodeKind::Expr)
+                { wvErr(w, id, "field base is not an expression"); return null; }
+            Ty obt = wvUnwrapTy(w, wvResolved(w, on->kind.payload.Expr.value.resolvedType));
+            IrValue* base; Ty sty;
+            if (obt != 0 && (w->ctx->types + obt)->kind.tag == TypeKind::Pointer)
+            {
+                sty = (w->ctx->types + obt)->kind.payload.Pointer.base;
+                base = wvExpr(w, obj); // the pointer value
+            }
+            else
+            {
+                sty = obt;
+                base = wvAddrOf(w, obj); // address of the struct value
+            }
+            if (base == null) return null;
+            u32 fi = wvFieldIdx(w, sty, fname);
+            if (fi == 0xFFFFFFFF) { wvErr(w, id, "unknown struct field"); return null; }
+            return wvGepField(w, base, fi);
+        },
+        ExprKind::TupleField => {
+            NodeId obj = e->kind.payload.TupleField.obj;
+            u32 ti = e->kind.payload.TupleField.index;
+            Node* on = wvNode(w, obj);
+            if (on->kind.tag != NodeKind::Expr)
+                { wvErr(w, id, "tuple base is not an expression"); return null; }
+            Ty obt = wvUnwrapTy(w, wvResolved(w, on->kind.payload.Expr.value.resolvedType));
+            IrValue* base;
+            if (obt != 0 && (w->ctx->types + obt)->kind.tag == TypeKind::Pointer)
+                base = wvExpr(w, obj);
+            else
+                base = wvAddrOf(w, obj);
+            return wvGepField(w, base, ti);
+        },
+        ExprKind::Index => {
+            NodeId obj = e->kind.payload.Index.obj;
+            NodeId ixId = e->kind.payload.Index.index;
+            Node* on = wvNode(w, obj);
+            if (on->kind.tag != NodeKind::Expr)
+                { wvErr(w, id, "index base is not an expression"); return null; }
+            Ty obt = wvUnwrapTy(w, wvResolved(w, on->kind.payload.Expr.value.resolvedType));
+            IrValue* base = null;
+            IrType* pointee = null;
+            bool byElement = false;
+            if (obt != 0)
+            {
+                TypeEntry* oe = w->ctx->types + obt;
+                if (oe->kind.tag == TypeKind::Array)
+                {
+                    /* an array value: its address points at element 0 */
+                    base = wvAddrOf(w, obj);
+                    pointee = wvTy(w, oe->kind.payload.Array.base, 0);
+                    byElement = true;
+                }
+                else if (oe->kind.tag == TypeKind::Pointer)
+                {
+                    /* p[i]: C pointer arithmetic steps sizeOf(pointee) */
+                    base = wvExpr(w, obj);
+                    Ty pe = wvUnwrapTy(w, oe->kind.payload.Pointer.base);
+                    TypeEntry* peE = pe != 0 ? w->ctx->types + pe : null;
+                    if (peE != null && peE->kind.tag == TypeKind::Array)
+                        pointee = wvTy(w, pe, 0);           // whole-array step
+                    else
+                        pointee = wvTy(w, pe, 0);           // scalar/struct step
+                }
+                else if (oe->kind.tag == TypeKind::Slice || oe->kind.tag == TypeKind::Str)
+                {
+                    Ty et = oe->kind.tag == TypeKind::Slice
+                        ? oe->kind.payload.Slice.base : (Ty)0;
+                    IrType* eir = et != 0 ? wvTy(w, et, 0) : w->ir->tyInt(8);
+                    IrValue* va = wvAddrOf(w, obj);
+                    if (va == null) return null;
+                    IrValue* pSlot = wvGepField(w, va, 0); // { ptr, len } layout
+                    if (pSlot == null) return null;
+                    base = wvV(w->b.load(w->ir->tyPtr(eir), pSlot));
+                    pointee = eir;
+                }
+            }
+            if (base == null || pointee == null)
+                { wvErr(w, id, "unsupported index base"); return null; }
+            IrValue* idx = wvExpr(w, ixId);
+            if (idx == null) return null;
+            return wvIndexAddr(w, base, pointee, idx, byElement);
+        },
+        ExprKind::StructLiteral => {
+            Ty st = wvResolved(w, e->kind.payload.StructLiteral.typeNode);
+            if (e->kind.payload.StructLiteral.variantName != 0)
+                { wvErr(w, id, "variant construction (Phase 3)"); return null; }
+            IrType* irt = st != 0 ? wvTy(w, st, 0) : null;
+            if (irt == null || irt->kind != IrTypeKind::Struct)
+                { wvErr(w, id, "struct literal needs a struct type"); return null; }
+            IrValue* slot = wvV(w->b.alloca(irt));
+            if (slot == null) return null;
+            u32 i = 0;
+            u32 n = e->kind.payload.StructLiteral.fieldValuesLen;
+            Str* fnames = e->kind.payload.StructLiteral.fieldNames;
+            NodeId* fvals = e->kind.payload.StructLiteral.fieldValues;
+            while (i < n)
+            {
+                if (fnames == null || fvals == null || fvals[i].index == 0) { i++; continue; }
+                u32 fi = wvFieldIdx(w, st, fnames[i]);
+                if (fi == 0xFFFFFFFF || fi >= irt->nparams)
+                    { wvErr(w, id, "unknown struct literal field"); return null; }
+                IrValue* fa = wvGepField(w, slot, fi);
+                if (fa == null) return null;
+                IrType* ft = irt->params[fi];
+                if (wvIsAgg(ft))
+                {
+                    IrValue* sv = wvAddrOf(w, fvals[i]);
+                    if (sv == null) return null;
+                    if (!wvCopyAgg(w, fa, sv, ft, 0)) return null;
+                }
+                else
+                {
+                    IrValue* v = wvExpr(w, fvals[i]);
+                    if (v == null) return null;
+                    w->b.store(v, fa);
+                }
+                i++;
+            }
+            return slot;
+        },
+        ExprKind::ArrayLiteral | ExprKind::TupleExpr => {
+            Ty at = wvResolved(w, e->resolvedType);
+            IrType* irt = at != 0 ? wvTy(w, at, 0) : null;
+            if (irt == null || (irt->kind != IrTypeKind::Array && irt->kind != IrTypeKind::Struct))
+                { wvErr(w, id, "array/tuple literal needs an aggregate type"); return null; }
+            IrValue* slot = wvV(w->b.alloca(irt));
+            if (slot == null) return null;
+            NodeId* elems = e->kind.tag == ExprKind::ArrayLiteral
+                ? e->kind.payload.ArrayLiteral.elems : e->kind.payload.TupleExpr.elems;
+            u32 n = e->kind.tag == ExprKind::ArrayLiteral
+                ? e->kind.payload.ArrayLiteral.elemsLen : e->kind.payload.TupleExpr.elemsLen;
+            u32 i = 0;
+            while (i < n)
+            {
+                if (elems == null || elems[i].index == 0) { i++; continue; }
+                if (irt->kind == IrTypeKind::Array && i >= irt->count) { i++; continue; }
+                IrValue*[1] idxs;
+                idxs[0] = w->ir->constInt(w->ir->tyInt(32), (u64)i);
+                IrValue* ea = wvV(w->b.gep(slot, idxs, 1));
+                if (ea == null) return null;
+                IrType* et = irt->kind == IrTypeKind::Array ? irt->elem
+                    : (i < irt->nparams ? irt->params[i] : null);
+                if (et == null) { i++; continue; }
+                if (wvIsAgg(et))
+                {
+                    IrValue* sv = wvAddrOf(w, elems[i]);
+                    if (sv == null) return null;
+                    if (!wvCopyAgg(w, ea, sv, et, 0)) return null;
+                }
+                else
+                {
+                    IrValue* v = wvExpr(w, elems[i]);
+                    if (v == null) return null;
+                    w->b.store(v, ea);
+                }
+                i++;
+            }
+            return slot;
+        },
+        else => { wvErr(w, id, "unsupported assignment target"); return null; },
+    }
+}
+
+/* element-wise aggregate copy through addresses (structs/arrays are never
+ * register values in this lowering — see the aggregate rule in expr.crl) */
+pub bool wvCopyAgg(Wv* w, IrValue* dst, IrValue* src, IrType* ty, u32 depth)
+{
+    if (dst == null || src == null || ty == null) return false;
+    if (depth > 16) { wvErr(w, NodeId{ .index = 0 }, "aggregate copy too deep"); return false; }
+    if (ty->kind == IrTypeKind::Struct)
+    {
+        u32 i = 0;
+        while (i < ty->nparams)
+        {
+            IrValue* d = wvGepField(w, dst, i);
+            IrValue* s = wvGepField(w, src, i);
+            if (d == null || s == null) return false;
+            if (!wvCopyAgg(w, d, s, ty->params[i], depth + 1)) return false;
+            i++;
+        }
+        return true;
+    }
+    if (ty->kind == IrTypeKind::Array || ty->kind == IrTypeKind::Vector)
+    {
+        u32 i = 0;
+        while (i < ty->count)
+        {
+            IrValue*[1] idxs;
+            idxs[0] = w->ir->constInt(w->ir->tyInt(32), (u64)i);
+            IrValue* d = wvV(w->b.gep(dst, idxs, 1));
+            IrValue* s = wvV(w->b.gep(src, idxs, 1));
+            if (d == null || s == null) return false;
+            if (!wvCopyAgg(w, d, s, ty->elem, depth + 1)) return false;
+            i++;
+        }
+        return true;
+    }
+    /* scalar: wallvm loads at most 8 bytes into one register */
+    u32 sz = w->ir->irTypeSizeOf(ty);
+    if (sz == 0 || sz > 8)
+    {
+        wvErr(w, NodeId{ .index = 0 }, "scalar wider than 8 bytes in aggregate copy (Phase 2)");
+        return false;
+    }
+    IrValue* v = wvV(w->b.load(ty, src));
+    if (v == null) return false;
+    w->b.store(v, dst);
+    return true;
+}
+
+/* compound-assignment operator: op is the Coral source operator
+ * ("+=", "-=", ...); cur is the loaded lhs, rhs the evaluated rhs.
+ * Returns the stored result. */
+pub IrValue* wvCompoundOp(Wv* w, str op, IrValue* cur, IrValue* rhs, Ty ct, NodeId id)
+{
+    if (cur == null || rhs == null) return null;
+    ExprKind k;
+    if (op.equals("+=")) k.tag = ExprKind::Add;
+    else if (op.equals("-=")) k.tag = ExprKind::Sub;
+    else if (op.equals("*=")) k.tag = ExprKind::Mul;
+    else if (op.equals("/=")) k.tag = ExprKind::Div;
+    else if (op.equals("%=")) k.tag = ExprKind::Mod;
+    else if (op.equals("&=")) k.tag = ExprKind::BitAnd;
+    else if (op.equals("|=")) k.tag = ExprKind::BitOr;
+    else if (op.equals("^=")) k.tag = ExprKind::BitXor;
+    else if (op.equals("<<=")) k.tag = ExprKind::Shl;
+    else if (op.equals(">>=")) k.tag = ExprKind::Shr;
+    else { wvErr(w, id, "unsupported assignment operator"); return null; }
+    return wvArithVals(w, k, cur, rhs, id, ct);
+}
+
+/* one assignment: address the target, then store (plain) or
+ * load–combine–store (compound). Aggregates copy element-wise. Shared by
+ * the ExprKind::Assign* family and StmtKind::Assign. Returns the stored
+ * value, or null (void / aggregate / error). */
+pub IrValue* wvAssignCommon(Wv* w, NodeId target, NodeId value, str op, NodeId id)
+{
+    IrValue* addr = wvAddrOf(w, target);
+    if (addr == null) return null;
+    Node* tn = wvNode(w, target);
+    Ty tgtTy = tn->kind.tag == NodeKind::Expr
+        ? wvResolved(w, tn->kind.payload.Expr.value.resolvedType) : 0;
+    IrType* vt = tgtTy != 0 ? wvTy(w, tgtTy, 0) : null;
+    if (vt == null || vt->kind == IrTypeKind::Void)
+        { wvErr(w, id, "cannot type assignment target"); return null; }
+
+    if (op.equals("="))
+    {
+        if (wvIsAgg(vt))
+        {
+            IrValue* src = wvAddrOf(w, value);
+            if (src == null) return null;
+            if (!wvCopyAgg(w, addr, src, vt, 0)) return null;
+            return null;
+        }
+        IrValue* val = wvExpr(w, value);
+        if (val == null) return null;
+        w->b.store(val, addr);
+        return val;
+    }
+    if (wvIsAgg(vt)) { wvErr(w, id, "compound assign on aggregate (Phase 2)"); return null; }
+    IrValue* cur = wvV(w->b.load(vt, addr));
+    IrValue* rhs = wvExpr(w, value);
+    IrValue* res = wvCompoundOp(w, op, cur, rhs, tgtTy, id);
+    if (res == null) return null;
+    w->b.store(res, addr);
+    return res;
+}
+
 
 pub IrValue* wvExpr(Wv* w, NodeId id)
 {
@@ -311,7 +741,7 @@ pub IrValue* wvExpr(Wv* w, NodeId id)
     switch (e->kind.tag)
     {
         ExprKind::IntLit => {
-            IrType* it = rt != 0 ? wvTy(w->ctx, w->file, w->ir, rt, 0)
+            IrType* it = rt != 0 ? wvTy(w, rt, 0)
                                  : w->ir->tyInt(32);
             return w->ir->constInt(it, e->kind.payload.IntLit.value);
         },
@@ -326,8 +756,21 @@ pub IrValue* wvExpr(Wv* w, NodeId id)
             return w->ir->constInt(w->ir->tyPtr(w->ir->tyInt(8)), 0);
         },
         ExprKind::FloatLit => {
-            wvErr(w, id, "float literals: Phase 2 (needs str→f64 parse)");
-            return null;
+            /* strtod on a NUL-terminated arena copy of the literal text */
+            str s = wvStr(w, e->kind.payload.FloatLit.value);
+            rawptr buf = w->arena->alloc(s.len + 1, 1);
+            if (buf == null) return null;
+            u8* bp = (u8*)buf;
+            usize i = 0;
+            while (i < s.len) { bp[i] = s.ptr[i]; i++; }
+            bp[s.len] = 0;
+            f64 d = strtod((const cchar*)bp, null);
+            IrType* ft = w->ir->tyDouble();
+            if (rt != 0 && (w->ctx->types + rt)->kind.tag == TypeKind::F32)
+                ft = w->ir->tyFloat();
+            IrValue* dv = w->ir->constFloat(w->ir->tyDouble(), d);
+            if (ft->width == 32) return wvV(w->b.fpTrunc(dv, ft));
+            return dv;
         },
         ExprKind::StringLit => {
             wvErr(w, id, "string literals: Phase 2 (needs global data, wallvm G29)");
@@ -338,12 +781,126 @@ pub IrValue* wvExpr(Wv* w, NodeId id)
             IrValue* slot = wvFindLocal(w, name);
             if (slot != null)
             {
-                IrType* vt = wvTy(w->ctx, w->file, w->ir, rt, 0);
+                IrType* vt = wvTy(w, rt, 0);
                 if (vt == null || vt->kind == IrTypeKind::Void) return null;
+                if (wvIsAgg(vt))
+                {
+                    wvErr(w, id, "aggregate value in value position (Phase 2: struct/str args & returns)");
+                    return null;
+                }
                 return wvV(w->b.load(vt, slot));
             }
             wvErr(w, id, "unresolved identifier (globals: Phase 2)");
             return null;
+        },
+        ExprKind::Field | ExprKind::DerefField | ExprKind::TupleField |
+        ExprKind::Index => {
+            IrValue* addr = wvAddrOf(w, id);
+            if (addr == null) return null;
+            IrType* vt = wvTy(w, rt, 0);
+            if (vt == null || vt->kind == IrTypeKind::Void) return null;
+            if (wvIsAgg(vt))
+            {
+                wvErr(w, id, "aggregate value in value position (Phase 2: struct/str args & returns)");
+                return null;
+            }
+            return wvV(w->b.load(vt, addr));
+        },
+        ExprKind::Assign | ExprKind::AssignAdd | ExprKind::AssignSub |
+        ExprKind::AssignMul | ExprKind::AssignDiv | ExprKind::AssignMod |
+        ExprKind::AssignBitAnd | ExprKind::AssignBitOr | ExprKind::AssignBitXor |
+        ExprKind::AssignShl | ExprKind::AssignShr => {
+            NodeId target; NodeId value;
+            str op = "=";
+            if (e->kind.tag == ExprKind::Assign)
+                { target = e->kind.payload.Assign.target; value = e->kind.payload.Assign.value; }
+            else if (e->kind.tag == ExprKind::AssignAdd)
+                { target = e->kind.payload.AssignAdd.target; value = e->kind.payload.AssignAdd.value; op = "+="; }
+            else if (e->kind.tag == ExprKind::AssignSub)
+                { target = e->kind.payload.AssignSub.target; value = e->kind.payload.AssignSub.value; op = "-="; }
+            else if (e->kind.tag == ExprKind::AssignMul)
+                { target = e->kind.payload.AssignMul.target; value = e->kind.payload.AssignMul.value; op = "*="; }
+            else if (e->kind.tag == ExprKind::AssignDiv)
+                { target = e->kind.payload.AssignDiv.target; value = e->kind.payload.AssignDiv.value; op = "/="; }
+            else if (e->kind.tag == ExprKind::AssignMod)
+                { target = e->kind.payload.AssignMod.target; value = e->kind.payload.AssignMod.value; op = "%="; }
+            else if (e->kind.tag == ExprKind::AssignBitAnd)
+                { target = e->kind.payload.AssignBitAnd.target; value = e->kind.payload.AssignBitAnd.value; op = "&="; }
+            else if (e->kind.tag == ExprKind::AssignBitOr)
+                { target = e->kind.payload.AssignBitOr.target; value = e->kind.payload.AssignBitOr.value; op = "|="; }
+            else if (e->kind.tag == ExprKind::AssignBitXor)
+                { target = e->kind.payload.AssignBitXor.target; value = e->kind.payload.AssignBitXor.value; op = "^="; }
+            else if (e->kind.tag == ExprKind::AssignShl)
+                { target = e->kind.payload.AssignShl.target; value = e->kind.payload.AssignShl.value; op = "<<="; }
+            else
+                { target = e->kind.payload.AssignShr.target; value = e->kind.payload.AssignShr.value; op = ">>="; }
+            return wvAssignCommon(w, target, value, op, id);
+        },
+        ExprKind::PostInc | ExprKind::PostDec | ExprKind::PreInc |
+        ExprKind::PreDec => {
+            NodeId tgt = e->kind.payload.PostInc.expr;
+            IrValue* addr = wvAddrOf(w, tgt);
+            if (addr == null) return null;
+            Node* tn = wvNode(w, tgt);
+            Ty tt = tn->kind.tag == NodeKind::Expr
+                ? wvResolved(w, tn->kind.payload.Expr.value.resolvedType) : 0;
+            IrType* vt = tt != 0 ? wvTy(w, tt, 0) : null;
+            if (vt == null || wvIsAgg(vt)) { wvErr(w, id, "increment target is not scalar"); return null; }
+            IrValue* cur = wvV(w->b.load(vt, addr));
+            bool dec = e->kind.tag == ExprKind::PostDec || e->kind.tag == ExprKind::PreDec;
+            IrValue* nv;
+            if (vt->kind == IrTypeKind::Float)
+            {
+                IrValue* one = w->ir->constFloat(vt, 1.0);
+                nv = wvV(dec ? w->b.fsub(cur, one) : w->b.fadd(cur, one));
+            }
+            else
+            {
+                IrValue* one = w->ir->constInt(vt, 1);
+                nv = wvV(dec ? w->b.sub(cur, one) : w->b.add(cur, one));
+            }
+            if (nv == null) return null;
+            w->b.store(nv, addr);
+            bool post = e->kind.tag == ExprKind::PostInc || e->kind.tag == ExprKind::PostDec;
+            return post ? cur : nv;
+        },
+        ExprKind::Ternary => {
+            IrValue* c = wvCond(w, wvExpr(w, e->kind.payload.Ternary.cond));
+            if (c == null) return null;
+            IrType* vt = rt != 0 ? wvTy(w, rt, 0) : null;
+            if (vt == null || vt->kind == IrTypeKind::Void)
+            {
+                /* void ternary: lower both arms as statements */
+                IrBlock* tBb = wvBlock(w, "sel.then");
+                IrBlock* fBb = wvBlock(w, "sel.else");
+                IrBlock* jBb = wvBlock(w, "sel.end");
+                w->b.condBr(c, tBb, fBb);
+                wvSetBlock(w, tBb);
+                wvExpr(w, e->kind.payload.Ternary.thenExpr);
+                if (!w->term) w->b.br(jBb);
+                wvSetBlock(w, fBb);
+                wvExpr(w, e->kind.payload.Ternary.elseExpr);
+                if (!w->term) w->b.br(jBb);
+                wvSetBlock(w, jBb);
+                return null;
+            }
+            if (wvIsAgg(vt)) { wvErr(w, id, "aggregate ternary (Phase 2)"); return null; }
+            IrValue* slot = wvV(w->b.alloca(vt));
+            if (slot == null) return null;
+            IrBlock* tBb = wvBlock(w, "sel.then");
+            IrBlock* fBb = wvBlock(w, "sel.else");
+            IrBlock* jBb = wvBlock(w, "sel.end");
+            w->b.condBr(c, tBb, fBb);
+            wvSetBlock(w, tBb);
+            IrValue* tv = wvExpr(w, e->kind.payload.Ternary.thenExpr);
+            if (tv != null) w->b.store(tv, slot);
+            w->b.br(jBb);
+            wvSetBlock(w, fBb);
+            IrValue* fv = wvExpr(w, e->kind.payload.Ternary.elseExpr);
+            if (fv != null) w->b.store(fv, slot);
+            w->b.br(jBb);
+            wvSetBlock(w, jBb);
+            return wvV(w->b.load(vt, slot));
         },
         ExprKind::Call => { return wvCall(w, e, id); },
         ExprKind::Add | ExprKind::Sub | ExprKind::Mul | ExprKind::Div |
@@ -399,27 +956,25 @@ pub IrValue* wvExpr(Wv* w, NodeId id)
         ExprKind::Deref => {
             IrValue* v = wvExpr(w, e->kind.payload.Deref.expr);
             if (v == null) return null;
-            IrType* vt = wvTy(w->ctx, w->file, w->ir, rt, 0);
+            IrType* vt = wvTy(w, rt, 0);
             return wvV(w->b.load(vt, v));
         },
         ExprKind::Cast => {
             IrValue* v = wvExpr(w, e->kind.payload.Cast.expr);
             if (v == null) return null;
             Ty tgt = wvResolved(w, e->kind.payload.Cast.targetType);
-            IrType* dt = wvTy(w->ctx, w->file, w->ir, tgt, 0);
+            IrType* dt = wvTy(w, tgt, 0);
             Expr* se = &wvNode(w, e->kind.payload.Cast.expr)->kind.payload.Expr.value;
             bool su = wvTyUnsigned(w, se->resolvedType);
             bool du = wvTyUnsigned(w, e->kind.payload.Cast.targetType);
             return wvCast(w, v, v->type, dt, su, du);
         },
         ExprKind::Sizeof => {
-            IrType* st = wvTy(w->ctx, w->file, w->ir,
-                              wvResolved(w, e->kind.payload.Sizeof.targetType), 0);
+            IrType* st = wvTy(w, wvResolved(w, e->kind.payload.Sizeof.targetType), 0);
             return w->ir->constInt(w->ir->tyInt(64), (u64)w->ir->irTypeSizeOf(st));
         },
         ExprKind::Alignof => {
-            IrType* at = wvTy(w->ctx, w->file, w->ir,
-                              wvResolved(w, e->kind.payload.Alignof.targetType), 0);
+            IrType* at = wvTy(w, wvResolved(w, e->kind.payload.Alignof.targetType), 0);
             return w->ir->constInt(w->ir->tyInt(64), (u64)w->ir->irTypeAlignOf(at));
         },
         else => {

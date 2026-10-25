@@ -21,6 +21,40 @@
 
 ### Known wallvm gaps relevant to this roadmap (verify in code — docs stale)
 
+- **Frame layout ignores the pushed callee-saves (correctness — blocks
+  call-heavy tests).** `allocaSlotOf`
+  (`lib/wallvm/target/x86_64/x86_64_base.crl:700-720`) returns
+  `*outOff = self.allocaBase + cum`, an offset measured from `%rbp`.
+  But the prologue pushes the callee-saves *above* the reservation
+  (`emitPrologue` ~`:1017-1060`: `pushq %rbx/%r12/…` land at
+  `rbp-8..rbp-8k`, then `subq $spillFrameBytes`), and
+  `allocaBase = spillSlotCount*16 + pad` (`:1051`) counts only spills +
+  alignment pad — never `8 * numCalleeSaves`. So with k saves pushed
+  every alloca (and lsra's synthetic spill allocas) sits k*8 bytes too
+  high: **on top of the saved registers**.
+  Repro: `i32 fib(i32 n) { if (n < 2) return n; return fib(n-1)+fib(n-2); }`
+  with `main { return fib(10); }` — prologue emits
+  `pushq %rbx/%r12/%r13` then `leaq -24(%rbp), %rbx; movl %esi, (%rbx)`,
+  which clobbers the saved `%r13`; the caller keeps its first call's
+  result in `%r13`, so after the second call returns it holds the
+  callee's `n` instead. Measured against the C backend: fib(2)=0 (want 1),
+  fib(4)=2 (want 3), fib(6)=6 (want 8), fib(10)=20 (want 55).
+  The printed IR for the same program is correct — purely a frame-layout
+  bug. Fix sketch: `*outOff = 8 * self.numCalleeSaves + self.allocaBase + cum`
+  (keeping the epilogue's `addq`/pop order and the 16-byte call alignment
+  that `pad` guarantees), or fold the pushes into the reservation itself.
+  **Reported, not fixed** — deliberately deferred so coral's IR codegen
+  lands first; runtime results of any function that both has locals and
+  uses callee-saves are untrustworthy until then.
+- **Spill quality bar: clang/gcc at -O2, not naive slots.** The current
+  scheme is one 16-byte slot per vreg with no packing, coalescing,
+  splitting or rematerialisation, and only `xmm2–xmm7` allocatable
+  (`docs/codegen-quality.md`, `next-todos.md` paused #3). Whenever the
+  frame-layout item above is fixed, spills must move to real O2-quality
+  machinery — callee-save use, interval splitting, remat of cheap
+  constants, packed slots — rather than papering over the layout with
+  more naive slots.
+
 - **Extern lib name is discarded today.** `extern("libname") T name(args);` —
   the parser (`coral-parser/decl.crl:403-409`) accepts the string literal
   but throws it away (`self.expect(TokenKind::String)`); the AST's

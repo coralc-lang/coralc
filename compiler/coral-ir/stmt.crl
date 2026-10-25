@@ -1,15 +1,16 @@
 #[[no_drop_all]]
 /* coral-ir/stmt.crl — statement lowering
  *
- * Phase 1: Return, Block, VarDecl, ExprStmt, If, While, Assign ("="),
- * Break/Continue. Blocks lower straight into the current function via
- * the builder; the `term` flag tracks terminators so dead statements
- * after Return/Break/Continue are skipped. No phis — locals are
- * alloca+load/store. */
+ * Return, Block (with scope popping), VarDecl (aggregate-aware init),
+ * ExprStmt, If, While, Loop, For, Assign (plain + compound via
+ * wvAssignCommon), Break/Continue. Blocks lower straight into the
+ * current function via the builder; the `term` flag tracks terminators
+ * so dead statements after Return/Break/Continue are skipped. No phis —
+ * locals are alloca+load/store. */
 import lower { Wv, wvNode, wvErr, wvStr, wvResolved, wvFindLocal, wvPushLocal,
                wvBlock, wvSetBlock, wvTerm, wvPos };
 import types { wvTy };
-import expr { wvExpr };
+import expr { wvExpr, wvAddrOf, wvCond, wvAssignCommon, wvIsAgg, wvCopyAgg };
 import context::context { AstContext };
 import sem { scope { Symbol, ScopeStack } };
 import ast {
@@ -30,33 +31,9 @@ pub IrValue* wvV(IrInst* inst) { return inst != null ? &inst->base : null; }
 
 pub void wvStmt(Wv* w, NodeId id);
 
-/* ── helpers ────────────────────────────────────────────────── */
 
-/* store an expression's value into an lvalue slot (Ident local or
- * Deref pointee). Returns false on unsupported targets. */
-pub bool wvAssignTo(Wv* w, NodeId targetId, IrValue* val)
-{
-    Node* tn = wvNode(w, targetId);
-    if (tn->kind.tag != NodeKind::Expr) return false;
-    Expr* te = &tn->kind.payload.Expr.value;
-    if (te->kind.tag == ExprKind::Ident)
-    {
-        IrValue* slot = wvFindLocal(w, te->kind.payload.Ident.name);
-        if (slot == null) return false;
-        w->b.store(val, slot);
-        return true;
-    }
-    if (te->kind.tag == ExprKind::Deref)
-    {
-        IrValue* ptr = wvExpr(w, te->kind.payload.Deref.expr);
-        if (ptr == null) return false;
-        w->b.store(val, ptr);
-        return true;
-    }
-    return false;
-}
-
-/* lower a VarDecl: alloca, optionally store init, register the local */
+/* lower a VarDecl: alloca, optionally initialise (aggregates copy
+ * element-wise from the source's address), register the local */
 pub void wvVarDecl(Wv* w, Stmt* s, NodeId id)
 {
     Str name = s->kind.payload.VarDecl.name;
@@ -72,7 +49,7 @@ pub void wvVarDecl(Wv* w, Stmt* s, NodeId id)
                 vt = wvResolved(w, in->kind.payload.Expr.value.resolvedType);
         }
     }
-    IrType* irt = vt != 0 ? wvTy(w->ctx, w->file, w->ir, vt, 0) : null;
+    IrType* irt = vt != 0 ? wvTy(w, vt, 0) : null;
     if (irt == null || irt->kind == IrTypeKind::Void)
     {
         wvErr(w, id, "cannot local-bind a void value");
@@ -82,13 +59,22 @@ pub void wvVarDecl(Wv* w, Stmt* s, NodeId id)
     if (slot == null) return;
     if ((s->kind.payload.VarDecl.flags & 2) != 0) // hasInit
     {
-        IrValue* init = wvExpr(w, s->kind.payload.VarDecl.init);
-        if (init != null) w->b.store(init, slot);
+        NodeId initId = s->kind.payload.VarDecl.init;
+        if (wvIsAgg(irt))
+        {
+            /* aggregates never load into a register: copy element-wise */
+            IrValue* src = wvAddrOf(w, initId);
+            if (src != null) wvCopyAgg(w, slot, src, irt, 0);
+        }
+        else
+        {
+            IrValue* init = wvExpr(w, initId);
+            if (init != null) w->b.store(init, slot);
+        }
     }
     wvPushLocal(w, name, slot);
 }
 
-/* ── the main statement dispatch ────────────────────────────── */
 
 pub void wvStmt(Wv* w, NodeId id)
 {
@@ -116,34 +102,27 @@ pub void wvStmt(Wv* w, NodeId id)
             wvTerm(w);
         },
         StmtKind::Block => {
+            /* block scope: locals declared inside vanish at the closing
+             * brace (sema enforces the same rule — see T0001 on escape) */
+            u32 scopeMark = w->locLen;
             u32 i = 0;
             while (i < s->kind.payload.Block.stmtsLen && !w->term)
             {
                 wvStmt(w, s->kind.payload.Block.stmts[i]);
                 i++;
             }
+            w->locLen = scopeMark;
         },
         StmtKind::Assign => {
-            Str op = s->kind.payload.Assign.op;
-            if (op == 0) return;
-            str ops = wvStr(w, op);
-            if (!ops.equals("="))
-            {
-                wvErr(w, id, "compound assignment: Phase 2");
-                return;
-            }
-            IrValue* val = wvExpr(w, s->kind.payload.Assign.value);
-            if (val == null) return;
-            if (!wvAssignTo(w, s->kind.payload.Assign.target, val))
-                wvErr(w, id, "unsupported assignment target (Phase 1)");
+            Str opS = s->kind.payload.Assign.op;
+            if (opS == 0) return;
+            str ops = wvStr(w, opS);
+            wvAssignCommon(w, s->kind.payload.Assign.target,
+                           s->kind.payload.Assign.value, ops, id);
         },
         StmtKind::If => {
-            IrValue* cond = wvExpr(w, s->kind.payload.If.cond);
-            if (cond == null) return;
-            IrValue* c = cond->type != null && cond->type->kind == IrTypeKind::Int &&
-                         cond->type->width == 1
-                ? cond
-                : wvV(w->b.icmp(IrICmpPred::Ne, cond, w->ir->constInt(cond->type, 1)));
+            IrValue* c = wvCond(w, wvExpr(w, s->kind.payload.If.cond));
+            if (c == null) return;
             IrBlock* thenBb = wvBlock(w, "if.then");
             NodeId elseId = s->kind.payload.If.elseBody;
             IrBlock* elseBb = elseId.index != 0 ? wvBlock(w, "if.else") : null;
@@ -168,12 +147,8 @@ pub void wvStmt(Wv* w, NodeId id)
             IrBlock* exitBb = wvBlock(w, "while.end");
             w->b.br(headBb);
             wvSetBlock(w, headBb);
-            IrValue* cond = wvExpr(w, s->kind.payload.While.cond);
-            if (cond == null) return;
-            IrValue* c = cond->type != null && cond->type->kind == IrTypeKind::Int &&
-                         cond->type->width == 1
-                ? cond
-                : wvV(w->b.icmp(IrICmpPred::Ne, cond, w->ir->constInt(cond->type, 1)));
+            IrValue* c = wvCond(w, wvExpr(w, s->kind.payload.While.cond));
+            if (c == null) return;
             w->b.condBr(c, bodyBb, exitBb);
 
             wvSetBlock(w, bodyBb);
@@ -188,6 +163,78 @@ pub void wvStmt(Wv* w, NodeId id)
             w->contT = savedCont;
             if (!w->term) w->b.br(headBb);
             wvSetBlock(w, exitBb);
+        },
+        StmtKind::Loop => {
+            /* `loop { ... }` — unconditionally re-enter the head block
+             * (an empty-trip body with no terminator: same shape as
+             * while(true)) */
+            IrBlock* headBb = wvBlock(w, "loop.head");
+            IrBlock* bodyBb = wvBlock(w, "loop.body");
+            IrBlock* exitBb = wvBlock(w, "loop.end");
+            w->b.br(headBb);
+            wvSetBlock(w, headBb);
+            w->b.br(bodyBb);
+
+            wvSetBlock(w, bodyBb);
+            IrBlock* savedBreak = w->breakT;
+            IrBlock* savedCont = w->contT;
+            w->breakT = exitBb;
+            w->contT = headBb;
+            w->loopDepth++;
+            wvStmt(w, s->kind.payload.Loop.body);
+            w->loopDepth--;
+            w->breakT = savedBreak;
+            w->contT = savedCont;
+            if (!w->term) w->b.br(headBb);
+            wvSetBlock(w, exitBb);
+        },
+        StmtKind::For => {
+            /* for (init; cond; post) — continue targets `post`, break
+             * targets the exit block. The init's locals are scoped to
+             * the whole loop (matching the C backend's for-scope). */
+            NodeId initId = s->kind.payload.For.init;
+            NodeId condId = s->kind.payload.For.cond;
+            NodeId postId = s->kind.payload.For.post;
+            bool hasPost = (s->kind.payload.For.flags & 4) != 0;
+            u32 scopeMark = w->locLen;
+
+            if (initId.index != 0) wvStmt(w, initId);
+
+            IrBlock* headBb = wvBlock(w, "for.head");
+            IrBlock* bodyBb = wvBlock(w, "for.body");
+            IrBlock* postBb = hasPost || postId.index != 0 ? wvBlock(w, "for.post") : null;
+            IrBlock* exitBb = wvBlock(w, "for.end");
+            w->b.br(headBb);
+
+            wvSetBlock(w, headBb);
+            if (condId.index != 0)
+            {
+                IrValue* c = wvCond(w, wvExpr(w, condId));
+                if (c == null) { w->locLen = scopeMark; return; }
+                w->b.condBr(c, bodyBb, exitBb);
+            }
+            else w->b.br(bodyBb); // no condition: run forever (break exits)
+
+            wvSetBlock(w, bodyBb);
+            IrBlock* savedBreak = w->breakT;
+            IrBlock* savedCont = w->contT;
+            w->breakT = exitBb;
+            w->contT = postBb != null ? postBb : headBb;
+            w->loopDepth++;
+            wvStmt(w, s->kind.payload.For.body);
+            w->loopDepth--;
+            w->breakT = savedBreak;
+            w->contT = savedCont;
+            if (!w->term) w->b.br(postBb != null ? postBb : headBb);
+
+            if (postBb != null)
+            {
+                wvSetBlock(w, postBb);
+                if (postId.index != 0) wvExpr(w, postId);
+                if (!w->term) w->b.br(headBb);
+            }
+            wvSetBlock(w, exitBb);
+            w->locLen = scopeMark;
         },
         StmtKind::Break => {
             if (w->breakT == null) { wvErr(w, id, "break outside a loop"); return; }
