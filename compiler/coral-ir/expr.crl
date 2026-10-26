@@ -8,9 +8,11 @@
  * stack (lookupFrom) → declId → the collection pass's fn map — no
  * per-reference re-mangling, no linear decl scans. */
 import lower { Wv, wvNode, wvErr, wvStr, wvResolved, wvSubstTy, wvFindLocal,
-               wvPushLocal, wvFnMapGet, wvBlock, wvSetBlock, wvTerm, wvPos };
-import types { wvTy, wvFindTypeDecl };
-import decl { wvMangle, wvDeclareFunc };
+               wvPushLocal, wvFnMapGet, wvFnMapPut, wvGMapGet, wvGMapPut, wvBlock,
+               wvSetBlock, wvTerm, wvPos, wvArr, wvMbCh, wvMbStr };
+import types { wvTy, wvFindTypeDecl, wvTyHasParam };
+import decl { wvMangle, wvDeclareFunc, wvDeclareMethod, wvMethodSelfKind,
+               wvOwnerStr, wvMethodMangle };
 import context::context { AstContext };
 import mono::mono { MonoContext, MonoInstance };
 import sem { scope { Symbol, ScopeStack } };
@@ -20,13 +22,13 @@ import ast {
     node { Node, NodeKind },
     expr { Expr, ExprKind },
     stmt { Stmt, StmtKind },
-    decl { Decl, DeclKind, Field, Param }
+    decl { Decl, DeclKind, Field, Param, File }
 };
 import common::slice { Slice };
-import(lib) wallvm::irtypes { IrContext, IrModule, IrFunc, IrValue, IrValueKind, IrType, IrTypeKind, IrInst };
+import(lib) wallvm::irtypes { IrContext, IrModule, IrFunc, IrValue, IrValueKind, IrType, IrTypeKind, IrInst, IrStringConst, IrGlobal };
 import(lib) wallvm::irOps { IrICmpPred, IrFCmpPred };
 import(lib) wallvm::irBuilder { IrBuilder };
-import(lib) std::mman { alloc, dealloc };
+import(lib) std::mman { alloc, dealloc, copy };
 import(lib) platform::libc { strtod };
 import(lib) core::cchar { cchar };
 
@@ -52,10 +54,11 @@ pub bool wvTyUnsigned(Wv* w, Ty t)
 pub IrValue* wvExpr(Wv* w, NodeId id);
 
 
-/* resolve a bare-name call target: sema scope lookup → declId → the
- * pre-declared IrFunc from the collection pass. Falls back to declaring
- * an on-the-fly shell (externs not seen in the collection pass). */
-pub IrFunc* wvResolveCallee(Wv* w, Str name, NodeId refSite)
+/* the silent half of callee resolution: sema scope lookup → declId →
+ * the collection pass's IrFunc, or a shell for an extern the pass never
+ * saw. Null when the name is not a function at all — callers that probe
+ * (a value that may be a function or a variable) must not report. */
+pub IrFunc* wvLookupFunc(Wv* w, Str name, NodeId refSite)
 {
     if (name == 0) return null;
     u32 refFile = 0;
@@ -64,26 +67,667 @@ pub IrFunc* wvResolveCallee(Wv* w, Str name, NodeId refSite)
         Node* rn = wvNode(w, refSite);
         refFile = locFile(rn->loc);
     }
-    if (w->sema != null && w->sema.scopes != null)
+    if (w->sema == null || w->sema.scopes == null) return null;
+    Symbol* sym = w->sema.scopes.lookupFrom(name, refFile);
+    if (sym == null || sym->declaration.index == 0) return null;
+    IrFunc* f = wvFnMapGet(w, sym->declaration.index);
+    if (f != null) return f;
+    Node* sn = wvNode(w, sym->declaration);
+    if (sn->kind.tag == NodeKind::Decl)
     {
-        Symbol* sym = w->sema.scopes.lookupFrom(name, refFile);
-        if (sym != null && sym->declaration.index != 0)
+        Decl* sd = &sn->kind.payload.Decl.value;
+        if (sd->kind.tag == DeclKind::Func)
         {
-            IrFunc* f = wvFnMapGet(w, sym->declaration.index);
-            if (f != null) return f;
-            /* not in the collection pass (e.g. an extern the pass skipped):
-             * declare a shell now */
-            Node* sn = wvNode(w, sym->declaration);
-            if (sn->kind.tag == NodeKind::Decl)
+            IrFunc* shell = wvDeclareFunc(w, sym->declaration, sd);
+            /* keep the shell: a second reference reuses it instead of
+             * minting another IrFunc of the same symbol */
+            if (shell != null) wvFnMapPut(w, sym->declaration.index, shell);
+            return shell;
+        }
+    }
+    return null;
+}
+
+/* the Func decl named `name` declared in file `refFile` (first match
+ * when the file has none) — the module-qualified call's lookup, after
+ * cgFindDeclFrom. */
+NodeId wvFindFuncDeclFrom(Wv* w, Str name, u32 refFile)
+{
+    NodeId first;
+    first.index = 0;
+    if (w->file == null || name == 0) return first;
+    File* file = w->file;
+    u32 i = 0;
+    while (i < file->declsLen)
+    {
+        NodeId id = file->decls[i];
+        Node* n = wvNode(w, id);
+        if (n->kind.tag == NodeKind::Decl &&
+            n->kind.payload.Decl.value.kind.tag == DeclKind::Func)
+        {
+            Decl* dd = &n->kind.payload.Decl.value;
+            if (dd->kind.payload.Func.name == name)
             {
-                Decl* sd = &sn->kind.payload.Decl.value;
-                if (sd->kind.tag == DeclKind::Func)
-                    return wvDeclareFunc(w, sym->declaration, sd);
+                if (refFile != 0 && locFile(n->loc) == refFile) return id;
+                if (first.index == 0) first = id;
+            }
+        }
+        i++;
+    }
+    return first;
+}
+
+/* a module path (`std::fs`) → the diagnostic file id of its source:
+ * `::` becomes `/`, `.crl` is appended when missing, then suffix-matched
+ * against sema's file table (mirror of cgFileForModulePath). */
+u32 wvFileForModulePath(Wv* w, Str path)
+{
+    if (path == 0 || w->sema == null || w->sema.diag == null) return 0;
+    if (w->sema.diag.fileCount == 0) return 0;
+    str p = wvStr(w, path);
+    if (p.len == 0) return 0;
+    bool hasCrl = p.len >= 4 && p.ptr[p.len - 4] == 46 && p.ptr[p.len - 3] == 99 &&
+                  p.ptr[p.len - 2] == 114 && p.ptr[p.len - 1] == 108;
+    usize n = p.len + (hasCrl ? 0 : 4);
+    u8* buf = (u8*)wvArr(w, n, 1);
+    if (buf == null) return 0;
+    usize j = 0;
+    usize k = 0;
+    while (j < p.len)
+    {
+        if (j + 1 < p.len && p.ptr[j] == 58 && p.ptr[j + 1] == 58)
+            { buf[k] = 47; k++; j += 2; } // "::" → '/'
+        else { buf[k] = p.ptr[j]; k++; j++; }
+    }
+    if (!hasCrl) { buf[k] = 46; buf[k + 1] = 99; buf[k + 2] = 114; buf[k + 3] = 108; }
+    u32 f = 0;
+    while (f < w->sema.diag.fileCount)
+    {
+        str fp = w->sema.diag.filePaths.at((usize)f);
+        if (fp.ptr != null && fp.len >= n)
+        {
+            bool ok = true;
+            usize q = 0;
+            while (q < n)
+            {
+                if (fp.ptr[fp.len - n + q] != buf[q]) { ok = false; break; }
+                q++;
+            }
+            if (ok) return f;
+        }
+        f++;
+    }
+    return 0;
+}
+
+/* `root::name(...)`: resolve through the module namespace the root
+ * names — import symbol → its source file → the Func declared there.
+ * Null when the root is not a module (the caller tries the next form). */
+IrFunc* wvLookupPathModule(Wv* w, Str root, Str fname, NodeId refSite)
+{
+    if (root == 0 || fname == 0 || w->sema == null || w->sema.scopes == null) return null;
+    u32 refFile = 0;
+    if (refSite.index != 0)
+    {
+        Node* rn = wvNode(w, refSite);
+        refFile = locFile(rn->loc);
+    }
+    Symbol* rsym = w->sema.scopes.lookupFrom(root, refFile);
+    if (rsym == null || rsym->kind != 5 || rsym->declaration.index == 0) return null;
+    Node* imn = wvNode(w, rsym->declaration);
+    if (imn->kind.tag != NodeKind::Decl) return null;
+    Decl* imd = &imn->kind.payload.Decl.value;
+    Str mpath = 0;
+    if (imd->kind.tag == DeclKind::Import) mpath = imd->kind.payload.Import.path;
+    else if (imd->kind.tag == DeclKind::ModReexport) mpath = imd->kind.payload.ModReexport.path;
+    else return null;
+    u32 mf = wvFileForModulePath(w, mpath);
+    if (mf == 0) return null;
+    NodeId md = wvFindFuncDeclFrom(w, fname, mf);
+    if (md.index == 0) return null;
+    IrFunc* f = wvFnMapGet(w, md.index);
+    if (f != null) return f;
+    Node* fdn = wvNode(w, md);
+    if (fdn->kind.tag != NodeKind::Decl) return null;
+    Decl* fd = &fdn->kind.payload.Decl.value;
+    if (fd->kind.tag != DeclKind::Func) return null;
+    f = wvDeclareFunc(w, md, fd);
+    if (f == null) return null;
+    w->mod.addFunc(f);
+    wvFnMapPut(w, md.index, f);
+    return f;
+}
+
+/* `Owner::method(...)`: the declaring node of a method whose owner
+ * text matches (the def side composes the same `owner_method` symbol).
+ * Generic owners are skipped — mono does not reach methods yet. */
+pub NodeId wvFindMethodDeclOwner(Wv* w, Str owner, Str methName)
+{
+    NodeId none;
+    none.index = 0;
+    if (owner == 0 || methName == 0 || w->file == null) return none;
+    File* file = w->file;
+    u32 i = 0;
+    while (i < file->declsLen)
+    {
+        Node* d = wvNode(w, file->decls[i]);
+        if (d->kind.tag == NodeKind::Decl)
+        {
+            Decl* dd = &d->kind.payload.Decl.value;
+            Str ow = 0;
+            NodeId* methods = null;
+            u32 mlen = 0;
+            if (dd->kind.tag == DeclKind::Struct)
+            {
+                if (dd->kind.payload.Struct.genericParamsLen != 0) { i++; continue; }
+                ow = dd->kind.payload.Struct.name;
+                methods = dd->kind.payload.Struct.methods;
+                mlen = dd->kind.payload.Struct.methodsLen;
+            }
+            else if (dd->kind.tag == DeclKind::Union)
+            {
+                if (dd->kind.payload.Union.genericParamsLen != 0) { i++; continue; }
+                ow = dd->kind.payload.Union.name;
+                methods = dd->kind.payload.Union.methods;
+                mlen = dd->kind.payload.Union.methodsLen;
+            }
+            else if (dd->kind.tag == DeclKind::Variant)
+            {
+                if (dd->kind.payload.Variant.genericParamsLen != 0) { i++; continue; }
+                ow = dd->kind.payload.Variant.name;
+                methods = dd->kind.payload.Variant.methods;
+                mlen = dd->kind.payload.Variant.methodsLen;
+            }
+            else if (dd->kind.tag == DeclKind::Extend)
+            {
+                if (dd->kind.payload.Extend.genericParamsLen != 0) { i++; continue; }
+                if (wvTyHasParam(w, dd->kind.payload.Extend.selfType, 0)) { i++; continue; }
+                ow = wvOwnerStr(w, dd->kind.payload.Extend.selfType);
+                methods = dd->kind.payload.Extend.methods;
+                mlen = dd->kind.payload.Extend.methodsLen;
+            }
+            else if (dd->kind.tag == DeclKind::ExtendTrait)
+            {
+                if (dd->kind.payload.ExtendTrait.genericParamsLen != 0) { i++; continue; }
+                if (wvTyHasParam(w, dd->kind.payload.ExtendTrait.selfType, 0)) { i++; continue; }
+                ow = wvOwnerStr(w, dd->kind.payload.ExtendTrait.selfType);
+                methods = dd->kind.payload.ExtendTrait.methods;
+                mlen = dd->kind.payload.ExtendTrait.methodsLen;
+            }
+            else { i++; continue; }
+            if (ow == owner && methods != null)
+            {
+                u32 m = 0;
+                while (m < mlen)
+                {
+                    Node* mn = wvNode(w, methods[m]);
+                    if (mn->kind.tag == NodeKind::Decl &&
+                        mn->kind.payload.Decl.value.kind.tag == DeclKind::Func &&
+                        mn->kind.payload.Decl.value.kind.payload.Func.name == methName)
+                        return methods[m];
+                    m++;
+                }
+            }
+        }
+        i++;
+    }
+    return none;
+}
+
+/* a `root::name(...)` callee: module function, then static method on
+ * an owner type, then the bare name as a last resort (the order the C
+ * backend resolves in). Null only after the last form also fails to
+ * name a function — that failure is reported by the bare resolver. */
+IrFunc* wvResolveCalleePath(Wv* w, NodeId calleeId, NodeId refSite)
+{
+    Node* cn = wvNode(w, calleeId);
+    if (cn->kind.tag != NodeKind::Expr) return null;
+    Expr* ce = &cn->kind.payload.Expr.value;
+    NodeId* segs = ce->kind.payload.Path.segments;
+    u32 sn = ce->kind.payload.Path.segmentsLen;
+    if (sn == 0) return null;
+    if (sn >= 2)
+    {
+        Node* s0 = wvNode(w, segs[0]);
+        Node* sl = wvNode(w, segs[sn - 1]);
+        if (s0->kind.tag == NodeKind::Expr && sl->kind.tag == NodeKind::Expr &&
+            s0->kind.payload.Expr.value.kind.tag == ExprKind::Ident &&
+            sl->kind.payload.Expr.value.kind.tag == ExprKind::Ident)
+        {
+            Str root = s0->kind.payload.Expr.value.kind.payload.Ident.name;
+            Str fname = sl->kind.payload.Expr.value.kind.payload.Ident.name;
+            IrFunc* f = wvLookupPathModule(w, root, fname, refSite);
+            if (f != null) return f;
+            NodeId mdef = wvFindMethodDeclOwner(w, root, fname);
+            if (mdef.index != 0)
+            {
+                if (w->mono != null && w->mono.genericCount(mdef) != 0)
+                    { wvErr(w, refSite, "call to a generic method (Phase 2)"); return null; }
+                if (wvMethodSelfKind(w, mdef) != 0)
+                    { wvErr(w, refSite, "instance method needs a receiver expression"); return null; }
+                f = wvFnMapGet(w, mdef.index);
+                if (f != null) return f;
+                Node* mn = wvNode(w, mdef);
+                if (mn->kind.tag != NodeKind::Decl) return null;
+                Decl* md = &mn->kind.payload.Decl.value;
+                if (md->kind.tag != DeclKind::Func) return null;
+                str msym = wvMethodMangle(w, mdef, root, fname);
+                if (msym.len == 0) return null;
+                f = wvDeclareMethod(w, mdef, md, msym, null);
+                if (f == null) return null;
+                w->mod.addFunc(f);
+                wvFnMapPut(w, mdef.index, f);
+                return f;
             }
         }
     }
-    wvErr(w, refSite, "unresolved call target");
+    /* last segment as a plain name */
+    Node* sl2 = wvNode(w, segs[sn - 1]);
+    if (sl2->kind.tag == NodeKind::Expr &&
+        sl2->kind.payload.Expr.value.kind.tag == ExprKind::Ident)
+        return wvResolveCallee(w, sl2->kind.payload.Expr.value.kind.payload.Ident.name, refSite);
     return null;
+}
+
+/* resolve a bare-name call target. Null means the name is not a
+ * function — reported here because every call site wants that said. */
+pub IrFunc* wvResolveCallee(Wv* w, Str name, NodeId refSite)
+{
+    IrFunc* f = wvLookupFunc(w, name, refSite);
+    if (f == null) wvErr(w, refSite, "unresolved call target");
+    return f;
+}
+
+/* resolve a bare name to a file-scope constant declaration: sema scope
+ * lookup (the same walk calls use) → declId, kept only when it really
+ * is a constant. Null when the name is not one — the caller decides
+ * whether that is an error or falls through to another resolution. */
+pub NodeId wvResolveConst(Wv* w, Str name, NodeId refSite)
+{
+    NodeId none;
+    none.index = 0;
+    if (name == 0 || w->sema == null || w->sema.scopes == null) return none;
+    u32 refFile = 0;
+    if (refSite.index != 0)
+    {
+        Node* rn = wvNode(w, refSite);
+        refFile = locFile(rn->loc);
+    }
+    Symbol* sym = w->sema.scopes.lookupFrom(name, refFile);
+    if (sym == null || sym->declaration.index == 0) return none;
+    Node* sn = wvNode(w, sym->declaration);
+    if (sn->kind.tag != NodeKind::Decl) return none;
+    if (sn->kind.payload.Decl.value.kind.tag != DeclKind::Constant) return none;
+    /* a name that keeps storage (`var`, `static`, `extern`) is not a
+     * value to fold — references reach its global through the map */
+    if ((sn->kind.payload.Decl.value.kind.payload.Constant.flags & 16) == 0) return none;
+    return sym->declaration;
+}
+
+/* a name that keeps storage → its address value. The collection pass
+ * registered one IrGlobal per declaring node, so the sema symbol's
+ * declaration indexes straight into that map. */
+pub IrValue* wvResolveGlobal(Wv* w, Str name, NodeId refSite)
+{
+    if (name == 0 || w->sema == null || w->sema.scopes == null) return null;
+    u32 refFile = 0;
+    if (refSite.index != 0)
+    {
+        Node* rn = wvNode(w, refSite);
+        refFile = locFile(rn->loc);
+    }
+    Symbol* sym = w->sema.scopes.lookupFrom(name, refFile);
+    if (sym == null || sym->declaration.index == 0) return null;
+    IrGlobal* g = wvGMapGet(w, sym->declaration.index);
+    if (g == null) return null;
+    return &g->base;
+}
+
+/* strtod over a NUL-terminated arena copy of the literal text */
+pub f64 wvParseFloat(Wv* w, Str value)
+{
+    str sv = wvStr(w, value);
+    if (w->arena == null) return 0;
+    rawptr buf = w->arena->alloc(sv.len + 1, 1);
+    if (buf == null) return 0;
+    u8* bp = (u8*)buf;
+    usize i = 0;
+    while (i < sv.len) { bp[i] = sv.ptr[i]; i++; }
+    bp[sv.len] = 0;
+    return strtod((const cchar*)bp, null);
+}
+
+/* the f64 a ConstFloat carries, read back out of its raw bits */
+f64 wvConstFloatBits(IrValue* v)
+{
+    f64 d = 0;
+    copy<u8>((u8*)&d, (u8*)&v->valData, 8);
+    return d;
+}
+
+pub IrValue* wvConstInit(Wv* w, NodeId initId, IrType* dt);
+
+/* fold an initializer and read it back as an integer / an f64. Both
+ * answer false without touching `out` when the node does not fold that
+ * way — the caller then reports. */
+bool wvConstU64(Wv* w, NodeId id, IrType* dt, u64* out)
+{
+    IrValue* v = wvConstInit(w, id, dt);
+    if (v == null || v->kind != IrValueKind::ConstInt) return false;
+    *out = v->valData;
+    return true;
+}
+
+bool wvConstF64(Wv* w, NodeId id, IrType* dt, f64* out)
+{
+    IrValue* v = wvConstInit(w, id, dt);
+    if (v == null || v->kind != IrValueKind::ConstFloat) return false;
+    *out = wvConstFloatBits(v);
+    return true;
+}
+
+/* compile-time initializer for static storage: literals, their negation
+ * and a cast over either fold into an IrValue of the storage's own type;
+ * anything else would need code at load time (Phase 3). */
+pub IrValue* wvConstInit(Wv* w, NodeId initId, IrType* dt)
+{
+    if (initId.index == 0 || dt == null) return null;
+    Node* n = wvNode(w, initId);
+    if (n->kind.tag != NodeKind::Expr)
+    {
+        wvErr(w, initId, "initializer of static storage must be a constant (Phase 3)");
+        return null;
+    }
+    Expr* e = &n->kind.payload.Expr.value;
+    switch (e->kind.tag)
+    {
+        ExprKind::IntLit => { return w->ir->constInt(dt, e->kind.payload.IntLit.value); },
+        ExprKind::BoolLit => {
+            u64 v = (e->kind.payload.BoolLit.flags & 1) != 0 ? 1 : 0;
+            return w->ir->constInt(dt, v);
+        },
+        ExprKind::CharLit => { return w->ir->constInt(dt, (u64)e->kind.payload.CharLit.value); },
+        ExprKind::NullLit => { return w->ir->constInt(dt, 0); },
+        ExprKind::FloatLit => {
+            return w->ir->constFloat(dt, wvParseFloat(w, e->kind.payload.FloatLit.value));
+        },
+        ExprKind::Neg => {
+            IrValue* v = wvConstInit(w, e->kind.payload.Neg.expr, dt);
+            if (v == null) return null;
+            if (v->kind == IrValueKind::ConstFloat)
+            {
+                f64 d = 0;
+                copy<u8>((u8*)&d, (u8*)&v->valData, 8);
+                return w->ir->constFloat(dt, -d);
+            }
+            return w->ir->constInt(dt, (u64)(0 - (i64)(v->valData & 0xFFFFFFFFFFFFFFFFUL)));
+        },
+        ExprKind::Ident => {
+            Str name = e->kind.payload.Ident.name;
+            /* a function reference is its symbol address */
+            IrFunc* f = wvLookupFunc(w, name, initId);
+            if (f != null) return &f->base;
+            /* another name that keeps storage: its address */
+            IrValue* gv = wvResolveGlobal(w, name, initId);
+            if (gv != null) return gv;
+            /* a plain constant folds to its own initializer */
+            NodeId cd = wvResolveConst(w, name, initId);
+            if (cd.index != 0)
+            {
+                Node* cn = wvNode(w, cd);
+                NodeId inner = cn->kind.payload.Decl.value.kind.payload.Constant.value;
+                if (inner.index != 0) return wvConstInit(w, inner, dt);
+            }
+            wvErr(w, initId, "initializer of static storage must be a constant (Phase 3)");
+            return null;
+        },
+        ExprKind::StringLit => {
+            str tok = wvStr(w, e->kind.payload.StringLit.value);
+            bool isC = (e->kind.payload.StringLit.flags & 1) != 0;
+            usize begin = 0;
+            usize end = tok.len;
+            if (isC)
+            {
+                if (tok.len >= 3 && tok.ptr[0] == 67 && tok.ptr[1] == 34)
+                    { begin = 2; end = tok.len - 1; }
+            }
+            else if (tok.len >= 2 && tok.ptr[0] == 34)
+                { begin = 1; end = tok.len - 1; }
+            u8* buf = (u8*)wvArr(w, (end - begin) + 4, 1);
+            if (buf == null) { wvErr(w, initId, "string literal buffer"); return null; }
+            usize dlen = wvDecodeLit(tok, begin, end, buf);
+            str bytes = str::fromParts(buf, dlen);
+            IrStringConst* sc = w->mod->findConstString(bytes, (u32)dlen);
+            if (sc == null)
+            {
+                sc = w->ir->createStringConst(bytes, (u32)dlen);
+                if (sc == null) { wvErr(w, initId, "string constant creation failed"); return null; }
+                w->mod->addConstString(sc);
+            }
+            if (isC) return &sc->base;
+            /* a `str` is { ptr, len } laid out statically */
+            Ty rt = wvResolved(w, e->resolvedType);
+            IrType* st = rt != 0 ? wvTy(w, rt, 0) : null;
+            if (st == null || st->kind != IrTypeKind::Struct)
+                { wvErr(w, initId, "str literal needs the str type"); return null; }
+            IrValue*[2] parts;
+            parts[0] = &sc->base;
+            parts[1] = w->ir->constInt(w->ir->tyInt(64), (u64)dlen);
+            return w->ir->createStructConst(st, parts, 2);
+        },
+        ExprKind::StructLiteral => {
+            if (e->kind.payload.StructLiteral.variantName != 0)
+                { wvErr(w, initId, "variant construction in static storage (Phase 3)"); return null; }
+            Ty stw = wvResolved(w, e->kind.payload.StructLiteral.typeNode);
+            /* the storage's own type decides the layout; the literal's
+             * type node only gives the field names their order */
+            IrType* irt = dt->kind == IrTypeKind::Struct ? dt
+                          : (stw != 0 ? wvTy(w, stw, 0) : null);
+            if (irt == null || irt->kind != IrTypeKind::Struct)
+                { wvErr(w, initId, "struct literal needs a struct type"); return null; }
+            u32 n = irt->nparams;
+            IrValue** fields = (IrValue**)wvArr(w, (usize)n, 8);
+            if (fields == null) return null;
+            u32 z = 0;
+            while (z < n) { fields[z] = null; z++; }
+            u32 i = 0;
+            u32 m = e->kind.payload.StructLiteral.fieldValuesLen;
+            Str* fnames = e->kind.payload.StructLiteral.fieldNames;
+            NodeId* fvals = e->kind.payload.StructLiteral.fieldValues;
+            while (i < m)
+            {
+                if (fnames == null || fvals == null || fvals[i].index == 0) { i++; continue; }
+                u32 fi = wvFieldIdx(w, stw, fnames[i]);
+                if (fi == 0xFFFFFFFF || fi >= n)
+                    { wvErr(w, initId, "unknown struct literal field"); return null; }
+                fields[fi] = wvConstInit(w, fvals[i], irt->params[fi]);
+                i++;
+            }
+            return w->ir->createStructConst(irt, fields, n);
+        },
+        ExprKind::ArrayLiteral | ExprKind::TupleExpr => {
+            IrType* irt = dt;
+            if (irt == null || (irt->kind != IrTypeKind::Array && irt->kind != IrTypeKind::Struct))
+                { wvErr(w, initId, "aggregate literal needs an aggregate type"); return null; }
+            NodeId* elems = e->kind.tag == ExprKind::ArrayLiteral
+                ? e->kind.payload.ArrayLiteral.elems : e->kind.payload.TupleExpr.elems;
+            u32 cnt = e->kind.tag == ExprKind::ArrayLiteral
+                ? e->kind.payload.ArrayLiteral.elemsLen : e->kind.payload.TupleExpr.elemsLen;
+            u32 cap = irt->kind == IrTypeKind::Array ? (irt->count > 0 ? irt->count : cnt) : irt->nparams;
+            if (cap < cnt) cap = cnt;
+            IrValue** evs = (IrValue**)wvArr(w, (usize)cap, 8);
+            if (evs == null) return null;
+            u32 i = 0;
+            while (i < cap)
+            {
+                evs[i] = null;
+                i++;
+            }
+            i = 0;
+            while (i < cnt && elems != null)
+            {
+                if (elems[i].index != 0)
+                {
+                    IrType* et = irt->kind == IrTypeKind::Array ? irt->elem
+                        : (i < irt->nparams ? irt->params[i] : null);
+                    if (et != null) evs[i] = wvConstInit(w, elems[i], et);
+                }
+                i++;
+            }
+            if (irt->kind == IrTypeKind::Array) return w->ir->constArray(irt, evs, cnt);
+            return w->ir->createStructConst(irt, evs, cap);
+        },
+        ExprKind::Sizeof => {
+            Ty st = wvResolved(w, e->kind.payload.Sizeof.targetType);
+            IrType* stt = st != 0 ? wvTy(w, st, 0) : null;
+            if (stt == null) { wvErr(w, initId, "sizeof of an unknown type in an initializer"); return null; }
+            return w->ir->constInt(dt, (u64)w->ir->irTypeSizeOf(stt));
+        },
+        ExprKind::Alignof => {
+            Ty st = wvResolved(w, e->kind.payload.Alignof.targetType);
+            IrType* stt = st != 0 ? wvTy(w, st, 0) : null;
+            if (stt == null) { wvErr(w, initId, "alignof of an unknown type in an initializer"); return null; }
+            u32 al = w->ir->irTypeAlignOf(stt);
+            if (al == 0) al = 1;
+            return w->ir->constInt(dt, (u64)al);
+        },
+        ExprKind::Cast => {
+            IrValue* v = wvConstInit(w, e->kind.payload.Cast.expr, dt);
+            if (v == null) return null;
+            /* both sides already carry the storage's type: only a float
+             * narrowed to an integer needs an actual conversion */
+            if (v->kind == IrValueKind::ConstFloat && dt->kind != IrTypeKind::Float)
+            {
+                f64 d = 0;
+                copy<u8>((u8*)&d, (u8*)&v->valData, 8);
+                return w->ir->constInt(dt, (u64)(i64)d);
+            }
+            if (v->kind == IrValueKind::ConstFloat) return w->ir->constFloat(dt, wvConstFloatBits(v));
+            if (dt->kind == IrTypeKind::Float)
+                return w->ir->constFloat(dt, (f64)(i64)(v->valData & 0xFFFFFFFFFFFFFFFFUL));
+            return w->ir->constInt(dt, v->valData);
+        },
+        ExprKind::BitNot | ExprKind::Not => {
+            if (dt->kind != IrTypeKind::Int)
+                { wvErr(w, initId, "bitwise not of a non-integer constant (Phase 3)"); return null; }
+            NodeId inner = e->kind.tag == ExprKind::BitNot
+                ? e->kind.payload.BitNot.expr : e->kind.payload.Not.expr;
+            u64 v = 0;
+            if (!wvConstU64(w, inner, dt, &v))
+                { wvErr(w, initId, "initializer of static storage must be a constant (Phase 3)"); return null; }
+            if (e->kind.tag == ExprKind::BitNot) return w->ir->constInt(dt, ~v);
+            return w->ir->constInt(dt, v == 0 ? 1 : 0);
+        },
+        ExprKind::Add | ExprKind::Sub | ExprKind::Mul | ExprKind::Div |
+        ExprKind::Mod | ExprKind::BitAnd | ExprKind::BitOr | ExprKind::BitXor |
+        ExprKind::Shl | ExprKind::Shr | ExprKind::And | ExprKind::Or => {
+            NodeId lid = e->kind.payload.Add.left;
+            NodeId rid = e->kind.payload.Add.right;
+            bool isArith = e->kind.tag == ExprKind::Add || e->kind.tag == ExprKind::Sub ||
+                           e->kind.tag == ExprKind::Mul || e->kind.tag == ExprKind::Div ||
+                           e->kind.tag == ExprKind::Mod;
+            if (dt->kind == IrTypeKind::Float)
+            {
+                if (!isArith || e->kind.tag == ExprKind::Mod)
+                    { wvErr(w, initId, "operator has no constant float form (Phase 3)"); return null; }
+                f64 a = 0;
+                f64 b = 0;
+                if (!wvConstF64(w, lid, dt, &a) || !wvConstF64(w, rid, dt, &b))
+                    { wvErr(w, initId, "initializer of static storage must be a constant (Phase 3)"); return null; }
+                f64 r = 0;
+                if (e->kind.tag == ExprKind::Add) r = a + b;
+                else if (e->kind.tag == ExprKind::Sub) r = a - b;
+                else if (e->kind.tag == ExprKind::Mul) r = a * b;
+                else if (b != 0) r = a / b;
+                return w->ir->constFloat(dt, r);
+            }
+            if (dt->kind != IrTypeKind::Int)
+                { wvErr(w, initId, "arithmetic on a non-numeric constant (Phase 3)"); return null; }
+            u64 a = 0;
+            u64 b = 0;
+            if (!wvConstU64(w, lid, dt, &a) || !wvConstU64(w, rid, dt, &b))
+                { wvErr(w, initId, "initializer of static storage must be a constant (Phase 3)"); return null; }
+            /* signedness comes from the expression's own resolved type:
+             * the IR type carries only a width */
+            Ty ct = wvResolved(w, e->resolvedType);
+            bool uns = ct != 0 && wvTyUnsigned(w, ct);
+            i32 k = e->kind.tag;
+            u64 r = 0;
+            if (k == ExprKind::Add) r = a + b;
+            else if (k == ExprKind::Sub) r = a - b;
+            else if (k == ExprKind::Mul) r = a * b;
+            else if (k == ExprKind::BitAnd) r = a & b;
+            else if (k == ExprKind::BitOr) r = a | b;
+            else if (k == ExprKind::BitXor) r = a ^ b;
+            else if (k == ExprKind::And) r = (a != 0 && b != 0) ? 1 : 0;
+            else if (k == ExprKind::Or) r = (a != 0 || b != 0) ? 1 : 0;
+            else if (k == ExprKind::Shl) r = b >= 64 ? 0 : (a << b);
+            else if (k == ExprKind::Shr)
+                r = b >= 64 ? (uns ? 0 : 0)
+                            : (uns ? (a >> b) : (u64)((i64)a >> (i64)b));
+            else if (k == ExprKind::Div || k == ExprKind::Mod)
+            {
+                if (b == 0)
+                    { wvErr(w, initId, "division by zero in a constant expression"); return null; }
+                if (uns) r = (k == ExprKind::Div) ? (a / b) : (a % b);
+                else
+                {
+                    i64 sa = (i64)a;
+                    i64 sb = (i64)b;
+                    r = (k == ExprKind::Div) ? (u64)(sa / sb) : (u64)(sa % sb);
+                }
+            }
+            return w->ir->constInt(dt, r);
+        },
+        else => {
+            wvErr(w, initId, "initializer of static storage must be a constant (Phase 3)");
+            return null;
+        },
+    }
+}
+
+/* static storage for one name: an IrGlobal registered under the
+ * declaring node, typed as a pointer to the data so loads, stores and
+ * geppes all reach it. `disambiguator` (0 for file scope) keeps two
+ * same-named statics in one file from sharing a symbol. */
+pub IrValue* wvMakeGlobal(Wv* w, NodeId declId, Str name, Ty vt, NodeId initId,
+                          bool isConst, bool isExtern, u32 disambiguator)
+{
+    IrGlobal* seen = wvGMapGet(w, declId.index);
+    if (seen != null) return &seen->base;
+    if (vt == 0 && initId.index != 0)
+    {
+        /* `const NAME = value;` carries no type node: take the type the
+         * initializer resolved to */
+        Node* in = wvNode(w, initId);
+        if (in->kind.tag == NodeKind::Expr)
+            vt = wvResolved(w, in->kind.payload.Expr.value.resolvedType);
+    }
+    IrType* dt = vt != 0 ? wvTy(w, vt, 0) : null;
+    if (dt == null || dt->kind == IrTypeKind::Void)
+    {
+        wvErr(w, declId, "cannot give this name storage");
+        return null;
+    }
+    IrValue* init = null;
+    if (initId.index != 0 && !isExtern) init = wvConstInit(w, initId, dt);
+    str mangled = wvMangle(w, declId, name);
+    if (disambiguator != 0)
+    {
+        wvMbCh(w, 36); // '$'
+        u32 d = disambiguator;
+        u8[10] tmp;
+        u32 k = 0;
+        if (d == 0) tmp[k++] = 48;
+        while (d > 0) { tmp[k++] = (u8)(48 + (d % 10)); d /= 10; }
+        while (k > 0) { k--; wvMbCh(w, tmp[k]); }
+        mangled = wvMbStr(w);
+    }
+    IrGlobal* g = w->ir->createGlobal(mangled, w->ir->tyPtr(dt), isConst, isExtern,
+                                      init, w->ir->irTypeAlignOf(dt));
+    w->mod->addGlobal(g);
+    wvGMapPut(w, declId.index, g);
+    return &g->base;
 }
 
 /* C default-argument promotions for variadic args: int < 32-bit →
@@ -113,49 +757,178 @@ pub IrValue* wvPromoteVararg(Wv* w, IrValue* v, Ty coralTy)
 }
 
 
+/* evaluate a call's argument list: an optional receiver first, then
+ * every listed argument (with vararg promotion past the fixed prefix).
+ * Shared by bare calls and method calls. On failure *fail is set and
+ * the array (if any) is already freed. */
+pub IrValue** wvBuildCallArgs(Wv* w, IrFunc* f, NodeId* argv, u32 argvLen,
+                              IrValue* recv, bool passRecv, u32* outN, bool* fail)
+{
+    *fail = false;
+    *outN = 0;
+    u32 n = argvLen + (passRecv ? 1 : 0);
+    IrValue** args = null;
+    if (n > 0)
+    {
+        args = alloc<IrValue*>((usize)n);
+        if (args == null) { *fail = true; return null; }
+    }
+    u32 j = 0;
+    if (passRecv) { args[0] = recv; j = 1; }
+    bool vararg = f != null && f->base.type != null && f->base.type->isVararg;
+    u32 fixed = f != null ? f->nparams : 0;
+    u32 i = 0;
+    while (i < argvLen)
+    {
+        IrValue* av = wvExpr(w, argv[i]);
+        if (av == null)
+        {
+            *fail = true;
+            if (args != null) dealloc<IrValue*>(args);
+            return null;
+        }
+        if (vararg && (i + (passRecv ? 1 : 0)) >= fixed)
+        {
+            Node* an = wvNode(w, argv[i]);
+            Ty at = an->kind.tag == NodeKind::Expr ? an->kind.payload.Expr.value.resolvedType : 0;
+            av = wvPromoteVararg(w, av, at);
+        }
+        args[j] = av;
+        j++;
+        i++;
+    }
+    *outN = n;
+    return args;
+}
+
 pub IrValue* wvCall(Wv* w, Expr* e, NodeId id)
 {
     NodeId calleeId = e->kind.payload.Call.callee;
     Node* cn = wvNode(w, calleeId);
-    if (cn->kind.tag != NodeKind::Expr ||
-        cn->kind.payload.Expr.value.kind.tag != ExprKind::Ident)
+    if (cn->kind.tag != NodeKind::Expr)
     {
         wvErr(w, id, "unsupported callee form (Phase 1: bare-name calls only)");
         return null;
     }
-    Str name = cn->kind.payload.Expr.value.kind.payload.Ident.name;
-    IrFunc* f = wvResolveCallee(w, name, calleeId);
-    if (f == null) return null;
-
-    u32 nargs = e->kind.payload.Call.argsLen;
-    IrValue** args = null;
-    if (nargs > 0) args = alloc<IrValue*>((usize)nargs);
-    bool vararg = f->base.type != null && f->base.type->isVararg;
-    u32 fixed = f->nparams;
-    bool fail = false;
-    u32 i = 0;
-    while (i < nargs && !fail)
+    i32 ck = cn->kind.payload.Expr.value.kind.tag;
+    IrFunc* f = null;
+    if (ck == ExprKind::Ident)
+        f = wvResolveCallee(w, cn->kind.payload.Expr.value.kind.payload.Ident.name, calleeId);
+    else if (ck == ExprKind::Path)
+        f = wvResolveCalleePath(w, calleeId, id);
+    else
     {
-        IrValue* av = wvExpr(w, e->kind.payload.Call.args[i]);
-        if (av == null) { fail = true; break; }
-        if (vararg && i >= fixed)
-        {
-            Node* an = wvNode(w, e->kind.payload.Call.args[i]);
-            Ty at = an->kind.tag == NodeKind::Expr ? an->kind.payload.Expr.value.resolvedType : 0;
-            av = wvPromoteVararg(w, av, at);
-        }
-        args[i] = av;
-        i++;
-    }
-    if (fail)
-    {
-        if (args != null) dealloc<IrValue*>(args);
+        wvErr(w, id, "unsupported callee form (Phase 1: bare-name calls only)");
         return null;
     }
+    if (f == null) return null;
+
+    u32 nargs = 0;
+    bool fail = false;
+    IrValue** args = wvBuildCallArgs(w, f, e->kind.payload.Call.args,
+                                     e->kind.payload.Call.argsLen,
+                                     null, false, &nargs, &fail);
+    if (fail) return null;
     IrValue* res = wvV(w->b.call(&f->base, args, nargs));
     if (args != null) dealloc<IrValue*>(args);
     if (f->retType != null && f->retType->kind == IrTypeKind::Void) return null;
     return res;
+}
+
+/* `recv.method(args...)`: a real method when the receiver's type (or a
+ * matching extend) declares one — the receiver becomes the shell's
+ * parameter 0 unless the method is static — otherwise a fn-pointer
+ * field of the receiver called with only the listed arguments. */
+pub IrValue* wvMethodCall(Wv* w, Expr* e, NodeId id)
+{
+    NodeId recvNode = e->kind.payload.MethodCall.receiver;
+    Str meth = e->kind.payload.MethodCall.method;
+    NodeId* argv = e->kind.payload.MethodCall.args;
+    u32 argvLen = e->kind.payload.MethodCall.argsLen;
+
+    Node* rn = wvNode(w, recvNode);
+    Ty recvTy = rn->kind.tag == NodeKind::Expr
+        ? rn->kind.payload.Expr.value.resolvedType : 0;
+
+    NodeId mdef = wvFindMethodDecl(w, recvTy, meth);
+    if (mdef.index != 0)
+    {
+        Node* mn = wvNode(w, mdef);
+        if (mn->kind.tag != NodeKind::Decl ||
+            mn->kind.payload.Decl.value.kind.tag != DeclKind::Func)
+            { wvErr(w, id, "method is not a function"); return null; }
+        Decl* md = &mn->kind.payload.Decl.value;
+        if (w->mono != null && w->mono.genericCount(mdef) != 0)
+            { wvErr(w, id, "call to a generic method (Phase 2)"); return null; }
+
+        IrFunc* f = wvFnMapGet(w, mdef.index);
+        if (f == null)
+        {
+            /* the collection pass declares every method it sees; this
+             * shell only fires for a tree it skipped. The receiver's
+             * own type gives both the symbol's owner and the self
+             * parameter's pointee. */
+            Str owner = wvOwnerStr(w, recvTy);
+            str msym = wvMethodMangle(w, mdef, owner, meth);
+            if (msym.len == 0) { wvErr(w, id, "cannot compose the method symbol"); return null; }
+            IrType* selfPt = null;
+            if (wvMethodSelfKind(w, mdef) == 1)
+            {
+                Ty u = wvUnwrapTy(w, recvTy);
+                if (u != 0 && (w->ctx->types + u)->kind.tag == TypeKind::Pointer)
+                    u = wvUnwrapTy(w, (w->ctx->types + u)->kind.payload.Pointer.base);
+                if (u != 0) selfPt = w->ir->tyPtr(wvTy(w, u, 0));
+            }
+            f = wvDeclareMethod(w, mdef, md, msym, selfPt);
+            if (f == null) { wvErr(w, id, "cannot declare the method"); return null; }
+            w->mod.addFunc(f);
+            wvFnMapPut(w, mdef.index, f);
+        }
+
+        u8 sk = wvMethodSelfKind(w, mdef);
+        IrValue* recvVal = null;
+        bool passRecv = sk != 0;
+        if (passRecv)
+        {
+            Ty rt = wvUnwrapTy(w, recvTy);
+            bool recvIsPtr = rt != 0 && (w->ctx->types + rt)->kind.tag == TypeKind::Pointer;
+            recvVal = recvIsPtr ? wvExpr(w, recvNode) : wvAddrOf(w, recvNode);
+            if (recvVal == null) return null;
+        }
+        u32 nargs = 0;
+        bool fail = false;
+        IrValue** args = wvBuildCallArgs(w, f, argv, argvLen, recvVal, passRecv,
+                                         &nargs, &fail);
+        if (fail) return null;
+        IrValue* res = wvV(w->b.call(&f->base, args, nargs));
+        if (args != null) dealloc<IrValue*>(args);
+        if (f->retType != null && f->retType->kind == IrTypeKind::Void) return null;
+        return res;
+    }
+
+    /* not a method: a fn-pointer field, called as `(recv.field)(args)` */
+    if (wvHasField(w, recvTy, meth))
+    {
+        IrValue* faddr = wvFieldAddr(w, recvNode, meth, id);
+        if (faddr == null) return null;
+        IrType* fty = faddr->type != null ? faddr->type->elem : null;
+        if (fty == null || fty->kind != IrTypeKind::Func)
+            { wvErr(w, id, "field is not a function pointer"); return null; }
+        IrValue* fval = wvV(w->b.load(fty, faddr));
+        if (fval == null) return null;
+        u32 nargs = 0;
+        bool fail = false;
+        IrValue** args = wvBuildCallArgs(w, null, argv, argvLen, null, false,
+                                         &nargs, &fail);
+        if (fail) return null;
+        IrValue* res = wvV(w->b.call(fval, args, nargs));
+        if (args != null) dealloc<IrValue*>(args);
+        if (fty->ret == null || fty->ret->kind == IrTypeKind::Void) return null;
+        return res;
+    }
+
+    wvErr(w, id, "no such method or function-pointer field");
+    return null;
 }
 
 
@@ -353,6 +1126,161 @@ pub bool wvIsAgg(IrType* t)
  * order wvStructTy feeds createStructType, which is the order wallvm's
  * emitGep walks for field offsets. Str/Slice expose the fixed {ptr,len}
  * pair. 0xFFFFFFFF when the field is unknown. */
+/* the field's address: pointer receivers pass the value through, value
+ * receivers contribute their address — shared by `x.f`, `x?.f`-style
+ * chains and the fn-pointer-field call form of a method call. */
+pub IrValue* wvFieldAddr(Wv* w, NodeId obj, Str fname, NodeId errId)
+{
+    Node* on = wvNode(w, obj);
+    if (on->kind.tag != NodeKind::Expr)
+        { wvErr(w, errId, "field base is not an expression"); return null; }
+    Ty obt = wvUnwrapTy(w, wvResolved(w, on->kind.payload.Expr.value.resolvedType));
+    IrValue* base; Ty sty;
+    if (obt != 0 && (w->ctx->types + obt)->kind.tag == TypeKind::Pointer)
+    {
+        sty = (w->ctx->types + obt)->kind.payload.Pointer.base;
+        base = wvExpr(w, obj); // the pointer value
+    }
+    else
+    {
+        sty = obt;
+        base = wvAddrOf(w, obj); // address of the struct value
+    }
+    if (base == null) return null;
+    u32 fi = wvFieldIdx(w, sty, fname);
+    if (fi == 0xFFFFFFFF) { wvErr(w, errId, "unknown struct field"); return null; }
+    return wvGepField(w, base, fi);
+}
+
+/* the declaring node of a method on a receiver type — the same walk
+ * cgMethodRecvKind performs: unwrap ptr/const/comptime to the named
+ * type, then scan the type's own methods and the extends whose self
+ * type matches. 0 when the name is not a method at all. */
+pub NodeId wvFindMethodDecl(Wv* w, Ty recvTy, Str method)
+{
+    NodeId none;
+    none.index = 0;
+    if (recvTy == 0 || method == 0 || w->file == null) return none;
+    Ty t = recvTy;
+    u32 guard = 0;
+    while (t != 0 && guard < 8)
+    {
+        guard++;
+        TypeEntry* e = w->ctx->types + t;
+        if (e->kind.tag == TypeKind::Pointer) t = e->kind.payload.Pointer.base;
+        else if (e->kind.tag == TypeKind::Const) t = e->kind.payload.Const.base;
+        else if (e->kind.tag == TypeKind::Comptime) t = e->kind.payload.Comptime.base;
+        else break;
+    }
+    if (t == 0 || (w->ctx->types + t)->kind.tag != TypeKind::Named) return none;
+    Str typeName = (w->ctx->types + t)->kind.payload.Named.name;
+    File* file = w->file;
+    u32 i = 0;
+    while (i < file->declsLen)
+    {
+        Node* d = wvNode(w, file->decls[i]);
+        if (d->kind.tag == NodeKind::Decl)
+        {
+            Decl* dd = &d->kind.payload.Decl.value;
+            NodeId* methods = null;
+            u32 mlen = 0;
+            switch (dd->kind.tag)
+            {
+                DeclKind::Struct => {
+                    if (dd->kind.payload.Struct.name != typeName) break;
+                    methods = dd->kind.payload.Struct.methods;
+                    mlen = dd->kind.payload.Struct.methodsLen;
+                },
+                DeclKind::Union => {
+                    if (dd->kind.payload.Union.name != typeName) break;
+                    methods = dd->kind.payload.Union.methods;
+                    mlen = dd->kind.payload.Union.methodsLen;
+                },
+                DeclKind::Variant => {
+                    if (dd->kind.payload.Variant.name != typeName) break;
+                    methods = dd->kind.payload.Variant.methods;
+                    mlen = dd->kind.payload.Variant.methodsLen;
+                },
+                /* an extend's methods belong to its self type — without
+                 * this filter a fn-pointer field call (`p->alloc(...)`,
+                 * where some OTHER type has an `alloc` method) matches
+                 * this unrelated extend and composes a bogus call */
+                DeclKind::Extend | DeclKind::ExtendTrait => {
+                    Ty st = dd->kind.tag == DeclKind::Extend
+                        ? dd->kind.payload.Extend.selfType
+                        : dd->kind.payload.ExtendTrait.selfType;
+                    st = wvUnwrapTy(w, st);
+                    if (st != 0 && (w->ctx->types + st)->kind.tag == TypeKind::Pointer)
+                        st = wvUnwrapTy(w, (w->ctx->types + st)->kind.payload.Pointer.base);
+                    if (st == 0 || (w->ctx->types + st)->kind.tag != TypeKind::Named ||
+                        (w->ctx->types + st)->kind.payload.Named.name != typeName) break;
+                    methods = dd->kind.tag == DeclKind::Extend
+                        ? dd->kind.payload.Extend.methods
+                        : dd->kind.payload.ExtendTrait.methods;
+                    mlen = dd->kind.tag == DeclKind::Extend
+                        ? dd->kind.payload.Extend.methodsLen
+                        : dd->kind.payload.ExtendTrait.methodsLen;
+                },
+                else => {},
+            }
+            if (methods != null)
+            {
+                u32 m = 0;
+                while (m < mlen)
+                {
+                    Node* mn = wvNode(w, methods[m]);
+                    if (mn->kind.tag == NodeKind::Decl &&
+                        mn->kind.payload.Decl.value.kind.tag == DeclKind::Func &&
+                        mn->kind.payload.Decl.value.kind.payload.Func.name == method)
+                        return methods[m];
+                    m++;
+                }
+            }
+        }
+        i++;
+    }
+    return none;
+}
+
+/* does the receiver's named struct/union declare field `name`? (the
+ * fn-pointer field form a method call may fall back to) */
+pub bool wvHasField(Wv* w, Ty recvTy, Str name)
+{
+    if (recvTy == 0 || name == 0) return false;
+    Ty u = wvUnwrapTy(w, recvTy);
+    if (u != 0 && (w->ctx->types + u)->kind.tag == TypeKind::Pointer)
+        u = wvUnwrapTy(w, (w->ctx->types + u)->kind.payload.Pointer.base);
+    if (u == 0 || (w->ctx->types + u)->kind.tag != TypeKind::Named) return false;
+    Str tn = (w->ctx->types + u)->kind.payload.Named.name;
+    NodeId d = wvFindTypeDecl(w, tn);
+    if (d.index == 0) return false;
+    Node* dn = wvNode(w, d);
+    if (dn->kind.tag != NodeKind::Decl) return false;
+    Decl* dd = &dn->kind.payload.Decl.value;
+    NodeId* fields = null;
+    u32 flen = 0;
+    if (dd->kind.tag == DeclKind::Struct)
+    {
+        fields = dd->kind.payload.Struct.fields;
+        flen = dd->kind.payload.Struct.fieldsLen;
+    }
+    else if (dd->kind.tag == DeclKind::Union)
+    {
+        fields = dd->kind.payload.Union.fields;
+        flen = dd->kind.payload.Union.fieldsLen;
+    }
+    else return false;
+    u32 i = 0;
+    while (i < flen)
+    {
+        Node* fn = wvNode(w, fields[i]);
+        if (fn->kind.tag == NodeKind::Field && fn->kind.payload.Field.value.name == name)
+            return true;
+        i++;
+    }
+    return false;
+}
+
 pub u32 wvFieldIdx(Wv* w, Ty t, Str name)
 {
     u32 none = 0xFFFFFFFF;
@@ -371,7 +1299,7 @@ pub u32 wvFieldIdx(Wv* w, Ty t, Str name)
             return none;
         }
         if (e->kind.tag != TypeKind::Named) return none;
-        NodeId td = wvFindTypeDecl(w->file, w->ctx, e->kind.payload.Named.name);
+        NodeId td = wvFindTypeDecl(w, e->kind.payload.Named.name);
         if (td.index == 0) return none;
         Node* dn = wvNode(w, td);
         if (dn->kind.tag != NodeKind::Decl) return none;
@@ -431,6 +1359,142 @@ pub IrValue* wvGepField(Wv* w, IrValue* base, u32 fi)
     return wvV(w->b.gep(base, idxs, 1));
 }
 
+/* An aggregate value IS its address, so the alloca that holds one is
+ * typed as the aggregate itself: call/return ABI classification reads
+ * the struct words through that address (kind 3/4), which it only does
+ * when the value's type says Struct. Scalar slots stay ptr-typed — they
+ * are loaded into registers instead. */
+pub IrValue* wvAggSlot(Wv* w, IrType* ty)
+{
+    IrValue* slot = wvV(w->b.alloca(ty));
+    if (slot != null) slot->type = ty;
+    return slot;
+}
+
+/* decode Coral string-literal token text [begin,end) into out — every
+ * escape becomes one byte (\n \t \r \0 \a \b \f \v \\ \" \' \xNN,
+ * \NNN octal; unknown escapes drop the backslash, like C). out must hold
+ * at least end-begin bytes; returns the decoded length. Shared by string
+ * literals and asm template pieces so both reach IR as identical bytes. */
+pub usize wvDecodeLit(str tok, usize begin, usize end, u8* out)
+{
+    usize dlen = 0;
+    usize i = begin;
+    while (i < end)
+    {
+        u8 c = tok.ptr[i];
+        if (c != '\\' || i + 1 >= end) { out[dlen++] = c; i++; continue; }
+        u8 esc = tok.ptr[i + 1];
+        if (esc == 'n') { out[dlen++] = 10; i += 2; continue; }
+        if (esc == 't') { out[dlen++] = 9; i += 2; continue; }
+        if (esc == 'r') { out[dlen++] = 13; i += 2; continue; }
+        if (esc == '0') { out[dlen++] = 0; i += 2; continue; }
+        if (esc == 'a') { out[dlen++] = 7; i += 2; continue; }
+        if (esc == 'b') { out[dlen++] = 8; i += 2; continue; }
+        if (esc == 'f') { out[dlen++] = 12; i += 2; continue; }
+        if (esc == 'v') { out[dlen++] = 11; i += 2; continue; }
+        if (esc == '\\' || esc == '"' || esc == '\'') { out[dlen++] = esc; i += 2; continue; }
+        if (esc == 'x')
+        {
+            u32 v = 0;
+            usize j = i + 2;
+            u32 used = 0;
+            while (j < end && used < 2)
+            {
+                u8 h = tok.ptr[j];
+                u32 d;
+                if (h >= '0' && h <= '9') d = (u32)(h - '0');
+                else if (h >= 'a' && h <= 'f') d = (u32)(h - 'a' + 10);
+                else if (h >= 'A' && h <= 'F') d = (u32)(h - 'A' + 10);
+                else break;
+                v = v * 16 + d;
+                j++; used++;
+            }
+            if (used == 0) { out[dlen++] = 'x'; i += 2; continue; }
+            out[dlen++] = (u8)v;
+            i = j;
+            continue;
+        }
+        if (esc >= '0' && esc <= '7')
+        {
+            u32 v = 0;
+            usize j = i + 1;
+            u32 used = 0;
+            while (j < end && used < 3)
+            {
+                u8 h = tok.ptr[j];
+                if (h < '0' || h > '7') break;
+                v = v * 8 + (u32)(h - '0');
+                j++; used++;
+            }
+            out[dlen++] = (u8)v;
+            i = j;
+            continue;
+        }
+        /* unknown escape: the backslash drops, like C */
+        out[dlen++] = esc;
+        i += 2;
+    }
+    return dlen;
+}
+
+/* StringLit → address of merged rodata.
+ *   C"..." → the pointer value itself (record is NUL-terminated)
+ *   "..."  → { ptr, len } in an aggregate slot, field-wise initialized
+ * Token text keeps its quotes and escapes; decoding happens here the way
+ * the C backend lets the C compiler do it: every escape is one byte of
+ * the str's len. */
+pub IrValue* wvStringLit(Wv* w, NodeId id)
+{
+    Node* n = wvNode(w, id);
+    if (n == null || n->kind.tag != NodeKind::Expr)
+        { wvErr(w, id, "string literal"); return null; }
+    Expr* e = &n->kind.payload.Expr.value;
+    str tok = wvStr(w, e->kind.payload.StringLit.value);
+    bool isC = (e->kind.payload.StringLit.flags & 1) != 0;
+    usize begin = 0;
+    usize end = tok.len;
+    if (isC)
+    {
+        /* token text is `C"…"`: drop the prefix and both quotes */
+        if (tok.len >= 3 && tok.ptr[0] == 'C' && tok.ptr[1] == '"')
+            { begin = 2; end = tok.len - 1; }
+    }
+    else if (tok.len >= 2 && tok.ptr[0] == '"')
+        { begin = 1; end = tok.len - 1; }
+
+    u8* buf = (u8*)wvArr(w, (end - begin) + 4, 1);
+    if (buf == null) { wvErr(w, id, "string literal buffer"); return null; }
+    usize dlen = wvDecodeLit(tok, begin, end, buf);
+
+
+    IrValue*[1] z;
+    z[0] = w->ir->constInt(w->ir->tyInt(32), 0);
+    str bytes = str::fromParts(buf, dlen);
+    IrStringConst* sc = w->mod->findConstString(bytes, (u32)dlen);
+    if (sc == null)
+    {
+        sc = w->ir->createStringConst(bytes, (u32)dlen);
+        if (sc == null) { wvErr(w, id, "string constant creation failed"); return null; }
+        w->mod->addConstString(sc);
+    }
+    IrValue* addr = wvV(w->b.gep(&sc->base, z, 1));
+    if (addr == null) return null;
+    if (isC) return addr;
+
+    Ty rt = wvResolved(w, e->resolvedType);
+    IrType* st = wvTy(w, rt, 0);
+    if (st == null || st->kind != IrTypeKind::Struct)
+        { wvErr(w, id, "str literal needs the str type"); return null; }
+    IrValue* slot = wvAggSlot(w, st);
+    if (slot == null) return null;
+    w->b.store(addr, slot);
+    IrValue* lenF = wvGepField(w, slot, 1);
+    if (lenF == null) return null;
+    w->b.store(w->ir->constInt(w->ir->tyInt(64), (u64)dlen), lenF);
+    return slot;
+}
+
 /* the address of an lvalue expression: local slot, deref pointee, or a
  * gep chain (field / tuple field / index). Used by plain assignment,
  * compound assignment and aggregate copies alike. */
@@ -443,10 +1507,13 @@ pub IrValue* wvAddrOf(Wv* w, NodeId id)
     switch (e->kind.tag)
     {
         ExprKind::Ident => {
-            IrValue* slot = wvFindLocal(w, e->kind.payload.Ident.name);
-            if (slot == null)
-                wvErr(w, id, "cannot assign to a non-local name (globals: Phase 2)");
-            return slot;
+            Str name = e->kind.payload.Ident.name;
+            IrValue* slot = wvFindLocal(w, name);
+            if (slot != null) return slot;
+            IrValue* gv = wvResolveGlobal(w, name, id);
+            if (gv != null) return gv;
+            wvErr(w, id, "cannot assign to a non-local name");
+            return null;
         },
         ExprKind::Deref => { return wvExpr(w, e->kind.payload.Deref.expr); },
         ExprKind::Field | ExprKind::DerefField => {
@@ -455,25 +1522,7 @@ pub IrValue* wvAddrOf(Wv* w, NodeId id)
                 { obj = e->kind.payload.Field.obj; fname = e->kind.payload.Field.field; }
             else
                 { obj = e->kind.payload.DerefField.obj; fname = e->kind.payload.DerefField.field; }
-            Node* on = wvNode(w, obj);
-            if (on->kind.tag != NodeKind::Expr)
-                { wvErr(w, id, "field base is not an expression"); return null; }
-            Ty obt = wvUnwrapTy(w, wvResolved(w, on->kind.payload.Expr.value.resolvedType));
-            IrValue* base; Ty sty;
-            if (obt != 0 && (w->ctx->types + obt)->kind.tag == TypeKind::Pointer)
-            {
-                sty = (w->ctx->types + obt)->kind.payload.Pointer.base;
-                base = wvExpr(w, obj); // the pointer value
-            }
-            else
-            {
-                sty = obt;
-                base = wvAddrOf(w, obj); // address of the struct value
-            }
-            if (base == null) return null;
-            u32 fi = wvFieldIdx(w, sty, fname);
-            if (fi == 0xFFFFFFFF) { wvErr(w, id, "unknown struct field"); return null; }
-            return wvGepField(w, base, fi);
+            return wvFieldAddr(w, obj, fname, id);
         },
         ExprKind::TupleField => {
             NodeId obj = e->kind.payload.TupleField.obj;
@@ -546,7 +1595,7 @@ pub IrValue* wvAddrOf(Wv* w, NodeId id)
             IrType* irt = st != 0 ? wvTy(w, st, 0) : null;
             if (irt == null || irt->kind != IrTypeKind::Struct)
                 { wvErr(w, id, "struct literal needs a struct type"); return null; }
-            IrValue* slot = wvV(w->b.alloca(irt));
+            IrValue* slot = wvAggSlot(w, irt);
             if (slot == null) return null;
             u32 i = 0;
             u32 n = e->kind.payload.StructLiteral.fieldValuesLen;
@@ -582,7 +1631,7 @@ pub IrValue* wvAddrOf(Wv* w, NodeId id)
             IrType* irt = at != 0 ? wvTy(w, at, 0) : null;
             if (irt == null || (irt->kind != IrTypeKind::Array && irt->kind != IrTypeKind::Struct))
                 { wvErr(w, id, "array/tuple literal needs an aggregate type"); return null; }
-            IrValue* slot = wvV(w->b.alloca(irt));
+            IrValue* slot = wvAggSlot(w, irt);
             if (slot == null) return null;
             NodeId* elems = e->kind.tag == ExprKind::ArrayLiteral
                 ? e->kind.payload.ArrayLiteral.elems : e->kind.payload.TupleExpr.elems;
@@ -616,6 +1665,7 @@ pub IrValue* wvAddrOf(Wv* w, NodeId id)
             }
             return slot;
         },
+        ExprKind::StringLit => { return wvStringLit(w, id); },
         else => { wvErr(w, id, "unsupported assignment target"); return null; },
     }
 }
@@ -756,15 +1806,7 @@ pub IrValue* wvExpr(Wv* w, NodeId id)
             return w->ir->constInt(w->ir->tyPtr(w->ir->tyInt(8)), 0);
         },
         ExprKind::FloatLit => {
-            /* strtod on a NUL-terminated arena copy of the literal text */
-            str s = wvStr(w, e->kind.payload.FloatLit.value);
-            rawptr buf = w->arena->alloc(s.len + 1, 1);
-            if (buf == null) return null;
-            u8* bp = (u8*)buf;
-            usize i = 0;
-            while (i < s.len) { bp[i] = s.ptr[i]; i++; }
-            bp[s.len] = 0;
-            f64 d = strtod((const cchar*)bp, null);
+            f64 d = wvParseFloat(w, e->kind.payload.FloatLit.value);
             IrType* ft = w->ir->tyDouble();
             if (rt != 0 && (w->ctx->types + rt)->kind.tag == TypeKind::F32)
                 ft = w->ir->tyFloat();
@@ -772,9 +1814,10 @@ pub IrValue* wvExpr(Wv* w, NodeId id)
             if (ft->width == 32) return wvV(w->b.fpTrunc(dv, ft));
             return dv;
         },
-        ExprKind::StringLit => {
-            wvErr(w, id, "string literals: Phase 2 (needs global data, wallvm G29)");
-            return null;
+        ExprKind::StringLit => { return wvStringLit(w, id); },
+        ExprKind::StructLiteral | ExprKind::ArrayLiteral | ExprKind::TupleExpr => {
+            /* aggregates are address-valued: the literal's slot IS the value */
+            return wvAddrOf(w, id);
         },
         ExprKind::Ident => {
             Str name = e->kind.payload.Ident.name;
@@ -783,14 +1826,36 @@ pub IrValue* wvExpr(Wv* w, NodeId id)
             {
                 IrType* vt = wvTy(w, rt, 0);
                 if (vt == null || vt->kind == IrTypeKind::Void) return null;
-                if (wvIsAgg(vt))
-                {
-                    wvErr(w, id, "aggregate value in value position (Phase 2: struct/str args & returns)");
-                    return null;
-                }
+                /* an aggregate's value is its address — no load */
+                if (wvIsAgg(vt)) return slot;
                 return wvV(w->b.load(vt, slot));
             }
-            wvErr(w, id, "unresolved identifier (globals: Phase 2)");
+            IrType* vt = wvTy(w, rt, 0);
+            if (vt == null || vt->kind == IrTypeKind::Void) return null;
+            /* an aggregate's value is its address, and that address is
+             * one copy in storage — never re-materialised per use */
+            if (wvIsAgg(vt))
+            {
+                IrValue* gva = wvResolveGlobal(w, name, id);
+                if (gva != null) return gva;
+                wvErr(w, id, "aggregate name has no storage");
+                return null;
+            }
+            /* a function in value position is a pointer to itself */
+            IrFunc* fv = wvLookupFunc(w, name, id);
+            if (fv != null) return &fv->base;
+            /* a scalar constant has no storage to read: fold it */
+            NodeId cd = wvResolveConst(w, name, id);
+            if (cd.index != 0)
+            {
+                Node* cn = wvNode(w, cd);
+                NodeId init = cn->kind.payload.Decl.value.kind.payload.Constant.value;
+                if (init.index != 0) return wvExpr(w, init);
+            }
+            /* a name that keeps storage reads through its global */
+            IrValue* gv = wvResolveGlobal(w, name, id);
+            if (gv != null) return wvV(w->b.load(vt, gv));
+            wvErr(w, id, "unresolved identifier");
             return null;
         },
         ExprKind::Field | ExprKind::DerefField | ExprKind::TupleField |
@@ -903,6 +1968,17 @@ pub IrValue* wvExpr(Wv* w, NodeId id)
             return wvV(w->b.load(vt, slot));
         },
         ExprKind::Call => { return wvCall(w, e, id); },
+        ExprKind::MethodCall => { return wvMethodCall(w, e, id); },
+        ExprKind::Path => {
+            NodeId* segs = e->kind.payload.Path.segments;
+            u32 sn = e->kind.payload.Path.segmentsLen;
+            if (sn == 0) { wvErr(w, id, "empty path expression"); return null; }
+            /* a value reference through a namespace resolves to its
+             * final segment (a function becomes its address, a constant
+             * folds, an enum/variant name reports and gets fixed when
+             * the layout work lands) */
+            return wvExpr(w, segs[sn - 1]);
+        },
         ExprKind::Add | ExprKind::Sub | ExprKind::Mul | ExprKind::Div |
         ExprKind::Mod | ExprKind::BitAnd | ExprKind::BitOr | ExprKind::BitXor |
         ExprKind::Shl | ExprKind::Shr => {
@@ -939,19 +2015,9 @@ pub IrValue* wvExpr(Wv* w, NodeId id)
             return wvV(w->b.notOp(v));
         },
         ExprKind::AddressOf => {
-            NodeId tgt = e->kind.payload.AddressOf.expr;
-            Node* tn = wvNode(w, tgt);
-            if (tn->kind.tag == NodeKind::Expr)
-            {
-                Expr* te = &tn->kind.payload.Expr.value;
-                if (te->kind.tag == ExprKind::Ident)
-                {
-                    IrValue* slot = wvFindLocal(w, te->kind.payload.Ident.name);
-                    if (slot != null) return slot;
-                }
-            }
-            wvErr(w, id, "address-of target: only locals supported (Phase 1)");
-            return null;
+            /* the address of an lvalue — locals, globals, and the same
+             * field/index chains assignment accepts */
+            return wvAddrOf(w, e->kind.payload.AddressOf.expr);
         },
         ExprKind::Deref => {
             IrValue* v = wvExpr(w, e->kind.payload.Deref.expr);

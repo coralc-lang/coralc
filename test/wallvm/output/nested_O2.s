@@ -9,8 +9,8 @@ main:
 	pushq %r13
 	subq $56, %rsp
 .Lmain_entry_2:
-	leaq -24(%rbp), %rsi
-	leaq -40(%rbp), %rdi
+	leaq -48(%rbp), %rsi
+	leaq -64(%rbp), %rdi
 	movabsq $0x0000000000000000, %r10
 	movq %r10, (%rsi)
 	movabsq $0x0000000000000000, %r10
@@ -26,7 +26,7 @@ main:
 	jne .Lmain_inner_pre_4
 	jmp .Lmain_done_8
 .Lmain_inner_pre_4:
-	leaq -56(%rbp), %r9
+	leaq -80(%rbp), %r9
 	movabsq $0x0000000000000000, %r10
 	movq %r10, (%r9)
 	jmp .Lmain_inner_5

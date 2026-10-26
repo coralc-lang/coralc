@@ -49,7 +49,7 @@ main:
 	pushq %r12
 	subq $16, %rsp
 .Lmain_entry_18:
-	leaq -16(%rbp), %rbx
+	leaq -32(%rbp), %rbx
 	jmp .Lmain_inl25_3_29
 .Lmain_inl25_0_26:
 	movl %esi, %esi

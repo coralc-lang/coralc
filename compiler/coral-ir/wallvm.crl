@@ -7,11 +7,13 @@
  * raw-name collisions at compile time, declares IrFunc shells (externs
  * + definitions), then lowers definition bodies. */
 import lower { Wv, WallVmResult, wvNode, wvErr, wvStr, wvResolved, wvPushLocal,
-               wvBlock, wvSetBlock, wvTerm, wvPos, wvFnMapInit, wvFnMapPut };
-import types { wvTy };
-import decl { wvMangle, wvMangleExempt, wvDeclareFunc };
+               wvBlock, wvSetBlock, wvTerm, wvPos, wvFnMapInit, wvFnMapPut,
+               wvTyMapInit, wvTdMapInit, wvGMapInit };
+import types { wvTy, wvDeclTy, wvTyHasParam };
+import decl { wvMangle, wvMangleExempt, wvDeclareMethod, wvMethodSelfKind,
+               wvOwnerStr, wvMethodMangle };
 import stmt { wvStmt };
-import expr { wvExpr };
+import expr { wvExpr, wvAggSlot, wvIsAgg, wvMakeGlobal, wvUnwrapTy };
 import context::context { AstContext, InternEntry };
 import build::arena { Arena };
 import mono::mono { MonoContext, MonoInstance, MonoInstanceKind };
@@ -35,7 +37,6 @@ import(lib) wallvm::wallvm { irCompileAsm, gUnrollEnabled };
 import(lib) wallvm::rules::asm_rules { CallingConvention };
 import(lib) std::mman { alloc, dealloc };
 import(lib) std::string { String };
-import(lib) platform::libc { printf };
 
 /* ── name → first-decl collision table (open-addressed) ─────── */
 
@@ -108,6 +109,85 @@ u32 wvOptLevel(str opt)
     return 0; // debug
 }
 
+/* a type-named decl that owns methods (mirrors the C backend's
+ * cgEmitMethodSet set: struct/union/variant bodies plus the two
+ * extension forms) */
+bool wvIsOwnerDecl(Decl* d)
+{
+    return d->kind.tag == DeclKind::Struct || d->kind.tag == DeclKind::Union ||
+           d->kind.tag == DeclKind::Variant || d->kind.tag == DeclKind::Extend ||
+           d->kind.tag == DeclKind::ExtendTrait;
+}
+
+/* the methods[] array and owner shape of such a decl; false when the
+ * owner is generic (Phase 2 — mono does not reach methods yet) */
+bool wvOwnerMethods(Wv* w, Decl* d, Str* owner, NodeId** methodsOut, u32* mlenOut,
+                    IrType** selfPtOut)
+{
+    *owner = 0;
+    *methodsOut = null;
+    *mlenOut = 0;
+    *selfPtOut = null;
+    if (d->kind.tag == DeclKind::Struct || d->kind.tag == DeclKind::Union ||
+        d->kind.tag == DeclKind::Variant)
+    {
+        NodeId* methods = null;
+        u32 mlen = 0;
+        if (d->kind.tag == DeclKind::Struct)
+        {
+            if (d->kind.payload.Struct.genericParamsLen != 0) return false;
+            *owner = d->kind.payload.Struct.name;
+            methods = d->kind.payload.Struct.methods;
+            mlen = d->kind.payload.Struct.methodsLen;
+        }
+        else if (d->kind.tag == DeclKind::Union)
+        {
+            if (d->kind.payload.Union.genericParamsLen != 0) return false;
+            *owner = d->kind.payload.Union.name;
+            methods = d->kind.payload.Union.methods;
+            mlen = d->kind.payload.Union.methodsLen;
+        }
+        else
+        {
+            if (d->kind.payload.Variant.genericParamsLen != 0) return false;
+            *owner = d->kind.payload.Variant.name;
+            methods = d->kind.payload.Variant.methods;
+            mlen = d->kind.payload.Variant.methodsLen;
+        }
+        *selfPtOut = w->ir->tyPtr(wvDeclTy(w, d, 0));
+        *methodsOut = methods;
+        *mlenOut = mlen;
+        return mlen > 0;
+    }
+    Ty st = 0;
+    if (d->kind.tag == DeclKind::Extend)
+    {
+        if (d->kind.payload.Extend.genericParamsLen != 0) return false;
+        st = d->kind.payload.Extend.selfType;
+        *methodsOut = d->kind.payload.Extend.methods;
+        *mlenOut = d->kind.payload.Extend.methodsLen;
+    }
+    else if (d->kind.tag == DeclKind::ExtendTrait)
+    {
+        if (d->kind.payload.ExtendTrait.genericParamsLen != 0) return false;
+        st = d->kind.payload.ExtendTrait.selfType;
+        *methodsOut = d->kind.payload.ExtendTrait.methods;
+        *mlenOut = d->kind.payload.ExtendTrait.methodsLen;
+    }
+    else return false;
+    if (st == 0 || wvTyHasParam(w, st, 0)) return false;
+    *owner = wvOwnerStr(w, st);
+    Ty u = wvUnwrapTy(w, st);
+    TypeEntry* ue = w->ctx->types + u;
+    if (ue->kind.tag == TypeKind::Pointer)
+    {
+        u = wvUnwrapTy(w, ue->kind.payload.Pointer.base);
+        if (u == 0) return false;
+    }
+    *selfPtOut = w->ir->tyPtr(wvTy(w, u, 0));
+    return *mlenOut > 0;
+}
+
 /* ── body lowering ──────────────────────────────────────────── */
 
 void wvLowerBody(Wv* w, NodeId declId, Decl* d, IrFunc* f)
@@ -122,6 +202,27 @@ void wvLowerBody(Wv* w, NodeId declId, Decl* d, IrFunc* f)
 
     IrBlock* entry = wvBlock(w, "entry");
     wvSetBlock(w, entry);
+
+    /* a method's receiver: parameter 0 of the shell, never spelled in
+     * the Coral param list (the parser rejects explicit `self`) */
+    if (wvMethodSelfKind(w, declId) == 1 && f->nparams > 0)
+    {
+        IrType* st = f->paramTypes[0];
+        IrValue* av = alloc<IrValue>((usize)1);
+        if (av == null) { wvErr(w, declId, "out of memory binding self"); return; }
+        *av = IrValue { IrValueKind::Arg, st, w->ir->nextValueId(), 0,
+                        wvStr(w, w->ctx->intern("self")), null, 0, 0 };
+        f->addArg(av);
+        if (st != null && st->kind != IrTypeKind::Void)
+        {
+            IrValue* slot = wvIsAgg(st) ? wvAggSlot(w, st) : wvV(w->b.alloca(st));
+            if (slot != null)
+            {
+                w->b.store(av, slot);
+                wvPushLocal(w, w->ctx->intern("self"), slot);
+            }
+        }
+    }
 
     /* bind params: create arg values, alloca slots, store args in */
     u32 np = d->kind.payload.Func.paramsLen;
@@ -142,7 +243,7 @@ void wvLowerBody(Wv* w, NodeId declId, Decl* d, IrFunc* f)
                 f->addArg(av);
                 if (at != null && at->kind != IrTypeKind::Void)
                 {
-                    IrValue* slot = wvV(w->b.alloca(at));
+                    IrValue* slot = wvIsAgg(at) ? wvAggSlot(w, at) : wvV(w->b.alloca(at));
                     if (slot != null)
                     {
                         w->b.store(av, slot);
@@ -167,18 +268,19 @@ void wvLowerBody(Wv* w, NodeId declId, Decl* d, IrFunc* f)
     }
 }
 
-/* declare + collect one function decl; returns the IrFunc for the
- * definition (or null for extern-only / generic / collision-skipped) */
-IrFunc* wvCollectFunc(Wv* w, WvNames* names, NodeId declId, Decl* d)
+/* claim a symbol for a function shell under an already-composed name:
+ * dedup against the name table (extern/definition of one symbol bind
+ * together, two definitions are an error), register the IrFunc for
+ * call sites, add it to the module. selfTy, when non-null, is the
+ * method receiver prepended as parameter 0. `names` may be null for a
+ * bare on-demand declaration (the fn map still dedups per declId). */
+IrFunc* wvRegisterFunc(Wv* w, WvNames* names, NodeId declId, Decl* d, str name, IrType* selfTy)
 {
-    /* skip generics (Phase 2) */
-    if (w->mono != null && w->mono.genericCount(declId) != 0) return null;
-
-    str name = wvMangle(w, declId, d->kind.payload.Func.name);
     bool isExtern = (d->kind.payload.Func.flags & 2) != 0;
     bool isDefn = (d->kind.payload.Func.flags & 8) != 0 && !isExtern;
 
-    WvNameEnt* ent = wvNamesFind(names, name);
+    WvNameEnt* ent = null;
+    if (names != null && name.len != 0) ent = wvNamesFind(names, name);
     if (ent != null)
     {
         /* two definitions of the same final name = error */
@@ -211,18 +313,37 @@ IrFunc* wvCollectFunc(Wv* w, WvNames* names, NodeId declId, Decl* d)
     }
 
     /* new name: declare the shell, claim the slot, register for calls */
-    IrFunc* f = wvDeclareFunc(w, declId, d);
+    IrFunc* f = wvDeclareMethod(w, declId, d, name, selfTy);
     if (f == null) return null;
     w->mod.addFunc(f);
-    ent = wvNamesInsert(names, name);
-    if (ent != null)
+    if (names != null && name.len != 0)
     {
-        ent->declIdx = declId.index;
-        ent->isDefn = isDefn;
-        ent->f = f;
+        ent = wvNamesInsert(names, name);
+        if (ent != null)
+        {
+            /* createFunc's irDupStr copy, NOT `name`: `name` is a view
+             * into w->mb, which the next wvMangle call overwrites —
+             * every entry would then alias the same bytes and
+             * false-match any query of equal length */
+            ent->name = f->base.name;
+            ent->declIdx = declId.index;
+            ent->isDefn = isDefn;
+            ent->f = f;
+        }
     }
     wvFnMapPut(w, declId.index, f);
     return isDefn ? f : null;
+}
+
+/* declare + collect one function decl; returns the IrFunc for the
+ * definition (or null for extern-only / generic / collision-skipped) */
+IrFunc* wvCollectFunc(Wv* w, WvNames* names, NodeId declId, Decl* d)
+{
+    /* skip generics (Phase 2) */
+    if (w->mono != null && w->mono.genericCount(declId) != 0) return null;
+
+    str name = wvMangle(w, declId, d->kind.payload.Func.name);
+    return wvRegisterFunc(w, names, declId, d, name, null);
 }
 
 /* ── entry point ────────────────────────────────────────────── */
@@ -259,14 +380,27 @@ pub WallVmResult generateWallVm(AstContext* ctx, File* file, MonoContext* mono, 
     w.fnKeys = null;
     w.fnVals = null;
     w.fnCap = 0;
+    w.gKeys = null;
+    w.gVals = null;
+    w.gCap = 0;
     w.subs = null;
     w.subsLen = 0;
+    w.tyKeys = null;
+    w.tyVals = null;
+    w.tyBusy = null;
+    w.tyCap = 0;
+    w.tdKeys = null;
+    w.tdVals = null;
+    w.tdCap = 0;
 
     w.ir = irCtxCreate();
     if (w.ir == null) { result.errors = 1; return result; }
     w.mod = w.ir->createModule("coral");
     w.b = IrBuilder::new(w.ir);
     wvFnMapInit(&w, 1024);
+    wvGMapInit(&w, 256);
+    wvTyMapInit(&w, 4096);
+    wvTdMapInit(&w, 4096);
 
     WvNames names;
     wvNamesInit(&names, 1024);
@@ -276,6 +410,25 @@ pub WallVmResult generateWallVm(AstContext* ctx, File* file, MonoContext* mono, 
     NodeId* bodyDecls = null;
     u32 bodiesLen = 0;
     u32 bodiesCap = file->declsLen + 64;
+    /* methods ride the same body list: size for every owner's method
+     * array up front so the collection loop never has to grow it */
+    {
+        u32 ci = 0;
+        while (ci < file->declsLen)
+        {
+            Node* cn = wvNode(&w, file->decls[ci]);
+            if (cn->kind.tag == NodeKind::Decl && wvIsOwnerDecl(&cn->kind.payload.Decl.value))
+            {
+                Decl* cd = &cn->kind.payload.Decl.value;
+                if (cd->kind.tag == DeclKind::Struct) bodiesCap += cd->kind.payload.Struct.methodsLen;
+                else if (cd->kind.tag == DeclKind::Union) bodiesCap += cd->kind.payload.Union.methodsLen;
+                else if (cd->kind.tag == DeclKind::Variant) bodiesCap += cd->kind.payload.Variant.methodsLen;
+                else if (cd->kind.tag == DeclKind::Extend) bodiesCap += cd->kind.payload.Extend.methodsLen;
+                else bodiesCap += cd->kind.payload.ExtendTrait.methodsLen;
+            }
+            ci++;
+        }
+    }
     if (bodiesCap > 0)
     {
         bodies = alloc<IrFunc*>((usize)bodiesCap);
@@ -297,6 +450,55 @@ pub WallVmResult generateWallVm(AstContext* ctx, File* file, MonoContext* mono, 
                     bodies[bodiesLen] = f;
                     bodyDecls[bodiesLen] = did;
                     bodiesLen++;
+                }
+            }
+            else if (d->kind.tag == DeclKind::Constant)
+            {
+                /* every file-scope constant gets one copy of storage —
+                 * aggregates are addressed through it, scalars may still
+                 * fold into their uses instead of being read back */
+                u8 cf = d->kind.payload.Constant.flags;
+                wvMakeGlobal(&w, did, d->kind.payload.Constant.name,
+                             wvResolved(&w, d->kind.payload.Constant.typeNode),
+                             d->kind.payload.Constant.value,
+                             (cf & 16) != 0, (cf & 2) != 0, 0);
+            }
+            else if (wvIsOwnerDecl(d))
+            {
+                /* every method of a type-named decl: its symbol composes
+                 * `owner_method`, and an implicit receiver becomes
+                 * parameter 0 of the shell (bind in wvLowerBody) */
+                Str owner = 0;
+                NodeId* methods = null;
+                u32 mlen = 0;
+                IrType* selfPt = null;
+                if (wvOwnerMethods(&w, d, &owner, &methods, &mlen, &selfPt))
+                {
+                    u32 mi = 0;
+                    while (mi < mlen)
+                    {
+                        NodeId mdef = methods[mi];
+                        Node* mn = wvNode(&w, mdef);
+                        if (mn->kind.tag == NodeKind::Decl)
+                        {
+                            Decl* md = &mn->kind.payload.Decl.value;
+                            if (md->kind.tag == DeclKind::Func &&
+                                (w.mono == null || w.mono.genericCount(mdef) == 0))
+                            {
+                                u8 sk = wvMethodSelfKind(&w, mdef);
+                                str msym = wvMethodMangle(&w, mdef, owner, md->kind.payload.Func.name);
+                                IrFunc* f = wvRegisterFunc(&w, &names, mdef, md, msym,
+                                                           sk == 1 ? selfPt : null);
+                                if (f != null && bodiesLen < bodiesCap)
+                                {
+                                    bodies[bodiesLen] = f;
+                                    bodyDecls[bodiesLen] = mdef;
+                                    bodiesLen++;
+                                }
+                            }
+                        }
+                        mi++;
+                    }
                 }
             }
         }
@@ -376,6 +578,11 @@ pub WallVmResult generateWallVm(AstContext* ctx, File* file, MonoContext* mono, 
     if (names.ents != null) dealloc<WvNameEnt>(names.ents);
     if (w.fnKeys != null) dealloc<u32>(w.fnKeys);
     if (w.fnVals != null) dealloc<IrFunc*>(w.fnVals);
+    if (w.tyKeys != null) dealloc<u32>(w.tyKeys);
+    if (w.tyVals != null) dealloc<IrType*>(w.tyVals);
+    if (w.tyBusy != null) dealloc<u8>(w.tyBusy);
+    if (w.tdKeys != null) dealloc<u32>(w.tdKeys);
+    if (w.tdVals != null) dealloc<u32>(w.tdVals);
     w.mb.free();
     if (w.locNames != null) dealloc<Str>(w.locNames);
     if (w.locSlots != null) dealloc<IrValue*>(w.locSlots);

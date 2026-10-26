@@ -43,12 +43,14 @@ pub str[] X86_64_FLOAT_REGS = {
     "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"
 };
 
-import(lib) wallvm::irtypes { IrContext, IrModule, IrFunc, IrBlock, IrInst, IrValue, IrValueKind, IrTypeKind };
+import(lib) wallvm::irtypes { IrContext, IrModule, IrFunc, IrBlock, IrInst, IrValue, IrValueKind, IrTypeKind, IrStringConst, IrGlobal, IrArrayConst, IrStructConst };
 import(lib) wallvm::irOps { IrOpcode, IrICmpPred, IrFCmpPred };
 import(lib) wallvm::irMetadata { funcIsEntry, funcIsNaked, hasFuncAttr, funcAttrInt };
 import(lib) wallvm::assembly::x86::common { lookupReg };
 import(lib) std::string { String };
 import(lib) std::mman { alloc, dealloc };
+import(lib) std::ios { eprintln };
+import(lib) wallvm::assembly::common { parseConstraints, AsmConstraint, AsmConClass, AsmParseError };
 
 
 pub struct CpuFeatures
@@ -483,6 +485,8 @@ pub struct X86_64CodeGen
     IrFunc* currentFunc;
     u32 allocaBase;
     u32 allocaBytes;
+    str[16] asmTaken;
+    u32 asmTakenN;
 
     void init(IrContext* ctx,
               IrModule* modd,
@@ -658,6 +662,295 @@ pub struct X86_64CodeGen
         self.emitter.emitLine(".section .text");
     }
 
+    /* module string constants: one NUL-terminated record per unique
+     * literal in a mergeable strings section ("aM" = SHF_MERGE +
+     * SHF_STRINGS), so both GAS and the linker can fold equal payloads
+     * and the terminator is part of the record the merge key includes */
+    void emitConstStrings()
+    {
+        if (self.modd == null || self.modd->nconstStrings == 0) return;
+        // mergeable, read-only, string-sized records: the linker folds
+        // identical ones. PE/COFF spells the same idea as .rdata.
+        if (self.isWindows)
+            self.emitter.emitLine(".section .rdata,\"dr\"");
+        else
+            self.emitter.emitLine(".section .rodata.str1.1,\"aM\",@progbits,1");
+        for (u32 i = 0; i < self.modd->nconstStrings; i++)
+        {
+            IrStringConst* sc = self.modd->constStrings[i];
+            if (sc == null) continue;
+            str lbl = self.stringLabel(&sc->base);
+            if (lbl.len == 0) continue;
+            self.emitter.emit(lbl);
+            self.emitter.emitLine(":");
+            u32 j = 0;
+            while (j < sc->length)
+            {
+                self.emitter.emit("\t.byte ");
+                u32 row = 0;
+                while (j < sc->length && row < 16)
+                {
+                    if (row > 0) self.emitter.emit(", ");
+                    self.emitter.emit(u32ToStr((u32)sc->data[j]));
+                    j++;
+                    row++;
+                }
+                self.emitter.emitLine("");
+            }
+            self.emitter.emitLine("\t.byte 0");
+        }
+    }
+
+    /* file-scope variables: one record per defined global, initialised
+     * from its IR constant or zero-filled. Emitted after the function
+     * stream (like the string pool) so the section switch cannot capture
+     * any instruction text, and read back through the same rip-relative
+     * folding a literal's address gets. */
+    void emitGlobals()
+    {
+        if (self.modd == null || self.modd->nglobals == 0) return;
+        bool started = false;
+        u32 i = 0;
+        while (i < self.modd->nglobals)
+        {
+            IrGlobal* g = self.modd->globals[i];
+            i++;
+            if (g == null || g->isExtern) continue;
+            if (!started)
+            {
+                self.emitter.emitLine(".section .data");
+                started = true;
+            }
+            IrType* dt = g->base.type;
+            if (dt != null && dt->kind == IrTypeKind::Ptr && dt->elem != null) dt = dt->elem;
+            u32 size = dt != null ? self.ctx->irTypeSizeOf(dt) : 8;
+            u32 align = g->alignment != 0 ? g->alignment
+                       : (dt != null ? self.ctx->irTypeAlignOf(dt) : 8);
+            if (align == 0) align = 1;
+            if (align > 64) align = 8;
+            self.emitter.emit("\t.balign ");
+            self.emitter.emitLine(u32ToStr(align));
+            self.emitter.emit(g->base.name);
+            self.emitter.emitLine(":");
+            self.emitGlobalInit(g->initVal, size);
+        }
+    }
+
+    /* one global's bytes: a scalar, an aggregate folded at compile
+     * time, a byte array, or (when nothing represents it) zero fill */
+    void emitGlobalInit(IrValue* iv, u32 size)
+    {
+        if (iv == null)
+        {
+            self.emitter.emit("\t.zero ");
+            self.emitter.emitLine(u32ToStr(size));
+            return;
+        }
+        if (iv->kind == IrValueKind::StructConst)
+        {
+            self.emitStructConstData(iv, size);
+            return;
+        }
+        if (iv->kind == IrValueKind::ConstInt)
+        {
+            self.emitScalarConst(iv, size);
+            return;
+        }
+        if (iv->kind == IrValueKind::ConstFloat)
+        {
+            if (size == 4)
+            {
+                /* the constant carries f64 bits: narrow to f32 first */
+                f64 d = 0;
+                copy<u8>((u8*)&d, (u8*)&iv->valData, 8);
+                f32 f = (f32)d;
+                u32 bits = 0;
+                copy<u8>((u8*)&bits, (u8*)&f, 4);
+                self.emitter.emit("\t.long ");
+                self.emitter.emitLine(u64ToHex((u64)bits));
+            }
+            else
+            {
+                self.emitter.emit("\t.quad ");
+                self.emitter.emitLine(u64ToHex(iv->valData));
+            }
+            return;
+        }
+        if (iv->kind == IrValueKind::ConstArray)
+        {
+            IrArrayConst* ac = (IrArrayConst*)iv;
+            IrType* et = iv->type != null ? iv->type->elem : null;
+            u32 esz = et != null ? self.ctx->irTypeSizeOf(et) : 1;
+            if (esz == 1)
+            {
+                u32 j = 0;
+                while (j < ac->nelems)
+                {
+                    self.emitter.emit("\t.byte ");
+                    u32 row = 0;
+                    while (j < ac->nelems && row < 16)
+                    {
+                        u64 b = 0;
+                        if (ac->elems[j] != null && ac->elems[j]->kind == IrValueKind::ConstInt)
+                            b = ac->elems[j]->valData & 0xFFUL;
+                        if (row > 0) self.emitter.emit(", ");
+                        self.emitter.emit(u64ToHex(b));
+                        j++;
+                        row++;
+                    }
+                    self.emitter.emitLine("");
+                }
+                if (size > ac->nelems)
+                {
+                    self.emitter.emit("\t.zero ");
+                    self.emitter.emitLine(u32ToStr(size - ac->nelems));
+                }
+                return;
+            }
+            /* multi-byte elements: one directive per element */
+            for (u32 j = 0; j < ac->nelems; j++)
+            {
+                IrValue* ev = ac->elems[j];
+                u64 b = 0;
+                if (ev != null && ev->kind == IrValueKind::ConstInt) b = ev->valData;
+                if (esz == 2) { self.emitter.emit("\t.short "); self.emitter.emitLine(u64ToHex(b & 0xFFFFUL)); }
+                else if (esz == 4) { self.emitter.emit("\t.long "); self.emitter.emitLine(u64ToHex(b & 0xFFFFFFFFUL)); }
+                else { self.emitter.emit("\t.quad "); self.emitter.emitLine(u64ToHex(b)); }
+            }
+            if (size > ac->nelems * esz)
+            {
+                self.emitter.emit("\t.zero ");
+                self.emitter.emitLine(u32ToStr(size - ac->nelems * esz));
+            }
+            return;
+        }
+        self.emitter.emit("\t.zero ");
+        self.emitter.emitLine(u32ToStr(size));
+    }
+
+    /* an integer scalar at `size` bytes: the directive and the masked
+     * value, nothing else */
+    void emitScalarConst(IrValue* iv, u32 size)
+    {
+        u64 v = iv->valData;
+        str txt;
+        if (size <= 1)
+        {
+            self.emitter.emit("\t.byte ");
+            txt = u64ToHex(v & 0xFFUL);
+        }
+        else if (size == 2)
+        {
+            self.emitter.emit("\t.short ");
+            txt = u64ToHex(v & 0xFFFFUL);
+        }
+        else if (size == 4)
+        {
+            self.emitter.emit("\t.long ");
+            txt = u64ToHex(v & 0xFFFFFFFFUL);
+        }
+        else if (size == 8)
+        {
+            self.emitter.emit("\t.quad ");
+            txt = u64ToHex(v);
+        }
+        else
+        {
+            self.emitter.emit("\t.zero ");
+            txt = u32ToStr(size);
+        }
+        self.emitter.emitLine(txt);
+    }
+
+    /* a struct constant: each field placed at its aligned offset the
+     * same way gepConstOffset walks them, then the tail zero-filled.
+     * A function, global or literal address stores as one quad (the
+     * linker resolves the symbol), which is exactly what a vtable or
+     * allocator slot needs. */
+    void emitStructConstData(IrValue* iv, u32 size)
+    {
+        IrStructConst* sc = (IrStructConst*)iv;
+        IrType* st = iv->type;
+        u32 off = 0;
+        u32 i = 0;
+        while (i < sc->nelems && st != null && i < st->nparams)
+        {
+            IrValue* fv = sc->elems[i];
+            IrType* ft = st->params[i];
+            if (ft == null) { i++; continue; }
+            u32 fal = self.ctx.irTypeAlignOf(ft);
+            if (fal == 0) fal = 1;
+            u32 fsz = self.ctx.irTypeSizeOf(ft);
+            if ((off % fal) != 0)
+            {
+                u32 pad = fal - (off % fal);
+                self.emitter.emit("\t.zero ");
+                self.emitter.emitLine(u32ToStr(pad));
+                off += pad;
+            }
+            self.emitGlobalConstValue(fv, ft, fsz);
+            off += fsz;
+            i++;
+        }
+        if (size > off)
+        {
+            self.emitter.emit("\t.zero ");
+            self.emitter.emitLine(u32ToStr(size - off));
+        }
+    }
+
+    /* one entry of a folded aggregate: a scalar, another aggregate, a
+     * byte array, or an address the linker resolves */
+    void emitGlobalConstValue(IrValue* fv, IrType* ft, u32 fsz)
+    {
+        if (fv == null)
+        {
+            self.emitter.emit("\t.zero ");
+            self.emitter.emitLine(u32ToStr(fsz));
+            return;
+        }
+        if (fv->kind == IrValueKind::ConstInt) { self.emitScalarConst(fv, fsz); return; }
+        if (fv->kind == IrValueKind::ConstFloat)
+        {
+            if (fsz == 4)
+            {
+                f64 d = 0;
+                copy<u8>((u8*)&d, (u8*)&fv->valData, 8);
+                f32 f = (f32)d;
+                u32 bits = 0;
+                copy<u8>((u8*)&bits, (u8*)&f, 4);
+                self.emitter.emit("\t.long ");
+                self.emitter.emitLine(u64ToHex((u64)bits));
+            }
+            else
+            {
+                self.emitter.emit("\t.quad ");
+                self.emitter.emitLine(u64ToHex(fv->valData));
+            }
+            return;
+        }
+        if (fv->kind == IrValueKind::StructConst) { self.emitStructConstData(fv, fsz); return; }
+        if (fv->kind == IrValueKind::ConstArray) { self.emitGlobalInit(fv, fsz); return; }
+        if (fv->kind == IrValueKind::Func ||
+            fv->kind == IrValueKind::Global ||
+            fv->kind == IrValueKind::StringConst)
+        {
+            str lbl = fv->kind == IrValueKind::StringConst
+                ? self.stringLabel(fv) : fv->name;
+            if (lbl.len == 0)
+            {
+                self.emitter.emit("\t.zero ");
+                self.emitter.emitLine(u32ToStr(fsz));
+                return;
+            }
+            self.emitter.emit("\t.quad ");
+            self.emitter.emitLine(lbl);
+            return;
+        }
+        self.emitter.emit("\t.zero ");
+        self.emitter.emitLine(u32ToStr(fsz));
+    }
+
     // One alloca's frame footprint. The allocated type is compile-time
     // known (the instruction carries no count operand), so the size is
     // static and the whole region can be reserved in the prologue.
@@ -666,8 +959,14 @@ pub struct X86_64CodeGen
     u32 allocaSlotSize(IrInst* inst)
     {
         u32 sz = 0;
-        if (inst->base.type != null && inst->base.type->elem != null)
-            sz = self.ctx->irTypeSizeOf(inst->base.type->elem);
+        if (inst->base.type != null)
+        {
+            // a pointer alloca sizes to its element; an aggregate alloca
+            // (one whose result IS the value's address) sizes to itself
+            IrType* at = inst->base.type;
+            IrType* st = (at->kind == IrTypeKind::Ptr && at->elem != null) ? at->elem : at;
+            sz = self.ctx->irTypeSizeOf(st);
+        }
         if (sz == 0) sz = 16;
         if ((sz % 16) != 0) sz = (sz / 16 + 1) * 16;
         return sz;
@@ -711,7 +1010,10 @@ pub struct X86_64CodeGen
                 cum += self.allocaSlotSize(inst);
                 if (&inst->base == target)
                 {
-                    *outOff = self.allocaBase + cum;
+                    // the saved callee saves sit between rbp and the
+                    // region the prologue subtracted, so the slot's
+                    // rbp-relative offset starts past them
+                    *outOff = 8 * self.numCalleeSaves + self.allocaBase + cum;
                     return true;
                 }
             }
@@ -1971,9 +2273,124 @@ pub struct X86_64CodeGen
     // The address value in a register for an indirect operand: a
     // spilled pointer reloads into r11 first (r11 is reserved, never
     // allocated), a register home goes in as-is.
+    /* symbol for a string constant: its stable ".Lcs<id>" name */
+    str stringLabel(IrValue* v)
+    {
+        if (v == null) return str::empty();
+        if (v->name.len > 0) return v->name;
+        return self.ctx.stringConstLabel(v->id);
+    }
+
+    /* label[+-off](%rip) — the RIP-relative spelling every reference to
+     * rodata uses; built into the rotating text buffers, consumed by the
+     * next line emitted */
+    str ripOperand(str label, i64 off)
+    {
+        String* b = textBufNext();
+        b->pushView(label);
+        if (off > 0)
+        {
+            b->pushChar('+');
+            b->pushView(u32ToStr((u32)off));
+        }
+        else if (off < 0)
+        {
+            b->pushChar('-');
+            b->pushView(u32ToStr((u32)(-off)));
+        }
+        b->pushView("(%rip)");
+        return b->asView();
+    }
+
+    /* constant byte offset of a Gep whose indices are all constant — the
+     * same layout walk emitGep performs (align-then-place struct fields,
+     * element strides for arrays), factored out so a literal's address
+     * can be folded into one RIP-relative operand */
+    bool gepConstOffset(IrInst* g, i64* off)
+    {
+        if (g == null || g->opcode != IrOpcode::Gep) return false;
+        IrType* rt = null;
+        if (g->nops > 0 && g->ops[0] != null && g->ops[0]->type != null)
+        {
+            IrType* pt = g->ops[0]->type;
+            rt = pt->kind == IrTypeKind::Ptr ? pt->elem : pt;
+        }
+        i64 constOff = 0;
+        for (u32 k = 1; k < g->nops && rt != null; k++)
+        {
+            IrValue* iv = g->ops[k];
+            if (iv == null || !valueIsIntConst(iv)) return false;
+            if (rt->kind == IrTypeKind::Struct)
+            {
+                u32 fi = (u32)(iv->valData & 0xFFFFFFFF);
+                if (fi >= rt->nparams) return false;
+                u32 o = 0;
+                for (u32 f = 0; f < rt->nparams; f++)
+                {
+                    u32 al = self.ctx.irTypeAlignOf(rt->params[f]);
+                    if (al > 1) o = (o + al - 1u) / al * al;
+                    if (f == fi) break;
+                    o += self.ctx.irTypeSizeOf(rt->params[f]);
+                }
+                constOff += (i64)o;
+                rt = rt->params[fi];
+                continue;
+            }
+            if (rt->kind != IrTypeKind::Array && rt->kind != IrTypeKind::Vector) return false;
+            u32 stride = self.ctx.irTypeSizeOf(rt->elem);
+            if (stride == 0) stride = 1;
+            i64 c = (i64)iv->valData;
+            u32 iw = iv->type != null ? iv->type->width : 64;
+            if (iw < 64 && iw > 0 && (c & ((i64)1 << (i64)(iw - 1))) != 0)
+                c |= ~(((i64)1 << (i64)iw) - 1);
+            constOff += c * (i64)stride;
+            rt = rt->elem;
+        }
+        *off = constOff;
+        return true;
+    }
+
+    /* a link-time constant address: a string constant itself, or a Gep
+     * chain over one with constant indices. Lets a load/store through a
+     * literal become a single RIP-relative memory operand instead of a
+     * lea into a scratch plus a memory access */
+    bool constAddrOf(IrValue* v, str* label, i64* off)
+    {
+        i64 total = 0;
+        while (v != null && v->kind == IrValueKind::Inst)
+        {
+            IrInst* g = (IrInst*)v;
+            if (g->opcode != IrOpcode::Gep) return false;
+            i64 o = 0;
+            if (!self.gepConstOffset(g, &o)) return false;
+            total += o;
+            v = g->nops > 0 ? g->ops[0] : null;
+        }
+        if (v == null) return false;
+        if (v->kind == IrValueKind::StringConst)
+        {
+            *label = self.stringLabel(v);
+            *off = total;
+            return true;
+        }
+        /* a file-scope variable is a link-time constant address too, so
+         * its references fold into one rip-relative operand the same way
+         * a literal's do */
+        if (v->kind == IrValueKind::Global)
+        {
+            *label = v->name;
+            *off = total;
+            return true;
+        }
+        return false;
+    }
+
     str addrFor(IrValue* av, str fallback)
     {
         if (av == null) return fallback;
+        str lb;
+        i64 off = 0;
+        if (self.constAddrOf(av, &lb, &off)) return self.ripOperand(lb, off);
         if (self.valueIsSpill(av) || valueIsIntConst(av))
             return self.opForReg(av, "r11");
         return self.opFor(av);
@@ -2636,15 +3053,17 @@ pub struct X86_64CodeGen
 
     // Slot layout: every spilled vreg gets one slot of 16 bytes so vector
     // values fit; scalar ints store their 8-byte register with movq and
-    // f32/f64 store 4/8 bytes with movss/movsd into the slot head. Slot
-    // i lives at -16*(i+1)(%rbp). rbp is established in the prologue
-    // whenever hasAny spill slot exists, so the homes are stable for the
-    // whole function.
+    // f32/f64 store 4/8 bytes with movss/movsd into the slot head. The
+    // prologue pushes the saved callee saves first, then subtracts the
+    // spill+alloca region, so slot i lives at -8*numCalleeSaves-16*(i+1)
+    // (%rbp): the saves sit between rbp and the spill region. rbp is
+    // established in the prologue whenever hasAny spill slot exists, so
+    // the homes are stable for the whole function.
     str slotText(u32 slot)
     {
         String* b = textBufNext();
         b->pushChar('-');
-        b->pushView(u32ToStr((slot + 1) * 16));
+        b->pushView(u32ToStr(8 * self.numCalleeSaves + (slot + 1) * 16));
         b->pushView("(%rbp)");
         return b->asView();
     }
@@ -2654,6 +3073,23 @@ pub struct X86_64CodeGen
     str opFor(IrValue* v)
     {
         if (v == null) return "rax";
+        if (v->kind == IrValueKind::StringConst)
+        {
+            // no home is allocated for a constant's address, so it lands
+            // in the scratch every register-only consumer can read
+            self.emitter.emit("\tleaq ");
+            self.emitter.emit(self.ripOperand(self.stringLabel(v), 0));
+            self.emitter.emitLine(", %r11");
+            return "r11";
+        }
+        if (v->kind == IrValueKind::Global)
+        {
+            // a symbol has no home either: lea it into the same scratch
+            self.emitter.emit("\tleaq ");
+            self.emitter.emit(self.ripOperand(v->name, 0));
+            self.emitter.emitLine(", %r11");
+            return "r11";
+        }
         if (valueIsIntConst(v)) return intImmText(v);
         u64 vd = v->valData;
         if (vd & 0x80000000UL)
@@ -2670,6 +3106,31 @@ pub struct X86_64CodeGen
         return "rax";
     }
 
+    // Immediate → dst in one short instruction. A value that fits in 32
+    // bits moving to a register takes movl (which zeroes the upper half);
+    // stack slots and wider values keep movabsq, because movl would leave
+    // stale bytes in memory or drop the value's high half.
+    void emitImmTo(u64 val, str dst)
+    {
+        bool paren = false;
+        for (usize q = 0; q < dst.len; q++)
+            if (dst.ptr[q] == (u8)'(') { paren = true; break; }
+        if (!paren && val <= 0xFFFFFFFFUL)
+        {
+            self.emitter.emit("\tmovl $");
+            self.emitter.emit(u64ToHex(val));
+            self.emitter.emit(", ");
+            self.emitter.emitLine(toReg32(dst));
+        }
+        else
+        {
+            self.emitter.emit("\tmovabsq $");
+            self.emitter.emit(u64ToHex(val));
+            self.emitter.emit(", ");
+            self.emitter.emitLine(dst);
+        }
+    }
+
     // the old name stays as an alias so every unconverted call site is
     // spill-correct for memory-accepting positions; register-only positions
     // go through opForReg/opForRegF instead
@@ -2684,12 +3145,25 @@ pub struct X86_64CodeGen
     str opForReg(IrValue* v, str scratch)
     {
         if (v == null) return scratch;
-        if (valueIsIntConst(v))
+        if (v->kind == IrValueKind::StringConst)
         {
-            self.emitter.emit("\tmovabsq ");
-            self.emitter.emit(intImmText(v));
+            self.emitter.emit("\tleaq ");
+            self.emitter.emit(self.ripOperand(self.stringLabel(v), 0));
             self.emitter.emit(", ");
             self.emitter.emitLine(scratch);
+            return scratch;
+        }
+        if (v->kind == IrValueKind::Global)
+        {
+            self.emitter.emit("\tleaq ");
+            self.emitter.emit(self.ripOperand(v->name, 0));
+            self.emitter.emit(", ");
+            self.emitter.emitLine(scratch);
+            return scratch;
+        }
+        if (valueIsIntConst(v))
+        {
+            self.emitImmTo(v->valData, scratch);
             return scratch;
         }
         if (self.valueIsSpill(v))
@@ -2721,12 +3195,17 @@ pub struct X86_64CodeGen
     str opForRegInPlace(IrValue* v, str scratch)
     {
         if (v == null) return scratch;
-        if (valueIsIntConst(v))
+        if (v->kind == IrValueKind::StringConst)
         {
-            self.emitter.emit("\tmovabsq ");
-            self.emitter.emit(intImmText(v));
+            self.emitter.emit("\tleaq ");
+            self.emitter.emit(self.ripOperand(self.stringLabel(v), 0));
             self.emitter.emit(", ");
             self.emitter.emitLine(scratch);
+            return scratch;
+        }
+        if (valueIsIntConst(v))
+        {
+            self.emitImmTo(v->valData, scratch);
             return scratch;
         }
         if (self.valueIsSpill(v))
@@ -3056,6 +3535,7 @@ pub struct X86_64CodeGen
             IrOpcode::Bswap => { self.emitBswap(inst); },
             IrOpcode::Rotl => { self.emitRot(inst, "rolq"); },
             IrOpcode::Rotr => { self.emitRot(inst, "rorq"); },
+            IrOpcode::InlineAsm => { self.emitInlineAsm(inst); },
             IrOpcode::SMin => { self.emitMinMax(inst, "cmpnless", true, false); },
             IrOpcode::SMax => { self.emitMinMax(inst, "cmpnless", false, false); },
             IrOpcode::UMin => { self.emitMinMax(inst, "cmpnless", true, true); },
@@ -3444,6 +3924,20 @@ void emitIntExtendTo(str src, str dst32, u32 width, bool isSigned)
     void emitGep(IrInst* inst)
     {
         str dst = self.getRegForValue(&inst->base);
+        bool dstSpill0 = self.valueIsSpill(&inst->base);
+        // a constant rodata address needs no base materialization: one
+        // lea from %rip, straight into the destination (or r10 + sink)
+        str constLbl;
+        i64 constLblOff = 0;
+        if (self.constAddrOf(&inst->base, &constLbl, &constLblOff))
+        {
+            self.emitter.emit("\tleaq ");
+            self.emitter.emit(self.ripOperand(constLbl, constLblOff));
+            self.emitter.emit(", ");
+            self.emitter.emitLine(dstSpill0 ? "r10" : dst);
+            if (dstSpill0) self.sinkInt(&inst->base, "r10");
+            return;
+        }
         // sib parts are register-only, spills reload into the scratches;
         // a base already in a register goes straight into the lea
         str base = (inst->nops > 0) ? self.opForRegInPlace(inst->ops[0], "r10") : "rax";
@@ -3562,9 +4056,7 @@ void emitIntExtendTo(str src, str dst32, u32 width, bool isSigned)
             }
             else
             {
-                self.emitter.emit("\tmovabsq ");
-                self.emitter.emit(i64ToHex(constOff));
-                self.emitter.emitLine(", %r11");
+                self.emitImmTo((u64)constOff, "r11");
                 self.emitter.emit("\tleaq (");
                 self.emitter.emit(base);
                 self.emitter.emit(", %r11, 1), ");
@@ -3583,9 +4075,7 @@ void emitIntExtendTo(str src, str dst32, u32 width, bool isSigned)
             }
             else
             {
-                self.emitter.emit("\tmovabsq ");
-                self.emitter.emit(i64ToHex(constOff));
-                self.emitter.emitLine(", %rax");
+                self.emitImmTo((u64)constOff, "rax");
                 self.emitter.emitLine("\taddq %rax, %r11");
             }
         }
@@ -3782,7 +4272,12 @@ void emitIntExtendTo(str src, str dst32, u32 width, bool isSigned)
         switch (inst->opcode)
         {
             IrOpcode::Trunc => {
-                if (dstWidth == 32)
+                if (dst.equals(src))
+                {
+                    // same home: every reader of a trunc takes the low
+                    // bits that are already in place — nothing to emit
+                }
+                else if (dstWidth == 32)
                 {
                     self.emitter.emit("\tmovl ");
                     self.emitter.emit(toReg32(src));
@@ -4279,6 +4774,553 @@ void emitIntExtendTo(str src, str dst32, u32 width, bool isSigned)
         return 0;
     }
 
+    // ── inline asm ─────────────────────────────────────────────────────
+    // The template is substituted and written into the .s text (gas
+    // assembles it); constraints bind operands to physical registers
+    // around it. lsra treats InlineAsm as a call, so values live across
+    // it sit in callee-saves — the pick pools below are the reserved set
+    // plus this ABI's caller-save allocatables, all safe to touch.
+    void asmHardErr(IrInst* inst, str why)
+    {
+        eprintln("coralc: inline asm: {}", why);
+        self.emitter.emitLine("\tud2");
+    }
+
+    bool asmIsTaken(str r)
+    {
+        for (u32 i = 0; i < self.asmTakenN; i++)
+            if (self.asmTaken[i].equals(r)) return true;
+        return false;
+    }
+
+    void asmTake(str r)
+    {
+        if (self.asmTakenN < 16)
+        {
+            self.asmTaken[self.asmTakenN] = r;
+            self.asmTakenN++;
+        }
+    }
+
+    str asmPickFree()
+    {
+        str[8] poolS = { "rax", "rcx", "rdx", "r10", "rsi", "rdi", "r8", "r9" };
+        str[6] poolW = { "rax", "rcx", "rdx", "r10", "r8", "r9" };
+        u32 n = 6;
+        if (!self.isWindows) n = 8;
+        for (u32 i = 0; i < n; i++)
+        {
+            str r = "rax";
+            if (self.isWindows) r = poolW[i];
+            else r = poolS[i];
+            if (!self.asmIsTaken(r))
+            {
+                self.asmTake(r);
+                return r;
+            }
+        }
+        return str::empty();
+    }
+
+    str asmPickQ()
+    {
+        str[3] pool = { "rax", "rcx", "rdx" };
+        for (u32 i = 0; i < 3; i++)
+        {
+            if (!self.asmIsTaken(pool[i]))
+            {
+                self.asmTake(pool[i]);
+                return pool[i];
+            }
+        }
+        return str::empty();
+    }
+
+    str asmFixedReg(str nm)
+    {
+        if (nm.equals("a")) return "rax";
+        if (nm.equals("c")) return "rcx";
+        if (nm.equals("d")) return "rdx";
+        if (nm.equals("S")) return "rsi";
+        if (nm.equals("D")) return "rdi";
+        return str::empty();
+    }
+
+    str asmR32(str r)
+    {
+        if (r.equals("rax")) return "eax";
+        if (r.equals("rcx")) return "ecx";
+        if (r.equals("rdx")) return "edx";
+        if (r.equals("r10")) return "r10d";
+        if (r.equals("rsi")) return "esi";
+        if (r.equals("rdi")) return "edi";
+        if (r.equals("r8")) return "r8d";
+        if (r.equals("r9")) return "r9d";
+        return r;
+    }
+
+    str asmR8(str r)
+    {
+        if (r.equals("rax")) return "al";
+        if (r.equals("rcx")) return "cl";
+        if (r.equals("rdx")) return "dl";
+        if (r.equals("r10")) return "r10b";
+        if (r.equals("rsi")) return "sil";
+        if (r.equals("rdi")) return "dil";
+        if (r.equals("r8")) return "r8b";
+        if (r.equals("r9")) return "r9b";
+        return r;
+    }
+
+    bool asmClobberSafe(str nm)
+    {
+        if (self.isWindows && (nm.equals("rsi") || nm.equals("rdi"))) return false;
+        if (nm.equals("rax") || nm.equals("rcx") || nm.equals("rdx") ||
+            nm.equals("r10") || nm.equals("r11") || nm.equals("rsi") ||
+            nm.equals("rdi") || nm.equals("r8") || nm.equals("r9") ||
+            nm.equals("rsp") || nm.equals("rbp") ||
+            nm.equals("xmm0") || nm.equals("xmm1") || nm.equals("xmm15"))
+            return true;
+        return false;
+    }
+
+    void emitInlineAsm(IrInst* inst)
+    {
+        self.asmTakenN = 0;
+        u32 nops = inst->nops;
+        if (nops > 24) { self.asmHardErr(inst, "too many operands"); return; }
+
+        AsmConstraint[24] cc;
+        AsmParseError perr = AsmParseError { .msg = str::empty(), .lineNo = 0 };
+        u32 nc = parseConstraints(inst->asmConstraints, cc, 24, &perr);
+        if (nc == 0xFFFF) { self.asmHardErr(inst, perr.msg); return; }
+        if (nc != nops) { self.asmHardErr(inst, "constraint and operand counts differ"); return; }
+
+        // value mode: a non-void asm carries its result as the inst
+        // value — when that home sits in the caller-save pick pool it is
+        // reserved up front so the register output writes it directly
+        // and no read-back move is needed
+        bool valMode = inst->base.type != null && inst->base.type->kind != IrTypeKind::Void;
+        str resPref = str::empty();
+        bool resPrefUsed = false;
+        if (valMode)
+        {
+            str h = self.opFor(&inst->base);
+            str[8] poolS = { "rax", "rcx", "rdx", "r10", "rsi", "rdi", "r8", "r9" };
+            str[6] poolW = { "rax", "rcx", "rdx", "r10", "r8", "r9" };
+            u32 pn = 8;
+            if (self.isWindows) pn = 6;
+            for (u32 i = 0; i < pn; i++)
+            {
+                str r = poolS[i];
+                if (self.isWindows) r = poolW[i];
+                if (h.equals(r)) { resPref = h; self.asmTake(h); break; }
+            }
+        }
+
+        // clobbers: caller-save/reserved regs never hold a value across
+        // the asm (lsra pushes those to callee-saves), so they are safe —
+        // a callee-save would be silently corrupted, so reject it here
+        str cb = inst->asmClobbers;
+        usize ci = 0;
+        while (ci < cb.len)
+        {
+            usize st = ci;
+            while (ci < cb.len && cb.ptr[ci] != (u8)',') ci++;
+            usize en = ci;
+            usize a = st;
+            while (a < en && (cb.ptr[a] == (u8)' ' || cb.ptr[a] == (u8)'\t')) a++;
+            while (en > a && (cb.ptr[en - 1] == (u8)' ' || cb.ptr[en - 1] == (u8)'\t')) en--;
+            if (en > a)
+            {
+                str nm = str::fromParts(cb.ptr + a, en - a);
+                if (!nm.equals("memory") && !nm.equals("cc") && !self.asmClobberSafe(nm))
+                {
+                    self.asmHardErr(inst, "clobber list names a callee-save register");
+                    return;
+                }
+            }
+            if (ci < cb.len) ci++;
+        }
+
+        u8[24] mode;      // 0 unset, 1 in-reg, 2 out-reg, 3 inout-reg, 4 mem, 5 imm
+        str[24] treg;
+        for (u32 k = 0; k < 24; k++) { mode[k] = 0; treg[k] = str::empty(); }
+
+        // pass 1: fixed registers, memory operands, immediates
+        for (u32 k = 0; k < nops; k++)
+        {
+            AsmConstraint c = cc[k];
+            if (c.cls == AsmConClass::ConTied) continue;
+            u8 dir = 1;
+            if (c.isInOut) dir = (u8)3;
+            else if (c.isOut) dir = (u8)2;
+            if (c.cls == AsmConClass::ConMem)
+            {
+                str a = self.asmPickFree();
+                if (a.len == 0) { self.asmHardErr(inst, "out of registers for memory operand"); return; }
+                mode[k] = 4;
+                treg[k] = a;
+            }
+            else if (c.cls == AsmConClass::ConImm)
+            {
+                if (dir != 1) { self.asmHardErr(inst, "immediate operand cannot be an output"); return; }
+                mode[k] = 5;
+            }
+            else if (c.cls == AsmConClass::ConGeneral)
+            {
+                str a = str::empty();
+                if (resPref.len > 0 && !resPrefUsed && dir != 1)
+                {
+                    a = resPref;
+                    resPrefUsed = true;
+                }
+                else a = self.asmPickFree();
+                if (a.len == 0) { self.asmHardErr(inst, "out of registers for operand"); return; }
+                mode[k] = dir;
+                treg[k] = a;
+            }
+            else if (c.cls == AsmConClass::ConRegName)
+            {
+                str r = str::empty();
+                if (c.regName.equals("q")) r = self.asmPickQ();
+                else
+                {
+                    r = self.asmFixedReg(c.regName);
+                    if (r.len > 0)
+                    {
+                        if (self.asmIsTaken(r))
+                        {
+                            // the result's own pinned home still counts
+                            if (resPref.len > 0 && !resPrefUsed && dir != 1 && r.equals(resPref))
+                                resPrefUsed = true;
+                            else { self.asmHardErr(inst, "register assigned to two operands"); return; }
+                        }
+                        else self.asmTake(r);
+                    }
+                }
+                if (r.len == 0) { self.asmHardErr(inst, "unsupported register constraint"); return; }
+                mode[k] = dir;
+                treg[k] = r;
+            }
+            else { self.asmHardErr(inst, "unknown constraint class"); return; }
+        }
+
+        // pass 2: tied operands borrow their partner's register
+        for (u32 k = 0; k < nops; k++)
+        {
+            AsmConstraint c = cc[k];
+            if (c.cls != AsmConClass::ConTied) continue;
+            u32 t = c.tieIdx;
+            if (t >= nops || t == k || mode[t] == 0 || mode[t] == 4 || mode[t] == 5)
+            { self.asmHardErr(inst, "tied operand points nowhere"); return; }
+            treg[k] = treg[t];
+            mode[k] = c.isInOut ? (u8)3 : (u8)1;
+        }
+
+        // input moves as a parallel copy, staging through r11; the only
+        // hazard is writing a register another pending move still reads
+        u8[24] mvKind;    // 1 = register, 2 = spill slot, 3 = immediate, 4 = string
+        str[24] mvSrc;
+        str[24] mvDst;
+        u32[24] mvSlot;
+        IrValue*[24] mvVal;
+        bool[24] mvDone;
+        bool[24] mvStaged;
+        bool[24] mvDeref; // inout: operand is a variable — load its value
+        u32 mvN = 0;
+        for (u32 k = 0; k < nops; k++)
+        {
+            if (mode[k] != 1 && mode[k] != 3) continue;
+            IrValue* v = inst->ops[k];
+            if (v == null) { self.asmHardErr(inst, "missing input operand"); return; }
+            mvDeref[mvN] = false;
+            if (valueIsIntConst(v)) { mvKind[mvN] = 3; mvVal[mvN] = v; mvSrc[mvN] = str::empty(); }
+            else if (v->kind == IrValueKind::StringConst) { mvKind[mvN] = 4; mvVal[mvN] = v; mvSrc[mvN] = str::empty(); }
+            else if (self.valueIsSpill(v))
+            {
+                mvKind[mvN] = 2;
+                mvVal[mvN] = v;
+                mvSlot[mvN] = (u32)(v->valData & 0x3FFFFFFF);
+                mvSrc[mvN] = str::empty();
+            }
+            else
+            {
+                mvKind[mvN] = 1;
+                mvVal[mvN] = v;
+                if (mode[k] == 3 && !valMode)
+                {
+                    // pointer model: the inout operand IS the variable's
+                    // address — load the pointee into the register
+                    if (v->type == null || v->type->kind != IrTypeKind::Ptr)
+                    { self.asmHardErr(inst, "inout operand must be an address"); return; }
+                    mvDeref[mvN] = true;
+                }
+                mvSrc[mvN] = self.opFor(v);
+            }
+            mvDst[mvN] = treg[k];
+            mvDone[mvN] = false;
+            mvStaged[mvN] = false;
+            mvN++;
+        }
+        u32 doneN = 0;
+        u32 guard = 0;
+        while (doneN < mvN && guard < 600)
+        {
+            guard++;
+            bool prog = false;
+            for (u32 m = 0; m < mvN; m++)
+            {
+                if (mvDone[m]) continue;
+                bool blocked = false;
+                for (u32 o = 0; o < mvN; o++)
+                {
+                    if (mvDone[o] || o == m || mvKind[o] != 1 || mvStaged[o]) continue;
+                    if (mvSrc[o].equals(mvDst[m])) { blocked = true; break; }
+                }
+                if (blocked) continue;
+                if (mvStaged[m])
+                {
+                    self.emitter.emit("\tmovq %r11, ");
+                    self.emitter.emitLine(mvDst[m]);
+                }
+                else if (mvKind[m] == 1)
+                {
+                    if (mvDeref[m])
+                    {
+                        for (u32 o = 0; o < mvN; o++)
+                            if (mvStaged[o] && !mvDone[o])
+                            { self.asmHardErr(inst, "inout load needs a scratch"); return; }
+                        bool pr = false;
+                        for (usize q = 0; q < mvSrc[m].len; q++)
+                            if (mvSrc[m].ptr[q] == (u8)'(') pr = true;
+                        str w = "movq";
+                        u32 bits = 64;
+                        IrValue* av = mvVal[m];
+                        if (av->type != null && av->type->elem != null &&
+                            av->type->elem->kind == IrTypeKind::Int)
+                            bits = av->type->elem->width;
+                        str dr = mvDst[m];
+                        if (bits <= 8) { w = "movzbl"; dr = self.asmR32(mvDst[m]); }
+                        else if (bits <= 32) { w = "movl"; dr = self.asmR32(mvDst[m]); }
+                        if (pr)
+                        {
+                            self.emitter.emit("\tmovq ");
+                            self.emitter.emit(mvSrc[m]);
+                            self.emitter.emitLine(", %r11");
+                            self.emitter.emit("\t");
+                            self.emitter.emit(w);
+                            self.emitter.emit(" (%r11), ");
+                            self.emitter.emitLine(dr);
+                        }
+                        else
+                        {
+                            self.emitter.emit("\t");
+                            self.emitter.emit(w);
+                            self.emitter.emit(" (");
+                            self.emitter.emit(mvSrc[m]);
+                            self.emitter.emit("), ");
+                            self.emitter.emitLine(dr);
+                        }
+                    }
+                    else if (!mvSrc[m].equals(mvDst[m]))
+                    {
+                        self.emitter.emit("\tmovq ");
+                        self.emitter.emit(mvSrc[m]);
+                        self.emitter.emit(", ");
+                        self.emitter.emitLine(mvDst[m]);
+                    }
+                }
+                else if (mvKind[m] == 2)
+                {
+                    self.emitter.emit("\tmovq ");
+                    self.emitter.emit(self.slotText(mvSlot[m]));
+                    self.emitter.emit(", ");
+                    self.emitter.emitLine(mvDst[m]);
+                }
+                else if (mvKind[m] == 3)
+                {
+                    self.emitImmTo(mvVal[m]->valData, mvDst[m]);
+                }
+                else
+                {
+                    self.emitter.emit("\tleaq ");
+                    self.emitter.emit(self.ripOperand(self.stringLabel(mvVal[m]), 0));
+                    self.emitter.emit(", ");
+                    self.emitter.emitLine(mvDst[m]);
+                }
+                mvDone[m] = true;
+                doneN++;
+                prog = true;
+            }
+            if (doneN >= mvN) break;
+            if (!prog)
+            {
+                u32 m = 0;
+                while (m < mvN && (mvDone[m] || mvStaged[m] || mvKind[m] != 1)) m++;
+                if (m >= mvN) { self.asmHardErr(inst, "input copy cannot be scheduled"); return; }
+                for (u32 o = 0; o < mvN; o++)
+                    if (mvStaged[o] && !mvDone[o])
+                    { self.asmHardErr(inst, "input copy needs a second scratch"); return; }
+                self.emitter.emit("\tmovq ");
+                self.emitter.emit(mvSrc[m]);
+                self.emitter.emit(", %r11");
+                self.emitter.emitLine("");
+                mvStaged[m] = true;
+            }
+        }
+        if (doneN < mvN) { self.asmHardErr(inst, "input copy did not finish"); return; }
+
+        // memory operands: materialise the address after the copy (their
+        // homes are callee-saves, so nothing above could have touched them)
+        for (u32 k = 0; k < nops; k++)
+        {
+            if (mode[k] != 4) continue;
+            IrValue* v = inst->ops[k];
+            if (v == null) { self.asmHardErr(inst, "missing memory operand"); return; }
+            self.opForReg(v, treg[k]);
+        }
+
+        // template: %% is a literal %, %N expands to the operand spelling
+        str tmpl = inst->asmString;
+        usize cap = tmpl.len + 48 + (usize)nops * 8;
+        u8* buf = alloc<u8>(cap);
+        if (buf == null) { self.asmHardErr(inst, "out of memory"); return; }
+        usize k2 = 0;
+        usize ti = 0;
+        bool subErr = false;
+        while (ti < tmpl.len)
+        {
+            u8 ch = tmpl.ptr[ti];
+            if (ch == (u8)'%' && ti + 1 < tmpl.len)
+            {
+                u8 nx = tmpl.ptr[ti + 1];
+                if (nx == (u8)'%') { buf[k2] = '%'; k2++; ti = ti + 2; continue; }
+                if (nx >= (u8)'0' && nx <= (u8)'9')
+                {
+                    u32 idx = 0;
+                    ti++;
+                    while (ti < tmpl.len && tmpl.ptr[ti] >= (u8)'0' && tmpl.ptr[ti] <= (u8)'9')
+                    {
+                        idx = idx * 10 + (u32)(tmpl.ptr[ti] - (u8)'0');
+                        ti++;
+                    }
+                    if (idx >= nops || mode[idx] == 0) { subErr = true; break; }
+                    if (mode[idx] == 5)
+                    {
+                        str it = intImmText(inst->ops[idx]);
+                        for (usize q = 0; q < it.len; q++) { buf[k2] = it.ptr[q]; k2++; }
+                    }
+                    else if (mode[idx] == 4)
+                    {
+                        buf[k2] = '('; k2++;
+                        buf[k2] = '%'; k2++;
+                        str r = treg[idx];
+                        for (usize q = 0; q < r.len; q++) { buf[k2] = r.ptr[q]; k2++; }
+                        buf[k2] = ')'; k2++;
+                    }
+                    else
+                    {
+                        buf[k2] = '%'; k2++;
+                        str r = treg[idx];
+                        for (usize q = 0; q < r.len; q++) { buf[k2] = r.ptr[q]; k2++; }
+                    }
+                    continue;
+                }
+                if (nx == (u8)'[') { subErr = true; break; }
+                /* %rax / %eflags etc: pass the % through verbatim, the
+                 * rest of the name is copied by the next round */
+                buf[k2] = '%';
+                k2++;
+                ti++;
+                continue;
+            }
+            buf[k2] = ch;
+            k2++;
+            ti++;
+        }
+        if (subErr)
+        {
+            dealloc<u8>(buf);
+            self.asmHardErr(inst, "unsupported % escape in template");
+            return;
+        }
+        if (k2 > 0)
+        {
+            self.emitter.emit("\t");
+            self.emitter.emit(str::fromParts(buf, k2));
+            self.emitter.emitLine("");
+        }
+        dealloc<u8>(buf);
+
+        // register outputs: value mode moves the result into the inst's
+        // own home (the value, not a pointer); the pointer model stores
+        // through the operand's address at the pointee's width
+        bool resMoved = false;
+        for (u32 k = 0; k < nops; k++)
+        {
+            if (mode[k] != 2 && mode[k] != 3) continue;
+            IrValue* pv = inst->ops[k];
+            bool ptrOut = pv != null && pv->type != null && pv->type->kind == IrTypeKind::Ptr;
+            if (!ptrOut)
+            {
+                if (!valMode || resMoved)
+                { self.asmHardErr(inst, "output operand must be an address"); return; }
+                resMoved = true;
+                str home = self.opFor(&inst->base);
+                if (home.equals(treg[k])) continue;
+                u32 bits = 64;
+                if (inst->base.type != null) bits = inst->base.type->width;
+                str ws = "movq";
+                str sr = treg[k];
+                str dst = home;
+                if (bits <= 8) { ws = "movb"; sr = self.asmR8(treg[k]); dst = self.asmR8(home); }
+                else if (bits <= 32) { ws = "movl"; sr = self.asmR32(treg[k]); dst = self.asmR32(home); }
+                self.emitter.emit("\t");
+                self.emitter.emit(ws);
+                self.emitter.emit(" ");
+                self.emitter.emit(sr);
+                self.emitter.emit(", ");
+                self.emitter.emit(dst);
+                self.emitter.emitLine("");
+                continue;
+            }
+            if (pv == null) continue;
+            u32 bits = 64;
+            if (pv->type->elem != null && pv->type->elem->kind == IrTypeKind::Int)
+                bits = pv->type->elem->width;
+            str home = self.opFor(pv);
+            str w = "movq";
+            str sr = treg[k];
+            if (bits <= 8) { w = "movb"; sr = self.asmR8(treg[k]); }
+            else if (bits <= 32) { w = "movl"; sr = self.asmR32(treg[k]); }
+            bool paren = false;
+            for (usize q = 0; q < home.len; q++) if (home.ptr[q] == (u8)'(') paren = true;
+            if (paren)
+            {
+                // spilled pointer: reload it into r11, store through it
+                self.emitter.emit("\tmovq ");
+                self.emitter.emit(home);
+                self.emitter.emitLine(", %r11");
+                self.emitter.emit("\t");
+                self.emitter.emit(w);
+                self.emitter.emit(" ");
+                self.emitter.emit(sr);
+                self.emitter.emitLine(", (%r11)");
+            }
+            else
+            {
+                self.emitter.emit("\t");
+                self.emitter.emit(w);
+                self.emitter.emit(" ");
+                self.emitter.emit(sr);
+                self.emitter.emit(", (");
+                self.emitter.emit(home);
+                self.emitter.emitLine(")");
+            }
+        }
+    }
+
     void emitCall(IrInst* inst)
     {
         if (inst->nops == 0 || inst->ops[0] == null) return;
@@ -4480,10 +5522,7 @@ void emitIntExtendTo(str src, str dst32, u32 width, bool isSigned)
                 }
                 else if (arg != null && arg->kind == IrValueKind::ConstFloat)
                 {
-                    str num = u64ToHex(arg->valData);
-                    self.emitter.emit("\tmovabsq $");
-                    self.emitter.emit(num);
-                    self.emitter.emitLine(", r11");
+                    self.emitImmTo(arg->valData, "r11");
                     self.emitter.emit("\tmovq r11, ");
                     self.emitter.emitU32(outOff);
                     self.emitter.emitLine("(%rsp)");
@@ -4582,10 +5621,7 @@ void emitIntExtendTo(str src, str dst32, u32 width, bool isSigned)
                 }
                 else if (mvKind[m] == 5)
                 {
-                    str num = u64ToHex(arg->valData);
-                    self.emitter.emit("\tmovabsq $");
-                    self.emitter.emit(num);
-                    self.emitter.emitLine(", r11");
+                    self.emitImmTo(arg->valData, "r11");
                     self.emitter.emit("\tmovq r11, ");
                     self.emitter.emitLine(dst);
                 }
@@ -4780,10 +5816,7 @@ void emitIntExtendTo(str src, str dst32, u32 width, bool isSigned)
                                           ? inst->ops[1] : inst->ops[2];
                 if (valueIsIntConst(chosen))
                 {
-                    self.emitter.emit("\tmovabsq ");
-                    self.emitter.emit(intImmText(chosen));
-                    self.emitter.emit(", ");
-                    self.emitter.emitLine(work);
+                    self.emitImmTo(chosen->valData, work);
                 }
                 else
                 {

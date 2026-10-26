@@ -8,9 +8,10 @@
  * so dead statements after Return/Break/Continue are skipped. No phis —
  * locals are alloca+load/store. */
 import lower { Wv, wvNode, wvErr, wvStr, wvResolved, wvFindLocal, wvPushLocal,
-               wvBlock, wvSetBlock, wvTerm, wvPos };
+               wvBlock, wvSetBlock, wvTerm, wvPos, wvArr };
 import types { wvTy };
-import expr { wvExpr, wvAddrOf, wvCond, wvAssignCommon, wvIsAgg, wvCopyAgg };
+import expr { wvExpr, wvAddrOf, wvCond, wvAssignCommon, wvIsAgg, wvCopyAgg, wvAggSlot,
+               wvDecodeLit, wvCompareVals, wvResolveConst, wvMakeGlobal };
 import context::context { AstContext };
 import sem { scope { Symbol, ScopeStack } };
 import ast {
@@ -18,8 +19,9 @@ import ast {
     types { Ty, TypeEntry, TypeKind },
     node { Node, NodeKind },
     expr { Expr, ExprKind },
-    stmt { Stmt, StmtKind },
-    decl { Decl, DeclKind, Param }
+    stmt { Stmt, StmtKind, SwitchCase },
+    decl { Decl, DeclKind, Param },
+    pat { Pat, PatKind }
 };
 import common::slice { Slice };
 import(lib) wallvm::irtypes { IrContext, IrModule, IrFunc, IrValue, IrValueKind, IrType, IrTypeKind, IrInst, IrBlock };
@@ -30,6 +32,227 @@ import(lib) std::mman { alloc, dealloc };
 pub IrValue* wvV(IrInst* inst) { return inst != null ? &inst->base : null; }
 
 pub void wvStmt(Wv* w, NodeId id);
+
+/* one pattern's test against an already-evaluated scrutinee: an i1
+ * value, or null with *isWildcard set when the pattern matches every
+ * value. Mirrors the C backend's cgPatTest; the arm's patterns are OR'd
+ * by wvSwitchTest. */
+pub IrValue* wvPatTest(Wv* w, NodeId patId, IrValue* scrut, Ty scrutTy,
+                        bool* isWildcard, NodeId id)
+{
+    *isWildcard = false;
+    if (patId.index == 0) { *isWildcard = true; return null; }
+    Node* n = wvNode(w, patId);
+    if (n->kind.tag == NodeKind::Pat)
+    {
+        Pat* p = &n->kind.payload.Pat.value;
+        switch (p.kind.tag)
+        {
+            PatKind::Wildcard => { *isWildcard = true; return null; },
+            PatKind::Lit => {
+                IrValue* lit = wvExpr(w, p.kind.payload.Lit.expr);
+                if (lit == null) return null;
+                return wvCompareVals(w, ExprKind::Eq, scrut, lit, id, scrutTy);
+            },
+            PatKind::Ident => {
+                /* a bare name in a value switch is a file-scope constant
+                 * (`switch (sig) { SIGSEGV_ => … }`), not a binding */
+                NodeId cd = wvResolveConst(w, p.kind.payload.Ident.name, patId);
+                if (cd.index == 0)
+                    { wvErr(w, patId, "pattern names an unknown constant"); return null; }
+                NodeId init = wvNode(w, cd)->kind.payload.Decl.value.kind.payload.Constant.value;
+                IrValue* lit = wvExpr(w, init);
+                if (lit == null) return null;
+                return wvCompareVals(w, ExprKind::Eq, scrut, lit, id, scrutTy);
+            },
+            PatKind::Or => {
+                IrValue* acc = null;
+                u32 i = 0;
+                while (i < p.kind.payload.Or.alternativesLen)
+                {
+                    bool wild = false;
+                    IrValue* t = wvPatTest(w, p.kind.payload.Or.alternatives[i],
+                                           scrut, scrutTy, &wild, id);
+                    if (wild) { *isWildcard = true; return null; }
+                    if (t == null) return null;
+                    acc = acc == null ? t : wvV(w->b.orOp(acc, t));
+                    if (acc == null) return null;
+                    i++;
+                }
+                if (acc == null) { *isWildcard = true; return null; }
+                return acc;
+            },
+            PatKind::Range => {
+                IrValue* lo = wvExpr(w, p.kind.payload.Range.start);
+                IrValue* hi = wvExpr(w, p.kind.payload.Range.end);
+                if (lo == null || hi == null) return null;
+                bool incl = (p.kind.payload.Range.flags & 1) != 0;
+                IrValue* a = wvCompareVals(w, ExprKind::Ge, scrut, lo, id, scrutTy);
+                IrValue* b = wvCompareVals(w, incl ? ExprKind::Le : ExprKind::Lt,
+                                           scrut, hi, id, scrutTy);
+                if (a == null || b == null) return null;
+                return wvV(w->b.andOp(a, b));
+            },
+            PatKind::Guard => {
+                /* pattern-level guard: test && cond; a wildcard inner
+                 * pattern leaves the guard as the whole test */
+                bool wild = false;
+                IrValue* t = wvPatTest(w, p.kind.payload.Guard.pattern,
+                                       scrut, scrutTy, &wild, id);
+                IrValue* g = wvCond(w, wvExpr(w, p.kind.payload.Guard.cond));
+                if (g == null) return null;
+                if (wild) return g;
+                if (t == null) return null;
+                return wvV(w->b.andOp(t, g));
+            },
+            else => { wvErr(w, patId, "pattern kind unsupported (Phase 3)"); return null; },
+        }
+    }
+    if (n->kind.tag == NodeKind::Expr)
+    {
+        /* bare expression pattern (a literal or constant reference) */
+        IrValue* lit = wvExpr(w, patId);
+        if (lit == null) return null;
+        return wvCompareVals(w, ExprKind::Eq, scrut, lit, id, scrutTy);
+    }
+    wvErr(w, patId, "unsupported pattern");
+    return null;
+}
+
+/* the arm's test: every pattern OR'd together; a wildcard anywhere in
+ * the arm matches all values */
+pub IrValue* wvSwitchTest(Wv* w, SwitchCase* c, IrValue* scrut, Ty scrutTy,
+                           bool* isWildcard, NodeId id)
+{
+    *isWildcard = false;
+    IrValue* acc = null;
+    u32 p = 0;
+    while (p < c->patternsLen)
+    {
+        bool wild = false;
+        IrValue* t = wvPatTest(w, c->patterns[p], scrut, scrutTy, &wild, id);
+        if (wild) { *isWildcard = true; return null; }
+        if (t == null) return null;
+        acc = acc == null ? t : wvV(w->b.orOp(acc, t));
+        if (acc == null) return null;
+        p++;
+    }
+    if (acc == null) { *isWildcard = true; return null; }
+    return acc;
+}
+
+/* value switch as a compare chain in blocks (no phis). Each arm owns a
+ * test block and a body block; a failed test or a failed guard branches
+ * to the next arm's test block, then to the else arm, then to the join.
+ * The else arm runs only when nothing matched, wherever it sits in the
+ * source — the same shape cgEmitSwitchChain prints as if/else-if. */
+pub void wvSwitch(Wv* w, Stmt* s, NodeId id)
+{
+    NodeId scrutId = s->kind.payload.Switch.expr;
+    if (scrutId.index == 0) { wvErr(w, id, "switch without a scrutinee"); return; }
+    Node* sn = wvNode(w, scrutId);
+    if (sn->kind.tag != NodeKind::Expr) { wvErr(w, id, "switch scrutinee"); return; }
+    IrValue* scrut = wvExpr(w, scrutId);
+    if (scrut == null) return;
+    Ty scrutTy = wvResolved(w, sn->kind.payload.Expr.value.resolvedType);
+
+    SwitchCase* cases = s->kind.payload.Switch.cases;
+    u32 n = s->kind.payload.Switch.casesLen;
+    if (cases == null || n == 0) { wvErr(w, id, "switch without cases"); return; }
+
+    IrBlock** tbb = (IrBlock**)wvArr(w, (usize)n, 8);
+    IrBlock** bbb = (IrBlock**)wvArr(w, (usize)n, 8);
+    IrBlock** gbb = (IrBlock**)wvArr(w, (usize)n, 8);
+    IrBlock** fbb = (IrBlock**)wvArr(w, (usize)n, 8);
+    if (tbb == null || bbb == null || gbb == null || fbb == null)
+        { wvErr(w, id, "switch: out of memory"); return; }
+
+    u32 elseIdx = 0xFFFFFFFF;
+    u32 i = 0;
+    while (i < n)
+    {
+        tbb[i] = null;
+        bbb[i] = null;
+        gbb[i] = null;
+        fbb[i] = null;
+        SwitchCase* c = cases + i;
+        if ((c.flags & 4) != 0 || c.patternsLen == 0)
+        {
+            if (elseIdx == 0xFFFFFFFF) elseIdx = i;
+        }
+        else
+        {
+            tbb[i] = wvBlock(w, "sw.test");
+            bbb[i] = wvBlock(w, "sw.body");
+            if ((c.flags & 1) != 0 && c.guard.index != 0)
+                gbb[i] = wvBlock(w, "sw.guard");
+        }
+        i++;
+    }
+    IrBlock* joinBb = wvBlock(w, "sw.end");
+    IrBlock* elseBb = elseIdx != 0xFFFFFFFF ? wvBlock(w, "sw.else") : null;
+
+    /* fail targets, walked backwards so each arm knows where a failed
+     * test or guard lands: the next arm's test, else, then join */
+    IrBlock* nextTest = null;
+    i = n;
+    while (i > 0)
+    {
+        i--;
+        if (i == elseIdx || tbb[i] == null) continue;
+        fbb[i] = nextTest != null ? nextTest
+                 : (elseBb != null ? elseBb : joinBb);
+        nextTest = tbb[i];
+    }
+    IrBlock* entry = nextTest != null ? nextTest
+                     : (elseBb != null ? elseBb : joinBb);
+    w->b.br(entry);
+
+    IrBlock* savedBreak = w->breakT;
+    w->breakT = joinBb;
+    w->loopDepth++;
+
+    i = 0;
+    while (i < n)
+    {
+        if (i == elseIdx || tbb[i] == null) { i++; continue; }
+        SwitchCase* c = cases + i;
+        IrBlock* fail = fbb[i];
+
+        wvSetBlock(w, tbb[i]);
+        bool wild = false;
+        IrValue* test = wvSwitchTest(w, c, scrut, scrutTy, &wild, id);
+        if (!wild && test == null) break;
+        IrBlock* hit = gbb[i] != null ? gbb[i] : bbb[i];
+        if (wild) w->b.br(hit);
+        else w->b.condBr(test, hit, fail);
+
+        if (gbb[i] != null)
+        {
+            wvSetBlock(w, gbb[i]);
+            IrValue* g = wvCond(w, wvExpr(w, c->guard));
+            if (g == null) break;
+            w->b.condBr(g, bbb[i], fail);
+        }
+
+        wvSetBlock(w, bbb[i]);
+        wvStmt(w, c->body);
+        if (!w->term) w->b.br(joinBb);
+        i++;
+    }
+
+    if (elseBb != null && elseIdx < n)
+    {
+        wvSetBlock(w, elseBb);
+        wvStmt(w, cases[elseIdx].body);
+        if (!w->term) w->b.br(joinBb);
+    }
+
+    w->breakT = savedBreak;
+    w->loopDepth--;
+    wvSetBlock(w, joinBb);
+}
+
 
 
 /* lower a VarDecl: alloca, optionally initialise (aggregates copy
@@ -55,7 +278,18 @@ pub void wvVarDecl(Wv* w, Stmt* s, NodeId id)
         wvErr(w, id, "cannot local-bind a void value");
         return;
     }
-    IrValue* slot = wvV(w->b.alloca(irt));
+    if ((s->kind.payload.VarDecl.flags & 4) != 0)
+    {
+        /* `static` keeps its storage across calls: a global registered
+         * under this statement, pushed as a local so loads and stores
+         * reach it; its initializer is constant, never run at entry */
+        IrValue* gv = wvMakeGlobal(w, id, name, vt, s->kind.payload.VarDecl.init,
+                                   (s->kind.payload.VarDecl.flags & 1) != 0, false,
+                                   id.index);
+        if (gv != null) wvPushLocal(w, name, gv);
+        return;
+    }
+    IrValue* slot = wvIsAgg(irt) ? wvAggSlot(w, irt) : wvV(w->b.alloca(irt));
     if (slot == null) return;
     if ((s->kind.payload.VarDecl.flags & 2) != 0) // hasInit
     {
@@ -236,6 +470,232 @@ pub void wvStmt(Wv* w, NodeId id)
             wvSetBlock(w, exitBb);
             w->locLen = scopeMark;
         },
+        StmtKind::Asm => {
+            /* gcc-style extended asm → one InlineAsm. Template pieces
+             * join; output/input sections are constraint/operand pairs
+             * that flatten to a comma-joined constraint list plus an
+             * ops array (outputs first, then inputs). Outputs and
+             * memory-class inputs go through wvAddrOf — the emitter
+             * reads and writes them through that pointer, so every
+             * read-back operand carries a Ptr(T) alloca. All buffers
+             * are arena-backed; inlineAsm dupStr's what it keeps. */
+            u32 tLen = s->kind.payload.Asm.templateLen;
+            u32 outLen = s->kind.payload.Asm.outputsLen;
+            u32 inLen = s->kind.payload.Asm.inputsLen;
+            u32 clobLen = s->kind.payload.Asm.clobbersLen;
+            if ((outLen & 1) != 0 || (inLen & 1) != 0)
+            {
+                wvErr(w, id, "asm operand constraint needs a value");
+                return;
+            }
+
+            /* template: string-literal pieces, escapes decoded like any
+             * other literal */
+            usize tcap = 0;
+            u32 i = 0;
+            while (i < tLen)
+            {
+                Node* tn = wvNode(w, s->kind.payload.Asm.template[i]);
+                if (tn->kind.tag != NodeKind::Expr ||
+                    tn->kind.payload.Expr.value.kind.tag != ExprKind::StringLit)
+                    { wvErr(w, id, "asm template pieces must be string literals"); return; }
+                tcap += wvStr(w, tn->kind.payload.Expr.value.kind.payload.StringLit.value).len;
+                i++;
+            }
+            u8* tbuf = (u8*)wvArr(w, tcap + 1, 1);
+            if (tbuf == null) { wvErr(w, id, "asm template buffer"); return; }
+            usize tlen = 0;
+            i = 0;
+            while (i < tLen)
+            {
+                str tok = wvStr(w, wvNode(w, s->kind.payload.Asm.template[i])
+                                ->kind.payload.Expr.value.kind.payload.StringLit.value);
+                usize b = 0;
+                usize e = tok.len;
+                if (e >= 2 && tok.ptr[0] == '"') { b = 1; e = e - 1; }
+                tlen += wvDecodeLit(tok, b, e, tbuf + tlen);
+                i++;
+            }
+
+            /* constraints: raw token capacity first (validate the nodes),
+             * then decode outputs then inputs into one comma list */
+            usize ccap = 0;
+            i = 0;
+            while (i < outLen)
+            {
+                Node* cn = wvNode(w, s->kind.payload.Asm.outputs[i]);
+                if (cn->kind.tag != NodeKind::Expr ||
+                    cn->kind.payload.Expr.value.kind.tag != ExprKind::StringLit)
+                    { wvErr(w, id, "asm operand constraint must be a string literal"); return; }
+                ccap += wvStr(w, cn->kind.payload.Expr.value.kind.payload.StringLit.value).len + 1;
+                i += 2;
+            }
+            i = 0;
+            while (i < inLen)
+            {
+                Node* cn = wvNode(w, s->kind.payload.Asm.inputs[i]);
+                if (cn->kind.tag != NodeKind::Expr ||
+                    cn->kind.payload.Expr.value.kind.tag != ExprKind::StringLit)
+                    { wvErr(w, id, "asm operand constraint must be a string literal"); return; }
+                ccap += wvStr(w, cn->kind.payload.Expr.value.kind.payload.StringLit.value).len + 1;
+                i += 2;
+            }
+            u8* cbuf = (u8*)wvArr(w, ccap + 1, 1);
+            if (cbuf == null) { wvErr(w, id, "asm constraint buffer"); return; }
+            usize clen = 0;
+            i = 0;
+            while (i < outLen)
+            {
+                str tok = wvStr(w, wvNode(w, s->kind.payload.Asm.outputs[i])
+                                ->kind.payload.Expr.value.kind.payload.StringLit.value);
+                usize b = 0;
+                usize e = tok.len;
+                if (e >= 2 && tok.ptr[0] == '"') { b = 1; e = e - 1; }
+                if (clen > 0) { cbuf[clen] = ','; clen++; }
+                clen += wvDecodeLit(tok, b, e, cbuf + clen);
+                i = i + 2;
+            }
+            i = 0;
+            while (i < inLen)
+            {
+                str tok = wvStr(w, wvNode(w, s->kind.payload.Asm.inputs[i])
+                                ->kind.payload.Expr.value.kind.payload.StringLit.value);
+                usize b = 0;
+                usize e = tok.len;
+                if (e >= 2 && tok.ptr[0] == '"') { b = 1; e = e - 1; }
+                if (clen > 0) { cbuf[clen] = ','; clen++; }
+                clen += wvDecodeLit(tok, b, e, cbuf + clen);
+                i = i + 2;
+            }
+
+            /* exactly one register-class output ⇒ value mode: the asm
+             * produces the result directly (no address escape), so
+             * mem2reg still promotes the local; the value is stored back
+             * to the lvalue right after. Multiple register outputs or
+             * all-memory outputs keep the pointer model. */
+            u32 nOut = outLen / 2;
+            u32 nIn = inLen / 2;
+            u32 regOut = 0;
+            u32 regOutIdx = 0;
+            bool regInOut = false;
+            i = 0;
+            while (i < outLen)
+            {
+                str raw = wvStr(w, wvNode(w, s->kind.payload.Asm.outputs[i])
+                                ->kind.payload.Expr.value.kind.payload.StringLit.value);
+                usize qi = 0;
+                bool isInOut = false;
+                while (qi < raw.len)
+                {
+                    u8 c = raw.ptr[qi];
+                    if (c == (u8)'+') isInOut = true;
+                    if (c == (u8)'"' || c == (u8)'=' || c == (u8)'+' || c == (u8)'&') { qi++; continue; }
+                    break;
+                }
+                u8 cls = qi < raw.len ? raw.ptr[qi] : (u8)'r';
+                bool isTie = cls >= (u8)'0' && cls <= (u8)'9';
+                if (!isTie && cls != (u8)'m' && cls != (u8)'i' && cls != (u8)'f')
+                {
+                    regOut++;
+                    regOutIdx = i;
+                    if (isInOut) regInOut = true;
+                }
+                i += 2;
+            }
+            IrType* retT = null;
+            if (regOut == 1)
+            {
+                Node* en = wvNode(w, s->kind.payload.Asm.outputs[regOutIdx + 1]);
+                if (en->kind.tag == NodeKind::Expr && en->kind.payload.Expr.value.resolvedType != 0)
+                    retT = wvTy(w, wvResolved(w, en->kind.payload.Expr.value.resolvedType), 0);
+            }
+            bool valMode = regOut == 1 && retT != null;
+
+            u32 nops = nOut + nIn;
+            IrValue** ops = null;
+            if (nops > 0)
+            {
+                ops = (IrValue**)wvArr(w, (usize)nops, 8);
+                if (ops == null) { wvErr(w, id, "asm operand array"); return; }
+            }
+            u32 k = 0;
+            i = 0;
+            while (i < outLen)
+            {
+                if (valMode && i == regOutIdx)
+                {
+                    /* the single register output: value operand — inout
+                     * carries the current value, pure output carries
+                     * nothing (the result rides on the inst value) */
+                    ops[k] = regInOut ? wvExpr(w, s->kind.payload.Asm.outputs[i + 1]) : null;
+                }
+                else
+                {
+                    ops[k] = wvAddrOf(w, s->kind.payload.Asm.outputs[i + 1]);
+                    if (ops[k] == null) return;
+                }
+                k++;
+                i += 2;
+            }
+            i = 0;
+            while (i < inLen)
+            {
+                Node* cn = wvNode(w, s->kind.payload.Asm.inputs[i]);
+                str ctok = wvStr(w, cn->kind.payload.Expr.value.kind.payload.StringLit.value);
+                bool isMem = false;
+                usize qi = 0;
+                while (qi < ctok.len) { if (ctok.ptr[qi] == (u8)'m') isMem = true; qi++; }
+                NodeId vid = s->kind.payload.Asm.inputs[i + 1];
+                if (isMem) ops[k] = wvAddrOf(w, vid);
+                else ops[k] = wvExpr(w, vid);
+                if (ops[k] == null) return;
+                k++;
+                i += 2;
+            }
+
+            /* clobbers: bare string literals, comma-joined */
+            usize kcap = 0;
+            i = 0;
+            while (i < clobLen)
+            {
+                Node* kn = wvNode(w, s->kind.payload.Asm.clobbers[i]);
+                if (kn->kind.tag != NodeKind::Expr ||
+                    kn->kind.payload.Expr.value.kind.tag != ExprKind::StringLit)
+                    { wvErr(w, id, "asm clobber must be a string literal"); return; }
+                kcap += wvStr(w, kn->kind.payload.Expr.value.kind.payload.StringLit.value).len + 1;
+                i++;
+            }
+            u8* kbuf = (u8*)wvArr(w, kcap + 1, 1);
+            if (kbuf == null) { wvErr(w, id, "asm clobber buffer"); return; }
+            usize klen = 0;
+            i = 0;
+            while (i < clobLen)
+            {
+                str tok = wvStr(w, wvNode(w, s->kind.payload.Asm.clobbers[i])
+                                ->kind.payload.Expr.value.kind.payload.StringLit.value);
+                usize b = 0;
+                usize e = tok.len;
+                if (e >= 2 && tok.ptr[0] == '"') { b = 1; e = e - 1; }
+                if (klen > 0) { kbuf[klen] = ','; klen++; }
+                klen += wvDecodeLit(tok, b, e, kbuf + klen);
+                i++;
+            }
+
+            IrInst* asmInst = w->b.inlineAsm(str::fromParts(tbuf, tlen),
+                           str::fromParts(cbuf, clen),
+                           str::fromParts(kbuf, klen),
+                           (s->kind.payload.Asm.flags & 1) != 0,
+                           ops, nops, retT);
+            if (valMode && asmInst != null)
+            {
+                /* write the register result back to the local — mem2reg
+                 * removes the pair whenever the local stays promotable */
+                IrValue* res = wvV(asmInst);
+                IrValue* dst = wvAddrOf(w, s->kind.payload.Asm.outputs[regOutIdx + 1]);
+                if (res != null && dst != null) w->b.store(res, dst);
+            }
+        },
+        StmtKind::Switch => { wvSwitch(w, s, id); },
         StmtKind::Break => {
             if (w->breakT == null) { wvErr(w, id, "break outside a loop"); return; }
             w->b.br(w->breakT);

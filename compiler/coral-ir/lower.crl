@@ -20,7 +20,7 @@ import ast {
 };
 import common::slice { Slice };
 import build::arena { Arena };
-import(lib) wallvm::irtypes { IrContext, IrModule, IrFunc, IrBlock, IrValue, IrType };
+import(lib) wallvm::irtypes { IrContext, IrModule, IrFunc, IrBlock, IrValue, IrType, IrGlobal };
 import(lib) wallvm::irBuilder { IrBuilder };
 import(lib) std::mman { alloc, dealloc };
 import(lib) std::string { String };
@@ -67,6 +67,28 @@ pub struct Wv
     u32* fnKeys;       // declId.index + 1; 0 = empty slot
     IrFunc** fnVals;
     u32 fnCap;         // power of two
+
+    /* declId.index → IrGlobal* for names that keep storage: a
+     * DeclKind::Constant carrying static/extern storage (file-scope) or
+     * a function-scope `static` VarDecl, keyed by the declaring node */
+    u32* gKeys;        // declId.index + 1; 0 = empty slot
+    IrGlobal** gVals;
+    u32 gCap;          // power of two
+
+    /* Ty → IrType* memo for wvTy. Without it a nested/recursive struct
+     * re-derives its whole field graph on every visit (exponential on
+     * std's type graph — observed as a hard hang in MiAlloc_alloc). */
+    u32* tyKeys;       // Ty + 1; 0 = empty slot
+    IrType** tyVals;
+    u8* tyBusy;        // 1 while that Ty is being derived (cycle marker)
+    u32 tyCap;         // power of two
+
+    /* interned type-name → its type decl (wvFindTypeDecl). The merged
+     * file's decl list is scanned linearly otherwise — 37% of compile
+     * time on std-sized units. */
+    u32* tdKeys;       // Str + 1; 0 = empty slot
+    u32* tdVals;       // NodeId.index + 1
+    u32 tdCap;         // power of two
 
     /* monomorphisation substitution for the current instance */
     MonoSubstitution* subs;
@@ -284,5 +306,150 @@ pub IrFunc* wvFnMapGet(Wv* w, u32 declIdx)
     return null;
 }
 
+/* ── declId → IrGlobal* map (globals keep storage: see Wv.gKeys) ─────── */
+
+pub void wvGMapInit(Wv* w, u32 capPow2)
+{
+    w->gCap = capPow2;
+    w->gKeys = alloc<u32>((usize)capPow2);
+    w->gVals = alloc<IrGlobal*>((usize)capPow2);
+    if (w->gKeys == null || w->gVals == null)
+    {
+        w->gCap = 0;
+        return;
+    }
+    u32 i = 0;
+    while (i < capPow2) { w->gKeys[i] = 0; w->gVals[i] = null; i++; }
+}
+
+pub void wvGMapPut(Wv* w, u32 declIdx, IrGlobal* g)
+{
+    if (w->gCap == 0 || declIdx == 0xffffffff) return;
+    u32 slot = declIdx & (w->gCap - 1);
+    while (w->gKeys[slot] != 0)
+    {
+        if (w->gKeys[slot] == declIdx + 1) { w->gVals[slot] = g; return; }
+        slot = (slot + 1) & (w->gCap - 1);
+    }
+    w->gKeys[slot] = declIdx + 1;
+    w->gVals[slot] = g;
+}
+
+pub IrGlobal* wvGMapGet(Wv* w, u32 declIdx)
+{
+    if (w->gCap == 0 || declIdx == 0xffffffff) return null;
+    u32 slot = declIdx & (w->gCap - 1);
+    while (w->gKeys[slot] != 0)
+    {
+        if (w->gKeys[slot] == declIdx + 1) return w->gVals[slot];
+        slot = (slot + 1) & (w->gCap - 1);
+    }
+    return null;
+}
+
 /* the decl→wallvm entry, defined in decl.crl */
 pub str wvMangle(Wv* w, NodeId declId, Str name);
+
+/* ── Ty → IrType* memo (see Wv.tyKeys) ──────────────────────────────── */
+
+pub void wvTyMapInit(Wv* w, u32 capPow2)
+{
+    w->tyCap = capPow2;
+    w->tyKeys = alloc<u32>((usize)capPow2);
+    w->tyVals = alloc<IrType*>((usize)capPow2);
+    w->tyBusy = alloc<u8>((usize)capPow2);
+    if (w->tyKeys == null || w->tyVals == null || w->tyBusy == null)
+    {
+        w->tyCap = 0;
+        return;
+    }
+    u32 i = 0;
+    while (i < capPow2) { w->tyKeys[i] = 0; w->tyVals[i] = null; w->tyBusy[i] = 0; i++; }
+}
+
+/* found: fills busy (1 = still being derived) and val (null while busy) */
+pub bool wvTyMapFind(Wv* w, Ty t, u8* busy, IrType** val)
+{
+    if (w->tyCap == 0) return false;
+    u32 slot = ((u32)t) & (w->tyCap - 1);
+    while (w->tyKeys[slot] != 0)
+    {
+        if (w->tyKeys[slot] == (u32)t + 1)
+        {
+            *busy = w->tyBusy[slot];
+            *val = w->tyVals[slot];
+            return true;
+        }
+        slot = (slot + 1) & (w->tyCap - 1);
+    }
+    return false;
+}
+
+/* claim the slot for derivation (busy=1) or publish a finished type
+ * (busy=0, v!=null) */
+pub void wvTyMapSet(Wv* w, Ty t, u8 b, IrType* v)
+{
+    if (w->tyCap == 0) return;
+    u32 slot = ((u32)t) & (w->tyCap - 1);
+    while (w->tyKeys[slot] != 0)
+    {
+        if (w->tyKeys[slot] == (u32)t + 1)
+        {
+            w->tyBusy[slot] = b;
+            if (v != null) w->tyVals[slot] = v;
+            return;
+        }
+        slot = (slot + 1) & (w->tyCap - 1);
+    }
+    w->tyKeys[slot] = (u32)t + 1;
+    w->tyVals[slot] = v;
+    w->tyBusy[slot] = b;
+}
+
+/* ── type-name → decl memo (see Wv.tdKeys) ─────────────────────────────── */
+
+pub void wvTdMapInit(Wv* w, u32 capPow2)
+{
+    w->tdCap = capPow2;
+    w->tdKeys = alloc<u32>((usize)capPow2);
+    w->tdVals = alloc<u32>((usize)capPow2);
+    if (w->tdKeys == null || w->tdVals == null)
+    {
+        w->tdCap = 0;
+        return;
+    }
+    u32 i = 0;
+    while (i < capPow2) { w->tdKeys[i] = 0; w->tdVals[i] = 0; i++; }
+}
+
+/* returns 0 when not memoized; out: 1+index when present (0 = "absent"
+ * is cached too, as 1<<31 marker handled by caller) */
+pub u32 wvTdMapGet(Wv* w, Str name, bool* found)
+{
+    *found = false;
+    if (w->tdCap == 0) return 0;
+    u32 slot = ((u32)name) & (w->tdCap - 1);
+    while (w->tdKeys[slot] != 0)
+    {
+        if (w->tdKeys[slot] == (u32)name + 1)
+        {
+            *found = true;
+            return w->tdVals[slot];
+        }
+        slot = (slot + 1) & (w->tdCap - 1);
+    }
+    return 0;
+}
+
+pub void wvTdMapPut(Wv* w, Str name, u32 v)
+{
+    if (w->tdCap == 0) return;
+    u32 slot = ((u32)name) & (w->tdCap - 1);
+    while (w->tdKeys[slot] != 0)
+    {
+        if (w->tdKeys[slot] == (u32)name + 1) { w->tdVals[slot] = v; return; }
+        slot = (slot + 1) & (w->tdCap - 1);
+    }
+    w->tdKeys[slot] = (u32)name + 1;
+    w->tdVals[slot] = v;
+}

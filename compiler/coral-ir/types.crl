@@ -16,7 +16,7 @@
  * are honoured here via createStructType — packed = 1-byte field
  * alignment, reorder = sort fields by descending alignment. */
 
-import lower { Wv, wvArr };
+import lower { Wv, wvArr, wvTyMapFind, wvTyMapSet, wvTdMapGet, wvTdMapPut };
 import ast::id { Str, NodeId, locFile };
 import ast::types { Ty, TypeEntry, TypeKind };
 import ast::node { Node, NodeKind };
@@ -40,12 +40,23 @@ Slice wvSlice(AstContext* ctx, Str s)
 }
 
 /* find a type-named decl (struct/enum/union/variant/alias/distinct) in
- * the merged file by bare name; 0 when absent */
-pub NodeId wvFindTypeDecl(File* file, AstContext* ctx, Str name)
+ * the merged file by bare name; 0 when absent. Memoized on the interned
+ * name — the merged decl list is O(#decls) per lookup and this sits in
+ * the innermost type loop. */
+pub NodeId wvFindTypeDecl(Wv* w, Str name)
 {
     NodeId none;
     none.index = 0;
-    if (file == null || name == 0) return none;
+    if (w->file == null || name == 0) return none;
+    bool hit = false;
+    u32 mv = wvTdMapGet(w, name, &hit);
+    if (hit)
+    {
+        if (mv >= 2) none.index = mv - 1;
+        return none;
+    }
+    File* file = w->file;
+    AstContext* ctx = w->ctx;
     u32 i = 0;
     while (i < file->declsLen)
     {
@@ -65,10 +76,15 @@ pub NodeId wvFindTypeDecl(File* file, AstContext* ctx, Str name)
                 DeclKind::Distinct => { dn = dd->kind.payload.Distinct.name; },
                 else => {},
             }
-            if (dn == name) return id;
+            if (dn == name)
+            {
+                wvTdMapPut(w, name, id.index + 1);
+                return id;
+            }
         }
         i++;
     }
+    wvTdMapPut(w, name, 1); /* cache the miss too */
     return none;
 }
 
@@ -103,10 +119,12 @@ pub IrType* wvStructTy(Wv* w, Decl* dd, u32 depth)
     return st->irType;
 }
 
-pub IrType* wvTy(Wv* w, Ty t, u32 depth)
+pub IrType* wvTy(Wv* w, Ty t, u32 depth);
+
+/* the uncached Ty→IrType derivation; wvTy wraps this with the memo */
+IrType* wvTyBuild(Wv* w, Ty t, u32 depth)
 {
     AstContext* ctx = w->ctx;
-    File* file = w->file;
     IrContext* ir = w->ir;
     if (t == 0 || depth > 32) return ir->tyInt(32);
     TypeEntry* e = ctx->types + t;
@@ -184,48 +202,107 @@ pub IrType* wvTy(Wv* w, Ty t, u32 depth)
             return st->irType;
         },
         TypeKind::Named => {
-            NodeId td = wvFindTypeDecl(file, ctx, e->kind.payload.Named.name);
+            NodeId td = wvFindTypeDecl(w, e->kind.payload.Named.name);
             if (td.index == 0) return ir->tyInt(64); // unresolved named → opaque 64-bit
             Node* dn = ctx->nodes + td.index;
             if (dn->kind.tag != NodeKind::Decl) return ir->tyInt(64);
-            Decl* dd = &dn->kind.payload.Decl.value;
-            switch (dd->kind.tag)
-            {
-                DeclKind::Struct => { return wvStructTy(w, dd, depth); },
-                DeclKind::Enum => {
-                    if ((dd->kind.payload.Enum.flags & 1) != 0)
-                        return wvTy(w, dd->kind.payload.Enum.backingType, depth + 1);
-                    return ir->tyInt(32);
-                },
-                DeclKind::TypeAlias => { return wvTy(w, dd->kind.payload.TypeAlias.target, depth + 1); },
-                DeclKind::Distinct => { return wvTy(w, dd->kind.payload.Distinct.baseType, depth + 1); },
-                DeclKind::Union => {
-                    // union = [size x i8], size = max field size (Phase 3:
-                    // real tagged layout for variant; opaque for now)
-                    u32 maxSz = 1;
-                    u32 k = 0;
-                    while (k < dd->kind.payload.Union.fieldsLen)
-                    {
-                        Node* fn = ctx->nodes + dd->kind.payload.Union.fields[k].index;
-                        if (fn->kind.tag == NodeKind::Field)
-                        {
-                            IrType* ft = wvTy(w, fn->kind.payload.Field.value.typeNode, depth + 1);
-                            u32 sz = ir->irTypeSizeOf(ft);
-                            if (sz > maxSz) maxSz = sz;
-                        }
-                        k++;
-                    }
-                    return ir->tyArray(ir->tyInt(8), maxSz);
-                },
-                DeclKind::Variant => {
-                    // variant = opaque byte blob (tag + union); exact layout Phase 3
-                    return ir->tyArray(ir->tyInt(8), 16);
-                },
-                else => { return ir->tyInt(64); },
-            }
+            return wvDeclTy(w, &dn->kind.payload.Decl.value, depth);
         },
         TypeKind::TypeParam => { return ir->tyInt(64); }, // erased after mono
         TypeKind::ValueInt => { return ir->tyInt(64); },
         else => { return ir->tyInt(32); },
     }
+}
+
+/* the IrType a declaring decl denotes — the Named arm's body without
+ * the name lookup, so a caller that already holds the decl (method
+ * collection composes the self parameter's pointee) can reuse it. */
+pub IrType* wvDeclTy(Wv* w, Decl* dd, u32 depth)
+{
+    AstContext* ctx = w->ctx;
+    IrContext* ir = w->ir;
+    switch (dd->kind.tag)
+    {
+        DeclKind::Struct => { return wvStructTy(w, dd, depth); },
+        DeclKind::Enum => {
+            if ((dd->kind.payload.Enum.flags & 1) != 0)
+                return wvTy(w, dd->kind.payload.Enum.backingType, depth + 1);
+            return ir->tyInt(32);
+        },
+        DeclKind::TypeAlias => { return wvTy(w, dd->kind.payload.TypeAlias.target, depth + 1); },
+        DeclKind::Distinct => { return wvTy(w, dd->kind.payload.Distinct.baseType, depth + 1); },
+        DeclKind::Union => {
+            // union = [size x i8], size = max field size (Phase 3:
+            // real tagged layout for variant; opaque for now)
+            u32 maxSz = 1;
+            u32 k = 0;
+            while (k < dd->kind.payload.Union.fieldsLen)
+            {
+                Node* fn = ctx->nodes + dd->kind.payload.Union.fields[k].index;
+                if (fn->kind.tag == NodeKind::Field)
+                {
+                    IrType* ft = wvTy(w, fn->kind.payload.Field.value.typeNode, depth + 1);
+                    u32 sz = ir->irTypeSizeOf(ft);
+                    if (sz > maxSz) maxSz = sz;
+                }
+                k++;
+            }
+            return ir->tyArray(ir->tyInt(8), maxSz);
+        },
+        DeclKind::Variant => {
+            // variant = opaque byte blob (tag + union); exact layout Phase 3
+            return ir->tyArray(ir->tyInt(8), 16);
+        },
+        else => { return ir->tyInt(64); },
+    }
+}
+
+/* does a type mention a generic parameter anywhere? (mirrors
+ * cgTyHasParam — a method on a not-yet-monomorphised owner is
+ * skipped by the collection pass) */
+pub bool wvTyHasParam(Wv* w, Ty t, u32 depth)
+{
+    if (t == 0 || depth > 8) return false;
+    TypeEntry* e = w->ctx->types + t;
+    switch (e->kind.tag)
+    {
+        TypeKind::TypeParam => { return true; },
+        TypeKind::Pointer => { return wvTyHasParam(w, e->kind.payload.Pointer.base, depth + 1); },
+        TypeKind::Const => { return wvTyHasParam(w, e->kind.payload.Const.base, depth + 1); },
+        TypeKind::Comptime => { return wvTyHasParam(w, e->kind.payload.Comptime.base, depth + 1); },
+        TypeKind::Named => {
+            u32 i = 0;
+            while (i < e->kind.payload.Named.genericArgsLen)
+            {
+                if (wvTyHasParam(w, e->kind.payload.Named.genericArgs[i], depth + 1)) return true;
+                i++;
+            }
+            return false;
+        },
+        else => { return false; },
+    }
+}
+
+/* memoized Ty→IrType. A Ty still being derived is a cycle: break it at
+ * the edge with a pointer-width placeholder (only reachable behind an
+ * indirection — a by-value cycle has no finite layout and is rejected
+ * upstream), so every Ty is built once and cached. Without this the
+ * nested rebuild is exponential on std's type graph. */
+pub IrType* wvTy(Wv* w, Ty t, u32 depth)
+{
+    IrContext* ir = w->ir;
+    if (t == 0) return ir->tyInt(32);
+    u8 busy = 0;
+    IrType* hit = null;
+    if (wvTyMapFind(w, t, &busy, &hit))
+    {
+        if (busy != 0) return ir->tyPtr(ir->tyInt(8));
+        if (hit != null) return hit;
+    }
+    if (depth > 32) return ir->tyInt(32);
+    wvTyMapSet(w, t, 1, null);
+    IrType* r = wvTyBuild(w, t, depth);
+    if (r == null) r = ir->tyInt(32);
+    wvTyMapSet(w, t, 0, r);
+    return r;
 }

@@ -8,8 +8,8 @@ main:
 	pushq %r12
 	subq $32, %rsp
 .Lmain_entry_2:
-	leaq -16(%rbp), %r12
-	leaq -32(%rbp), %rbx
+	leaq -32(%rbp), %r12
+	leaq -48(%rbp), %rbx
 	movabsq $0x0000000000000000, %r10
 	movq %r10, (%r12)
 	movabsq $0x0000000000000000, %r10
