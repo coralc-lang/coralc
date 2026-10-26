@@ -13,15 +13,13 @@ main:
 	movq %r10, (%rsi)
 	movl $0x0000000000000012, %r10d
 	movq %r10, (%rdi)
-	jmp .Lmain_loop_3
 .Lmain_loop_3:
 	movq (%rdi), %r8
 	testq %r8, %r8
 	setne %r11b
 	movzbq %r11b, %r9
 	testq %r9, %r9
-	jne .Lmain_body_4
-	jmp .Lmain_done_5
+	je .Lmain_done_5
 .Lmain_body_4:
 	movq (%rsi), %r8
 	movq (%rdi), %r9

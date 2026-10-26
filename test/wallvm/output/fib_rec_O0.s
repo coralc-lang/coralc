@@ -15,8 +15,7 @@ fib:
 	setl %r11b
 	movzbq %r11b, %rsi
 	testq %rsi, %rsi
-	jne .Lfib_base_4
-	jmp .Lfib_rec_5
+	je .Lfib_rec_5
 .Lfib_base_4:
 	movq %rdi, %rax
 	popq %r13

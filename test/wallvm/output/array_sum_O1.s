@@ -11,7 +11,6 @@ main:
 	leaq -80(%rbp), %rdi
 	movl $0x0000000000000000, %r10d
 	movq %r10, (%rdi)
-	jmp .Lmain_fill_3
 .Lmain_fill_3:
 	movq (%rdi), %r8
 	movl $0x0000000000000005, %r11d
@@ -19,8 +18,7 @@ main:
 	setl %r11b
 	movzbq %r11b, %r9
 	testq %r9, %r9
-	jne .Lmain_fill_body_4
-	jmp .Lmain_sum_pre_5
+	je .Lmain_sum_pre_5
 .Lmain_fill_body_4:
 	movq (%rdi), %r8
 	movq %r8, %r11
@@ -36,7 +34,6 @@ main:
 	leaq -96(%rbp), %r8
 	movl $0x0000000000000000, %r10d
 	movq %r10, (%r8)
-	jmp .Lmain_sum_6
 .Lmain_sum_6:
 	movq (%rdi), %r9
 	movl $0x0000000000000005, %r11d
@@ -44,8 +41,7 @@ main:
 	setl %r11b
 	movzbq %r11b, %rbx
 	testq %rbx, %rbx
-	jne .Lmain_sum_body_7
-	jmp .Lmain_done_8
+	je .Lmain_done_8
 .Lmain_sum_body_7:
 	movq (%rdi), %r9
 	movq %r9, %r11

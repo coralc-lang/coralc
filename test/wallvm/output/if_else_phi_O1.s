@@ -16,8 +16,7 @@ main:
 	setg %r11b
 	movzbq %r11b, %r9
 	testq %r9, %r9
-	jne .Lmain_then_3
-	jmp .Lmain_els_4
+	je .Lmain_els_4
 .Lmain_then_3:
 	movq (%rsi), %r8
 	movq $0x0000000000000001, %rcx
@@ -29,7 +28,6 @@ main:
 	movq %r8, %rsi
 	negq %rsi
 	movq %rsi, (%rdi)
-	jmp .Lmain_merge_5
 .Lmain_merge_5:
 	movq (%rdi), %rsi
 	movq %rsi, %rax

@@ -22,7 +22,6 @@ main:
 	movq %r10, (%r11)
 	movl $0x0000000000000000, %r10d
 	movq %r10, (%rdi)
-	jmp .Lmain_outer_3
 .Lmain_outer_3:
 	movq -56(%rbp), %r11
 	movq (%r11), %r12
@@ -32,14 +31,12 @@ main:
 	setl %r11b
 	movzbq %r11b, %r14
 	testq %r14, %r14
-	jne .Lmain_inner_pre_4
-	jmp .Lmain_done_8
+	je .Lmain_done_8
 .Lmain_inner_pre_4:
 	movq %r12, (%r8)
 	movq %r13, (%r9)
 	movl $0x0000000000000000, %r10d
 	movq %r10, (%rbx)
-	jmp .Lmain_inner_5
 .Lmain_inner_5:
 	movq (%r8), %r12
 	movq (%r9), %r14
@@ -49,8 +46,7 @@ main:
 	setl %r11b
 	movzbq %r11b, %rsi
 	testq %rsi, %rsi
-	jne .Lmain_inner_body_6
-	jmp .Lmain_inner_done_7
+	je .Lmain_inner_done_7
 .Lmain_inner_body_6:
 	movq %r12, %rsi
 	imulq %r15, %rsi

@@ -18,7 +18,6 @@ main:
 	movq %r10, (%rdi)
 	movl $0x0000000000000000, %r10d
 	movq %r10, (%r8)
-	jmp .Lmain_loop_3
 .Lmain_loop_3:
 	movq (%rsi), %r9
 	movq (%rdi), %rbx
@@ -33,7 +32,6 @@ main:
 	addq $0x0000000000000001, (%r8)
 	testq %r13, %r13
 	jne .Lmain_loop_3
-	jmp .Lmain_done_4
 .Lmain_done_4:
 	leaq (%r9,%r9,4), %r9
 	addq %r9, %r9
