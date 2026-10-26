@@ -8,13 +8,12 @@ main:
 .Lmain_entry_2:
 	leaq -16(%rbp), %rsi
 	leaq -64(%rbp), %rdi
-	movabsq $0x0000000000000007, %r10
+	movl $0x0000000000000007, %r10d
 	movq %r10, (%rsi)
-	movabsq $0x0000000000000003, %r10
+	movl $0x0000000000000003, %r10d
 	movq %r10, (%rdi)
 	movq (%rdi), %rsi
-	movl %esi, %edi
-	movq %rdi, %rax
+	movq %rsi, %rax
 	addq $64, %rsp
 	leave
 	ret

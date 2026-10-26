@@ -11,7 +11,10 @@ import lower { Wv, wvNode, wvErr, wvStr, wvResolved, wvFindLocal, wvPushLocal,
                wvBlock, wvSetBlock, wvTerm, wvPos, wvArr };
 import types { wvTy };
 import expr { wvExpr, wvAddrOf, wvCond, wvAssignCommon, wvIsAgg, wvCopyAgg, wvAggSlot,
-               wvDecodeLit, wvCompareVals, wvResolveConst, wvMakeGlobal };
+               wvDecodeLit, wvCompareVals, wvResolveConst, wvMakeGlobal, wvValBody,
+               wvMethodFnFor, wvCast, wvUnwrapTy, wvTyUnsigned, wvIndexAddr,
+               wvGepField, wvFieldIdx };
+import decl { wvMethodSelfKind };
 import context::context { AstContext };
 import sem { scope { Symbol, ScopeStack } };
 import ast {
@@ -145,10 +148,12 @@ pub IrValue* wvSwitchTest(Wv* w, SwitchCase* c, IrValue* scrut, Ty scrutTy,
  * test block and a body block; a failed test or a failed guard branches
  * to the next arm's test block, then to the else arm, then to the join.
  * The else arm runs only when nothing matched, wherever it sits in the
- * source — the same shape cgEmitSwitchChain prints as if/else-if. */
-pub void wvSwitch(Wv* w, Stmt* s, NodeId id)
+ * source — the same shape cgEmitSwitchChain prints as if/else-if.
+ * slot/vt are null for the statement form; a switch-expr passes its
+ * result slot and every arm's body value is stored into it. */
+pub void wvSwitchCore(Wv* w, NodeId scrutId, SwitchCase* cases, u32 n,
+                      NodeId id, IrValue* slot, IrType* vt)
 {
-    NodeId scrutId = s->kind.payload.Switch.expr;
     if (scrutId.index == 0) { wvErr(w, id, "switch without a scrutinee"); return; }
     Node* sn = wvNode(w, scrutId);
     if (sn->kind.tag != NodeKind::Expr) { wvErr(w, id, "switch scrutinee"); return; }
@@ -156,8 +161,6 @@ pub void wvSwitch(Wv* w, Stmt* s, NodeId id)
     if (scrut == null) return;
     Ty scrutTy = wvResolved(w, sn->kind.payload.Expr.value.resolvedType);
 
-    SwitchCase* cases = s->kind.payload.Switch.cases;
-    u32 n = s->kind.payload.Switch.casesLen;
     if (cases == null || n == 0) { wvErr(w, id, "switch without cases"); return; }
 
     IrBlock** tbb = (IrBlock**)wvArr(w, (usize)n, 8);
@@ -236,7 +239,12 @@ pub void wvSwitch(Wv* w, Stmt* s, NodeId id)
         }
 
         wvSetBlock(w, bbb[i]);
-        wvStmt(w, c->body);
+        if (slot != null)
+        {
+            IrValue* v = wvValBody(w, c->body, vt);
+            if (v != null) w->b.store(v, slot);
+        }
+        else wvStmt(w, c->body);
         if (!w->term) w->b.br(joinBb);
         i++;
     }
@@ -244,13 +252,25 @@ pub void wvSwitch(Wv* w, Stmt* s, NodeId id)
     if (elseBb != null && elseIdx < n)
     {
         wvSetBlock(w, elseBb);
-        wvStmt(w, cases[elseIdx].body);
+        if (slot != null)
+        {
+            IrValue* v = wvValBody(w, cases[elseIdx].body, vt);
+            if (v != null) w->b.store(v, slot);
+        }
+        else wvStmt(w, cases[elseIdx].body);
         if (!w->term) w->b.br(joinBb);
     }
 
     w->breakT = savedBreak;
     w->loopDepth--;
     wvSetBlock(w, joinBb);
+}
+
+/* the statement form: no result slot, every arm lowers as statements */
+pub void wvSwitch(Wv* w, Stmt* s, NodeId id)
+{
+    wvSwitchCore(w, s->kind.payload.Switch.expr, s->kind.payload.Switch.cases,
+                 s->kind.payload.Switch.casesLen, id, null, null);
 }
 
 
@@ -307,6 +327,393 @@ pub void wvVarDecl(Wv* w, Stmt* s, NodeId id)
         }
     }
     wvPushLocal(w, name, slot);
+}
+
+
+/* `for x in iterable` and `for x in iter(start, end)` — an index loop
+ * over a slice/array, or count()/at() calls over an @iter collection
+ * (with range() when bounds are given). Mirrors the C backend's ForIn:
+ * ranged bounds clamp to the collection, the receiver is the pointer
+ * value or the iterable's own address, multi-binding reads tuple
+ * fields, and the whole loop owns one scope. continue advances the
+ * index, break leaves it. */
+void wvForIn(Wv* w, Stmt* s, NodeId id)
+{
+    u32 scopeMark = w->locLen;
+    NodeId iterId = s->kind.payload.ForIn.iterExpr;
+    NodeId rangeStart = s->kind.payload.ForIn.rangeStart;
+    NodeId rangeEnd = s->kind.payload.ForIn.rangeEnd;
+    bool ranged = rangeStart.index != 0;
+    Str bindName = s->kind.payload.ForIn.bindName;
+    Ty bindType = wvResolved(w, s->kind.payload.ForIn.bindType);
+    u32 extraLen = s->kind.payload.ForIn.extraBindNamesLen;
+    NodeId bodyId = s->kind.payload.ForIn.body;
+
+    Node* in = wvNode(w, iterId);
+    Ty iterTy = in->kind.tag == NodeKind::Expr
+        ? wvResolved(w, in->kind.payload.Expr.value.resolvedType) : 0;
+    TypeEntry* te = iterTy != 0 ? w->ctx->types + iterTy : null;
+    bool indexed = te != null && (te->kind.tag == TypeKind::Slice ||
+                                  te->kind.tag == TypeKind::Array);
+
+    i32 ik = -1;
+    if (in->kind.tag == NodeKind::Expr) ik = in->kind.payload.Expr.value.kind.tag;
+    bool lshape = ik == ExprKind::Ident || ik == ExprKind::Field ||
+                  ik == ExprKind::DerefField || ik == ExprKind::Index ||
+                  ik == ExprKind::TupleField || ik == ExprKind::Deref;
+
+    Ty ub = wvUnwrapTy(w, iterTy);
+    bool iterIsPtr = ub != 0 && (w->ctx->types + ub)->kind.tag == TypeKind::Pointer;
+
+    /* the iterable is read once, before the loop: an lvalue's own
+     * storage, an rvalue materialized into a temp (an aggregate already
+     * is its own address) */
+    IrValue* stor = null;
+    if (indexed || !iterIsPtr)
+    {
+        if (lshape) stor = wvAddrOf(w, iterId);
+        else
+        {
+            IrValue* v = wvExpr(w, iterId);
+            if (v == null) { w->locLen = scopeMark; return; }
+            if (wvIsAgg(v->type)) stor = v;
+            else
+            {
+                stor = wvV(w->b.alloca(v->type));
+                if (stor == null) { w->locLen = scopeMark; return; }
+                w->b.store(v, stor);
+            }
+        }
+        if (stor == null)
+            { wvErr(w, id, "for-in iterable has no storage"); w->locLen = scopeMark; return; }
+    }
+    IrValue* recv = null; // the @iter receiver (non-indexed loops only)
+    if (!indexed)
+    {
+        if (iterIsPtr)
+        {
+            recv = wvExpr(w, iterId);
+            if (recv == null) { w->locLen = scopeMark; return; }
+        }
+        else recv = stor;
+    }
+
+    IrType* cntTy = w->ir->tyInt(64);
+    IrValue* iSlot = wvV(w->b.alloca(cntTy));
+    if (iSlot == null) { w->locLen = scopeMark; return; }
+    IrValue* endSlot = null;
+    IrValue* rsV = null;
+    IrValue* reV = null;
+    IrFunc* countFn = null;
+    IrFunc* atFn = null;
+    NodeId mdefC = NodeId{ .index = 0 };
+    NodeId mdefA = NodeId{ .index = 0 };
+
+    if (ranged)
+    {
+        rsV = wvExpr(w, rangeStart);
+        reV = wvExpr(w, rangeEnd);
+        if (rsV == null || reV == null) { w->locLen = scopeMark; return; }
+        Node* rsn = wvNode(w, rangeStart);
+        Node* ren = wvNode(w, rangeEnd);
+        Ty rst = rsn->kind.tag == NodeKind::Expr
+            ? wvResolved(w, rsn->kind.payload.Expr.value.resolvedType) : 0;
+        Ty ret = ren->kind.tag == NodeKind::Expr
+            ? wvResolved(w, ren->kind.payload.Expr.value.resolvedType) : 0;
+        rsV = wvCast(w, rsV, rsV->type, cntTy, wvTyUnsigned(w, rst), true);
+        reV = wvCast(w, reV, reV->type, cntTy, wvTyUnsigned(w, ret), true);
+        if (rsV == null || reV == null) { w->locLen = scopeMark; return; }
+    }
+
+    IrType* elemIr = null;
+    Ty et = 0;
+    if (indexed)
+    {
+        et = te->kind.tag == TypeKind::Slice
+            ? te->kind.payload.Slice.base : te->kind.payload.Array.base;
+        elemIr = wvTy(w, et, 0);
+        if (elemIr == null)
+            { wvErr(w, id, "for-in element type"); w->locLen = scopeMark; return; }
+        if (ranged)
+        {
+            IrValue* lenV = null;
+            if (te->kind.tag == TypeKind::Array)
+                lenV = w->ir->constInt(cntTy, (u64)te->kind.payload.Array.len);
+            else
+            {
+                IrValue* lSlot = wvGepField(w, stor, 1);
+                if (lSlot != null) lenV = wvV(w->b.load(cntTy, lSlot));
+            }
+            if (lenV == null) { w->locLen = scopeMark; return; }
+            /* clamp like C: rs = min(rs, len); re = min(re, len);
+             * if (re < rs) re = rs — size_t bounds, unsigned compares */
+            rsV = wvV(w->b.select(wvV(w->b.icmp(IrICmpPred::Ugt, rsV, lenV)), lenV, rsV));
+            reV = wvV(w->b.select(wvV(w->b.icmp(IrICmpPred::Ugt, reV, lenV)), lenV, reV));
+            reV = wvV(w->b.select(wvV(w->b.icmp(IrICmpPred::Ult, reV, rsV)), rsV, reV));
+            if (rsV == null || reV == null) { w->locLen = scopeMark; return; }
+            endSlot = wvV(w->b.alloca(cntTy));
+            if (endSlot == null) { w->locLen = scopeMark; return; }
+            w->b.store(rsV, iSlot);
+            w->b.store(reV, endSlot);
+        }
+        else w->b.store(w->ir->constInt(cntTy, 0), iSlot);
+    }
+    else
+    {
+        /* @iter collections are consumed through count()/at(), plus
+         * range() when bounds are given — both count and at must exist */
+        bool nfC = false;
+        bool nfA = false;
+        bool nfR = false;
+        NodeId mdefR = NodeId{ .index = 0 };
+        countFn = wvMethodFnFor(w, iterTy, w->ctx->intern("count"), id, &nfC, &mdefC);
+        atFn = wvMethodFnFor(w, iterTy, w->ctx->intern("at"), id, &nfA, &mdefA);
+        IrFunc* rangeFn = null;
+        if (ranged)
+            rangeFn = wvMethodFnFor(w, iterTy, w->ctx->intern("range"), id, &nfR, &mdefR);
+        if (nfC || nfA)
+        {
+            wvErr(w, id, "for-in over non-slice/array without @iter count()/at()");
+            w->locLen = scopeMark;
+            return;
+        }
+        if (ranged && nfR)
+            { wvErr(w, id, "for-in range() not found"); w->locLen = scopeMark; return; }
+        if (countFn == null || atFn == null) { w->locLen = scopeMark; return; }
+        if (ranged && rangeFn == null) { w->locLen = scopeMark; return; }
+
+        if (ranged)
+        {
+            u8 skR = wvMethodSelfKind(w, mdefR);
+            IrValue*[3] rargs;
+            u32 rn = 0;
+            if (skR != 0) rargs[rn++] = recv;
+            rargs[rn++] = rsV;
+            rargs[rn++] = reV;
+            IrValue* rObj = wvV(w->b.call(&rangeFn->base, rargs, rn));
+            if (rObj == null || !wvIsAgg(rObj->type))
+                { wvErr(w, id, "range() must return a start/end struct"); w->locLen = scopeMark; return; }
+            Ty rr = 0;
+            Node* mrn = wvNode(w, mdefR);
+            if (mrn->kind.tag == NodeKind::Decl &&
+                mrn->kind.payload.Decl.value.kind.tag == DeclKind::Func)
+                rr = wvResolved(w, mrn->kind.payload.Decl.value.kind.payload.Func.returnType);
+            u32 si = wvFieldIdx(w, rr, w->ctx->intern("start"));
+            u32 ei = wvFieldIdx(w, rr, w->ctx->intern("end"));
+            if (si == 0xFFFFFFFF || ei == 0xFFFFFFFF)
+                { wvErr(w, id, "range() must return a start/end struct"); w->locLen = scopeMark; return; }
+            IrType* stT = rObj->type->params[si];
+            IrType* etT = rObj->type->params[ei];
+            IrValue* sSlot = wvGepField(w, rObj, si);
+            IrValue* eSlot = wvGepField(w, rObj, ei);
+            if (sSlot == null || eSlot == null) { w->locLen = scopeMark; return; }
+            IrValue* sV = wvV(w->b.load(stT, sSlot));
+            IrValue* eV = wvV(w->b.load(etT, eSlot));
+            if (sV == null || eV == null) { w->locLen = scopeMark; return; }
+            sV = wvCast(w, sV, stT, cntTy, wvTyUnsigned(w, rr), true);
+            eV = wvCast(w, eV, etT, cntTy, wvTyUnsigned(w, rr), true);
+            if (sV == null || eV == null) { w->locLen = scopeMark; return; }
+            endSlot = wvV(w->b.alloca(cntTy));
+            if (endSlot == null) { w->locLen = scopeMark; return; }
+            w->b.store(sV, iSlot);
+            w->b.store(eV, endSlot);
+        }
+        else
+        {
+            u8 skC = wvMethodSelfKind(w, mdefC);
+            IrValue*[2] cargs;
+            u32 cn = 0;
+            if (skC != 0) cargs[cn++] = recv;
+            IrValue* nV = wvV(w->b.call(&countFn->base, cargs, cn));
+            if (nV == null) { w->locLen = scopeMark; return; }
+            Ty crt = 0;
+            Node* mcn = wvNode(w, mdefC);
+            if (mcn->kind.tag == NodeKind::Decl &&
+                mcn->kind.payload.Decl.value.kind.tag == DeclKind::Func)
+                crt = wvResolved(w, mcn->kind.payload.Decl.value.kind.payload.Func.returnType);
+            nV = wvCast(w, nV, nV->type, cntTy, wvTyUnsigned(w, crt), true);
+            if (nV == null) { w->locLen = scopeMark; return; }
+            endSlot = wvV(w->b.alloca(cntTy));
+            if (endSlot == null) { w->locLen = scopeMark; return; }
+            w->b.store(nV, endSlot);
+            w->b.store(w->ir->constInt(cntTy, 0), iSlot);
+        }
+    }
+
+    /* bind slots are allocated once, before the loop; each iteration
+     * stores the element into them (multi-binding: one slot per name) */
+    bool multi = extraLen > 0;
+    u32 bindCount = 1 + extraLen;
+    Ty* bindTypes = s->kind.payload.ForIn.bindTypes;
+    u32 bindTypesLen = s->kind.payload.ForIn.bindTypesLen;
+    if (multi && (bindTypes == null || bindTypesLen != bindCount))
+    {
+        wvErr(w, id, "for-in multi-binding requires a matching tuple element type");
+        w->locLen = scopeMark;
+        return;
+    }
+    IrValue** bindSlots = (IrValue**)wvArr(w, (usize)bindCount, 8);
+    if (bindSlots == null) { w->locLen = scopeMark; return; }
+    u32 b = 0;
+    while (b < bindCount)
+    {
+        Ty bt = multi ? wvResolved(w, bindTypes[b]) : bindType;
+        IrType* birt = bt != 0 ? wvTy(w, bt, 0) : null;
+        if (birt == null || birt->kind == IrTypeKind::Void)
+        {
+            wvErr(w, id, "for-in bind has no type");
+            w->locLen = scopeMark;
+            return;
+        }
+        bindSlots[b] = wvIsAgg(birt) ? wvAggSlot(w, birt) : wvV(w->b.alloca(birt));
+        if (bindSlots[b] == null) { w->locLen = scopeMark; return; }
+        b++;
+    }
+
+    IrBlock* headBb = wvBlock(w, "forin.head");
+    IrBlock* bodyBb = wvBlock(w, "forin.body");
+    IrBlock* postBb = wvBlock(w, "forin.post");
+    IrBlock* exitBb = wvBlock(w, "forin.end");
+    w->b.br(headBb);
+
+    wvSetBlock(w, headBb);
+    {
+        IrValue* endV = null;
+        if (endSlot != null) endV = wvV(w->b.load(cntTy, endSlot));
+        else if (te->kind.tag == TypeKind::Slice)
+        {
+            IrValue* lSlot = wvGepField(w, stor, 1);
+            if (lSlot != null) endV = wvV(w->b.load(cntTy, lSlot));
+        }
+        else endV = w->ir->constInt(cntTy, (u64)te->kind.payload.Array.len);
+        IrValue* iv = wvV(w->b.load(cntTy, iSlot));
+        if (endV == null || iv == null) { w->locLen = scopeMark; return; }
+        IrValue* c = wvV(w->b.icmp(IrICmpPred::Ult, iv, endV));
+        if (c == null) { w->locLen = scopeMark; return; }
+        w->b.condBr(c, bodyBb, exitBb);
+    }
+
+    wvSetBlock(w, bodyBb);
+    IrBlock* savedBreak = w->breakT;
+    IrBlock* savedCont = w->contT;
+    w->breakT = exitBb;
+    w->contT = postBb;
+    w->loopDepth++;
+    {
+        /* this iteration's element: an indexed address, or at(recv, i) */
+        IrValue* eAddr = null;
+        IrValue* atVal = null;
+        if (indexed)
+        {
+            IrValue* iv = wvV(w->b.load(cntTy, iSlot));
+            if (iv == null) { wvErr(w, id, "for-in index"); w->locLen = scopeMark; return; }
+            if (te->kind.tag == TypeKind::Array)
+                eAddr = wvIndexAddr(w, stor, elemIr, iv, true);
+            else
+            {
+                IrValue* pSlot = wvGepField(w, stor, 0);
+                if (pSlot == null) { w->locLen = scopeMark; return; }
+                IrValue* p = wvV(w->b.load(w->ir->tyPtr(elemIr), pSlot));
+                if (p == null) { w->locLen = scopeMark; return; }
+                eAddr = wvIndexAddr(w, p, elemIr, iv, false);
+            }
+            if (eAddr == null) { wvErr(w, id, "for-in element address"); w->locLen = scopeMark; return; }
+        }
+        else
+        {
+            u8 skA = wvMethodSelfKind(w, mdefA);
+            IrValue*[2] aargs;
+            u32 an = 0;
+            if (skA != 0) aargs[an++] = recv;
+            IrValue* iv = wvV(w->b.load(cntTy, iSlot));
+            if (iv == null) { wvErr(w, id, "for-in index"); w->locLen = scopeMark; return; }
+            u32 ip = skA != 0 ? 1 : 0;
+            if (ip < atFn->nparams && atFn->paramTypes[ip] != null &&
+                atFn->paramTypes[ip]->kind == IrTypeKind::Int &&
+                atFn->paramTypes[ip]->width != iv->type->width)
+            {
+                iv = wvCast(w, iv, iv->type, atFn->paramTypes[ip], false, true);
+                if (iv == null) { w->locLen = scopeMark; return; }
+            }
+            aargs[an++] = iv;
+            atVal = wvV(w->b.call(&atFn->base, aargs, an));
+            if (atVal == null) { wvErr(w, id, "for-in at()"); w->locLen = scopeMark; return; }
+        }
+
+        /* store the element into the bind slots */
+        b = 0;
+        while (b < bindCount)
+        {
+            Ty bt = multi ? wvResolved(w, bindTypes[b]) : bindType;
+            IrType* birt = wvTy(w, bt, 0);
+            if (birt == null) { w->locLen = scopeMark; return; }
+            if (multi)
+            {
+                IrValue* tupleAddr = indexed ? eAddr : atVal;
+                if (tupleAddr == null) { w->locLen = scopeMark; return; }
+                IrValue* fa = wvGepField(w, tupleAddr, b);
+                if (fa == null) { w->locLen = scopeMark; return; }
+                if (wvIsAgg(birt))
+                {
+                    if (!wvCopyAgg(w, bindSlots[b], fa, birt, 0)) { w->locLen = scopeMark; return; }
+                }
+                else
+                {
+                    IrValue* fv = wvV(w->b.load(birt, fa));
+                    if (fv == null) { w->locLen = scopeMark; return; }
+                    w->b.store(fv, bindSlots[b]);
+                }
+            }
+            else if (indexed)
+            {
+                if (wvIsAgg(birt))
+                {
+                    if (!wvCopyAgg(w, bindSlots[b], eAddr, birt, 0)) { w->locLen = scopeMark; return; }
+                }
+                else
+                {
+                    IrValue* ev = wvV(w->b.load(birt, eAddr));
+                    if (ev == null) { w->locLen = scopeMark; return; }
+                    w->b.store(ev, bindSlots[b]);
+                }
+            }
+            else
+            {
+                if (wvIsAgg(birt))
+                {
+                    if (!wvCopyAgg(w, bindSlots[b], atVal, birt, 0)) { w->locLen = scopeMark; return; }
+                }
+                else w->b.store(atVal, bindSlots[b]);
+            }
+            b++;
+        }
+
+        b = 0;
+        while (b < bindCount)
+        {
+            Str bn = b == 0 ? bindName : s->kind.payload.ForIn.extraBindNames[b - 1];
+            wvPushLocal(w, bn, bindSlots[b]);
+            b++;
+        }
+        wvStmt(w, bodyId);
+    }
+    w->loopDepth--;
+    w->breakT = savedBreak;
+    w->contT = savedCont;
+    if (!w->term) w->b.br(postBb);
+
+    wvSetBlock(w, postBb);
+    {
+        IrValue* iv = wvV(w->b.load(cntTy, iSlot));
+        if (iv == null) { w->locLen = scopeMark; return; }
+        IrValue* nv = wvV(w->b.add(iv, w->ir->constInt(cntTy, 1)));
+        if (nv == null) { w->locLen = scopeMark; return; }
+        w->b.store(nv, iSlot);
+        w->b.br(headBb);
+    }
+
+    wvSetBlock(w, exitBb);
+    w->locLen = scopeMark;
 }
 
 
@@ -696,6 +1103,16 @@ pub void wvStmt(Wv* w, NodeId id)
             }
         },
         StmtKind::Switch => { wvSwitch(w, s, id); },
+        StmtKind::ForIn => { wvForIn(w, s, id); },
+        StmtKind::Defer => {
+            wvErr(w, id, "defer is not supported");
+        },
+        StmtKind::Comptime => {
+            /* mono's CtEval replaces instantiated bodies with their
+             * surviving runtime statements; one reaching here was never
+             * evaluated — report instead of silently dropping it */
+            wvErr(w, id, "comptime block reached lowering unevaluated");
+        },
         StmtKind::Break => {
             if (w->breakT == null) { wvErr(w, id, "break outside a loop"); return; }
             w->b.br(w->breakT);

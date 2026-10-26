@@ -10,15 +10,15 @@ main:
 .Lmain_entry_2:
 	leaq -32(%rbp), %r12
 	leaq -48(%rbp), %rbx
-	movabsq $0x0000000000000000, %r10
+	movl $0x0000000000000000, %r10d
 	movq %r10, (%r12)
-	movabsq $0x0000000000000000, %r10
+	movl $0x0000000000000000, %r10d
 	movq %r10, (%rbx)
 	jmp .Lmain_loop_3
 .Lmain_loop_3:
 	movq (%r12), %r9
 	movq (%rbx), %r8
-	movabsq $0x000000000000000a, %r11
+	movl $0x000000000000000a, %r11d
 	cmpq %r11, %r9
 	setl %r11b
 	movzbq %r11b, %rsi

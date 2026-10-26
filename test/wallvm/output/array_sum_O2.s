@@ -6,59 +6,60 @@ main:
 	movq %rsp, %rbp
 	pushq %rbx
 	pushq %r12
-	subq $80, %rsp
+	pushq %r13
+	subq $104, %rsp
 .Lmain_entry_2:
-	leaq -64(%rbp), %rsi
-	leaq -80(%rbp), %rdi
-	movabsq $0x0000000000000000, %r10
+	leaq -80(%rbp), %rsi
+	leaq -96(%rbp), %rdi
+	leaq -112(%rbp), %r8
+	leaq -128(%rbp), %r9
+	movl $0x0000000000000000, %r10d
 	movq %r10, (%rdi)
 	jmp .Lmain_fill_3
 .Lmain_fill_3:
-	movq (%rdi), %r8
-	movabsq $0x0000000000000005, %r11
-	cmpq %r11, %r8
+	movq (%rdi), %rbx
+	movl $0x0000000000000005, %r11d
+	cmpq %r11, %rbx
 	setl %r11b
-	movzbq %r11b, %r9
-	testq %r9, %r9
+	movzbq %r11b, %r12
+	testq %r12, %r12
 	jne .Lmain_fill_body_4
 	jmp .Lmain_sum_pre_5
 .Lmain_fill_body_4:
-	movq %r8, %r11
-	leaq (%rsi, %r11, 8), %r9
-	incq %r8
-	movq %r8, (%r9)
+	movq %rbx, %r11
+	leaq (%rsi, %r11, 8), %r12
+	incq %rbx
+	movq %rbx, (%r12)
 	addq $0x0000000000000001, (%rdi)
 	jmp .Lmain_fill_3
 .Lmain_sum_pre_5:
-	movabsq $0x0000000000000000, %r10
-	movq %r10, (%rdi)
-	leaq -96(%rbp), %r8
-	movabsq $0x0000000000000000, %r10
+	movl $0x0000000000000000, %r10d
 	movq %r10, (%r8)
+	movl $0x0000000000000000, %r10d
+	movq %r10, (%r9)
 	jmp .Lmain_sum_6
 .Lmain_sum_6:
-	movq (%rdi), %r9
-	movabsq $0x0000000000000005, %r11
-	cmpq %r11, %r9
+	movq (%r8), %rdi
+	movq (%r9), %rbx
+	movl $0x0000000000000005, %r11d
+	cmpq %r11, %rdi
 	setl %r11b
-	movzbq %r11b, %rbx
-	testq %rbx, %rbx
+	movzbq %r11b, %r12
+	testq %r12, %r12
 	jne .Lmain_sum_body_7
 	jmp .Lmain_done_8
 .Lmain_sum_body_7:
-	movq %r9, %r11
-	leaq (%rsi, %r11, 8), %rbx
-	movq (%rbx), %r12
-	movq (%r8), %rbx
-	addq %rbx, %r12
-	movq %r12, (%r8)
-	addq $0x0000000000000001, (%rdi)
+	movq %rdi, %r11
+	leaq (%rsi, %r11, 8), %r12
+	movq (%r12), %r13
+	addq %rbx, %r13
+	addq $0x0000000000000001, (%r8)
+	movq %r13, (%r9)
 	jmp .Lmain_sum_6
 .Lmain_done_8:
-	movq (%r8), %rsi
-	movl %esi, %edi
-	movq %rdi, %rax
-	addq $80, %rsp
+	movq %rbx, %rax
+	addq $104, %rsp
+	popq %r13
 	popq %r12
 	popq %rbx
 	leave

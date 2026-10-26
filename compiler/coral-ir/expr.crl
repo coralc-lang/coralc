@@ -13,6 +13,7 @@ import lower { Wv, wvNode, wvErr, wvStr, wvResolved, wvSubstTy, wvFindLocal,
 import types { wvTy, wvFindTypeDecl, wvTyHasParam };
 import decl { wvMangle, wvDeclareFunc, wvDeclareMethod, wvMethodSelfKind,
                wvOwnerStr, wvMethodMangle };
+import stmt { wvStmt, wvSwitchCore };
 import context::context { AstContext };
 import mono::mono { MonoContext, MonoInstance };
 import sem { scope { Symbol, ScopeStack } };
@@ -21,7 +22,7 @@ import ast {
     types { Ty, TypeEntry, TypeKind },
     node { Node, NodeKind },
     expr { Expr, ExprKind },
-    stmt { Stmt, StmtKind },
+    stmt { Stmt, StmtKind, SwitchCase },
     decl { Decl, DeclKind, Field, Param, File }
 };
 import common::slice { Slice };
@@ -801,6 +802,60 @@ pub IrValue** wvBuildCallArgs(Wv* w, IrFunc* f, NodeId* argv, u32 argvLen,
     return args;
 }
 
+/* resolve a method's IrFunc: name-table hit first, otherwise declare a
+ * shell under the composed `owner_method` symbol. `owner` is the bare
+ * owner spelling (receiver side or the call site's own text), `recvTy`
+ * the receiver type used to derive the implicit self pointee (0 when
+ * the caller knows the method is static). *notFound distinguishes "no
+ * such method" (silent — callers fall back or word their own error)
+ * from a lowering failure (already reported). */
+IrFunc* wvMethodShell(Wv* w, NodeId mdef, Str owner, Ty recvTy, Str methName,
+                      NodeId id, bool* notFound)
+{
+    if (notFound != null) *notFound = false;
+    if (mdef.index == 0)
+    {
+        if (notFound != null) *notFound = true;
+        return null;
+    }
+    Node* mn = wvNode(w, mdef);
+    if (mn->kind.tag != NodeKind::Decl ||
+        mn->kind.payload.Decl.value.kind.tag != DeclKind::Func)
+        { wvErr(w, id, "method is not a function"); return null; }
+    Decl* md = &mn->kind.payload.Decl.value;
+    if (w->mono != null && w->mono.genericCount(mdef) != 0)
+        { wvErr(w, id, "call to a generic method (Phase 2)"); return null; }
+    IrFunc* f = wvFnMapGet(w, mdef.index);
+    if (f != null) return f;
+    str msym = wvMethodMangle(w, mdef, owner, methName);
+    if (msym.len == 0) { wvErr(w, id, "cannot compose the method symbol"); return null; }
+    IrType* selfPt = null;
+    if (wvMethodSelfKind(w, mdef) == 1 && recvTy != 0)
+    {
+        Ty u = wvUnwrapTy(w, recvTy);
+        if (u != 0 && (w->ctx->types + u)->kind.tag == TypeKind::Pointer)
+            u = wvUnwrapTy(w, (w->ctx->types + u)->kind.payload.Pointer.base);
+        if (u != 0) selfPt = w->ir->tyPtr(wvTy(w, u, 0));
+    }
+    f = wvDeclareMethod(w, mdef, md, msym, selfPt);
+    if (f == null) { wvErr(w, id, "cannot declare the method"); return null; }
+    w->mod.addFunc(f);
+    wvFnMapPut(w, mdef.index, f);
+    return f;
+}
+
+/* the receiver-typed form: find the method on recvTy's owner, then the
+ * shared shell. Used by method calls and for-in's count()/at()/range().
+ * *outDef (optional) receives the method decl so callers can ask about
+ * the receiver parameter. */
+pub IrFunc* wvMethodFnFor(Wv* w, Ty recvTy, Str methName, NodeId id,
+                          bool* notFound, NodeId* outDef)
+{
+    NodeId mdef = wvFindMethodDecl(w, recvTy, methName);
+    if (outDef != null) *outDef = mdef;
+    return wvMethodShell(w, mdef, wvOwnerStr(w, recvTy), recvTy, methName, id, notFound);
+}
+
 pub IrValue* wvCall(Wv* w, Expr* e, NodeId id)
 {
     NodeId calleeId = e->kind.payload.Call.callee;
@@ -850,41 +905,11 @@ pub IrValue* wvMethodCall(Wv* w, Expr* e, NodeId id)
     Ty recvTy = rn->kind.tag == NodeKind::Expr
         ? rn->kind.payload.Expr.value.resolvedType : 0;
 
-    NodeId mdef = wvFindMethodDecl(w, recvTy, meth);
-    if (mdef.index != 0)
+    bool nf = false;
+    NodeId mdef = NodeId{ .index = 0 };
+    IrFunc* f = wvMethodFnFor(w, recvTy, meth, id, &nf, &mdef);
+    if (f != null)
     {
-        Node* mn = wvNode(w, mdef);
-        if (mn->kind.tag != NodeKind::Decl ||
-            mn->kind.payload.Decl.value.kind.tag != DeclKind::Func)
-            { wvErr(w, id, "method is not a function"); return null; }
-        Decl* md = &mn->kind.payload.Decl.value;
-        if (w->mono != null && w->mono.genericCount(mdef) != 0)
-            { wvErr(w, id, "call to a generic method (Phase 2)"); return null; }
-
-        IrFunc* f = wvFnMapGet(w, mdef.index);
-        if (f == null)
-        {
-            /* the collection pass declares every method it sees; this
-             * shell only fires for a tree it skipped. The receiver's
-             * own type gives both the symbol's owner and the self
-             * parameter's pointee. */
-            Str owner = wvOwnerStr(w, recvTy);
-            str msym = wvMethodMangle(w, mdef, owner, meth);
-            if (msym.len == 0) { wvErr(w, id, "cannot compose the method symbol"); return null; }
-            IrType* selfPt = null;
-            if (wvMethodSelfKind(w, mdef) == 1)
-            {
-                Ty u = wvUnwrapTy(w, recvTy);
-                if (u != 0 && (w->ctx->types + u)->kind.tag == TypeKind::Pointer)
-                    u = wvUnwrapTy(w, (w->ctx->types + u)->kind.payload.Pointer.base);
-                if (u != 0) selfPt = w->ir->tyPtr(wvTy(w, u, 0));
-            }
-            f = wvDeclareMethod(w, mdef, md, msym, selfPt);
-            if (f == null) { wvErr(w, id, "cannot declare the method"); return null; }
-            w->mod.addFunc(f);
-            wvFnMapPut(w, mdef.index, f);
-        }
-
         u8 sk = wvMethodSelfKind(w, mdef);
         IrValue* recvVal = null;
         bool passRecv = sk != 0;
@@ -905,6 +930,7 @@ pub IrValue* wvMethodCall(Wv* w, Expr* e, NodeId id)
         if (f->retType != null && f->retType->kind == IrTypeKind::Void) return null;
         return res;
     }
+    if (!nf) return null; // the shell reported why
 
     /* not a method: a fn-pointer field, called as `(recv.field)(args)` */
     if (wvHasField(w, recvTy, meth))
@@ -1777,6 +1803,66 @@ pub IrValue* wvAssignCommon(Wv* w, NodeId target, NodeId value, str op, NodeId i
 }
 
 
+/* the value of a body node: an expression, an expression statement, or
+ * a block whose last statement is one — everything before it lowers as
+ * statements in its own scope. `vt` is the result type (null = no
+ * value); a body that yields nothing falls back to a zero constant. */
+pub IrValue* wvValBody(Wv* w, NodeId id, IrType* vt)
+{
+    if (id.index == 0) return vt != null ? w->ir->constInt(vt, 0) : null;
+    Node* n = wvNode(w, id);
+    if (n->kind.tag == NodeKind::Expr) return wvExpr(w, id);
+    if (n->kind.tag != NodeKind::Stmt)
+        { wvErr(w, id, "expected a statement or expression body"); return null; }
+    Stmt* s = &n->kind.payload.Stmt.value;
+    if (s->kind.tag == StmtKind::ExprStmt) return wvExpr(w, s->kind.payload.ExprStmt.expr);
+    if (s->kind.tag == StmtKind::Block)
+    {
+        u32 scopeMark = w->locLen;
+        u32 cnt = s->kind.payload.Block.stmtsLen;
+        u32 i = 0;
+        while (i + 1 < cnt && !w->term) { wvStmt(w, s->kind.payload.Block.stmts[i]); i++; }
+        IrValue* res = null;
+        if (cnt == 0 || w->term) res = vt != null ? w->ir->constInt(vt, 0) : null;
+        else
+        {
+            NodeId last = s->kind.payload.Block.stmts[cnt - 1];
+            Node* ln = wvNode(w, last);
+            if (ln->kind.tag == NodeKind::Stmt &&
+                ln->kind.payload.Stmt.value.kind.tag == StmtKind::ExprStmt)
+                res = wvExpr(w, ln->kind.payload.Stmt.value.kind.payload.ExprStmt.expr);
+            else
+            {
+                wvStmt(w, last);
+                res = vt != null ? w->ir->constInt(vt, 0) : null;
+            }
+        }
+        w->locLen = scopeMark;
+        return res;
+    }
+    wvErr(w, id, "expected a statement or expression body");
+    return null;
+}
+
+/* a zero-argument libc extern the source never declares (`abort` for
+ * @assert). Declared once per module under its bare C name. */
+IrFunc* wvExternFn0(Wv* w, str name)
+{
+    u32 i = 0;
+    while (i < w->mod.nfuncs)
+    {
+        IrFunc* f = w->mod.funcs[i];
+        if (f != null && f->base.name.equals(name)) return f;
+        i++;
+    }
+    IrFunc* f = w->ir->createFunc(name, w->ir->tyVoid(), null, 0);
+    if (f == null) return null;
+    f->isExtern = true;
+    w->mod.addFunc(f);
+    return f;
+}
+
+
 pub IrValue* wvExpr(Wv* w, NodeId id)
 {
     if (id.index == 0) return null;
@@ -2042,6 +2128,146 @@ pub IrValue* wvExpr(Wv* w, NodeId id)
         ExprKind::Alignof => {
             IrType* at = wvTy(w, wvResolved(w, e->kind.payload.Alignof.targetType), 0);
             return w->ir->constInt(w->ir->tyInt(64), (u64)w->ir->irTypeAlignOf(at));
+        },
+        ExprKind::TypeRef => {
+            wvErr(w, id, "unresolved TypeRef");
+            return null;
+        },
+        ExprKind::Typeof => {
+            wvErr(w, id, "typeof not supported");
+            return null;
+        },
+        ExprKind::Spread => {
+            /* `...pack` only survives to lowering when comptime never
+             * evaluated it — forward the inner expression */
+            return wvExpr(w, e->kind.payload.Spread.expr);
+        },
+        ExprKind::StaticCall => {
+            /* `Owner.method(args)` with no receiver: the method must be
+             * static, symbol composed from the call site's own text */
+            Str typeName = e->kind.payload.StaticCall.typeName;
+            Str meth = e->kind.payload.StaticCall.method;
+            NodeId mdef = wvFindMethodDeclOwner(w, typeName, meth);
+            if (mdef.index == 0)
+                { wvErr(w, id, "static method not found"); return null; }
+            if (w->mono != null && w->mono.genericCount(mdef) != 0)
+                { wvErr(w, id, "call to a generic method (Phase 2)"); return null; }
+            if (wvMethodSelfKind(w, mdef) != 0)
+                { wvErr(w, id, "instance method needs a receiver expression"); return null; }
+            IrFunc* f = wvMethodShell(w, mdef, typeName, 0, meth, id, null);
+            if (f == null) return null;
+            u32 nargs = 0;
+            bool fail = false;
+            IrValue** args = wvBuildCallArgs(w, f, e->kind.payload.StaticCall.args,
+                                             e->kind.payload.StaticCall.argsLen,
+                                             null, false, &nargs, &fail);
+            if (fail) return null;
+            IrValue* res = wvV(w->b.call(&f->base, args, nargs));
+            if (args != null) dealloc<IrValue*>(args);
+            if (f->retType != null && f->retType->kind == IrTypeKind::Void) return null;
+            return res;
+        },
+        ExprKind::BuiltinCall => {
+            str name = wvStr(w, e->kind.payload.BuiltinCall.name);
+            NodeId* bargs = e->kind.payload.BuiltinCall.args;
+            u32 bargsLen = e->kind.payload.BuiltinCall.argsLen;
+            /* @assert(cond) / @assertOut(cond[, msg]) — a failing
+             * condition calls libc abort, the same end C's assert()
+             * reaches; the optional message has no IR form yet */
+            bool isAssert = name.equals("assert");
+            bool isAssertOut = name.equals("assertOut");
+            if ((isAssert && bargsLen == 1) || (isAssertOut && bargsLen >= 1))
+            {
+                IrValue* c = wvCond(w, wvExpr(w, bargs[0]));
+                if (c == null) return null;
+                IrBlock* okBb = wvBlock(w, "assert.ok");
+                IrBlock* failBb = wvBlock(w, "assert.fail");
+                w->b.condBr(c, okBb, failBb);
+                wvSetBlock(w, failBb);
+                IrFunc* af = wvExternFn0(w, "abort");
+                if (af != null) w->b.call(&af->base, null, 0);
+                w->b.unreachable();
+                wvSetBlock(w, okBb);
+                IrType* vt = rt != 0 ? wvTy(w, rt, 0) : w->ir->tyInt(32);
+                if (vt == null || vt->kind == IrTypeKind::Void ||
+                    vt->kind == IrTypeKind::Struct || vt->kind == IrTypeKind::Array)
+                    return null;
+                return w->ir->constInt(vt, 0);
+            }
+            /* @isFormatLiteral(x): true only for a literal argument */
+            if (name.equals("isFormatLiteral"))
+            {
+                bool hasStrLit = false;
+                if (bargsLen == 1 && bargs != null)
+                {
+                    Node* an = wvNode(w, bargs[0]);
+                    if (an->kind.tag == NodeKind::Expr &&
+                        an->kind.payload.Expr.value.kind.tag == ExprKind::StringLit)
+                        hasStrLit = true;
+                }
+                IrType* vt = rt != 0 ? wvTy(w, rt, 0) : w->ir->tyInt(1);
+                if (vt == null || vt->kind == IrTypeKind::Void) return null;
+                return w->ir->constInt(vt, hasStrLit ? 1 : 0);
+            }
+            wvErr(w, id, "unsupported builtin call");
+            return null;
+        },
+        ExprKind::BlockExpr => {
+            u32 scopeMark = w->locLen;
+            NodeId* bstmts = e->kind.payload.BlockExpr.stmts;
+            u32 bn = e->kind.payload.BlockExpr.stmtsLen;
+            u32 i = 0;
+            while (i < bn && !w->term) { wvStmt(w, bstmts[i]); i++; }
+            if (w->term) { w->locLen = scopeMark; return null; }
+            IrValue* res = null;
+            NodeId resId = e->kind.payload.BlockExpr.result;
+            if (resId.index != 0) res = wvExpr(w, resId);
+            else
+            {
+                IrType* vt = rt != 0 ? wvTy(w, rt, 0) : null;
+                if (vt != null && vt->kind != IrTypeKind::Void &&
+                    !wvIsAgg(vt)) res = w->ir->constInt(vt, 0);
+            }
+            w->locLen = scopeMark;
+            return res;
+        },
+        ExprKind::IfExpr => {
+            IrValue* c = wvCond(w, wvExpr(w, e->kind.payload.IfExpr.cond));
+            if (c == null) return null;
+            IrType* vt = rt != 0 ? wvTy(w, rt, 0) : null;
+            bool hasVal = vt != null && vt->kind != IrTypeKind::Void;
+            if (hasVal && wvIsAgg(vt))
+                { wvErr(w, id, "aggregate if-expression (Phase 2)"); return null; }
+            IrValue* slot = hasVal ? wvV(w->b.alloca(vt)) : null;
+            if (hasVal && slot == null) return null;
+            IrBlock* thenBb = wvBlock(w, "if.then");
+            IrBlock* elseBb = wvBlock(w, "if.else");
+            IrBlock* endBb = wvBlock(w, "if.end");
+            w->b.condBr(c, thenBb, elseBb);
+            wvSetBlock(w, thenBb);
+            IrValue* tv = wvValBody(w, e->kind.payload.IfExpr.thenBody, vt);
+            if (tv != null && slot != null) w->b.store(tv, slot);
+            if (!w->term) w->b.br(endBb);
+            wvSetBlock(w, elseBb);
+            IrValue* fv = wvValBody(w, e->kind.payload.IfExpr.elseBody, vt);
+            if (fv != null && slot != null) w->b.store(fv, slot);
+            if (!w->term) w->b.br(endBb);
+            wvSetBlock(w, endBb);
+            if (!hasVal) return null;
+            return wvV(w->b.load(vt, slot));
+        },
+        ExprKind::SwitchExpr => {
+            IrType* vt = rt != 0 ? wvTy(w, rt, 0) : null;
+            if (vt == null || vt->kind == IrTypeKind::Void)
+                { wvErr(w, id, "switch expression without a result type"); return null; }
+            if (wvIsAgg(vt))
+                { wvErr(w, id, "aggregate switch-expression (Phase 2)"); return null; }
+            IrValue* slot = wvV(w->b.alloca(vt));
+            if (slot == null) return null;
+            wvSwitchCore(w, e->kind.payload.SwitchExpr.expr,
+                         e->kind.payload.SwitchExpr.cases,
+                         e->kind.payload.SwitchExpr.casesLen, id, slot, vt);
+            return wvV(w->b.load(vt, slot));
         },
         else => {
             wvErr(w, id, "unsupported expression (Phase 1)");

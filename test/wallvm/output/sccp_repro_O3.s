@@ -10,7 +10,7 @@ fib:
 	movq 0(%rsp), %rdi
 	addq $176, %rsp
 .Lfib_entry_3:
-	movabsq $0x0000000000000002, %r11
+	movl $0x0000000000000002, %r11d
 	cmpq %r11, %rdi
 	setl %r11b
 	movzbq %r11b, %rsi
@@ -52,7 +52,6 @@ main:
 	leaq -32(%rbp), %rbx
 	jmp .Lmain_inl25_3_29
 .Lmain_inl25_0_26:
-	movl %esi, %esi
 	movq %rsi, %rax
 	addq $16, %rsp
 	popq %r12

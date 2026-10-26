@@ -8,9 +8,9 @@ main:
 .Lmain_entry_2:
 	leaq -16(%rbp), %r8
 	leaq -32(%rbp), %rsi
-	movabsq $0x0000000000000001, %r10
+	movl $0x0000000000000001, %r10d
 	movl %r10d, (%r8)
-	movabsq $0x0000000000000002, %r10
+	movl $0x0000000000000002, %r10d
 	movl %r10d, (%rsi)
 	cmpq %rsi, %r8
 	sete %r11b

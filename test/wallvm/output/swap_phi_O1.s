@@ -12,11 +12,11 @@ main:
 	leaq -48(%rbp), %rsi
 	leaq -64(%rbp), %rdi
 	leaq -80(%rbp), %r8
-	movabsq $0x0000000000000001, %r10
+	movl $0x0000000000000001, %r10d
 	movq %r10, (%rsi)
-	movabsq $0x0000000000000002, %r10
+	movl $0x0000000000000002, %r10d
 	movq %r10, (%rdi)
-	movabsq $0x0000000000000000, %r10
+	movl $0x0000000000000000, %r10d
 	movq %r10, (%r8)
 	jmp .Lmain_loop_3
 .Lmain_loop_3:
@@ -24,7 +24,7 @@ main:
 	movq (%rdi), %rbx
 	movq (%r8), %r12
 	incq %r12
-	movabsq $0x0000000000000004, %r11
+	movl $0x0000000000000004, %r11d
 	cmpq %r11, %r12
 	setl %r11b
 	movzbq %r11b, %r13
@@ -38,8 +38,7 @@ main:
 	leaq (%r9,%r9,4), %r9
 	addq %r9, %r9
 	addq %r9, %rbx
-	movl %ebx, %esi
-	movq %rsi, %rax
+	movq %rbx, %rax
 	addq $56, %rsp
 	popq %r13
 	popq %r12

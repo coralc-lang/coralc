@@ -7,63 +7,59 @@ main:
 	pushq %rbx
 	pushq %r12
 	pushq %r13
-	subq $88, %rsp
+	subq $104, %rsp
 .Lmain_entry_2:
-	leaq -48(%rbp), %r9
-	leaq -96(%rbp), %r8
-	movabsq $0x0000000000000000, %r10
-	movq %r10, (%r9)
+	leaq -80(%rbp), %rbx
+	leaq -96(%rbp), %r13
+	leaq -112(%rbp), %r9
+	leaq -128(%rbp), %r8
+	movl $0x0000000000000000, %r10d
+	movq %r10, (%r13)
 	jmp .Lmain_fill_3
 .Lmain_fill_3:
-	movq (%r9), %rbx
-	movabsq $0x0000000000000005, %r11
-	cmpq %r11, %rbx
+	movq (%r13), %r12
+	movl $0x0000000000000005, %r11d
+	cmpq %r11, %r12
 	setl %r11b
 	movzbq %r11b, %rsi
+	movl $0x0000000000000000, %r10d
+	movq %r10, (%r9)
+	movl $0x0000000000000000, %r10d
+	movq %r10, (%r8)
 	testq %rsi, %rsi
 	jne .Lmain_fill_body_4
-	jmp .Lmain_sum_pre_5
-.Lmain_fill_body_4:
-	movq %rbx, %r11
-	leaq (%r8, %r11, 8), %rdi
-	movq $0x0000000000000001, %rsi
-	addq %rbx, %rsi
-	movq %rsi, (%rdi)
-	movq %rsi, (%r9)
-	jmp .Lmain_fill_3
-.Lmain_sum_pre_5:
-	movabsq $0x0000000000000000, %r10
-	movq %r10, (%r9)
-	leaq -112(%rbp), %rdi
-	movabsq $0x0000000000000000, %r10
-	movq %r10, (%rdi)
 	jmp .Lmain_sum_6
+.Lmain_fill_body_4:
+	movq %r12, %r11
+	leaq (%rbx, %r11, 8), %rdi
+	movq $0x0000000000000001, %rsi
+	addq %r12, %rsi
+	movq %rsi, (%rdi)
+	movq %rsi, (%r13)
+	jmp .Lmain_fill_3
 .Lmain_sum_6:
-	movq (%r9), %rsi
-	movabsq $0x0000000000000005, %r11
-	cmpq %r11, %rsi
+	movq (%r9), %rdi
+	movq (%r8), %rsi
+	movl $0x0000000000000005, %r11d
+	cmpq %r11, %rdi
 	setl %r11b
-	movzbq %r11b, %rbx
-	testq %rbx, %rbx
-	jne .Lmain_sum_body_7
+	movzbq %r11b, %r12
+	testq %r12, %r12
+	jne .Lmain_sum_body_2444637723
 	jmp .Lmain_done_8
-.Lmain_sum_body_7:
-	movq %rsi, %r11
-	leaq (%r8, %r11, 8), %rbx
-	movq (%rbx), %r13
-	movq (%rdi), %r12
-	movq %r13, %rbx
-	addq %r12, %rbx
-	movq %rbx, (%rdi)
-	movq $0x0000000000000001, %rbx
-	addq %rsi, %rbx
-	movq %rbx, (%r9)
+.Lmain_sum_body_2444637723:
+	movq %rdi, %r11
+	leaq (%rbx, %r11, 8), %r12
+	movq (%r12), %r13
+	movq %r13, %r12
+	addq %rsi, %r12
+	movq $0x0000000000000001, %r12
+	addq %rdi, %r12
 	jmp .Lmain_sum_6
 .Lmain_done_8:
-	movq (%rdi), %r8
-	movl %r8d, %esi
-	movq %rsi, %rax
-	addq $88, %rsp
+	movl %esi, %edi
+	movq %rdi, %rax
+	addq $104, %rsp
 	popq %r13
 	popq %r12
 	popq %rbx

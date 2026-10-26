@@ -8,14 +8,14 @@ main:
 .Lmain_entry_2:
 	leaq -16(%rbp), %rsi
 	leaq -32(%rbp), %rdi
-	movabsq $0x0000000000000000, %r10
+	movl $0x0000000000000000, %r10d
 	movq %r10, (%rsi)
-	movabsq $0x0000000000000000, %r10
+	movl $0x0000000000000000, %r10d
 	movq %r10, (%rdi)
 	jmp .Lmain_loop_3
 .Lmain_loop_3:
 	movq (%rsi), %r8
-	movabsq $0x000000000000000a, %r11
+	movl $0x000000000000000a, %r11d
 	cmpq %r11, %r8
 	setl %r11b
 	movzbq %r11b, %r9
@@ -32,8 +32,7 @@ main:
 	jmp .Lmain_loop_3
 .Lmain_done_5:
 	movq (%rdi), %rsi
-	movl %esi, %edi
-	movq %rdi, %rax
+	movq %rsi, %rax
 	addq $32, %rsp
 	leave
 	ret

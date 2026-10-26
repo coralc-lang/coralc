@@ -10,7 +10,7 @@ fib:
 	movq 0(%rsp), %rdi
 	addq $176, %rsp
 .Lfib_entry_3:
-	movabsq $0x0000000000000002, %r11
+	movl $0x0000000000000002, %r11d
 	cmpq %r11, %rdi
 	setl %r11b
 	movzbq %r11b, %rsi
@@ -47,6 +47,5 @@ main:
 	movq $0x000000000000000a, %rdi
 	call fib
 	movq %rax, %rsi
-	movl %esi, %edi
-	movq %rdi, %rax
+	movq %rsi, %rax
 	ret

@@ -8,9 +8,9 @@ main:
 	subq $24, %rsp
 .Lmain_entry_2:
 	leaq -32(%rbp), %rbx
-	movabsq $0x0000000000000028, %r10
+	movl $0x0000000000000028, %r10d
 	movq %r10, (%rbx)
-	movabsq $0x0000000000000028, %rax
+	movl $0x0000000000000028, %eax
 	addq $0x0000000000000002, %rax
 	movq %rax, (%rbx)
 	movq (%rbx), %rdi

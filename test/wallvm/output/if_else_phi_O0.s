@@ -8,10 +8,10 @@ main:
 .Lmain_entry_2:
 	leaq -16(%rbp), %rsi
 	leaq -32(%rbp), %rdi
-	movabsq $0x0000000000000007, %r10
+	movl $0x0000000000000007, %r10d
 	movq %r10, (%rsi)
 	movq (%rsi), %r8
-	movabsq $0x0000000000000005, %r11
+	movl $0x0000000000000005, %r11d
 	cmpq %r11, %r8
 	setg %r11b
 	movzbq %r11b, %r9
@@ -32,8 +32,7 @@ main:
 	jmp .Lmain_merge_5
 .Lmain_merge_5:
 	movq (%rdi), %rsi
-	movl %esi, %edi
-	movq %rdi, %rax
+	movq %rsi, %rax
 	addq $32, %rsp
 	leave
 	ret
