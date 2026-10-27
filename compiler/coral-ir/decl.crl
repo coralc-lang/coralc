@@ -9,12 +9,13 @@
  * sanitized to [A-Za-z0-9_] (leading digits prefixed with `_`).
  *
  * Exempt from mangling (raw source name): `main`, `extern` decls of any
- * form (`extern`, `extern("C")`, `extern("kernel32")` — detected by the
+ * form (`extern`, `extern("C")`, `extern("kernel32")` — detectxed by the
  * isExtern flag bit, not by convention string), and `#[[no_mangle]]`
  * decls. The C backend uses `__` instead of `$` (its C-text emission
  * cannot spell `$` in identifiers); the two backends intentionally
  * diverge — wallvm emits asm directly. */
-import lower { Wv, wvNode, wvStr, wvMbReset, wvMbCh, wvMbP, wvMbSeg, wvMbStr, wvArr };
+import lower { Wv, wvNode, wvStr, wvMbReset, wvMbCh, wvMbP, wvMbSeg, wvMbStr, wvArr,
+               wvSubstTy, wvMbHex, wvTyLeaf, wvTypeInstanceName };
 import types { wvTy };
 import context::context { AstContext, InternEntry };
 import mono::mono { MonoInstance };
@@ -193,6 +194,15 @@ pub str wvMangle(Wv* w, NodeId declId, Str name)
  * interned Func type for its whole lifetime. */
 IrFunc* wvDeclareFuncNamed(Wv* w, NodeId declId, Decl* d, str name, IrType* selfTy)
 {
+    /* stabilize the symbol before any wvTy below: instance-typed
+     * signatures rewrite w->mb through wvTypeInstanceName, and `name`
+     * is a view into it (the caller's compose would silently become
+     * the instance type name) */
+    if (name.ptr != null && name.len > 0)
+    {
+        Str ni = w->ctx->intern(name);
+        if (ni != 0) name = wvStr(w, ni);
+    }
     IrType* retTy = wvTy(w, d->kind.payload.Func.returnType, 0);
 
     u32 np = d->kind.payload.Func.paramsLen;
@@ -255,23 +265,58 @@ pub u8 wvMethodSelfKind(Wv* w, NodeId mdef)
     return 1;
 }
 
-/* the bare coral owner name a method symbol composes: def side (an
- * extend's self type) and call side (the receiver's type) both run it,
- * so the two spellings always agree. Pointer stripped like
- * cgOwnerName; 0 when the type has no bare name. */
+/* the owner name a method symbol composes: def side (an extend's self
+ * type) and call side (the receiver's type) both run it, so the two
+ * spellings always agree. Pointer stripped like cgOwnerName; a generic
+ * instance composes its `Vec_str`-style instance base; 0 when the type
+ * has no bare name. Inside an instance body the active substitutions
+ * are applied first so `self: Vec<T>` reaches the concrete instance. */
 pub Str wvOwnerStr(Wv* w, Ty selfTy)
 {
     if (selfTy == 0) return 0;
-    TypeEntry* e = w->ctx->types + selfTy;
+    if (w->subsLen > 0) selfTy = wvSubstTy(w, selfTy);
+    if (selfTy == 0) return 0;
+    /* strip qualifiers/pointers in any order and depth — `const String*`
+     * parses as Const(Pointer(…)), which a pointer-first single step
+     * fell through on (owner 0 → "cannot compose the method symbol");
+     * the receiver resolver unwraps the same way */
     Ty u = selfTy;
-    if (e->kind.tag == TypeKind::Pointer) u = e->kind.payload.Pointer.base;
+    u32 guard = 0;
+    while (u != 0 && guard < 8)
+    {
+        guard++;
+        TypeEntry* ue = w->ctx->types + u;
+        if (ue->kind.tag == TypeKind::Pointer) u = ue->kind.payload.Pointer.base;
+        else if (ue->kind.tag == TypeKind::Const) u = ue->kind.payload.Const.base;
+        else if (ue->kind.tag == TypeKind::Comptime) u = ue->kind.payload.Comptime.base;
+        else break;
+    }
     if (u == 0) return 0;
     TypeEntry* ue = w->ctx->types + u;
-    if (ue->kind.tag == TypeKind::Const) u = ue->kind.payload.Const.base;
-    else if (ue->kind.tag == TypeKind::Comptime) u = ue->kind.payload.Comptime.base;
-    if (u == 0) return 0;
-    ue = w->ctx->types + u;
-    if (ue->kind.tag == TypeKind::Named) return ue->kind.payload.Named.name;
+    if (ue->kind.tag == TypeKind::Named)
+    {
+        if (ue->kind.payload.Named.genericArgsLen != 0)
+        {
+            /* a receiver inside a generic body carries the raw type param
+             * (`self` in Vec<T>::push is Pointer(Named Vec<T>)) —
+             * wvSubstTy only matches a top-level TypeParam, so substitute
+             * each arg before composing the instance name, or the owner
+             * comes out `Vec_T0` and matches no decl or instance */
+            u32 gl = ue->kind.payload.Named.genericArgsLen;
+            Ty* ga = (Ty*)wvArr(w, (usize)gl, 4);
+            if (ga == null) return 0;
+            u32 gi = 0;
+            while (gi < gl)
+            {
+                ga[gi] = wvSubstTy(w, ue->kind.payload.Named.genericArgs[gi]);
+                gi++;
+            }
+            Str r = wvTypeInstanceName(w, ue->kind.payload.Named.name, ga, gl);
+            dealloc<Ty>(ga);
+            return r;
+        }
+        return ue->kind.payload.Named.name;
+    }
     if (ue->kind.tag == TypeKind::Str) return w->ctx->intern("str");
     if (ue->kind.tag == TypeKind::Slice) return w->ctx->intern("slice");
     if (ue->kind.tag == TypeKind::Rawptr) return w->ctx->intern("rawptr");
@@ -300,14 +345,96 @@ pub str wvMethodMangle(Wv* w, NodeId mdef, Str owner, Str methName)
     return wvMangle(w, mdef, cid);
 }
 
-/* declare an IrFunc for a monomorphisation instance */
+/* an instance's final mangled segment: <name>[_<argty>…][_v<key>]_<idx>.
+ * The declaring decl supplies the scope (wvMangle), the arguments and
+ * value key the specialization, and the instance index the tiebreak —
+ * two instances of one decl can never compose the same symbol. */
+pub str wvInstanceSymbol(Wv* w, MonoInstance* inst, u32 idx)
+{
+    if (inst == null || inst->name == 0) return str::empty();
+    wvMbReset(w);
+    wvMbP(w, wvStr(w, inst->name));
+    u32 i = 0;
+    while (i < inst->argumentsLen)
+    {
+        wvMbCh(w, 95);
+        wvTyLeaf(w, inst->arguments[i], 0);
+        i++;
+    }
+    if (inst->valueKey != 0)
+    {
+        wvMbP(w, "_v");
+        wvMbHex(w, inst->valueKey);
+    }
+    wvMbCh(w, 95);
+    wvMbHex(w, (u64)idx);
+    Str leaf = w->ctx->intern(wvMbStr(w));
+    if (leaf == 0) return str::empty();
+    return wvMangle(w, inst->declaration, leaf);
+}
+
+/* declare the IrFunc for a monomorphised function instance: fixed
+ * params carry the instance's substituted types, and the vararg slot is
+ * either specialized into named tail params (the rewritten body
+ * references them by name) or kept as a real `...` */
 pub IrFunc* wvDeclareInstanceFunc(Wv* w, MonoInstance* inst, str name)
 {
+    Node* dn = wvNode(w, inst->declaration);
+    if (dn->kind.tag != NodeKind::Decl) return null;
+    Decl* dd = &dn->kind.payload.Decl.value;
+    if (dd->kind.tag != DeclKind::Func) return null;
+    /* same mb-stabilization as wvDeclareFuncNamed: substituted
+     * signatures may rewrite the view `name` points into */
+    if (name.ptr != null && name.len > 0)
+    {
+        Str ni = w->ctx->intern(name);
+        if (ni != 0) name = wvStr(w, ni);
+    }
     IrType* retTy = wvTy(w, inst->returnType, 0);
-    u32 np = inst->paramTypesLen;
+    u32 np = dd->kind.payload.Func.paramsLen;
+    u32 max = np + inst->tailLen + 1;
     IrType** ptypes = null;
-    if (np > 0) ptypes = (IrType**)wvArr(w, (usize)np, 8);
+    if (max > 0) ptypes = (IrType**)wvArr(w, (usize)max, 8);
+    if (max > 0 && ptypes == null) return null;
+    u32 realNp = 0;
+    bool hasVararg = false;
     u32 i = 0;
-    while (i < np) { ptypes[i] = wvTy(w, inst->paramTypes[i], 0); i++; }
-    return w->ir->createFunc(name, retTy, ptypes, np);
+    while (i < np)
+    {
+        Node* pn = wvNode(w, dd->kind.payload.Func.params[i]);
+        if (pn->kind.tag == NodeKind::Param)
+        {
+            Param* pp = &pn->kind.payload.Param.value;
+            if ((pp->flags & 16) != 0)
+            {
+                if (inst->tailLen > 0 && inst->tailArgNames != null)
+                {
+                    u32 k = 0;
+                    while (k < inst->tailLen)
+                    {
+                        Ty tt = inst->tailTypes[k];
+                        if (tt != 0 && (w->ctx->types + tt)->kind.tag == TypeKind::Array)
+                            ptypes[realNp] = w->ir->tyPtr(
+                                wvTy(w, (w->ctx->types + tt)->kind.payload.Array.base, 0));
+                        else
+                            ptypes[realNp] = wvTy(w, tt, 0);
+                        realNp++;
+                        k++;
+                    }
+                }
+                else
+                    hasVararg = true;
+                i++;
+                continue;
+            }
+            Ty pt = i < inst->paramTypesLen ? inst->paramTypes[i] : pp->typeNode;
+            ptypes[realNp] = wvTy(w, pt, 0);
+            realNp++;
+        }
+        i++;
+    }
+    IrFunc* f = w->ir->createFunc(name, retTy, ptypes, realNp);
+    if (f == null) return null;
+    if (hasVararg) f->base.type = w->ir->tyFunc(retTy, ptypes, realNp, true);
+    return f;
 }

@@ -6,17 +6,18 @@
  * one collection pass that mangles each symbol exactly once, detects
  * raw-name collisions at compile time, declares IrFunc shells (externs
  * + definitions), then lowers definition bodies. */
-import lower { Wv, WallVmResult, wvNode, wvErr, wvStr, wvResolved, wvPushLocal,
-               wvBlock, wvSetBlock, wvTerm, wvPos, wvFnMapInit, wvFnMapPut,
-               wvTyMapInit, wvTdMapInit, wvGMapInit };
-import types { wvTy, wvDeclTy, wvTyHasParam };
+import lower { Wv, WallVmResult, WvNameEnt, WvNames, wvNode, wvErr, wvStr, wvResolved,
+               wvPushLocal, wvBlock, wvSetBlock, wvTerm, wvPos, wvFnMapInit, wvFnMapPut,
+               wvTyMapInit, wvTdMapInit, wvGMapInit, wvHashStr, wvNamesInit, wvNamesFind,
+               wvNamesInsert, wvTypeInstanceName };
+import types { wvTy, wvDeclTy, wvTyHasParam, wvTypeInstanceTy, wvFindTypeDecl };
 import decl { wvMangle, wvMangleExempt, wvDeclareMethod, wvMethodSelfKind,
-               wvOwnerStr, wvMethodMangle };
+               wvOwnerStr, wvMethodMangle, wvDeclareInstanceFunc, wvInstanceSymbol };
 import stmt { wvStmt };
-import expr { wvExpr, wvAggSlot, wvIsAgg, wvMakeGlobal, wvUnwrapTy };
+import expr { wvExpr, wvAggSlot, wvIsAgg, wvMakeGlobal, wvUnwrapTy, wvSelfTyMatches };
 import context::context { AstContext, InternEntry };
 import build::arena { Arena };
-import mono::mono { MonoContext, MonoInstance, MonoInstanceKind };
+import mono::mono { MonoContext, MonoInstance, MonoInstanceKind, MonoSubstitution };
 import diag::code { ErrorCode };
 import sem::sema { Sema };
 import ast {
@@ -38,67 +39,6 @@ import(lib) wallvm::rules::asm_rules { CallingConvention };
 import(lib) std::mman { alloc, dealloc };
 import(lib) std::string { String };
 
-/* ── name → first-decl collision table (open-addressed) ─────── */
-
-struct WvNameEnt
-{
-    str name;        // stable (owned by IrFunc) or empty = empty slot
-    u32 declIdx;     // declId.index of the first decl seen
-    bool isDefn;     // first decl had a body
-    IrFunc* f;
-}
-
-struct WvNames
-{
-    WvNameEnt* ents;
-    u32 cap;         // power of two
-}
-
-u32 wvHashStr(str s)
-{
-    u32 h = 2166136261;
-    usize i = 0;
-    while (i < s.len) { h = (h ^ (u32)s.ptr[i]) * 16777619; i++; }
-    return h;
-}
-
-bool wvNamesInit(WvNames* t, u32 capPow2)
-{
-    t->cap = capPow2;
-    t->ents = alloc<WvNameEnt>((usize)capPow2);
-    if (t->ents == null) { t->cap = 0; return false; }
-    u32 i = 0;
-    while (i < capPow2) { t->ents[i].name = str::empty(); t->ents[i].f = null; i++; }
-    return true;
-}
-
-/* look up a name; returns the entry or null */
-WvNameEnt* wvNamesFind(WvNames* t, str name)
-{
-    if (t->cap == 0) return null;
-    u32 slot = wvHashStr(name) & (t->cap - 1);
-    while (t->ents[slot].name.len != 0)
-    {
-        if (t->ents[slot].name.equals(name)) return t->ents + slot;
-        slot = (slot + 1) & (t->cap - 1);
-    }
-    return null;
-}
-
-/* claim a slot for a new name; returns the entry */
-WvNameEnt* wvNamesInsert(WvNames* t, str name)
-{
-    if (t->cap == 0) return null;
-    u32 slot = wvHashStr(name) & (t->cap - 1);
-    while (t->ents[slot].name.len != 0)
-    {
-        if (t->ents[slot].name.equals(name)) return t->ents + slot;
-        slot = (slot + 1) & (t->cap - 1);
-    }
-    t->ents[slot].name = name;
-    return t->ents + slot;
-}
-
 /* ── opt-level mapping (mirror of runGcc's C flags) ─────────── */
 
 u32 wvOptLevel(str opt)
@@ -117,6 +57,24 @@ bool wvIsOwnerDecl(Decl* d)
     return d->kind.tag == DeclKind::Struct || d->kind.tag == DeclKind::Union ||
            d->kind.tag == DeclKind::Variant || d->kind.tag == DeclKind::Extend ||
            d->kind.tag == DeclKind::ExtendTrait;
+}
+
+/* is this file-scope constant a type alias (`const c2 = cchar`)? The
+ * value is a bare identifier naming a type decl: no storage, and uses
+ * resolve through the type system (the C backend spells a typedef;
+ * here every use site's Named type carries the name directly). */
+bool wvConstIsTypeAlias(Wv* w, NodeId declId)
+{
+    Node* n = wvNode(w, declId);
+    if (n->kind.tag != NodeKind::Decl) return false;
+    Decl* dd = &n->kind.payload.Decl.value;
+    if (dd->kind.tag != DeclKind::Constant) return false;
+    NodeId v = dd->kind.payload.Constant.value;
+    if (v.index == 0) return false;
+    Node* vn = wvNode(w, v);
+    if (vn->kind.tag != NodeKind::Expr ||
+        vn->kind.payload.Expr.value.kind.tag != ExprKind::Ident) return false;
+    return wvFindTypeDecl(w, vn->kind.payload.Expr.value.kind.payload.Ident.name).index != 0;
 }
 
 /* the methods[] array and owner shape of such a decl; false when the
@@ -190,7 +148,12 @@ bool wvOwnerMethods(Wv* w, Decl* d, Str* owner, NodeId** methodsOut, u32* mlenOu
 
 /* ── body lowering ──────────────────────────────────────────── */
 
-void wvLowerBody(Wv* w, NodeId declId, Decl* d, IrFunc* f)
+/* lower one function body. hasSelf says the shell was declared with a
+ * receiver as parameter 0 (only the method-collection path does that —
+ * plain file functions never take one). body is the node to lower: the
+ * decl's own, or a monomorphisation instance's rewritten body when inst
+ * is non-null (its substitutions are the caller's responsibility). */
+void wvLowerBody(Wv* w, NodeId declId, Decl* d, IrFunc* f, u8 hasSelf, NodeId body, MonoInstance* inst)
 {
     w->fn = f;
     w->retTy = d->kind.payload.Func.returnType;
@@ -205,8 +168,10 @@ void wvLowerBody(Wv* w, NodeId declId, Decl* d, IrFunc* f)
 
     /* a method's receiver: parameter 0 of the shell, never spelled in
      * the Coral param list (the parser rejects explicit `self`) */
-    if (wvMethodSelfKind(w, declId) == 1 && f->nparams > 0)
+    u32 pi = 0;
+    if (hasSelf != 0 && f->nparams > 0)
     {
+        pi = 1;
         IrType* st = f->paramTypes[0];
         IrValue* av = alloc<IrValue>((usize)1);
         if (av == null) { wvErr(w, declId, "out of memory binding self"); return; }
@@ -219,12 +184,14 @@ void wvLowerBody(Wv* w, NodeId declId, Decl* d, IrFunc* f)
             if (slot != null)
             {
                 w->b.store(av, slot);
-                wvPushLocal(w, w->ctx->intern("self"), slot);
+                wvPushLocal(w, w->ctx->intern("self"), slot, 0);
             }
         }
     }
 
-    /* bind params: create arg values, alloca slots, store args in */
+    /* bind params: create arg values, alloca slots, store args in.
+     * The type comes from the shell's own signature (f->paramTypes), so
+     * binding can never drift from what the call site was given. */
     u32 np = d->kind.payload.Func.paramsLen;
     u32 i = 0;
     while (i < np)
@@ -235,7 +202,8 @@ void wvLowerBody(Wv* w, NodeId declId, Decl* d, IrFunc* f)
             Param* pp = &pn->kind.payload.Param.value;
             if ((pp->flags & 16) == 0) // not variadic
             {
-                IrType* at = wvTy(w, pp->typeNode, 0);
+                IrType* at = pi < f->nparams ? f->paramTypes[pi] : wvTy(w, pp->typeNode, 0);
+                pi++;
                 IrValue* av = alloc<IrValue>((usize)1);
                 if (av == null) { wvErr(w, declId, "out of memory binding param"); return; }
                 *av = IrValue { IrValueKind::Arg, at, w->ir->nextValueId(), 0,
@@ -247,7 +215,7 @@ void wvLowerBody(Wv* w, NodeId declId, Decl* d, IrFunc* f)
                     if (slot != null)
                     {
                         w->b.store(av, slot);
-                        wvPushLocal(w, pp->name, slot);
+                        wvPushLocal(w, pp->name, slot, wvResolved(w, pp->typeNode));
                     }
                 }
             }
@@ -255,8 +223,36 @@ void wvLowerBody(Wv* w, NodeId declId, Decl* d, IrFunc* f)
         i++;
     }
 
+    /* an instance whose vararg slot was specialized: the rewritten body
+     * references the tail args by their synthesized names (_varg0, …) */
+    if (inst != null && inst->tailLen > 0 && inst->tailArgNames != null)
+    {
+        u32 k = 0;
+        while (k < inst->tailLen && pi < f->nparams)
+        {
+            IrType* at = f->paramTypes[pi];
+            pi++;
+            IrValue* av = alloc<IrValue>((usize)1);
+            if (av == null) { wvErr(w, declId, "out of memory binding tail arg"); return; }
+            Str tn = inst->tailArgNames[k];
+            *av = IrValue { IrValueKind::Arg, at, w->ir->nextValueId(), 0,
+                            wvStr(w, tn), null, 0, 0 };
+            f->addArg(av);
+            if (at != null && at->kind != IrTypeKind::Void)
+            {
+                IrValue* slot = wvIsAgg(at) ? wvAggSlot(w, at) : wvV(w->b.alloca(at));
+                if (slot != null)
+                {
+                    w->b.store(av, slot);
+                    wvPushLocal(w, tn, slot, 0);
+                }
+            }
+            k++;
+        }
+    }
+
     /* lower the body block */
-    wvStmt(w, d->kind.payload.Func.body);
+    wvStmt(w, body);
 
     /* implicit terminator on fallthrough */
     if (!w->term)
@@ -318,13 +314,12 @@ IrFunc* wvRegisterFunc(Wv* w, WvNames* names, NodeId declId, Decl* d, str name, 
     w->mod.addFunc(f);
     if (names != null && name.len != 0)
     {
-        ent = wvNamesInsert(names, name);
+        /* key from the IrFunc's own copy: wvTy inside the declare may
+         * have rewritten `name`'s view into w->mb (instance-typed
+         * signatures go through wvTypeInstanceName) */
+        ent = wvNamesInsert(names, f->base.name);
         if (ent != null)
         {
-            /* createFunc's irDupStr copy, NOT `name`: `name` is a view
-             * into w->mb, which the next wvMangle call overwrites —
-             * every entry would then alias the same bytes and
-             * false-match any query of equal length */
             ent->name = f->base.name;
             ent->declIdx = declId.index;
             ent->isDefn = isDefn;
@@ -344,6 +339,91 @@ IrFunc* wvCollectFunc(Wv* w, WvNames* names, NodeId declId, Decl* d)
 
     str name = wvMangle(w, declId, d->kind.payload.Func.name);
     return wvRegisterFunc(w, names, declId, d, name, null);
+}
+
+/* one entry of the monomorphised body queue: the shell, the decl whose
+ * params it binds, the body node, the mono instance supplying the
+ * substitutions while lowering, and whether the shell carries a receiver
+ * as parameter 0. FunctionInstance entries pass the instance's rewritten
+ * body; instance-method entries pass the method's own body. */
+struct WvBodyEnt
+{
+    IrFunc* f;
+    NodeId decl;
+    NodeId body;
+    u32 inst;
+    u8 self;
+}
+
+/* declare + queue one instance method under the instance-composed
+ * `<owner>_<method>` symbol (mirror cgEmitInstMethodList). Never
+ * wvRegisterFunc: mdef is shared by every instance of the type, so the
+ * names table — keyed by the composed symbol, deduping alias-equal
+ * instances — is the only binding, and the fn map must not answer for
+ * it. Signature building runs with the instance's substitutions active. */
+void wvQueueInstMethod(Wv* w, NodeId mdef, Decl* md, Str iown, IrType* selfPt,
+                       MonoInstance* inst, u32 ii, WvBodyEnt* ents, u32* qlen, u32 qcap)
+{
+    str msym = wvMethodMangle(w, mdef, iown, md->kind.payload.Func.name);
+    if (msym.len == 0)
+    {
+        wvErr(w, mdef, "cannot compose the instance method symbol");
+        return;
+    }
+    if (w->names != null && wvNamesFind(w->names, msym) != null) return;
+    u8 sk = wvMethodSelfKind(w, mdef);
+    u8 flags = md->kind.payload.Func.flags;
+    MonoSubstitution* oldS = w->subs;
+    u32 oldSL = w->subsLen;
+    w->subs = inst->substitutions;
+    w->subsLen = inst->substitutionsLen;
+    IrFunc* f = wvDeclareMethod(w, mdef, md, msym, sk == 1 ? selfPt : null);
+    w->subs = oldS;
+    w->subsLen = oldSL;
+    if (f == null) return;
+    w->mod.addFunc(f);
+    if (w->names != null)
+    {
+        /* key from the IrFunc's own copy: `msym` is a view into w->mb,
+         * which the signature's instance types just rewrote */
+        WvNameEnt* ent = wvNamesInsert(w->names, f->base.name);
+        if (ent != null)
+        {
+            ent->name = f->base.name;
+            ent->declIdx = mdef.index;
+            ent->isDefn = (flags & 8) != 0 && (flags & 2) == 0;
+            ent->f = f;
+        }
+    }
+    if ((flags & 8) != 0 && (flags & 2) == 0 && ents != null && qlen != null && *qlen < qcap)
+    {
+        ents[*qlen] = WvBodyEnt { .f = f, .decl = mdef,
+                                  .body = md->kind.payload.Func.body,
+                                  .inst = ii, .self = sk == 1 ? 1 : 0 };
+        *qlen = *qlen + 1;
+    }
+}
+
+/* one owner's method list through the instance queue: non-generic
+ * methods only (own generics stay Phase 2), like cgEmitInstMethodList */
+void wvQueueInstMethods(Wv* w, NodeId* methods, u32 mlen, Str iown, IrType* selfPt,
+                        MonoInstance* inst, u32 ii, WvBodyEnt* ents, u32* qlen, u32 qcap)
+{
+    if (methods == null) return;
+    u32 k = 0;
+    while (k < mlen)
+    {
+        NodeId mdef = methods[k];
+        Node* mn = wvNode(w, mdef);
+        if (mn->kind.tag == NodeKind::Decl)
+        {
+            Decl* md = &mn->kind.payload.Decl.value;
+            if (md->kind.tag == DeclKind::Func &&
+                (w->mono == null || w->mono.genericCount(mdef) == 0))
+                wvQueueInstMethod(w, mdef, md, iown, selfPt, inst, ii, ents, qlen, qcap);
+        }
+        k++;
+    }
 }
 
 /* ── entry point ────────────────────────────────────────────── */
@@ -385,6 +465,8 @@ pub WallVmResult generateWallVm(AstContext* ctx, File* file, MonoContext* mono, 
     w.gCap = 0;
     w.subs = null;
     w.subsLen = 0;
+    w.instFns = null;
+    w.instFnsLen = 0;
     w.tyKeys = null;
     w.tyVals = null;
     w.tyBusy = null;
@@ -404,14 +486,45 @@ pub WallVmResult generateWallVm(AstContext* ctx, File* file, MonoContext* mono, 
 
     WvNames names;
     wvNamesInit(&names, 1024);
+    w.names = &names;
+    w.instTys = null;
+    w.instTysLen = 0;
+    if (mono != null && mono.instancesLen > 0)
+    {
+        w.instTysLen = mono.instancesLen;
+        w.instTys = alloc<IrType*>((usize)mono.instancesLen);
+        if (w.instTys != null)
+        {
+            u32 zi = 0;
+            while (zi < w.instTysLen) { w.instTys[zi] = null; zi++; }
+        }
+        else w.instTysLen = 0;
+    }
+    /* build every type instance's IrType up front: method shells and
+     * concrete extends resolve field/parameter types through these
+     * while collecting, before any body is lowered */
+    if (w.instTys != null)
+    {
+        u32 pj = 0;
+        while (pj < w.instTysLen)
+        {
+            MonoInstance* pinst = mono.instances + pj;
+            if (pinst->kind == MonoInstanceKind::TypeInstance)
+                wvTypeInstanceTy(&w, pinst->name, pinst->arguments,
+                                 pinst->argumentsLen, 0);
+            pj++;
+        }
+    }
 
     /* collect + declare every function (externs + non-generic defs) */
     IrFunc** bodies = null;
     NodeId* bodyDecls = null;
+    u8* bodySelf = null;   // 1 when the shell carries a receiver param 0
     u32 bodiesLen = 0;
     u32 bodiesCap = file->declsLen + 64;
     /* methods ride the same body list: size for every owner's method
      * array up front so the collection loop never has to grow it */
+    u32 instMethodCap = 0;
     {
         u32 ci = 0;
         while (ci < file->declsLen)
@@ -428,11 +541,58 @@ pub WallVmResult generateWallVm(AstContext* ctx, File* file, MonoContext* mono, 
             }
             ci++;
         }
+        /* instance methods queue too: each TypeInstance's own methods
+         * plus every matching extend (over-count of skipped externs and
+         * own-generic methods is safe — the queue bounds-checks) */
+        if (mono != null && mono.instancesLen > 0)
+        {
+            u32 pj = 0;
+            while (pj < mono.instancesLen)
+            {
+                MonoInstance* pinst = mono.instances + pj;
+                if (pinst->kind == MonoInstanceKind::TypeInstance)
+                {
+                    Node* pn = wvNode(&w, pinst->declaration);
+                    if (pn->kind.tag == NodeKind::Decl)
+                    {
+                        Decl* pd = &pn->kind.payload.Decl.value;
+                        if (pd->kind.tag == DeclKind::Struct) instMethodCap += pd->kind.payload.Struct.methodsLen;
+                        else if (pd->kind.tag == DeclKind::Union) instMethodCap += pd->kind.payload.Union.methodsLen;
+                        else if (pd->kind.tag == DeclKind::Variant) instMethodCap += pd->kind.payload.Variant.methodsLen;
+                    }
+                    u32 d = 0;
+                    while (d < file->declsLen)
+                    {
+                        Node* dn = wvNode(&w, file->decls[d]);
+                        if (dn->kind.tag == NodeKind::Decl)
+                        {
+                            Decl* xd = &dn->kind.payload.Decl.value;
+                            if (xd->kind.tag == DeclKind::Extend &&
+                                wvSelfTyMatches(&w, xd->kind.payload.Extend.selfType,
+                                                pinst->name, pinst->arguments, pinst->argumentsLen))
+                                instMethodCap += xd->kind.payload.Extend.methodsLen;
+                            else if (xd->kind.tag == DeclKind::ExtendTrait &&
+                                     wvSelfTyMatches(&w, xd->kind.payload.ExtendTrait.selfType,
+                                                     pinst->name, pinst->arguments, pinst->argumentsLen))
+                                instMethodCap += xd->kind.payload.ExtendTrait.methodsLen;
+                        }
+                        d++;
+                    }
+                }
+                pj++;
+            }
+        }
     }
     if (bodiesCap > 0)
     {
         bodies = alloc<IrFunc*>((usize)bodiesCap);
         bodyDecls = alloc<NodeId>((usize)bodiesCap);
+        bodySelf = alloc<u8>((usize)bodiesCap);
+        if (bodySelf != null)
+        {
+            u32 zi = 0;
+            while (zi < bodiesCap) { bodySelf[zi] = 0; zi++; }
+        }
     }
     u32 i = 0;
     while (i < file->declsLen)
@@ -452,7 +612,7 @@ pub WallVmResult generateWallVm(AstContext* ctx, File* file, MonoContext* mono, 
                     bodiesLen++;
                 }
             }
-            else if (d->kind.tag == DeclKind::Constant)
+            else if (d->kind.tag == DeclKind::Constant && !wvConstIsTypeAlias(&w, did))
             {
                 /* every file-scope constant gets one copy of storage —
                  * aggregates are addressed through it, scalars may still
@@ -493,6 +653,7 @@ pub WallVmResult generateWallVm(AstContext* ctx, File* file, MonoContext* mono, 
                                 {
                                     bodies[bodiesLen] = f;
                                     bodyDecls[bodiesLen] = mdef;
+                                    bodySelf[bodiesLen] = (sk == 1 && selfPt != null) ? 1 : 0;
                                     bodiesLen++;
                                 }
                             }
@@ -505,15 +666,180 @@ pub WallVmResult generateWallVm(AstContext* ctx, File* file, MonoContext* mono, 
         i++;
     }
 
+    /* declare every collected function instance under its own symbol —
+     * call resolution runs during body lowering and picks through
+     * w.instFns, so this must precede both lowering loops */
+    WvBodyEnt* iEnts = null;
+    u32 iBodiesLen = 0;
+    u32 iQCap = 0;
+    if (mono != null && mono.instancesLen > 0)
+    {
+        u32 icap = mono.instancesLen;
+        iQCap = icap + instMethodCap;
+        w.instFns = alloc<IrFunc*>((usize)icap);
+        iEnts = alloc<WvBodyEnt>((usize)iQCap);
+        if (w.instFns != null)
+        {
+            w.instFnsLen = icap;
+            u32 zi = 0;
+            while (zi < icap) { w.instFns[zi] = null; zi++; }
+        }
+        u32 ii = 0;
+        while (ii < icap)
+        {
+            MonoInstance* inst = mono.instances + ii;
+            if (inst->kind == MonoInstanceKind::FunctionInstance && inst->body.index != 0 &&
+                w.instFns != null && iEnts != null)
+            {
+                Node* dn = wvNode(&w, inst->declaration);
+                if (dn->kind.tag == NodeKind::Decl)
+                {
+                    Decl* dd = &dn->kind.payload.Decl.value;
+                    if (dd->kind.tag == DeclKind::Func)
+                    {
+                        str isym = wvInstanceSymbol(&w, inst, ii);
+                        if (isym.len == 0)
+                        {
+                            w.errors++;
+                            w.sema.semaErrorNode(ErrorCode::CodegenInternal, inst->declaration,
+                                                 "cannot compose the function instance symbol");
+                        }
+                        else if (wvNamesFind(&names, isym) != null)
+                        {
+                            w.errors++;
+                            w.sema.semaErrorNode(ErrorCode::CodegenInternal, inst->declaration,
+                                                 "duplicate function instance symbol");
+                        }
+                        else
+                        {
+                            IrFunc* f = wvDeclareInstanceFunc(&w, inst, isym);
+                            if (f == null)
+                            {
+                                w.errors++;
+                                w.sema.semaErrorNode(ErrorCode::CodegenInternal, inst->declaration,
+                                                     "cannot declare the function instance");
+                            }
+                            else
+                            {
+                                w.mod.addFunc(f);
+                                /* key from the IrFunc's own copy: isym is
+                                 * a view into w->mb, which the instance's
+                                 * substituted signature just rewrote */
+                                WvNameEnt* ent = wvNamesInsert(&names, f->base.name);
+                                if (ent != null)
+                                {
+                                    ent->name = f->base.name;
+                                    ent->declIdx = inst->declaration.index;
+                                    ent->isDefn = true;
+                                    ent->f = f;
+                                }
+                                w.instFns[ii] = f;
+                                iEnts[iBodiesLen] = WvBodyEnt { .f = f,
+                                                                .decl = inst->declaration,
+                                                                .body = inst->body,
+                                                                .inst = ii, .self = 0 };
+                                iBodiesLen++;
+                            }
+                        }
+                    }
+                }
+            }
+            ii++;
+        }
+
+        /* instance methods: each TypeInstance's own methods plus every
+         * matching extend, under the instance-composed owner (mirror
+         * cgEmitInstanceMethods); bodies ride the same queue with the
+         * instance's substitutions active while lowering */
+        ii = 0;
+        while (ii < mono.instancesLen)
+        {
+            MonoInstance* inst = mono.instances + ii;
+            if (inst->kind == MonoInstanceKind::TypeInstance && iEnts != null)
+            {
+                if (w.instTys == null || ii >= w.instTysLen || w.instTys[ii] == null)
+                    wvErr(&w, inst->declaration, "cannot build the instance type for its methods");
+                else
+                {
+                    Str iown = wvTypeInstanceName(&w, inst->name, inst->arguments,
+                                                  inst->argumentsLen);
+                    IrType* selfPt = w.ir->tyPtr(w.instTys[ii]);
+                    Node* pn = wvNode(&w, inst->declaration);
+                    if (pn->kind.tag == NodeKind::Decl)
+                    {
+                        Decl* pd = &pn->kind.payload.Decl.value;
+                        NodeId* im = null;
+                        u32 iml = 0;
+                        if (pd->kind.tag == DeclKind::Struct)
+                            { im = pd->kind.payload.Struct.methods; iml = pd->kind.payload.Struct.methodsLen; }
+                        else if (pd->kind.tag == DeclKind::Union)
+                            { im = pd->kind.payload.Union.methods; iml = pd->kind.payload.Union.methodsLen; }
+                        else if (pd->kind.tag == DeclKind::Variant)
+                            { im = pd->kind.payload.Variant.methods; iml = pd->kind.payload.Variant.methodsLen; }
+                        wvQueueInstMethods(&w, im, iml, iown, selfPt, inst, ii,
+                                           iEnts, &iBodiesLen, iQCap);
+                    }
+                    u32 d = 0;
+                    while (d < file->declsLen)
+                    {
+                        Node* dn2 = wvNode(&w, file->decls[d]);
+                        if (dn2->kind.tag == NodeKind::Decl)
+                        {
+                            Decl* xd = &dn2->kind.payload.Decl.value;
+                            NodeId* em = null;
+                            u32 eml = 0;
+                            if (xd->kind.tag == DeclKind::Extend &&
+                                wvSelfTyMatches(&w, xd->kind.payload.Extend.selfType,
+                                                inst->name, inst->arguments, inst->argumentsLen))
+                                { em = xd->kind.payload.Extend.methods; eml = xd->kind.payload.Extend.methodsLen; }
+                            else if (xd->kind.tag == DeclKind::ExtendTrait &&
+                                     wvSelfTyMatches(&w, xd->kind.payload.ExtendTrait.selfType,
+                                                     inst->name, inst->arguments, inst->argumentsLen))
+                                { em = xd->kind.payload.ExtendTrait.methods; eml = xd->kind.payload.ExtendTrait.methodsLen; }
+                            wvQueueInstMethods(&w, em, eml, iown, selfPt, inst, ii,
+                                               iEnts, &iBodiesLen, iQCap);
+                        }
+                        d++;
+                    }
+                }
+            }
+            ii++;
+        }
+    }
+
     /* lower definition bodies */
     i = 0;
     while (i < bodiesLen && w.errors == 0)
     {
         Node* n = wvNode(&w, bodyDecls[i]);
         Decl* d = &n->kind.payload.Decl.value;
-        wvLowerBody(&w, bodyDecls[i], d, bodies[i]);
+        wvLowerBody(&w, bodyDecls[i], d, bodies[i], bodySelf != null ? bodySelf[i] : 0,
+                    d->kind.payload.Func.body, null);
         i++;
     }
+
+    /* lower monomorphised instance bodies (function instances and
+     * instance methods) with their substitutions active */
+    i = 0;
+    while (i < iBodiesLen && w.errors == 0)
+    {
+        WvBodyEnt* ent = iEnts + i;
+        MonoInstance* inst = mono.instances + ent->inst;
+        Node* n = wvNode(&w, ent->decl);
+        if (n->kind.tag == NodeKind::Decl)
+        {
+            Decl* d = &n->kind.payload.Decl.value;
+            MonoSubstitution* oldS = w.subs;
+            u32 oldSL = w.subsLen;
+            w.subs = inst->substitutions;
+            w.subsLen = inst->substitutionsLen;
+            wvLowerBody(&w, ent->decl, d, ent->f, ent->self, ent->body, inst);
+            w.subs = oldS;
+            w.subsLen = oldSL;
+        }
+        i++;
+    }
+    if (iEnts != null) dealloc<WvBodyEnt>(iEnts);
 
     /* validate every function in the module */
     if (w.errors == 0)

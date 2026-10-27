@@ -45,6 +45,7 @@ pub struct Wv
     /* local slots: name → alloca ptr (pushed per function / per scope) */
     Str* locNames;
     IrValue** locSlots;
+    Ty* locTys;
     u32 locLen;
     u32 locCap;
 
@@ -93,6 +94,81 @@ pub struct Wv
     /* monomorphisation substitution for the current instance */
     MonoSubstitution* subs;
     u32 subsLen;
+
+    /* mono FunctionInstance index → its IrFunc (null when the instance
+     * has no lowered body); call resolution picks through this */
+    IrFunc** instFns;
+    u32 instFnsLen;
+
+    /* mono TypeInstance index → its IrType, built with that instance's
+     * substitutions active; wvTy resolves a generic-named type
+     * (`Vec<str>`) through this table */
+    IrType** instTys;
+    u32 instTysLen;
+
+    /* symbol table, set by generateWallVm so expression lowering can
+     * find an instance-method shell by its composed symbol */
+    WvNames* names;
+}
+
+/* symbol → first-decl collision table (open-addressed) */
+pub struct WvNameEnt
+{
+    str name;        // stable (owned by IrFunc) or empty = empty slot
+    u32 declIdx;     // declId.index of the first decl seen
+    bool isDefn;     // first decl had a body
+    IrFunc* f;
+}
+
+pub struct WvNames
+{
+    WvNameEnt* ents;
+    u32 cap;         // power of two
+}
+
+pub u32 wvHashStr(str s)
+{
+    u32 h = 2166136261;
+    usize i = 0;
+    while (i < s.len) { h = (h ^ (u32)s.ptr[i]) * 16777619; i++; }
+    return h;
+}
+
+pub bool wvNamesInit(WvNames* t, u32 capPow2)
+{
+    t->cap = capPow2;
+    t->ents = alloc<WvNameEnt>((usize)capPow2);
+    if (t->ents == null) { t->cap = 0; return false; }
+    u32 i = 0;
+    while (i < capPow2) { t->ents[i].name = str::empty(); t->ents[i].f = null; i++; }
+    return true;
+}
+
+/* look up a name; returns the entry or null */
+pub WvNameEnt* wvNamesFind(WvNames* t, str name)
+{
+    if (t == null || t->cap == 0) return null;
+    u32 slot = wvHashStr(name) & (t->cap - 1);
+    while (t->ents[slot].name.len != 0)
+    {
+        if (t->ents[slot].name.equals(name)) return t->ents + slot;
+        slot = (slot + 1) & (t->cap - 1);
+    }
+    return null;
+}
+
+/* claim a slot for a new name; returns the entry */
+pub WvNameEnt* wvNamesInsert(WvNames* t, str name)
+{
+    if (t == null || t->cap == 0) return null;
+    u32 slot = wvHashStr(name) & (t->cap - 1);
+    while (t->ents[slot].name.len != 0)
+    {
+        if (t->ents[slot].name.equals(name)) return t->ents + slot;
+        slot = (slot + 1) & (t->cap - 1);
+    }
+    t->ents[slot].name = name;
+    return t->ents + slot;
 }
 
 pub struct WallVmResult
@@ -199,24 +275,28 @@ pub Ty wvResolved(Wv* w, Ty t)
 }
 
 /* local-slot stack push/pop */
-pub void wvPushLocal(Wv* w, Str name, IrValue* slot)
+pub void wvPushLocal(Wv* w, Str name, IrValue* slot, Ty ty)
 {
     if (w->locLen >= w->locCap)
     {
         u32 nc = w->locCap == 0 ? 8 : w->locCap * 2;
         Str* nn = alloc<Str>((usize)nc);
         IrValue** ns = alloc<IrValue*>((usize)nc);
-        if (nn == null || ns == null) { wvErr(w, NodeId{}, "out of memory in local table"); return; }
+        Ty* nt = alloc<Ty>((usize)nc);
+        if (nn == null || ns == null || nt == null) { wvErr(w, NodeId{}, "out of memory in local table"); return; }
         u32 i = 0;
-        while (i < w->locLen) { nn[i] = w->locNames[i]; ns[i] = w->locSlots[i]; i++; }
+        while (i < w->locLen) { nn[i] = w->locNames[i]; ns[i] = w->locSlots[i]; nt[i] = w->locTys[i]; i++; }
         if (w->locNames != null) dealloc<Str>(w->locNames);
         if (w->locSlots != null) dealloc<IrValue*>(w->locSlots);
+        if (w->locTys != null) dealloc<Ty>(w->locTys);
         w->locNames = nn;
         w->locSlots = ns;
+        w->locTys = nt;
         w->locCap = nc;
     }
     w->locNames[w->locLen] = name;
     w->locSlots[w->locLen] = slot;
+    w->locTys[w->locLen] = ty;
     w->locLen++;
 }
 
@@ -229,6 +309,29 @@ pub IrValue* wvFindLocal(Wv* w, Str name)
         if (w->locNames[i] == name) return w->locSlots[i];
     }
     return null;
+}
+
+/* the declared sema type a local was pushed with — the type source for
+ * exprs sema never stamped: typecheck skips comptime switch arms
+ * (generic scrutinees would false-reject) and CtEval emits the selected
+ * arm, so those nodes carry resolvedType == 0. The C backend re-derives
+ * the same way, from symbols rather than sema annotations. */
+pub Ty wvLocalTy(Wv* w, Str name)
+{
+    u32 i = w->locLen;
+    while (i > 0)
+    {
+        i--;
+        if (w->locNames[i] == name) return w->locTys != null ? w->locTys[i] : 0;
+    }
+    return 0;
+}
+
+/* the value a slot holds: slot types are Ptr(value), except aggregates,
+ * whose slot IS the value under the address convention */
+pub IrType* wvSlotTy(IrType* t)
+{
+    return t != null && t->kind == IrTypeKind::Ptr ? t->elem : t;
 }
 
 /* ── reusable mangle buffer ─────────────────────────────────── */
@@ -452,4 +555,113 @@ pub void wvTdMapPut(Wv* w, Str name, u32 v)
     }
     w->tdKeys[slot] = (u32)name + 1;
     w->tdVals[slot] = v;
+}
+
+/* write v as lowercase hex into the mangle buffer */
+pub void wvMbHex(Wv* w, u64 v)
+{
+    u8[16] rev;
+    u32 n = 0;
+    if (v == 0) rev[n++] = 48;
+    while (v != 0)
+    {
+        u32 d = (u32)(v & 15);
+        rev[n++] = (u8)(d < 10 ? 48 + d : 87 + d);
+        v >>= 4;
+    }
+    while (n != 0) { n--; wvMbCh(w, rev[n]); }
+}
+
+/* append t's leaf spelling to the mangle buffer: the argument
+ * discriminator inside an instance symbol. Structural, injective for
+ * distinct shapes, depth-bounded (nesting past the cap spells `_`). */
+pub void wvTyLeaf(Wv* w, Ty t, u32 depth)
+{
+    if (t == 0 || depth > 8) { wvMbP(w, "_"); return; }
+    TypeEntry* e = w->ctx->types + t;
+    switch (e->kind.tag)
+    {
+        TypeKind::Void => { wvMbP(w, "void"); },
+        TypeKind::Bool => { wvMbP(w, "bool"); },
+        TypeKind::Char => { wvMbP(w, "char"); },
+        TypeKind::I8 => { wvMbP(w, "i8"); },
+        TypeKind::U8 => { wvMbP(w, "u8"); },
+        TypeKind::I16 => { wvMbP(w, "i16"); },
+        TypeKind::U16 => { wvMbP(w, "u16"); },
+        TypeKind::I32 => { wvMbP(w, "i32"); },
+        TypeKind::U32 => { wvMbP(w, "u32"); },
+        TypeKind::I64 => { wvMbP(w, "i64"); },
+        TypeKind::U64 => { wvMbP(w, "u64"); },
+        TypeKind::I128 => { wvMbP(w, "i128"); },
+        TypeKind::U128 => { wvMbP(w, "u128"); },
+        TypeKind::F32 => { wvMbP(w, "f32"); },
+        TypeKind::F64 => { wvMbP(w, "f64"); },
+        TypeKind::Isize => { wvMbP(w, "isize"); },
+        TypeKind::Usize => { wvMbP(w, "usize"); },
+        TypeKind::Rawptr => { wvMbP(w, "rawptr"); },
+        TypeKind::Str => { wvMbP(w, "str"); },
+        TypeKind::Pointer => { wvMbP(w, "p"); wvTyLeaf(w, e->kind.payload.Pointer.base, depth + 1); },
+        TypeKind::Const => { wvMbP(w, "cv"); wvTyLeaf(w, e->kind.payload.Const.base, depth + 1); },
+        TypeKind::Comptime => { wvMbP(w, "ct"); wvTyLeaf(w, e->kind.payload.Comptime.base, depth + 1); },
+        TypeKind::Slice => { wvMbP(w, "s"); wvTyLeaf(w, e->kind.payload.Slice.base, depth + 1); },
+        TypeKind::Array => {
+            wvMbP(w, "a");
+            wvMbHex(w, (u64)e->kind.payload.Array.len);
+            wvMbCh(w, 95);
+            wvTyLeaf(w, e->kind.payload.Array.base, depth + 1);
+        },
+        TypeKind::FnPtr => {
+            wvMbP(w, "fp");
+            wvTyLeaf(w, e->kind.payload.FnPtr.returnType, depth + 1);
+            u32 i = 0;
+            while (i < e->kind.payload.FnPtr.paramsLen)
+            {
+                wvMbCh(w, 95);
+                wvTyLeaf(w, e->kind.payload.FnPtr.params[i], depth + 1);
+                i++;
+            }
+        },
+        TypeKind::Tuple => {
+            wvMbP(w, "tp");
+            u32 i = 0;
+            while (i < e->kind.payload.Tuple.elemsLen)
+            {
+                wvMbCh(w, 95);
+                wvTyLeaf(w, e->kind.payload.Tuple.elems[i], depth + 1);
+                i++;
+            }
+        },
+        TypeKind::Named => {
+            wvMbP(w, wvStr(w, e->kind.payload.Named.name));
+            u32 i = 0;
+            while (i < e->kind.payload.Named.genericArgsLen)
+            {
+                wvMbCh(w, 95);
+                wvTyLeaf(w, e->kind.payload.Named.genericArgs[i], depth + 1);
+                i++;
+            }
+        },
+        TypeKind::TypeParam => { wvMbP(w, "T"); wvMbHex(w, (u64)e->kind.payload.TypeParam.index); },
+        TypeKind::ValueInt => { wvMbP(w, "v"); wvMbHex(w, e->kind.payload.ValueInt.value); },
+        else => { wvMbP(w, "x"); },
+    }
+}
+
+/* the mono type-instance symbol base for `name<args...>`: the bare
+ * decl name, then `_` per argument spelled through wvTyLeaf — the same
+ * `name_arg…` shape the C backend's cgInstanceName composes (and the
+ * same leaf spelling function-instance symbols use). */
+pub Str wvTypeInstanceName(Wv* w, Str name, Ty* args, u32 argsLen)
+{
+    if (argsLen == 0 || args == null) return name;
+    wvMbReset(w);
+    wvMbP(w, wvStr(w, name));
+    u32 i = 0;
+    while (i < argsLen)
+    {
+        wvMbCh(w, 95);
+        wvTyLeaf(w, args[i], 0);
+        i++;
+    }
+    return w->ctx->intern(wvMbStr(w));
 }

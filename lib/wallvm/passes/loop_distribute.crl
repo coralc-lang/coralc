@@ -175,9 +175,63 @@ pub struct LoopDistributePass
         // Need at least 2 partitions to distribute
         if (nPartitions < 2) return false;
 
+        // The chain has exactly one place to end: the header's single
+        // in-loop successor. Two in-loop arms would need the condition
+        // re-tested after the chain, and an out-of-loop-only header leaves
+        // the body unreachable — both shapes bail (B1b/B1e).
+        IrInst* hTerm = header->terminator();
+        IrBlock* inTgt = null;
+        u32 nIn = 0;
+        if (hTerm != null && hTerm->opcode == IrOpcode::Br && hTerm->nops >= 1)
+        {
+            IrBlock* t = (IrBlock*)hTerm->ops[0];
+            for (u32 bi = 0; bi < lp->nblocks; bi++)
+                if (lp->blocks[bi] == t) { inTgt = t; nIn = 1; break; }
+        }
+        else if (hTerm != null && hTerm->opcode == IrOpcode::CondBr && hTerm->nops >= 3)
+        {
+            for (u32 j = 1; j <= 2; j++)
+            {
+                IrBlock* t = (IrBlock*)hTerm->ops[j];
+                bool inLoop = false;
+                for (u32 bi = 0; bi < lp->nblocks && !inLoop; bi++)
+                    if (lp->blocks[bi] == t) inLoop = true;
+                if (inLoop) { if (inTgt == null) inTgt = t; nIn++; }
+            }
+        }
+        if (nIn != 1) return false;
+
+        // Safety: a partition's stores must not alias memory touched
+        // anywhere else in the header. Those accesses keep their position
+        // relative to the stores only when the objects are provably
+        // distinct (B1d — partitionLoopBody ignores aliasing entirely).
+        for (u32 pi = 0; pi < nPartitions; pi++)
+        {
+            for (u32 si = 0; si < partitions[pi].ninsts; si++)
+            {
+                IrInst* st = partitions[pi].insts[si];
+                if (st->opcode != IrOpcode::Store) continue;
+                IrValue* sAddr = st->nops > 1 ? st->ops[1] : null;
+                for (u32 hi = 0; hi < header->ninsts; hi++)
+                {
+                    IrInst* m = header->insts[hi];
+                    if (m->opcode != IrOpcode::Load && m->opcode != IrOpcode::Store) continue;
+                    bool inPi = false;
+                    for (u32 jj = 0; jj < partitions[pi].ninsts && !inPi; jj++)
+                        if (partitions[pi].insts[jj] == m) inPi = true;
+                    if (inPi) continue;
+                    IrValue* mAddr = m->opcode == IrOpcode::Load
+                        ? m->ops[0]
+                        : (m->nops > 1 ? m->ops[1] : null);
+                    if (!aa->isNoAlias(sAddr, mAddr)) return false;
+                }
+            }
+        }
+
         // Create new loop bodies for each partition
-        IrBlock* lastBlock = null;
         IrBlock*[MAX_PARTITIONS] newBlocks;
+        for (u32 pi = 0; pi < nPartitions; pi++)
+            newBlocks[pi] = self.createNamedBlock(func);
 
         // Each partition must be self-contained, every header instruction
         // its clones reference is either partitioned (cloned once and
@@ -255,9 +309,7 @@ pub struct LoopDistributePass
 
         for (u32 pi = 0; pi < nPartitions; pi++)
         {
-            // Create a new block for this partition
-            IrBlock* newBlock = self.createNamedBlock(func);
-            newBlocks[pi] = newBlock;
+            IrBlock* newBlock = newBlocks[pi];
 
             // Copy this partition's instructions with their needed
             // non-partitioned dependencies, in topological order
@@ -280,26 +332,16 @@ pub struct LoopDistributePass
                 newBlock->addInst(clone);
             }
 
-            // Add a branch to the next block or back to the header
+            // Chain link: the next partition, or — for the last one —
+            // where the header's arm used to go (the old header->inTgt
+            // edge is removed during retargeting below)
+            IrBlock* btarget = (pi + 1 < nPartitions) ? newBlocks[pi + 1] : inTgt;
             IrInst* br = self.ctx->createInst(IrOpcode::Br, self.ctx->tyVoid(), null, 1, 0, 0);
-            br->ops[0] = &header->base;
-            header->base.addUser(br);
+            br->ops[0] = &btarget->base;
+            btarget->base.addUser(br);
             br->parent = newBlock;
             newBlock->addInst(br);
-
-            if (lastBlock != null)
-            {
-                // Update the last block's terminator to point to this new block
-                IrInst* lastTerm = lastBlock->insts[lastBlock->ninsts - 1];
-                if (lastTerm->opcode == IrOpcode::Br)
-                {
-                    lastTerm->ops[0]->removeUser(lastTerm);
-                    lastTerm->ops[0] = &newBlock->base;
-                    newBlock->base.addUser(lastTerm);
-                }
-            }
-
-            lastBlock = newBlock;
+            newBlock->addSucc(btarget);
         }
 
         // Remap clone operands so they point at the clones, not the originals
@@ -357,112 +399,71 @@ pub struct LoopDistributePass
             }
         }
 
-        // Remove original instructions from header (they've been copied to partitions)
+        // Remove original instructions from header (they've been copied to
+        // partitions). Anything still referenced — the terminator's ICmp
+        // condition, values the body reads — has to stay, or the header
+        // dangles (B1a: the old guard only protected the terminator).
+        // Iterating backwards removes users before their producers.
         for (u32 ii = header->ninsts; ii > 0; ii--)
         {
             IrInst* inst = header->insts[ii - 1];
-            // Only remove non-PHI, non-terminator instructions
-            if (inst->opcode != IrOpcode::Phi && ii - 1 < header->ninsts - 1)
+            if (inst != hTerm && inst->opcode != IrOpcode::Phi &&
+                inst->base.nusers == 0)
             {
                 inst->erase();
             }
         }
 
-        // Retarget the edges that referenced the now-empty header to enter
-        // the partition chain at newBlocks[0]. The in-loop arm of the
-        // header terminator goes first, then every entry edge from a
-        // predecessor outside the loop
-        IrInst* hTerm = header->insts[header->ninsts - 1];
+        // The header's single in-loop arm now enters the partition chain.
+        // Entry edges and the latch backedge are left alone, so the header
+        // keeps its phi pairs (B1c). succs[] is patched in place because
+        // validate requires succs[k] == cond_br ops[k+1] positionally;
+        // removeSucc/addSucc would shuffle the order (B1e).
+        if (hTerm->opcode == IrOpcode::Br)
         {
-            IrBlock* hOldTgt = null;
-            if (hTerm->opcode == IrOpcode::Br && hTerm->nops >= 1)
-                hOldTgt = (IrBlock*)hTerm->ops[0];
-            else if (hTerm->opcode == IrOpcode::CondBr && hTerm->nops >= 3)
-            {
-                for (u32 j = 1; j <= 2; j++)
-                {
-                    IrBlock* oldTgt = (IrBlock*)hTerm->ops[j];
-                    bool inLoop = false;
-                    for (u32 bi = 0; bi < lp->nblocks; bi++)
-                        if (lp->blocks[bi] == oldTgt) { inLoop = true; break; }
-                    if (inLoop)
-                    {
-                        hTerm->ops[j]->removeUser(hTerm);
-                        oldTgt->removePred(header);
-                        header->removeSucc(oldTgt);
-                        hTerm->ops[j] = &newBlocks[0]->base;
-                        newBlocks[0]->base.addUser(hTerm);
-                    }
-                }
-                if (hTerm->ops[1] == &newBlocks[0]->base ||
-                    hTerm->ops[2] == &newBlocks[0]->base)
-                    header->addSucc(newBlocks[0]);
-            }
-            if (hTerm->opcode == IrOpcode::Br && hOldTgt != null)
-            {
-                hTerm->ops[0]->removeUser(hTerm);
-                hOldTgt->removePred(header);
-                header->removeSucc(hOldTgt);
-                hTerm->ops[0] = &newBlocks[0]->base;
-                newBlocks[0]->base.addUser(hTerm);
-                header->addSucc(newBlocks[0]);
-            }
+            hTerm->ops[0]->removeUser(hTerm);
+            inTgt->removePred(header);
+            hTerm->ops[0] = &newBlocks[0]->base;
+            newBlocks[0]->base.addUser(hTerm);
+            header->succs[0] = newBlocks[0];
+            newBlocks[0]->addPred(header);
         }
-
-        // The entry edge(s) from outside the loop must land on the first
-        // partition block. licm's preheader edge shows the bookkeeping shape
+        else
         {
-            IrValue* headerVal = &header->base;
-            u32 i = 0;
-            while (i < header->npreds)
+            for (u32 j = 1; j <= 2; j++)
             {
-                IrBlock* pred = header->preds[i];
-                bool inLoop = false;
-                for (u32 bi = 0; bi < lp->nblocks; bi++)
-                    if (lp->blocks[bi] == pred) { inLoop = true; break; }
-                if (!inLoop)
+                if ((IrBlock*)hTerm->ops[j] == inTgt)
                 {
-                    IrInst* term = pred->terminator();
-                    if (term != null)
-                    {
-                        if (term->opcode == IrOpcode::Br && term->nops >= 1)
-                        {
-                            if (term->ops[0] == headerVal)
-                            {
-                                headerVal->removeUser(term);
-                                term->ops[0] = &newBlocks[0]->base;
-                                newBlocks[0]->base.addUser(term);
-                            }
-                        }
-                        else if (term->opcode == IrOpcode::CondBr && term->nops >= 3)
-                        {
-                            for (u32 j = 1; j <= 2; j++)
-                            {
-                                if (term->ops[j] == headerVal)
-                                {
-                                    headerVal->removeUser(term);
-                                    term->ops[j] = &newBlocks[0]->base;
-                                    newBlocks[0]->base.addUser(term);
-                                }
-                            }
-                        }
-
-                        pred->removeSucc(header);
-                        header->removePred(pred);
-                        pred->addSucc(newBlocks[0]);
-                    }
-                }
-                else
-                {
-                    i++;
+                    hTerm->ops[j]->removeUser(hTerm);
+                    inTgt->removePred(header);
+                    hTerm->ops[j] = &newBlocks[0]->base;
+                    newBlocks[0]->base.addUser(hTerm);
+                    header->succs[j - 1] = newBlocks[0];
+                    newBlocks[0]->addPred(header);
                 }
             }
         }
 
-        // Keep CFG predecessor/successor lists in sync with the new chain
-        for (u32 pi = 0; pi + 1 < nPartitions; pi++)
-            newBlocks[pi]->addSucc(newBlocks[pi + 1]);
-        newBlocks[nPartitions - 1]->addSucc(header);
+        // The chain ends where the header used to go: rewrite the old
+        // target's phi pairs from (v, header) to (v, last partition),
+        // since the edge now comes from there.
+        {
+            IrBlock* last = newBlocks[nPartitions - 1];
+            for (u32 k = 0; k < inTgt->ninsts; k++)
+            {
+                IrInst* phi = inTgt->insts[k];
+                if (phi->opcode != IrOpcode::Phi) break;
+                for (u32 pk = 1; pk < phi->nops; pk += 2)
+                {
+                    if (phi->ops[pk] == &header->base)
+                    {
+                        phi->ops[pk] = &last->base;
+                        header->base.removeUser(phi);
+                        last->base.addUser(phi);
+                    }
+                }
+            }
+        }
 
         // Free partition allocations
         for (u32 pi = 0; pi < nPartitions; pi++)

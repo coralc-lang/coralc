@@ -4,7 +4,7 @@ Consolidated from five parallel audits (branch/CFG, loop, SSA/canonical,
 memory/analysis, transform/vectorizer) plus empirical repros (crafted .ir,
 `WALLVM_PRINT_AFTER_PASS`, gdb, valgrind, ASAN). Every entry starts **OPEN**
 and must be *verified against the actual code* before being fixed — an entry
-is only marked FIXED after rebuild + `test/wallvm/run.sh` (target 84/84) is
+is only marked FIXED after rebuild + `test/wallvm/run.sh` (target 88/88) is
 green, or INVALID with a reason.
 
 Status legend: `OPEN` → `VERIFIED` (issue confirmed real) → `FIXED` /
@@ -22,6 +22,7 @@ Status legend: `OPEN` → `VERIFIED` (issue confirmed real) → `FIXED` /
 | P0-6 | SCCP `getCell` returned meet-neutral `Bottom` for Arg/Global/aggregates → param-derived phi contributions silently dropped (`phi [0,entry],[x,backedge]` folded to 0) | sccp.crl (only Inst reads `cells[]`) |
 | P0-7 | lsra liveness walks skipped `IrValueKind::Arg` uses → param interval `[0,0] uses=0`, never `spansCall`, assigned caller-saved reg → clobbered across calls (O0/O1 miscompile) | lsra.crl (3 walks allow Inst‖Arg; coalescing sites untouched) |
 | P0-8 | `getRegName` rejected non-Inst → Args mapped to "" → `funcUsesReg("rbx")` missed param's callee-saved home → rbx never pushed, recursive calls clobber caller rbx | x86_64_base.crl (Inst‖Arg) |
+| P0-9 | `valueIsSpill` rejected non-Inst → spilled **Arg** (lsra sets the spill bit on Arg valData) took the direct staging-commit path → `movq mem, mem` in the prologue → assembler error whenever an Arg spills | x86_64_base.crl (`valueIsSpill` Inst‖Arg) |
 
 ---
 
@@ -56,9 +57,9 @@ Status legend: `OPEN` → `VERIFIED` (issue confirmed real) → `FIXED` /
 | B1c | Critical | loop_distribute.crl:414-460 | Header phis never rewritten for rewired entry edges (old pred pair stays, `newBlocks[n-1]` pred has no pair) → validate failure + wrong values. | OPEN |
 | B1d | High | loop_distribute.crl:480,486-536 | `aa` parameter accepted, never read; partitioning = "one partition per store", no dependence check — aliasing stores sequentially reordered across a load (violates the file's own safety claim). | OPEN |
 | B1e | High | loop_distribute.crl:382-399,437-452 | Both-arms-in-loop (or both-to-header) CondBr retargeted but `addSucc` once ⇒ nsuccs=1 behind a 2-target CondBr. | OPEN |
-| B2a | Critical | loop_interchange.crl:301-324 | "Interchange" swaps the two increments' phi operands with **no CFG change** — inner backedge becomes `outer_iv+step` → infinite/zero-trip inner loop. Flat miscompile of every immediately-nested counted loop at O3 (runs unconditionally, wallvm.crl:311). | OPEN |
-| B2b | Medium | loop_interchange.crl:277-299 | Initial-value swap dead: keyed on `IrLoop.preheader`, which detector inits null and this pass never creates. | OPEN |
-| B2c | Low | loop_interchange.crl:326-329 | "Header swap" mutates only analysis structs (freed at :108) — no IR effect. | OPEN |
+| B2a | Critical | loop_interchange.crl:301-324 | "Interchange" swaps the two increments' phi operands with **no CFG change** — inner backedge becomes `outer_iv+step` → infinite/zero-trip inner loop. **Empirically confirmed**: instrumentation showed `canInterchange=true` ×8 + `interchange DONE` ×2 on `cases/loop_swap.ir` (first CondBr-block ICmp is a param compare → ivdep check passes), producing validate errors + non-assembling output. | FIXED (`interchangeLoops` bails before any mutation; `cases/loop_swap.ir` expect 36) |
+| B2b | Medium | loop_interchange.crl:277-299 | Initial-value swap dead: keyed on `IrLoop.preheader`, which detector inits null and this pass never creates. | INVALID — dead code (preheader always null); unreachable now that B2a disables the pass |
+| B2c | Low | loop_interchange.crl:326-329 | "Header swap" mutates only analysis structs (freed at :108) — no IR effect. | INVALID — no IR effect by definition; unreachable now |
 | B2d | Medium | loop_interchange.crl:113-122,181-194,215-234 | Naive legality: `findLoopCompare` = first compare in loop (not the exit test); dependence check only direct; `isLoopContained` header-only ⇒ multi-latch loops misread as nested. | OPEN |
 | B3a | High | licm.crl:188-226,363 | Speculatively hoists potentially-trapping `SDiv/UDiv/SRem/URem` into preheader → executes on zero-trip loops; div-by-zero trap newly reachable. | OPEN |
 | B3b | Medium | licm.crl:195,239-254,352-362,383-404 | Load hoisting is dead code (`isLoopInvariant` returns false for Load) — the entire alias-guard machinery below is unreachable. | OPEN |
@@ -146,7 +147,7 @@ Status legend: `OPEN` → `VERIFIED` (issue confirmed real) → `FIXED` /
 
 ## Fix order (severity-first, verify-before-fix)
 
-1. ~~E1 (compiler hang)~~ ✓ — done, plus E7/E8/E9 and P0-6/7/8. Next: B2a (unconditional O3 miscompile), B1a-e (UAF/infinite loop)
+1. ~~E1 (compiler hang)~~ ✓ · ~~B2a (unconditional O3 miscompile)~~ ✓ — done, plus E7/E8/E9 and P0-6/7/8/9. Next: B1a-e (UAF/infinite loop)
 2. D2 (O1+ miscompile), D3 (unsound AA), D1 (unsound forwarding)
 3. C1-C4 (critical folds), C5 (OOB), A1-A3 (miscompiles)
 4. E2, E3, E4, C6-C8, A5-A6 (validate/CFG litter)

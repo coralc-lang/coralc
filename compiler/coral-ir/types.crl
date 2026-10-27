@@ -16,13 +16,15 @@
  * are honoured here via createStructType — packed = 1-byte field
  * alignment, reorder = sort fields by descending alignment. */
 
-import lower { Wv, wvArr, wvTyMapFind, wvTyMapSet, wvTdMapGet, wvTdMapPut };
+import lower { Wv, wvArr, wvTyMapFind, wvTyMapSet, wvTdMapGet, wvTdMapPut, wvSubstTy,
+               wvTypeInstanceName };
 import ast::id { Str, NodeId, locFile };
 import ast::types { Ty, TypeEntry, TypeKind };
 import ast::node { Node, NodeKind };
 import ast::decl { File, Decl, DeclKind, Field };
 import context::context { AstContext, InternEntry };
 import common::slice { Slice };
+import mono::mono { MonoInstance, MonoInstanceKind, MonoSubstitution };
 import(lib) wallvm::irtypes { IrContext, IrType, IrTypeKind, IrStructType };
 
 pub str wvStr(AstContext* ctx, Str s)
@@ -202,6 +204,17 @@ IrType* wvTyBuild(Wv* w, Ty t, u32 depth)
             return st->irType;
         },
         TypeKind::Named => {
+            /* a generic instance (`Vec<str>`) resolves through the mono
+             * table first: the decl itself is a parametrised template
+             * whose fields only make sense under its substitutions */
+            if (e->kind.payload.Named.genericArgsLen != 0)
+            {
+                IrType* ity = wvTypeInstanceTy(w, e->kind.payload.Named.name,
+                                               e->kind.payload.Named.genericArgs,
+                                               e->kind.payload.Named.genericArgsLen,
+                                               depth);
+                if (ity != null) return ity;
+            }
             NodeId td = wvFindTypeDecl(w, e->kind.payload.Named.name);
             if (td.index == 0) return ir->tyInt(64); // unresolved named → opaque 64-bit
             Node* dn = ctx->nodes + td.index;
@@ -270,6 +283,27 @@ pub bool wvTyHasParam(Wv* w, Ty t, u32 depth)
         TypeKind::Pointer => { return wvTyHasParam(w, e->kind.payload.Pointer.base, depth + 1); },
         TypeKind::Const => { return wvTyHasParam(w, e->kind.payload.Const.base, depth + 1); },
         TypeKind::Comptime => { return wvTyHasParam(w, e->kind.payload.Comptime.base, depth + 1); },
+        TypeKind::Slice => { return wvTyHasParam(w, e->kind.payload.Slice.base, depth + 1); },
+        TypeKind::Array => { return wvTyHasParam(w, e->kind.payload.Array.base, depth + 1); },
+        TypeKind::FnPtr => {
+            if (wvTyHasParam(w, e->kind.payload.FnPtr.returnType, depth + 1)) return true;
+            u32 i = 0;
+            while (i < e->kind.payload.FnPtr.paramsLen)
+            {
+                if (wvTyHasParam(w, e->kind.payload.FnPtr.params[i], depth + 1)) return true;
+                i++;
+            }
+            return false;
+        },
+        TypeKind::Tuple => {
+            u32 i = 0;
+            while (i < e->kind.payload.Tuple.elemsLen)
+            {
+                if (wvTyHasParam(w, e->kind.payload.Tuple.elems[i], depth + 1)) return true;
+                i++;
+            }
+            return false;
+        },
         TypeKind::Named => {
             u32 i = 0;
             while (i < e->kind.payload.Named.genericArgsLen)
@@ -283,6 +317,43 @@ pub bool wvTyHasParam(Wv* w, Ty t, u32 depth)
     }
 }
 
+/* the IrType for a concrete type instance (`Vec<str>`), built lazily
+ * with that instance's substitutions active so field types resolve to
+ * the concrete argument; memoised in w.instTys. Null when no mono
+ * TypeInstance matches (or depth overflows a value cycle guard). */
+pub IrType* wvTypeInstanceTy(Wv* w, Str name, Ty* args, u32 argsLen, u32 depth)
+{
+    if (w->mono == null || w->instTys == null || depth > 32) return null;
+    Str want = wvTypeInstanceName(w, name, args, argsLen);
+    u32 j = 0;
+    while (j < w->mono.instancesLen)
+    {
+        MonoInstance* inst = w->mono.instances + j;
+        if (inst->kind == MonoInstanceKind::TypeInstance && inst->name == name &&
+            inst->argumentsLen == argsLen)
+        {
+            if (wvTypeInstanceName(w, inst->name, inst->arguments,
+                                   inst->argumentsLen) != want)
+                { j++; continue; }
+            if (j >= w->instTysLen) return null;
+            if (w->instTys[j] != null) return w->instTys[j];
+            Node* tn = w->ctx->nodes + inst->declaration.index;
+            if (tn->kind.tag != NodeKind::Decl) return null;
+            MonoSubstitution* os = w->subs;
+            u32 osl = w->subsLen;
+            w->subs = inst->substitutions;
+            w->subsLen = inst->substitutionsLen;
+            IrType* ity = wvDeclTy(w, &tn->kind.payload.Decl.value, depth + 1);
+            w->subs = os;
+            w->subsLen = osl;
+            w->instTys[j] = ity;
+            return ity;
+        }
+        j++;
+    }
+    return null;
+}
+
 /* memoized Ty→IrType. A Ty still being derived is a cycle: break it at
  * the edge with a pointer-width placeholder (only reachable behind an
  * indirection — a by-value cycle has no finite layout and is rejected
@@ -292,6 +363,18 @@ pub IrType* wvTy(Wv* w, Ty t, u32 depth)
 {
     IrContext* ir = w->ir;
     if (t == 0) return ir->tyInt(32);
+    /* inside a monomorphised instance one Ty may denote a different
+     * concrete type per instance: substitute the top level here (each
+     * nested level substitutes on its own way down), and keep any type
+     * that still nests a param OUT of the shared memo — the memo key is
+     * the raw Ty, whose meaning depends on the active substitutions */
+    t = wvSubstTy(w, t);
+    if (w->subsLen > 0 && wvTyHasParam(w, t, 0))
+    {
+        if (depth > 32) return ir->tyInt(32);
+        IrType* pr = wvTyBuild(w, t, depth);
+        return pr != null ? pr : ir->tyInt(32);
+    }
     u8 busy = 0;
     IrType* hit = null;
     if (wvTyMapFind(w, t, &busy, &hit))
