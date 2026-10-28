@@ -4,7 +4,7 @@ Consolidated from five parallel audits (branch/CFG, loop, SSA/canonical,
 memory/analysis, transform/vectorizer) plus empirical repros (crafted .ir,
 `WALLVM_PRINT_AFTER_PASS`, gdb, valgrind, ASAN). Every entry starts **OPEN**
 and must be *verified against the actual code* before being fixed — an entry
-is only marked FIXED after rebuild + `test/wallvm/run.sh` (target 88/88) is
+is only marked FIXED after rebuild + `test/wallvm/run.sh` (target 100/100) is
 green, or INVALID with a reason.
 
 Status legend: `OPEN` → `VERIFIED` (issue confirmed real) → `FIXED` /
@@ -23,6 +23,14 @@ Status legend: `OPEN` → `VERIFIED` (issue confirmed real) → `FIXED` /
 | P0-7 | lsra liveness walks skipped `IrValueKind::Arg` uses → param interval `[0,0] uses=0`, never `spansCall`, assigned caller-saved reg → clobbered across calls (O0/O1 miscompile) | lsra.crl (3 walks allow Inst‖Arg; coalescing sites untouched) |
 | P0-8 | `getRegName` rejected non-Inst → Args mapped to "" → `funcUsesReg("rbx")` missed param's callee-saved home → rbx never pushed, recursive calls clobber caller rbx | x86_64_base.crl (Inst‖Arg) |
 | P0-9 | `valueIsSpill` rejected non-Inst → spilled **Arg** (lsra sets the spill bit on Arg valData) took the direct staging-commit path → `movq mem, mem` in the prologue → assembler error whenever an Arg spills | x86_64_base.crl (`valueIsSpill` Inst‖Arg) |
+| P0-10 | irParser table grow copied `valueNames` but never `values` (same for `blockNames`/`blocks`) → any function with >32 values or >16 blocks lost every pointer slot on realloc → `undefined value` / `unknown label` at the first use past the old capacity; nothing in the suite was large enough until `cases/dist_swap.ir` | irParser.crl `addValue`/`addBlockName` (copy both arrays) |
+| P0-11 | loop_distribute clone loop called `addUser` only for `IrValueKind::Inst` operands → const operands never listed the clone → 16× use-def validate errors after distribution | loop_distribute.crl (addUser every non-null op) |
+| P0-12 | stack_layout swapped `entry->insts` for an exact-`newCap` array but left `capInsts` at the old (larger) value → lower_phis' grow check passed and wrote off the end (heap-buffer-overflow, ASAN) | stack_layout.crl (`capInsts = newCap`) |
+| P0-13 | tco teardown called `freeInst` (unhook+free per inst) in program order → consumers freed after producers `removeUser`'d already-freed operands (valgrind UAF on `tco_cbe`) | tco.crl (`unhookInst` phase over all doomed insts, then `destroyInst`) |
+| P0-14 | lsra `allocate` freed `linearInsts`/`instVreg`/… at its tail, but `irGraphRegAlloc` calls `lsra.rewrite` a second time after recoloring → `parkUnallocatedResults` read freed arrays (ASAN); the `numVregs==0` early return leaked the same arrays | lsra.crl (scratch-array frees moved to `destroy()`) |
+| P0-15 | sccp: (a) cond folds `createInst(Br)` whose id exceeds the entry scan's `maxId` → phase 1/2 `cells[]` read one past the heap; fixed with bounds guards (out-of-range ⇒ Top ⇒ skip/keep). (b) unreachable-block wipe unhooked+freed per inst → cross-block and producer-before-consumer references chased freed values; fixed with a full unhook pre-pass before any free (trigger: `tco_acc` O2) | sccp.crl (bounds guards + two-phase wipe) |
+| P0-16 | mem2reg promoted allocas with mixed-width accesses: a narrow store REPLACED the wider slot's SSA value (i32 const handed to i64 users; constfold then legitimately folded `lshr i64` with the i32 bit width) → wrong results at O2/O3 (repro `cases/dse_wide.ir`: 0/5 instead of 170 before the fix) | mem2reg.crl (promotability: every load/store type must equal the slot's element type) |
+| P0-17 | mem2reg's promotability check blanket-allowed `Phi` users ("placed by us") though `placePhis` runs *after* the check → an input-level address-escaping `phi %p` was promoted and the alloca freed under the phi (use-def errors, wrong exits). Same repro exposed `AliasAnalysis_walkAddr` with no cycle guard: phi self/mutual cycles recursed forever → stack overflow, irtool SEGV (O1/O2/O3, from dse→analyze→walkAddr) | mem2reg.crl (any phi user ⇒ not promotable) + alias_analysis.crl (`OBJECT_INPROGRESS` marker, self-edge skip, marker always cleared) |
 
 ---
 
@@ -52,11 +60,13 @@ Status legend: `OPEN` → `VERIFIED` (issue confirmed real) → `FIXED` /
 
 | ID | Sev | Location | Issue | Status |
 |----|-----|----------|-------|--------|
-| B1a | Critical | loop_distribute.crl:361-369 | Header-erase loop erases non-phi non-terminator insts *including the ICmp feeding the header CondBr* (never seeded into partitions) — `erase` doesn't repair users ⇒ terminator operand dangles (UAF for validate/next pass). | OPEN |
-| B1b | Critical | loop_distribute.crl:390-399,463-465 | Latch orphaned: header's in-loop arm retargeted to `newBlocks[0]`, partitions loop back to header; original latch never reached ⇒ induction phi never advances → infinite loop. | OPEN |
-| B1c | Critical | loop_distribute.crl:414-460 | Header phis never rewritten for rewired entry edges (old pred pair stays, `newBlocks[n-1]` pred has no pair) → validate failure + wrong values. | OPEN |
-| B1d | High | loop_distribute.crl:480,486-536 | `aa` parameter accepted, never read; partitioning = "one partition per store", no dependence check — aliasing stores sequentially reordered across a load (violates the file's own safety claim). | OPEN |
-| B1e | High | loop_distribute.crl:382-399,437-452 | Both-arms-in-loop (or both-to-header) CondBr retargeted but `addSucc` once ⇒ nsuccs=1 behind a 2-target CondBr. | OPEN |
+| B1a | Critical | loop_distribute.crl:361-369 | Header-erase loop erases non-phi non-terminator insts *including the ICmp feeding the header CondBr* (never seeded into partitions) — `erase` doesn't repair users ⇒ terminator operand dangles (UAF for validate/next pass). | FIXED (erase keeps terminator, phis, and any inst with `nusers != 0`) |
+| B1b | Critical | loop_distribute.crl:390-399,463-465 | Latch orphaned: header's in-loop arm retargeted to `newBlocks[0]`, partitions loop back to header; original latch never reached ⇒ induction phi never advances → infinite loop. | FIXED (partitions chain to the header's old in-loop target; that block's phi pairs rewritten from `(v, header)` to `(v, last partition)`) |
+| B1c | Critical | loop_distribute.crl:414-460 | Header phis never rewritten for rewired entry edges (old pred pair stays, `newBlocks[n-1]` pred has no pair) → validate failure + wrong values. | FIXED (entry edges and latch left untouched — only the single in-loop arm retargeted, so phi pairs stay valid) |
+| B1d | High | loop_distribute.crl:480,486-536 | `aa` parameter accepted, never read; partitioning = "one partition per store", no dependence check — aliasing stores sequentially reordered across a load (violates the file's own safety claim). | FIXED (gate: header must have exactly one in-loop successor, and every partition's stores must be `isNoAlias` against all loads/stores elsewhere in the header, else the pass aborts) |
+| B1e | High | loop_distribute.crl:382-399,437-452 | Both-arms-in-loop (or both-to-header) CondBr retargeted but `addSucc` once ⇒ nsuccs=1 behind a 2-target CondBr. | FIXED (`succs[k]` patched in place with matching `removePred`/`addPred` — validate requires positional succs, so `addSucc`/`removeSucc` would shuffle the order) |
+
+B1 verification: repro `cases/dist_swap.ir` (expect 54) — loop1 rejected by the alias gate and runs normally, loop2 distributes (`loopdist` labels present at O3), exit 54 at all 4 levels, 0 validate errors, gcc assembles; ASAN + valgrind clean. The hunt also surfaced P0-10 (parser table grow) and P0-11 (clone `addUser`).
 | B2a | Critical | loop_interchange.crl:301-324 | "Interchange" swaps the two increments' phi operands with **no CFG change** — inner backedge becomes `outer_iv+step` → infinite/zero-trip inner loop. **Empirically confirmed**: instrumentation showed `canInterchange=true` ×8 + `interchange DONE` ×2 on `cases/loop_swap.ir` (first CondBr-block ICmp is a param compare → ivdep check passes), producing validate errors + non-assembling output. | FIXED (`interchangeLoops` bails before any mutation; `cases/loop_swap.ir` expect 36) |
 | B2b | Medium | loop_interchange.crl:277-299 | Initial-value swap dead: keyed on `IrLoop.preheader`, which detector inits null and this pass never creates. | INVALID — dead code (preheader always null); unreachable now that B2a disables the pass |
 | B2c | Low | loop_interchange.crl:326-329 | "Header swap" mutates only analysis structs (freed at :108) — no IR effect. | INVALID — no IR effect by definition; unreachable now |
@@ -107,7 +117,7 @@ Status legend: `OPEN` → `VERIFIED` (issue confirmed real) → `FIXED` /
 | ID | Sev | Location | Issue | Status |
 |----|-----|----------|-------|--------|
 | D1 | Critical | memory_ssa.crl:258-319; machine_opt.crl:105-121,188-212,245-267 | MemorySSA versions chained by *block array order* not CFG edges; machine_opt Pass 1 forwards with **no dominance check** (`isStoreKilledBy` scans only killer's block) → forwards a value not on the load's path (loop + single-pred shape). Pass 3 scans only *dominating* blocks, misses non-dominating side-path stores (and ignores `AtomicStore`). | OPEN |
-| D2 | Critical | dse.crl:101-127 | Kills a wider store with a narrower one: `store i64` erased by later `store i32` at same address — no `type->width` comparison anywhere (machine_opt's `isStoreDead` does compare). O1+. | OPEN |
+| D2 | Critical | dse.crl:101-127 | Kills a wider store with a narrower one: `store i64` erased by later `store i32` at same address — no `type->width` comparison anywhere (machine_opt's `isStoreDead` does compare). O1+. | FIXED — both passes compared `store->base.type->width`, but store base.type is **void** (width 0), so machine_opt's check was vacuous `0 == 0` and dse had none: now both compare the *value* operand's width and only kill when a same-address store of >= width covers the earlier one (unknown width never kills). Chasing the repro surfaced P0-16 (mem2reg mixed-width promotion) and P0-17 (address phi + walkAddr stack overflow). `cases/dse_wide.ir`: 170 at all levels. |
 | D3 | Critical | alias_analysis.crl:436-452 vs 292,302 | Multi-object phi caches the *first* incoming object → `phi(gepA,gepB)` permanently "A"; loads through real B answer NoAlias → gvn keeps stale load across store (miscompile). `walkAddr`'s own phi rule returns UNKNOWN on disagreement — cache poisons it. | OPEN |
 | D4 | High | gvn.crl:266-268; machine_opt.crl:53-55; memory_ssa.crl:373-375; licm.crl:318-320; loop_distribute.crl:79-81; alias_analysis.crl:144-149,208-213 | Cache-hit shallow copy (`aa=*aaPtr`) shares 6 buffers; `walkAddr` on a query can *realloc* those buffers (atomic addresses never analyzed → query-time `createObject`) → cache entry poisoned → `destroyCachedAliasAnalysis` double-frees. Invariant "query never allocates" unenforced. | OPEN |
 | D5 | High (dormant) | ipa_cp.crl:204-223,249-274,282-292 | Unwired. If wired: null-deref (`firstConst->id` when first site non-const) + unsound specialization (every entry-block alloca matched to every constant arg, loads RAUW'd module-wide, never erased; cloning steps unimplemented). | OPEN |
@@ -147,7 +157,7 @@ Status legend: `OPEN` → `VERIFIED` (issue confirmed real) → `FIXED` /
 
 ## Fix order (severity-first, verify-before-fix)
 
-1. ~~E1 (compiler hang)~~ ✓ · ~~B2a (unconditional O3 miscompile)~~ ✓ — done, plus E7/E8/E9 and P0-6/7/8/9. Next: B1a-e (UAF/infinite loop)
+1. ~~E1 (compiler hang)~~ ✓ · ~~B2a (unconditional O3 miscompile)~~ ✓ · ~~E14 (peephole br-cycle hang)~~ ✓ — done, plus E7/E8/E9, B1a-e, P0-6…P0-15, and ~~D2~~ ✓ (P0-16/P0-17 found while fixing D2). Next: D3/D1
 2. D2 (O1+ miscompile), D3 (unsound AA), D1 (unsound forwarding)
 3. C1-C4 (critical folds), C5 (OOB), A1-A3 (miscompiles)
 4. E2, E3, E4, C6-C8, A5-A6 (validate/CFG litter)
