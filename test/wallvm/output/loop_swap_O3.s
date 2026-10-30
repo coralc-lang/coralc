@@ -25,18 +25,18 @@ nest:
 	leaq -240(%rbp), %r12
 	leaq -256(%rbp), %r13
 	movl $0x0000000000000000, %r10d
-	movq -120(%rbp), %r11
-	movq %r10, (%r11)
+	movq -120(%rbp), %rdx
+	movq %r10, (%rdx)
 	movl $0x0000000000000000, %r10d
-	movq -136(%rbp), %r11
-	movq %r10, (%r11)
+	movq -136(%rbp), %rdx
+	movq %r10, (%rdx)
 	movl $0x0000000000000000, %r10d
 	movq %r10, (%r9)
 .Lnest_outer_4:
-	movq -120(%rbp), %r11
-	movq (%r11), %r14
-	movq -136(%rbp), %r11
-	movq (%r11), %r10
+	movq -120(%rbp), %rdx
+	movq (%rdx), %r14
+	movq -136(%rbp), %rdx
+	movq (%rdx), %r10
 	movq %r10, -88(%rbp)
 	movq (%r9), %r10
 	movq %r10, -72(%rbp)
@@ -81,10 +81,10 @@ nest:
 	setl %r11b
 	movzbq %r11b, %rsi
 	movq -104(%rbp), %r10
-	movq -120(%rbp), %r11
-	movq %r10, (%r11)
-	movq -136(%rbp), %r11
-	movq %r15, (%r11)
+	movq -120(%rbp), %rdx
+	movq %r10, (%rdx)
+	movq -136(%rbp), %rdx
+	movq %r15, (%rdx)
 	movq %rdi, (%r9)
 	movq %r8, (%rbx)
 	movq -152(%rbp), %r10

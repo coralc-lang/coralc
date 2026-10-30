@@ -55,11 +55,11 @@ main:
 	jmp .Lmain_loop1_3
 .Lmain_loop2_pre_5:
 	movl $0x0000000000000000, %r10d
-	movq -88(%rbp), %r11
-	movq %r10, (%r11)
+	movq -88(%rbp), %rdx
+	movq %r10, (%rdx)
 .Lmain_loop2_6:
-	movq -88(%rbp), %r11
-	movq (%r11), %r8
+	movq -88(%rbp), %rdx
+	movq (%rdx), %r8
 	movl $0x0000000000000002, %r11d
 	cmpq %r11, %r8
 	setl %r11b

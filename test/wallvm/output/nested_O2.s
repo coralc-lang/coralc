@@ -18,13 +18,13 @@ main:
 	leaq -128(%rbp), %r9
 	leaq -144(%rbp), %rbx
 	movl $0x0000000000000000, %r10d
-	movq -56(%rbp), %r11
-	movq %r10, (%r11)
+	movq -56(%rbp), %rdx
+	movq %r10, (%rdx)
 	movl $0x0000000000000000, %r10d
 	movq %r10, (%rdi)
 .Lmain_outer_3:
-	movq -56(%rbp), %r11
-	movq (%r11), %r12
+	movq -56(%rbp), %rdx
+	movq (%rdx), %r12
 	movq (%rdi), %r13
 	movl $0x0000000000000004, %r11d
 	cmpq %r11, %r12
@@ -57,8 +57,8 @@ main:
 	jmp .Lmain_inner_5
 .Lmain_inner_done_7:
 	incq %r12
-	movq -56(%rbp), %r11
-	movq %r12, (%r11)
+	movq -56(%rbp), %rdx
+	movq %r12, (%rdx)
 	movq %r14, (%rdi)
 	jmp .Lmain_outer_3
 .Lmain_done_8:

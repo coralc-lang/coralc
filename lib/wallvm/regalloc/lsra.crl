@@ -4,11 +4,15 @@ import(lib) wallvm::irOps { IrOpcode };
 import(lib) wallvm::rules::asm_rules { ABIRules };
 import(lib) std::mman { alloc, dealloc, copy };
 import(lib) std::ios { eprintln };
+import(lib) platform::libc { snprintf };
 
 const u32 NO_REG = 0xFFFFFFFF;
 const i32 NO_SLOT = -1;
 const u64 SPILL_BIT = 0x80000000UL;
 const u64 FLOAT_BIT = 0x40000000UL;
+// Edge-copy sentinel: the arm embeds its operand (immediate, symbol,
+// spill slot), so no register of ours is read and no ordering applies.
+const u64 EDGE_NO_REG = 0xFFFFFFFFFFFFFFFFUL;
 
 // Debug knob: dump the linear order, live intervals and final assignments
 // so a bad reg/interval pairing is visible without a gdb session.
@@ -61,6 +65,34 @@ pub struct LiveInterval
     u32 uses;
     u32 defs;
     f64 spillWeight;
+}
+
+// Every incoming edge of a function's phis, flattened. Copies sharing a
+// predecessor form a group that has to be ordered as one unit — a swap
+// cycle reads what a sibling copy writes — so the group logic walks this
+// whole table.
+struct PhiEdgeState
+{
+    IrValue** src;
+    IrType** ty;
+    u64* home;
+    IrValue** homeVal;
+    IrBlock** pred;
+    u64* srcReg;
+    bool* done;
+    // Edge target (the phi's block) and the resolved block the copies are
+    // inserted into: the pred itself, or a split block when the pred has
+    // several successors and the copies must not run on the other edge.
+    IrBlock** target;
+    IrBlock** ins;
+    // Split blocks created for (pred, target) pairs, reused by every phi
+    // edge that lands on the same pair. Capacity is the edge count: at
+    // most one split per edge.
+    IrBlock** spPred;
+    IrBlock** spTgt;
+    IrBlock** spBlk;
+    u32 nsp;
+    u32 n;
 }
 
 pub struct LinearScanRegAlloc
@@ -129,6 +161,14 @@ pub struct LinearScanRegAlloc
     IrValue** paramVals;
     u32 numParams;
     u32 capParams;
+
+    // Edge copies materialized from phis, paired with the phi value whose
+    // home they carry. A graph recolor republishes homes through a second
+    // rewrite(), and rewrite() re-syncs these copies from the phi values.
+    IrInst** phiCopies;
+    IrValue** phiCopyHomes;
+    u32 numPhiCopies;
+    u32 capPhiCopies;
 
     static LinearScanRegAlloc new(IrContext* ctx, ABIRules* abi, RegAllocConfig* cfg)
     {
@@ -217,6 +257,10 @@ pub struct LinearScanRegAlloc
         r.paramVals = null;
         r.numParams = 0;
         r.capParams = 0;
+        r.phiCopies = null;
+        r.phiCopyHomes = null;
+        r.numPhiCopies = 0;
+        r.capPhiCopies = 0;
         r.liveOutSets = null;
         r.numLiveOutBlocks = 0;
         return r;
@@ -535,6 +579,23 @@ pub struct LinearScanRegAlloc
                             }
                         }
                         if (predEnd < 0) continue;
+
+                        // The edge copy that defines this phi writes its
+                        // home at the same pred end, so the phi's own
+                        // interval has to reach back to that position:
+                        // otherwise the terminator's condition (last use
+                        // at the very same index) shares the home register
+                        // and the copy clobbers it before the branch.
+                        u32 phiVreg = (u32)inst->base.valData;
+                        for (u32 k = 0; k < self.numIntervals; k++)
+                        {
+                            if (self.intervals[k].vreg == phiVreg)
+                            {
+                                if ((u32)predEnd < self.intervals[k].start)
+                                    self.intervals[k].start = (u32)predEnd;
+                                break;
+                            }
+                        }
 
                         for (u32 k = 0; k < self.numIntervals; k++)
                         {
@@ -1306,6 +1367,19 @@ pub struct LinearScanRegAlloc
         if (self.backendHandlesSpills) return;
         if (self.nextSpillSlot == 0) return;
 
+        // Phis that survive to rewrite() get register-form edge copies, and
+        // a spilled arm's copy reads its slot straight out of the arm's
+        // SPILL encoding — the phi-operand reload insertion below would only
+        // add a reload with no home of its own. Phis demoted before lsra
+        // (lowrphis ran) are ordinary Inst operands and keep the old path.
+        bool phiForm = false;
+        for (u32 pb = 0; pb < self.numBlocks && !phiForm; pb++)
+        {
+            IrBlock* pbb = self.blocks[pb];
+            for (u32 pi = 0; pi < pbb->ninsts && !phiForm; pi++)
+                if (pbb->insts[pi]->opcode == IrOpcode::Phi) phiForm = true;
+        }
+
         IrBlock* entryBlock = self.blocks[0];
         for (i32 s = 0; s < self.nextSpillSlot; s++)
         {
@@ -1370,6 +1444,7 @@ pub struct LinearScanRegAlloc
                     if (inst == defStore) continue;
                     if (inst->opcode == IrOpcode::Phi)
                     {
+                        if (phiForm) continue;
                         // For phi uses, insert load at end of predecessor block
                         u32 numPairs = inst->nops / 2;
                         for (u32 j = 0; j < numPairs; j++)
@@ -1482,7 +1557,399 @@ pub struct LinearScanRegAlloc
                     val->valData = (u64)reg;
             }
         }
+        // Edge copies from a previous rewrite follow their homes into the
+        // new assignment — a graph recolor can hand a phi a different
+        // register (or un-spill it) after the copies were cut.
+        for (u32 c = 0; c < self.numPhiCopies; c++)
+            self.phiCopies[c]->base.valData = self.phiCopyHomes[c]->valData;
         self.parkUnallocatedResults();
+        self.materializePhis(func);
+    }
+
+    void recordPhiCopy(IrInst* copy, IrValue* homeVal)
+    {
+        if (self.numPhiCopies + 1 > self.capPhiCopies)
+        {
+            u32 newCap = self.capPhiCopies ? self.capPhiCopies * 2 : 16;
+            IrInst** nc = alloc<IrInst*>((usize)newCap);
+            IrValue** nh = alloc<IrValue*>((usize)newCap);
+            if (self.phiCopies != null)
+            {
+                copy<IrInst*>(nc, self.phiCopies, (usize)self.numPhiCopies);
+                copy<IrValue*>(nh, self.phiCopyHomes, (usize)self.numPhiCopies);
+                dealloc<IrInst*>(self.phiCopies);
+                dealloc<IrValue*>(self.phiCopyHomes);
+            }
+            self.phiCopies = nc;
+            self.phiCopyHomes = nh;
+            self.capPhiCopies = newCap;
+        }
+        self.phiCopies[self.numPhiCopies] = copy;
+        self.phiCopyHomes[self.numPhiCopies] = homeVal;
+        self.numPhiCopies++;
+    }
+
+    u64 edgeSrcReg(IrValue* arm)
+    {
+        if (arm == null) return EDGE_NO_REG;
+        if (arm->kind != IrValueKind::Inst && arm->kind != IrValueKind::Arg) return EDGE_NO_REG;
+        u64 vd = arm->valData;
+        if ((vd & SPILL_BIT) != 0) return EDGE_NO_REG;
+        return vd;
+    }
+
+    u64 edgeDstReg(u64 home)
+    {
+        if ((home & SPILL_BIT) != 0) return EDGE_NO_REG;
+        return home;
+    }
+
+    void insertBeforeTerm(IrBlock* bb, IrInst* newInst)
+    {
+        IrInst* term = bb->terminator();
+        u32 pos = bb->ninsts;
+        if (term != null)
+        {
+            for (u32 k = 0; k < bb->ninsts; k++)
+            {
+                if (bb->insts[k] == term) { pos = k; break; }
+            }
+        }
+        self.insertInstAt(bb, pos, newInst);
+    }
+
+    // One edge copy: move the arm into the phi's home right before the
+    // predecessor's terminator. The copy's own valData is the home, so
+    // opFor renders it as a register, a slot or an xmm operand directly.
+    void emitEdgeOne(PhiEdgeState* st, u32 e)
+    {
+        IrValue* src = st->src[e];
+        IrType* ty = st->ty[e];
+        IrOpcode op = IrOpcode::Trunc;
+        if (ty != null && ty->kind == IrTypeKind::Float) op = IrOpcode::Bitcast;
+        IrValue*[1] ops;
+        ops[0] = src;
+        IrInst* c = self.ctx->createInst(op, ty, ops, 1, 0, 0);
+        c->base.valData = st->home[e];
+        src->addUser(c);
+        self.insertBeforeTerm(st->ins[e], c);
+        self.recordPhiCopy(c, st->homeVal[e]);
+        st->done[e] = true;
+    }
+
+    // A pending copy's source register is written by a sibling that is
+    // itself blocked (a swap cycle): save the value to a scratch slot, so
+    // the write can go ahead and the reader reloads from memory instead.
+    bool divertEdge(PhiEdgeState* st, u32 e)
+    {
+        i32 tmp = self.nextSpillSlot;
+        self.nextSpillSlot = self.nextSpillSlot + 1;
+        IrValue* slotPtr = self.getOrCreateSlotAlloca(tmp, self.blocks[0], 0);
+        if (slotPtr == null) return false;
+        IrType* ty = st->ty[e];
+        IrOpcode op = IrOpcode::Trunc;
+        if (ty != null && ty->kind == IrTypeKind::Float) op = IrOpcode::Bitcast;
+        IrValue*[1] sops;
+        sops[0] = st->src[e];
+        IrInst* save = self.ctx->createInst(op, ty, sops, 1, 0, 0);
+        save->base.valData = SPILL_BIT | (u64)(u32)tmp;
+        sops[0]->addUser(save);
+        self.insertBeforeTerm(st->ins[e], save);
+        // The reload never lands in the block: it only stands in as the
+        // copy's source operand, and its slot encoding makes opFor render
+        // the memory operand in place of a register.
+        IrValue*[1] lops;
+        lops[0] = slotPtr;
+        IrInst* reload = self.ctx->createInst(IrOpcode::Load, ty, lops, 1, 0, 0);
+        reload->base.valData = SPILL_BIT | (u64)(u32)tmp;
+        slotPtr->addUser(reload);
+        st->src[e] = &reload->base;
+        st->srcReg[e] = EDGE_NO_REG;
+        return true;
+    }
+
+    // Emit one predecessor's copies in an order where no copy overwrites
+    // a register a pending sibling still has to read; a swap cycle breaks
+    // through a scratch slot.
+    void emitEdgeGroup(PhiEdgeState* st, u32* grp, u32 m)
+    {
+        u32 emitted = 0;
+        while (emitted < m)
+        {
+            bool progress = false;
+            for (u32 a = 0; a < m; a++)
+            {
+                u32 e = grp[a];
+                if (st->done[e]) continue;
+                u64 dst = self.edgeDstReg(st->home[e]);
+                bool blocked = false;
+                if (dst != EDGE_NO_REG)
+                {
+                    for (u32 b = 0; b < m; b++)
+                    {
+                        u32 f = grp[b];
+                        if (f == e || st->done[f]) continue;
+                        if (st->srcReg[f] == dst) { blocked = true; break; }
+                    }
+                }
+                if (blocked) continue;
+                self.emitEdgeOne(st, e);
+                emitted++;
+                progress = true;
+            }
+            if (progress) continue;
+            // Everyone is blocked: a cycle. Divert one reader's source
+            // through a scratch slot; the write it waited on can go next.
+            bool broke = false;
+            for (u32 a = 0; a < m && !broke; a++)
+            {
+                u32 z = grp[a];
+                if (st->done[z]) continue;
+                u64 dstz = self.edgeDstReg(st->home[z]);
+                if (dstz == EDGE_NO_REG) continue;
+                for (u32 b = 0; b < m; b++)
+                {
+                    u32 h = grp[b];
+                    if (h == z || st->done[h]) continue;
+                    if (st->srcReg[h] == dstz)
+                    {
+                        broke = self.divertEdge(st, h);
+                        break;
+                    }
+                }
+            }
+            if (!broke)
+            {
+                // Give up on ordering: emit the rest and let the emitter's
+                // missing-Phi canary speak if anything is still undetached.
+                for (u32 a = 0; a < m; a++)
+                    if (!st->done[grp[a]]) self.emitEdgeOne(st, grp[a]);
+                emitted = m;
+            }
+        }
+    }
+
+    // Distinct successors of a block, read off its terminator: an edge
+    // copy can sit unconditionally in the pred only when every path out of
+    // it takes that edge.
+    u32 distinctSuccCount(IrBlock* bb)
+    {
+        IrInst* term = bb->terminator();
+        if (term == null) return 0;
+        if (term->opcode == IrOpcode::Br) return 1;
+        if (term->opcode == IrOpcode::CondBr && term->nops >= 3)
+        {
+            if (term->ops[1] == term->ops[2]) return 1;
+            return 2;
+        }
+        return 1;
+    }
+
+    // The copies for a (pred, target) edge when the pred branches to more
+    // than one block: a fresh block holding `br target`, spliced onto just
+    // this edge. Without it the copies would also fire on the sibling edge
+    // — a loop exiting on its last pass would run the backedge swap one
+    // extra time.
+    IrBlock* edgeSplit(IrFunc* func, PhiEdgeState* st, IrBlock* pred, IrBlock* target)
+    {
+        for (u32 i = 0; i < st->nsp; i++)
+            if (st->spPred[i] == pred && st->spTgt[i] == target) return st->spBlk[i];
+
+        char[64] buf;
+        usize pos = 0;
+        str fname = func->base.name;
+        for (usize q = 0; q < fname.len && pos < 48; q++)
+        {
+            buf[pos] = (char)fname.ptr[q];
+            pos++;
+        }
+        buf[pos] = 0;
+        i32 nb = snprintf((cchar*)buf + pos, (usize)(64 - pos), C".split%u", st->nsp);
+        if (nb < 0) nb = 0;
+        usize nlen = pos + (usize)nb;
+        if (nlen > 63) nlen = 63;
+        IrBlock* x = self.ctx->createBlock(str::fromParts((const u8*)buf, nlen));
+        func->addBlock(x);
+        // addBlock may have grown func's block array; keep ours in sync so
+        // the next materialize (graph recolor's second rewrite) scans the
+        // live array rather than a freed one.
+        self.blocks = func->blocks;
+        self.numBlocks = func->nblocks;
+
+        IrValue*[1] bops;
+        bops[0] = &target->base;
+        IrInst* br = self.ctx->createInst(IrOpcode::Br, self.ctx->tyVoid(), bops, 1, 0, 0);
+        bops[0]->addUser(br);
+        x->addInst(br);
+        x->addSucc(target);
+
+        IrInst* term = pred->terminator();
+        if (term != null)
+        {
+            for (u32 j = 0; j < term->nops; j++)
+            {
+                if (term->ops[j] != &target->base) continue;
+                term->ops[j]->removeUser(term);
+                term->ops[j] = &x->base;
+                x->base.addUser(term);
+                break;
+            }
+        }
+        pred->removeSucc(target);
+        target->removePred(pred);
+        pred->addSucc(x);
+
+        st->spPred[st->nsp] = pred;
+        st->spTgt[st->nsp] = target;
+        st->spBlk[st->nsp] = x;
+        st->nsp++;
+        return x;
+    }
+
+    // Registers are final here: cut each phi into copies that write its
+    // home on every incoming edge, then detach the phi from its block.
+    // Readers keep pointing at the phi value — its valData is the home —
+    // so codegen never meets a Phi opcode.
+    void materializePhis(IrFunc* func)
+    {
+        u32 nphis = 0;
+        for (u32 b = 0; b < self.numBlocks; b++)
+        {
+            IrBlock* bb = self.blocks[b];
+            for (u32 i = 0; i < bb->ninsts; i++)
+                if (bb->insts[i]->opcode == IrOpcode::Phi) nphis++;
+        }
+        if (nphis == 0) return;
+
+        IrInst** phis = alloc<IrInst*>((usize)nphis);
+        bool* detach = alloc<bool>((usize)nphis);
+        u32 n = 0;
+        for (u32 b = 0; b < self.numBlocks; b++)
+        {
+            IrBlock* bb = self.blocks[b];
+            for (u32 i = 0; i < bb->ninsts; i++)
+            {
+                if (bb->insts[i]->opcode != IrOpcode::Phi) continue;
+                phis[n] = bb->insts[i];
+                // No incoming edges means no copies: keep such a phi in the
+                // block so the emitter's missing-Phi canary fires.
+                detach[n] = bb->insts[i]->nops >= 2 && bb->insts[i]->parent != null;
+                n++;
+            }
+        }
+
+        u32 nedges = 0;
+        for (u32 k = 0; k < n; k++)
+            nedges += phis[k]->nops / 2;
+
+        PhiEdgeState st;
+        st.n = nedges;
+        st.src = null;
+        st.ty = null;
+        st.home = null;
+        st.homeVal = null;
+        st.pred = null;
+        st.srcReg = null;
+        st.done = null;
+        st.target = null;
+        st.ins = null;
+        st.spPred = null;
+        st.spTgt = null;
+        st.spBlk = null;
+        st.nsp = 0;
+        if (nedges > 0)
+        {
+            st.src = alloc<IrValue*>((usize)nedges);
+            st.ty = alloc<IrType*>((usize)nedges);
+            st.home = alloc<u64>((usize)nedges);
+            st.homeVal = alloc<IrValue*>((usize)nedges);
+            st.pred = alloc<IrBlock*>((usize)nedges);
+            st.srcReg = alloc<u64>((usize)nedges);
+            st.done = alloc<bool>((usize)nedges);
+            st.target = alloc<IrBlock*>((usize)nedges);
+            st.ins = alloc<IrBlock*>((usize)nedges);
+            st.spPred = alloc<IrBlock*>((usize)nedges);
+            st.spTgt = alloc<IrBlock*>((usize)nedges);
+            st.spBlk = alloc<IrBlock*>((usize)nedges);
+            u32 e = 0;
+            for (u32 k = 0; k < n; k++)
+            {
+                IrInst* phi = phis[k];
+                u32 np = phis[k]->nops / 2;
+                for (u32 j = 0; j < np; j++)
+                {
+                    st.src[e] = phi->ops[j * 2];
+                    st.ty[e] = phi->base.type;
+                    st.home[e] = phi->base.valData;
+                    st.homeVal[e] = &phi->base;
+                    IrValue* pv = phi->ops[j * 2 + 1];
+                    st.pred[e] = (pv != null && pv->kind == IrValueKind::Block) ? (IrBlock*)pv : null;
+                    st.target[e] = phi->parent;
+                    st.srcReg[e] = self.edgeSrcReg(st.src[e]);
+                    st.done[e] = false;
+                    // A malformed edge gets no copy; keep its phi in the
+                    // block so the emitter's missing-Phi canary fires.
+                    if (st.pred[e] == null || st.src[e] == null) detach[k] = false;
+                    e++;
+                }
+            }
+
+            // Resolve where each edge's copies land: straight into the
+            // pred, or into a split block when the pred has a sibling
+            // successor that must not run them.
+            for (u32 e = 0; e < nedges; e++)
+            {
+                st.ins[e] = st.pred[e];
+                if (st.pred[e] == null || st.target[e] == null) continue;
+                if (self.distinctSuccCount(st.pred[e]) <= 1) continue;
+                st.ins[e] = self.edgeSplit(func, &st, st.pred[e], st.target[e]);
+            }
+        }
+
+        u32* grp = alloc<u32>((usize)(nedges > 0 ? nedges : 1));
+        for (u32 e = 0; e < nedges; e++)
+        {
+            if (st.done[e] || st.ins[e] == null) continue;
+            u32 m = 0;
+            for (u32 f = e; f < nedges; f++)
+                if (!st.done[f] && st.ins[f] == st.ins[e]) { grp[m] = f; m++; }
+            self.emitEdgeGroup(&st, grp, m);
+        }
+        dealloc<u32>(grp);
+
+        for (u32 k = 0; k < n; k++)
+        {
+            if (!detach[k]) continue;
+            IrInst* phi = phis[k];
+            IrBlock* pb = phi->parent;
+            if (pb == null) continue;
+            for (u32 i = 0; i < pb->ninsts; i++)
+            {
+                if (pb->insts[i] != phi) continue;
+                for (u32 z = i; z + 1 < pb->ninsts; z++)
+                    pb->insts[z] = pb->insts[z + 1];
+                pb->ninsts--;
+                break;
+            }
+        }
+
+        dealloc<IrInst*>(phis);
+        dealloc<bool>(detach);
+        if (nedges > 0)
+        {
+            dealloc<IrValue*>(st.src);
+            dealloc<IrType*>(st.ty);
+            dealloc<u64>(st.home);
+            dealloc<IrValue*>(st.homeVal);
+            dealloc<IrBlock*>(st.pred);
+            dealloc<u64>(st.srcReg);
+            dealloc<bool>(st.done);
+            dealloc<IrBlock*>(st.target);
+            dealloc<IrBlock*>(st.ins);
+            dealloc<IrBlock*>(st.spPred);
+            dealloc<IrBlock*>(st.spTgt);
+            dealloc<IrBlock*>(st.spBlk);
+        }
     }
 
     bool allocate(IrFunc* func)
@@ -1564,6 +2031,8 @@ pub struct LinearScanRegAlloc
         if (self.floatActive != null) dealloc<u32>(self.floatActive);
         if (self.slotAllocas != null) dealloc<IrValue*>(self.slotAllocas);
         if (self.paramVals != null) dealloc<IrValue*>(self.paramVals);
+        if (self.phiCopies != null) dealloc<IrInst*>(self.phiCopies);
+        if (self.phiCopyHomes != null) dealloc<IrValue*>(self.phiCopyHomes);
         if (self.liveOutSets != null) dealloc<bool>(self.liveOutSets);
     }
 }

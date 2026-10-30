@@ -19,16 +19,16 @@ main:
 	leaq -144(%rbp), %r9
 	leaq -160(%rbp), %rbx
 	movl $0x0000000000000000, %r10d
-	movq -56(%rbp), %r11
-	movq %r10, (%r11)
+	movq -56(%rbp), %rdx
+	movq %r10, (%rdx)
 	movl $0x0000000000000000, %r10d
-	movq -72(%rbp), %r11
-	movq %r10, (%r11)
+	movq -72(%rbp), %rdx
+	movq %r10, (%rdx)
 .Lmain_outer_3:
-	movq -56(%rbp), %r11
-	movq (%r11), %r12
-	movq -72(%rbp), %r11
-	movq (%r11), %r13
+	movq -56(%rbp), %rdx
+	movq (%rdx), %r12
+	movq -72(%rbp), %rdx
+	movq (%rdx), %r13
 	movl $0x0000000000000004, %r11d
 	cmpq %r11, %r12
 	setl %r11b
@@ -49,10 +49,10 @@ main:
 	cmpq %r11, %r15
 	setl %r11b
 	movzbq %r11b, %rdi
-	movq -56(%rbp), %r11
-	movq %rsi, (%r11)
-	movq -72(%rbp), %r11
-	movq %r14, (%r11)
+	movq -56(%rbp), %rdx
+	movq %rsi, (%rdx)
+	movq -72(%rbp), %rdx
+	movq %r14, (%rdx)
 	testq %rdi, %rdi
 	je .Lmain_outer_3
 .Lmain_inner_body_6:

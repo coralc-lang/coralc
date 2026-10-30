@@ -25,18 +25,18 @@ nest:
 	leaq -224(%rbp), %r12
 	leaq -240(%rbp), %r13
 	movl $0x0000000000000000, %r10d
-	movq -104(%rbp), %r11
-	movq %r10, (%r11)
+	movq -104(%rbp), %rdx
+	movq %r10, (%rdx)
 	movl $0x0000000000000000, %r10d
-	movq -120(%rbp), %r11
-	movq %r10, (%r11)
+	movq -120(%rbp), %rdx
+	movq %r10, (%rdx)
 	movl $0x0000000000000000, %r10d
 	movq %r10, (%r9)
 .Lnest_outer_4:
-	movq -104(%rbp), %r11
-	movq (%r11), %r14
-	movq -120(%rbp), %r11
-	movq (%r11), %r10
+	movq -104(%rbp), %rdx
+	movq (%rdx), %r14
+	movq -120(%rbp), %rdx
+	movq (%rdx), %r10
 	movq %r10, -88(%rbp)
 	movq (%r9), %r10
 	movq %r10, -72(%rbp)
@@ -88,8 +88,8 @@ nest:
 .Lnest_olatch_12:
 	movq -104(%rbp), %r10
 	addq $0x0000000000000001, (%r10)
-	movq -120(%rbp), %r11
-	movq %rdi, (%r11)
+	movq -120(%rbp), %rdx
+	movq %rdi, (%rdx)
 	movq %r15, (%r9)
 	jmp .Lnest_outer_4
 .Lnest_done_13:

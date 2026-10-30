@@ -1,0 +1,24 @@
+.section .text
+.globl main
+.type main, @function
+main:
+	pushq %rbp
+	movq %rsp, %rbp
+	subq $16, %rsp
+.Lmain_entry_2:
+	leaq -16(%rbp), %r8
+	leaq 8(%r8), %rdi
+	movl $0x0000000000000007, %r10d
+	movl %r10d, (%r8)
+	movl $0x0000000000000032, %r10d
+	movq %r10, (%rdi)
+	movl (%r8), %esi
+	movl %esi, %r8d
+	movq (%rdi), %rsi
+	movq %r8, %rdi
+	addq %rsi, %rdi
+	movl %edi, %esi
+	movq %rsi, %rax
+	addq $16, %rsp
+	leave
+	ret
