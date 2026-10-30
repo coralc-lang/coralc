@@ -42,21 +42,30 @@ fib:
 .globl main
 .type main, @function
 main:
+	pushq %rbp
+	movq %rsp, %rbp
 	pushq %rbx
+	pushq %r12
+	subq $16, %rsp
 .Lmain_entry_18:
+	leaq -32(%rbp), %rbx
 	jmp .Lmain_inl25_3_29
 .Lmain_inl25_0_26:
 	movq %rsi, %rax
+	addq $16, %rsp
+	popq %r12
 	popq %rbx
+	leave
 	ret
 .Lmain_inl25_3_29:
 	movq $0x0000000000000009, %rdi
 	call fib
-	movq %rax, %rbx
+	movq %rax, %r12
 	movq $0x0000000000000008, %rdi
 	call fib
 	movq %rax, %rsi
-	addq %rsi, %rbx
-	movq %rbx, %rsi
+	addq %rsi, %r12
+	movq %r12, (%rbx)
 .Lmain_inl25_4_40:
+	movq (%rbx), %rsi
 	jmp .Lmain_inl25_0_26
