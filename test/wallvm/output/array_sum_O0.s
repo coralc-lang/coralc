@@ -9,8 +9,7 @@ main:
 .Lmain_entry_2:
 	leaq -64(%rbp), %rsi
 	leaq -80(%rbp), %rdi
-	movl $0x0000000000000000, %r10d
-	movq %r10, (%rdi)
+	movq $0x0000000000000000, (%rdi)
 .Lmain_fill_3:
 	movq (%rdi), %r8
 	cmpq $0x0000000000000005, %r8
@@ -25,11 +24,9 @@ main:
 	addq $0x0000000000000001, (%rdi)
 	jmp .Lmain_fill_3
 .Lmain_sum_pre_5:
-	movl $0x0000000000000000, %r10d
-	movq %r10, (%rdi)
+	movq $0x0000000000000000, (%rdi)
 	leaq -96(%rbp), %r8
-	movl $0x0000000000000000, %r10d
-	movq %r10, (%r8)
+	movq $0x0000000000000000, (%r8)
 .Lmain_sum_6:
 	movq (%rdi), %r9
 	cmpq $0x0000000000000005, %r9

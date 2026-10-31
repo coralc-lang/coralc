@@ -8,10 +8,8 @@ main:
 .Lmain_entry_2:
 	leaq -16(%rbp), %r8
 	leaq 8(%r8), %rdi
-	movl $0x0000000000000007, %r10d
-	movl %r10d, (%r8)
-	movl $0x0000000000000032, %r10d
-	movq %r10, (%rdi)
+	movl $0x0000000000000007, (%r8)
+	movq $0x0000000000000032, (%rdi)
 	movl (%r8), %esi
 	movl %esi, %r8d
 	movq (%rdi), %rsi

@@ -7,8 +7,7 @@ main:
 	subq $16, %rsp
 .Lmain_entry_2:
 	leaq -16(%rbp), %rsi
-	movl $0x0000000000000007, %r10d
-	movq %r10, (%rsi)
+	movq $0x0000000000000007, (%rsi)
 	movq (%rsi), %rdi
 	cmpq $0x0000000000000005, %rdi
 	jle .Lmain_els_4

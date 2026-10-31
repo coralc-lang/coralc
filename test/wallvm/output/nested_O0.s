@@ -9,18 +9,15 @@ main:
 .Lmain_entry_2:
 	leaq -32(%rbp), %rsi
 	leaq -48(%rbp), %rdi
-	movl $0x0000000000000000, %r10d
-	movq %r10, (%rsi)
-	movl $0x0000000000000000, %r10d
-	movq %r10, (%rdi)
+	movq $0x0000000000000000, (%rsi)
+	movq $0x0000000000000000, (%rdi)
 .Lmain_outer_3:
 	movq (%rsi), %r8
 	cmpq $0x0000000000000004, %r8
 	jge .Lmain_done_8
 .Lmain_inner_pre_4:
 	leaq -64(%rbp), %r8
-	movl $0x0000000000000000, %r10d
-	movq %r10, (%r8)
+	movq $0x0000000000000000, (%r8)
 .Lmain_inner_5:
 	movq (%r8), %r9
 	cmpq $0x0000000000000003, %r9

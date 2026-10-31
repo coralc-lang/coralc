@@ -9,8 +9,7 @@ main:
 	leaq -16(%rbp), %rdi
 	movabsq $0x000000aa00000000, %r10
 	movq %r10, (%rdi)
-	movl $0x0000000000000005, %r10d
-	movl %r10d, (%rdi)
+	movl $0x0000000000000005, (%rdi)
 	movq (%rdi), %rsi
 	movq %rsi, %rdi
 	movq $0x0000000000000020, %rcx

@@ -9,30 +9,23 @@ main:
 	leaq -16(%rbp), %r9
 	leaq -32(%rbp), %rsi
 	leaq -48(%rbp), %r8
-	movl $0x0000000000000000, %r10d
-	movq %r10, (%r8)
-	movl $0x0000000000000005, %r10d
-	movq %r10, (%r9)
-	movl $0x0000000000000001, %r10d
-	movq %r10, (%rsi)
-	movl $0x0000000000000001, %r10d
-	movb %r10b, (%rsi)
+	movq $0x0000000000000000, (%r8)
+	movq $0x0000000000000005, (%r9)
+	movq $0x0000000000000001, (%rsi)
+	movb $0x0000000000000001, (%rsi)
 	movq (%rsi), %rdi
 	cmpq $0x0000000000000000, %rdi
 	jg .Lmain_els_4
 .Lmain_then_3:
-	movl $0x000000000000000a, %r10d
-	movq %r10, (%r8)
+	movq $0x000000000000000a, (%r8)
 	movq %r8, %rdi
 	jmp .Lmain_merge_5
 .Lmain_els_4:
-	movl $0x0000000000000014, %r10d
-	movq %r10, (%r9)
+	movq $0x0000000000000014, (%r9)
 	movq %r9, %rdi
 .Lmain_merge_5:
 	movq (%rdi), %r8
-	movl $0x000000000000001e, %r10d
-	movq %r10, (%r9)
+	movq $0x000000000000001e, (%r9)
 	movq (%rdi), %rsi
 	movq %r8, %rdi
 	addq %rsi, %rdi

@@ -13,8 +13,7 @@ main:
 	cmpq $0x0000000000000007, %rdi
 	jge .Lmain_done_5
 .Lmain_body_4:
-	movl $0x0000000000000007, %r10d
-	movq %r10, (%r8)
+	movq $0x0000000000000007, (%r8)
 	jmp .Lmain_loop_3
 .Lmain_done_5:
 	movl %edi, %esi

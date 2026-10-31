@@ -3,15 +3,11 @@
 .type main, @function
 main:
 .Lmain_entry_7:
-	leaq counter(%rip), %rdx
-	movq (%rdx), %rsi
-	leaq answer(%rip), %rdx
-	movq (%rdx), %rdi
+	movq counter(%rip), %rsi
+	movq answer(%rip), %rdi
 	addq %rdi, %rsi
-	leaq counter(%rip), %rdx
-	movq %rsi, (%rdx)
-	leaq alias(%rip), %rdx
-	movq (%rdx), %rsi
+	movq %rsi, counter(%rip)
+	movq alias(%rip), %rsi
 	movq (%rsi), %rdi
 	movq %rdi, %rax
 	ret

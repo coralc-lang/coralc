@@ -15,16 +15,12 @@ main:
 	leaq -80(%rbp), %r8
 	leaq -96(%rbp), %rdi
 	leaq -112(%rbp), %rsi
-	movl $0x000000000000000a, %r10d
-	movq %r10, (%r9)
+	movq $0x000000000000000a, (%r9)
 	leaq 8(%r9), %rbx
-	movl $0x0000000000000014, %r10d
-	movq %r10, (%rbx)
-	movl $0x0000000000000001, %r10d
-	movq %r10, (%r8)
+	movq $0x0000000000000014, (%rbx)
+	movq $0x0000000000000001, (%r8)
 	leaq 8(%r8), %rbx
-	movl $0x0000000000000002, %r10d
-	movq %r10, (%rbx)
+	movq $0x0000000000000002, (%rbx)
 	movq $0x0000000000000000, %rbx
 .Lmain_loop1_3:
 	movq %rbx, %r11

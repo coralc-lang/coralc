@@ -10,8 +10,7 @@ main:
 .Lmain_entry_2:
 	leaq -32(%rbp), %rbx
 	leaq -48(%rbp), %r12
-	movl $0x0000000000000007, %r10d
-	movq %r10, (%rbx)
+	movq $0x0000000000000007, (%rbx)
 	movq %rbx, %rcx
 	movq (%rcx), %rax
 addq $1, %rax

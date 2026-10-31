@@ -5,14 +5,10 @@ main:
 .Lmain_entry_5:
 	leaq msg(%rip), %rsi
 	leaq msg+1(%rip), %rdi
-	leaq first(%rip), %rdx
-	movq %rsi, (%rdx)
-	leaq msg(%rip), %rdx
-	movb (%rdx), %r8b
-	leaq msg+1(%rip), %rdx
-	movb (%rdx), %sil
-	leaq first(%rip), %rdx
-	movq (%rdx), %rdi
+	movq %rsi, first(%rip)
+	movb msg(%rip), %r8b
+	movb msg+1(%rip), %sil
+	movq first(%rip), %rdi
 	movq %rdi, %r9
 	leaq 2(%r9), %rdi
 	movb (%rdi), %r9b

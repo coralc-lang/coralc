@@ -8,10 +8,8 @@ main:
 .Lmain_entry_2:
 	leaq -16(%rbp), %rsi
 	leaq -32(%rbp), %rdi
-	movl $0x000000000000000a, %r10d
-	movq %r10, (%rsi)
-	movl $0x0000000000000000, %r10d
-	movq %r10, (%rdi)
+	movq $0x000000000000000a, (%rsi)
+	movq $0x0000000000000000, (%rdi)
 .Lmain_loop_3:
 	movq (%rsi), %r8
 	cmpq $0x0000000000000000, %r8
