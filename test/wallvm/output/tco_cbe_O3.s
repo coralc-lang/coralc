@@ -2,10 +2,10 @@
 .globl inf
 .type inf, @function
 inf:
-	subq $176, %rsp
+	subq $8, %rsp
 	movq %rdi, 0(%rsp)
 	movq 0(%rsp), %rsi
-	addq $176, %rsp
+	addq $8, %rsp
 .Linf_entry_3:
 .Linf_acc_loop_13:
 .Linf_entry_16:

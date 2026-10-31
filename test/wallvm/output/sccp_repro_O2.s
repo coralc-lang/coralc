@@ -5,10 +5,6 @@ fib:
 	pushq %rbx
 	pushq %r12
 	pushq %r13
-	subq $176, %rsp
-	movq %rdi, 0(%rsp)
-	movq 0(%rsp), %rdi
-	addq $176, %rsp
 .Lfib_entry_3:
 	cmpq $0x0000000000000002, %rdi
 	jge .Lfib_rec_5

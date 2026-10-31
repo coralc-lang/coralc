@@ -5,10 +5,10 @@ sumto:
 	pushq %rbx
 	pushq %r12
 	subq $8, %rsp
-	subq $176, %rsp
+	subq $8, %rsp
 	movq %rdi, 0(%rsp)
 	movq 0(%rsp), %rsi
-	addq $176, %rsp
+	addq $8, %rsp
 .Lsumto_entry_3:
 	movq $0x0000000000000000, %r12
 	movq %rsi, %rbx

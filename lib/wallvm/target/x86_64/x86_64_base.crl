@@ -499,6 +499,21 @@ pub struct X86_64CodeGen
     str[16] asmTaken;
     u32 asmTakenN;
 
+    // Param-seeding plan: classification runs once into these records
+    // and both emission walks replay them, so the stage and commit
+    // phases can agree on skip decisions and on staging layout. The
+    // capacity far exceeds any real signature.
+    u32[128] sdKind;
+    u32[128] sdReg;
+    u32[128] sdOff;
+    u32[128] sdWords;
+    u32[128] sdSlot;
+    bool[128] sdSkip;
+    IrValue*[128] sdSrc;
+    IrValue*[128] sdDst;
+    u32 nSeedsPlanned;
+    u32 sdStageBytes;
+
     void init(IrContext* ctx,
               IrModule* modd,
               bool isWindows, bool useAtt,
@@ -1430,46 +1445,79 @@ pub struct X86_64CodeGen
         // classifyCallArg never hands out more than maxInt integer
         // words or maxFp fp words from registers, and each word stages
         // in at most 8 (integer) or 16 (fp, vectors included) bytes,
-        // so this bound covers every slot the staging phase can emit.
-        // The pair is balanced before hasAny call or return; the only
-        // path that touches the red zone is the frameless one, where
-        // the gates above guarantee the zone is still empty.
-        u32 maxInt = self.isWindows ? 4 : 6;
-        u32 maxFp = self.isWindows ? 4 : 8;
-        str stageBuf = u32ToStr(maxInt * 8 + maxFp * 16);
-        self.emitter.emit("\tsubq $");
-        self.emitter.emit(stageBuf);
-        self.emitter.emitLine(", %rsp");
+        // so that pair is the ceiling the plan can never exceed. The
+        // plan itself sizes the region exactly: seeds whose home
+        // already is the register the value arrives in stage nothing,
+        // and a function where every seed lands that way gets no
+        // region at all. The pair is balanced before hasAny call or
+        // return; the only path that touches the red zone is the
+        // frameless one, where the gates above guarantee the zone is
+        // still empty.
+        self.planParamSeeds(func);
+        str stageBuf = u32ToStr(self.sdStageBytes);
+        if (self.sdStageBytes > 0)
+        {
+            self.emitter.emit("\tsubq $");
+            self.emitter.emit(stageBuf);
+            self.emitter.emitLine(", %rsp");
+        }
 
         self.walkParamSeeds(func, true);
         self.walkParamSeeds(func, false);
 
-        self.emitter.emit("\taddq $");
-        self.emitter.emit(stageBuf);
-        self.emitter.emitLine(", %rsp");
+        if (self.sdStageBytes > 0)
+        {
+            self.emitter.emit("\taddq $");
+            self.emitter.emit(stageBuf);
+            self.emitter.emitLine(", %rsp");
+        }
     }
 
-    // One pass of emitParamSeeding. stagePhase collects incoming bank
-    // words into the staging area sized by the caller; the commit pass
-    // reads them back out into homes and allocas. Both passes run the
-    // same store filter and the same classify state machine, so every
-    // stage slot lines up word for word between them.
-    void walkParamSeeds(IrFunc* func, bool stagePhase)
+    // Incoming ABI bank register by index — the one source both the
+    // plan's skip test and the stage walk's source operands read.
+    str seedIntReg(u32 idx)
     {
-        str[6] sysvIntRegs = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
-        str[4] win64IntRegs = {"rcx", "rdx", "r8", "r9"};
-        str[8] sysvFpRegs = {"xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"};
-        str[4] win64FpRegs = {"xmm0", "xmm1", "xmm2", "xmm3"};
-        str* intRegs = sysvIntRegs;
-        if (self.isWindows) intRegs = win64IntRegs;
-        str* fpRegs = sysvFpRegs;
-        if (self.isWindows) fpRegs = win64FpRegs;
+        str[6] sysv = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
+        str[4] win = {"rcx", "rdx", "r8", "r9"};
+        if (self.isWindows)
+        {
+            if (idx < 4) return win[idx];
+            return "";
+        }
+        if (idx < 6) return sysv[idx];
+        return "";
+    }
+
+    str seedFpReg(u32 idx)
+    {
+        str[8] sysv = {"xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"};
+        str[4] win = {"xmm0", "xmm1", "xmm2", "xmm3"};
+        if (self.isWindows)
+        {
+            if (idx < 4) return win[idx];
+            return "";
+        }
+        if (idx < 8) return sysv[idx];
+        return "";
+    }
+
+    // Classification for the seeding walks: resolve every parameter
+    // seed once (Arg values today; the entry-store walk covers legacy
+    // Inst-kind parameters), classify its ABI placement, then decide
+    // which seeds can drop the staging round trip and lay out the slots
+    // the survivors use. Both emission walks replay these records, so
+    // stage and commit can never disagree.
+    void planParamSeeds(IrFunc* func)
+    {
+        self.nSeedsPlanned = 0;
+        self.sdStageBytes = 0;
+        if (func == null || func->base.type == null) return;
+        if (func->nblocks == 0) return;
 
         u32 intIdx = 0;
         u32 fpIdx = 0;
         u32 stackOff = self.isWindows ? 32 : 0;
         u32 found = 0;
-        u32 stageOff = 0;
         IrBlock* eb = func->blocks[0];
         // Current IR models parameters as IrValueKind::Arg values. The
         // entry-store walk below remains for legacy Inst-kind parameters.
@@ -1504,6 +1552,9 @@ pub struct X86_64CodeGen
                 if (srcDefined) continue;
                 dstv = inst->nops > 1 ? inst->ops[1] : null;
             }
+
+            u32 slot = self.nSeedsPlanned;
+            if (slot >= 128) break;
             found++;
 
             u32 outReg = 0;
@@ -1511,6 +1562,91 @@ pub struct X86_64CodeGen
             u32 outWords = 1;
             u32 kind = self.classifyCallArg(src, &intIdx, &fpIdx, &stackOff,
                                              &outReg, &outOff, &outWords);
+            self.sdKind[slot] = kind;
+            self.sdReg[slot] = outReg;
+            self.sdOff[slot] = outOff;
+            self.sdWords[slot] = outWords;
+            self.sdSlot[slot] = 0;
+            self.sdSkip[slot] = false;
+            self.sdSrc[slot] = src;
+            self.sdDst[slot] = dstv;
+            self.nSeedsPlanned++;
+        }
+
+        // A scalar seed can drop staging only when its home already is
+        // the register the caller passes it in: the stage and its
+        // commit would move the value out of that register and straight
+        // back. That stays safe only while NO other seed's register
+        // home is that same register — any other commit writing it
+        // (including a memory-sourced seed committed straight from the
+        // stack) would otherwise overwrite the value we left in place.
+        // Struct seeds (kind 3) always stage: their commit also fills
+        // the alloca. Memory homes cannot skip either — the value has
+        // to reach the slot.
+        for (u32 i = 0; i < self.nSeedsPlanned; i++)
+        {
+            u32 k = self.sdKind[i];
+            if (k != 1 && k != 2) continue;
+            str home = self.getRegName(self.sdSrc[i]);
+            if (home.len == 0) continue;
+            str inc = (k == 2) ? self.seedFpReg(self.sdReg[i])
+                               : self.seedIntReg(self.sdReg[i]);
+            if (!home.equals(inc)) continue;
+            bool alone = true;
+            for (u32 j = 0; j < self.nSeedsPlanned && alone; j++)
+            {
+                if (j == i) continue;
+                str other = self.getRegName(self.sdSrc[j]);
+                if (other.len > 0 && other.equals(home)) alone = false;
+            }
+            if (alone) self.sdSkip[i] = true;
+        }
+
+        // Slot layout over the survivors — both walks read it, so the
+        // stage and commit phases agree on where each word lives.
+        u32 stageOff = 0;
+        for (u32 i = 0; i < self.nSeedsPlanned; i++)
+        {
+            if (self.sdSkip[i]) continue;
+            u32 k = self.sdKind[i];
+            if (k == 1)
+            {
+                self.sdSlot[i] = stageOff;
+                stageOff += 8;
+            }
+            else if (k == 2)
+            {
+                self.sdSlot[i] = stageOff;
+                stageOff += 16;
+            }
+            else if (k == 3)
+            {
+                self.sdSlot[i] = stageOff;
+                stageOff += 8 * self.sdWords[i];
+            }
+        }
+        self.sdStageBytes = stageOff;
+    }
+
+    // One pass of emitParamSeeding. Both walks replay the records
+    // planParamSeeds built: stagePhase collects the incoming bank words
+    // into their planned slots, the commit pass reads them back out
+    // into homes and allocas — same records, same slots, so every stage
+    // slot lines up word for word between them, and a seed the plan
+    // skipped (its home already is the register it arrives in) emits
+    // nothing in either phase.
+    void walkParamSeeds(IrFunc* func, bool stagePhase)
+    {
+        for (u32 si = 0; si < self.nSeedsPlanned; si++)
+        {
+            if (self.sdSkip[si]) continue;
+            IrValue* src = self.sdSrc[si];
+            IrValue* dstv = self.sdDst[si];
+            u32 kind = self.sdKind[si];
+            u32 outReg = self.sdReg[si];
+            u32 outOff = self.sdOff[si];
+            u32 outWords = self.sdWords[si];
+            u32 stageOff = self.sdSlot[si];
 
             if (stagePhase)
             {
@@ -1519,7 +1655,7 @@ pub struct X86_64CodeGen
                 {
                     stg = stageText(stageOff);
                     self.emitter.emit("\tmovdqu ");
-                    self.emitter.emit(fpRegs[outReg]);
+                    self.emitter.emit(self.seedFpReg(outReg));
                     self.emitter.emit(", ");
                     self.emitter.emitLine(stg);
                     stageOff += 16;
@@ -1528,7 +1664,7 @@ pub struct X86_64CodeGen
                 {
                     stg = stageText(stageOff);
                     self.emitter.emit("\tmovq ");
-                    self.emitter.emit(intRegs[outReg]);
+                    self.emitter.emit(self.seedIntReg(outReg));
                     self.emitter.emit(", ");
                     self.emitter.emitLine(stg);
                     stageOff += 8;
@@ -1539,7 +1675,7 @@ pub struct X86_64CodeGen
                     {
                         stg = stageText(stageOff);
                         self.emitter.emit("\tmovq ");
-                        self.emitter.emit(intRegs[outReg + w]);
+                        self.emitter.emit(self.seedIntReg(outReg + w));
                         self.emitter.emit(", ");
                         self.emitter.emitLine(stg);
                         stageOff += 8;

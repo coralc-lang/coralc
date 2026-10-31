@@ -10,11 +10,11 @@ nest:
 	pushq %r14
 	pushq %r15
 	subq $40, %rsp
-	subq $176, %rsp
+	subq $8, %rsp
 	movq %rdi, 0(%rsp)
 	movq 0(%rsp), %r11
 	movq %r11, -56(%rbp)
-	addq $176, %rsp
+	addq $8, %rsp
 .Lnest_entry_3:
 	movq $0x0000000000000000, %rdi
 	movq $0x0000000000000000, %r8
