@@ -4,33 +4,27 @@
 main:
 	pushq %rbp
 	movq %rsp, %rbp
-	subq $32, %rsp
+	subq $16, %rsp
 .Lmain_entry_2:
 	leaq -16(%rbp), %rsi
-	leaq -32(%rbp), %rdi
 	movl $0x0000000000000007, %r10d
 	movq %r10, (%rsi)
-	movq (%rsi), %r8
-	movl $0x0000000000000005, %r11d
-	cmpq %r11, %r8
-	setg %r11b
-	movzbq %r11b, %r9
-	testq %r9, %r9
-	je .Lmain_els_4
+	movq (%rsi), %rdi
+	cmpq $0x0000000000000005, %rdi
+	jle .Lmain_els_4
 .Lmain_then_3:
-	movq (%rsi), %r8
+	movq (%rsi), %rdi
 	movq $0x0000000000000001, %rcx
-	shlq %cl, %r8
-	movq %r8, (%rdi)
+	shlq %cl, %rdi
+	movq %rdi, %r8
 	jmp .Lmain_merge_5
 .Lmain_els_4:
-	movq (%rsi), %r8
-	movq %r8, %rsi
+	movq (%rsi), %r9
+	movq %r9, %rsi
 	negq %rsi
-	movq %rsi, (%rdi)
+	movq %rsi, %r8
 .Lmain_merge_5:
-	movq (%rdi), %rsi
-	movq %rsi, %rax
-	addq $32, %rsp
+	movq %r8, %rax
+	addq $16, %rsp
 	leave
 	ret

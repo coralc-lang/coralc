@@ -2,80 +2,56 @@
 .globl sumto
 .type sumto, @function
 sumto:
-	pushq %rbp
-	movq %rsp, %rbp
 	pushq %rbx
 	pushq %r12
-	pushq %r13
-	subq $40, %rsp
+	subq $8, %rsp
 	subq $176, %rsp
 	movq %rdi, 0(%rsp)
 	movq 0(%rsp), %rsi
 	addq $176, %rsp
 .Lsumto_entry_3:
-	leaq -48(%rbp), %r13
-	leaq -64(%rbp), %r12
-	movl $0x0000000000000000, %r10d
-	movq %r10, (%r13)
-	movq %rsi, (%r12)
+	movq $0x0000000000000000, %r12
+	movq %rsi, %rbx
 .Lsumto_acc_loop_23:
-	movq (%r13), %rbx
-	movq (%r12), %r9
 .Lsumto_entry_26:
-	movq %rbx, %rdi
-	addq %r9, %rdi
-	testq %r9, %r9
-	setle %r11b
-	movzbq %r11b, %rsi
-	movq %rdi, (%r13)
-	subq $0x0000000000000001, (%r12)
-	testq %rsi, %rsi
-	je .Lsumto_acc_loop_23
+	movq %rbx, %r9
+	decq %r9
+	movq %r12, %r8
+	addq %rbx, %r8
+	cmpq $0x0000000000000000, %rbx
+	jg .Lsumto_sumto.split0_56
 .Lsumto_base_27:
-	movq %rbx, %rax
-	addq $40, %rsp
-	popq %r13
+	movq %r12, %rax
+	addq $8, %rsp
 	popq %r12
 	popq %rbx
-	leave
 	ret
+.Lsumto_sumto.split0_56:
+	movq %r8, %r12
+	movq %r9, %rbx
+	jmp .Lsumto_acc_loop_23
 .globl main
 .type main, @function
 main:
-	pushq %rbp
-	movq %rsp, %rbp
 	pushq %rbx
-	pushq %r12
-	pushq %r13
-	subq $40, %rsp
 .Lmain_entry_16:
-	leaq -48(%rbp), %r13
-	leaq -64(%rbp), %r12
-	movl $0x0000000000000000, %r10d
-	movq %r10, (%r13)
-	movl $0x0000000000000005, %r10d
-	movq %r10, (%r12)
-	jmp .Lmain_inl22_2_48
-.Lmain_inl22_0_46:
+	movq $0x0000000000000000, %rbx
+	movq $0x0000000000000005, %r9
+	jmp .Lmain_inl22_2_40
+.Lmain_inl22_0_38:
 	movl %ebx, %esi
 	movq %rsi, %rax
-	addq $40, %rsp
-	popq %r13
-	popq %r12
 	popq %rbx
-	leave
 	ret
-.Lmain_inl22_2_48:
-	movq (%r13), %rbx
-	movq (%r12), %r9
-.Lmain_inl22_3_49:
+.Lmain_inl22_2_40:
+.Lmain_inl22_3_41:
+	movq %r9, %r8
+	decq %r8
 	movq %rbx, %rdi
 	addq %r9, %rdi
-	testq %r9, %r9
-	setle %r11b
-	movzbq %r11b, %rsi
-	movq %rdi, (%r13)
-	subq $0x0000000000000001, (%r12)
-	testq %rsi, %rsi
-	jne .Lmain_inl22_0_46
-	jmp .Lmain_inl22_2_48
+	cmpq $0x0000000000000000, %r9
+	jle .Lmain_inl22_0_38
+.Lmain_main.split0_62:
+	movq %rdi, %rbx
+	movq %r8, %r9
+	jmp .Lmain_inl22_2_40

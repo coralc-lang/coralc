@@ -10,12 +10,8 @@ fib:
 	movq 0(%rsp), %rdi
 	addq $176, %rsp
 .Lfib_entry_3:
-	movl $0x0000000000000002, %r11d
-	cmpq %r11, %rdi
-	setl %r11b
-	movzbq %r11b, %rsi
-	testq %rsi, %rsi
-	je .Lfib_rec_5
+	cmpq $0x0000000000000002, %rdi
+	jge .Lfib_rec_5
 .Lfib_base_4:
 	movq %rdi, %rax
 	popq %r13

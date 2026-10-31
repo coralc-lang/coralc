@@ -424,6 +424,17 @@ str narrowOp(str lOp, u32 width)
 static str[10] SETCC_INT = {
     "sete", "setne", "setl", "setle", "setg", "setge", "setb", "setbe", "seta", "setae"
 };
+// branch forms of the same predicates: TRUE jumps when the condition
+// holds, FALSE when it does not — emitCondBr fuses an icmp that only
+// feeds it into `cmp` + one of these, skipping the setcc/movzx/testq
+// materialization the bool would otherwise take
+static str[10] JCC_INT_TRUE = {
+    "je", "jne", "jl", "jle", "jg", "jge", "jb", "jbe", "ja", "jae"
+};
+
+static str[10] JCC_INT_FALSE = {
+    "jne", "je", "jge", "jg", "jle", "jl", "jae", "ja", "jbe", "jb"
+};
 
 static String[16] _r8buf;
 static u32 _r8i = 0;
@@ -3509,7 +3520,7 @@ pub struct X86_64CodeGen
             IrOpcode::Alloca => { self.emitAlloca(inst); },
             IrOpcode::Gep => { self.emitGep(inst); },
             IrOpcode::ICmp => {
-            if (!self.iselTryFoldCmpZero(inst))
+            if (!self.iselSkipFusedICmp(inst) && !self.iselTryFoldCmpZero(inst))
                 self.emitICmp(inst);
             },
             IrOpcode::FCmp => { self.emitFCmp(inst); },
@@ -4291,6 +4302,73 @@ void emitIntExtendTo(str src, str dst32, u32 width, bool isSigned)
         return false;
     }
 
+    // the cmp half of an icmp whose i1 dies at the next instruction:
+    // flags only, no setcc materialization. The second operand folds
+    // into the immediate form when it is a constant (`cmpq $2, %rdi`);
+    // a constant *first* operand keeps its register, since AT&T has no
+    // imm-first encoding and `imm - reg` is not `reg - imm` for the
+    // ordered predicates.
+    void emitCmpOperands(IrInst* cmp)
+    {
+        IrValue* a = cmp->nops > 0 ? cmp->ops[0] : null;
+        IrValue* b = cmp->nops > 1 ? cmp->ops[1] : null;
+        if (a == null || b == null) return;
+        bool ca = valueIsIntConst(a);
+        bool cb = valueIsIntConst(b);
+        str ra = self.getRegForValue(a);
+        str rb = self.getRegForValue(b);
+        if (ca) ra = self.opForReg(a, "r10");
+        // the immediate form only fires for a constant *second* operand;
+        // when the first is also constant, both materialize
+        if (cb && ca) rb = self.opForReg(b, "r11");
+        // cmp takes one memory operand at most, two spills need a reload
+        if (self.valueIsSpill(a) && self.valueIsSpill(b))
+            ra = self.opForReg(a, "r10");
+        u32 width = a->type != null ? a->type->width : 64;
+        str mn = width == 64 ? "cmpq " : width == 32 ? "cmpl "
+                      : width == 16 ? "cmpw " : "cmpb ";
+        if (width != 64)
+        {
+            if (!self.valueIsSpill(a)) ra = width == 32 ? toReg32(ra) : width == 16 ? toReg16(ra) : toReg8(ra);
+            if ((!cb || ca) && !self.valueIsSpill(b)) rb = width == 32 ? toReg32(rb) : width == 16 ? toReg16(rb) : toReg8(rb);
+        }
+        self.emitter.emit("\t");
+        self.emitter.emit(mn);
+        if (cb && !ca)
+        {
+            self.emitter.emit("$");
+            self.emitter.emit(u64ToHex(b->valData));
+            self.emitter.emit(", ");
+            self.emitter.emitLine(ra);
+            return;
+        }
+        self.emitter.emit(rb);
+        self.emitter.emit(", ");
+        self.emitter.emitLine(ra);
+    }
+
+    // true when `icmp` is the instruction right before `br` in the same
+    // block — the compared registers cannot have moved in between, so
+    // emitCondBr may re-emit the cmp and jump on its flags directly
+    bool iselFusedBranchPair(IrInst* icmp, IrInst* br)
+    {
+        IrBlock* bb = icmp->parent;
+        if (bb == null || bb->ninsts < 2) return false;
+        if (bb->insts[bb->ninsts - 1] != br) return false;
+        return bb->insts[bb->ninsts - 2] == icmp;
+    }
+
+    // the icmp half of a fused pair: emitCondBr re-emits the cmp, so the
+    // setcc materialization is skipped here
+    bool iselSkipFusedICmp(IrInst* inst)
+    {
+        if (inst->base.nusers != 1 || inst->base.users == null) return false;
+        IrInst* u = inst->base.users[0];
+        if (u == null || u->opcode != IrOpcode::CondBr || u->nops < 1 || u->ops[0] != &inst->base)
+            return false;
+        return self.iselFusedBranchPair(inst, u);
+    }
+
     void emitCondBr(IrInst* inst)
     {
         self.lastCallTarget = "";
@@ -4308,6 +4386,50 @@ void emitIntExtendTo(str src, str dst32, u32 width, bool isSigned)
                 self.emitBlockLabel(chosen);
                 self.emitter.emitLine("");
                 return;
+            }
+            // an icmp feeding only this branch keeps its flags: the pair
+            // fuses into `cmp` + one jcc (see JCC_INT_TRUE/FALSE)
+            IrValue* cv = inst->ops[0];
+            if (cv != null && cv->kind == IrValueKind::Inst)
+            {
+                IrInst* cmp = (IrInst*)cv;
+                u32 pred = (u32)cmp->icmpPred;
+                if (cmp->opcode == IrOpcode::ICmp && cmp->nops >= 2 && pred < 10
+                    && cv->nusers == 1 && self.iselFusedBranchPair(cmp, inst))
+                {
+                    self.emitCmpOperands(cmp);
+                    str jt = JCC_INT_TRUE[pred];
+                    str jf = JCC_INT_FALSE[pred];
+                    // same fallthrough policy as the testq path: branch
+                    // only at the edge that does not fall through
+                    if (self.blockFallsThrough(inst, falseTarget))
+                    {
+                        self.emitter.emit("\t");
+                        self.emitter.emit(jt);
+                        self.emitter.emit(" ");
+                        self.emitBlockLabel(trueTarget);
+                        self.emitter.emitLine("");
+                        return;
+                    }
+                    if (self.blockFallsThrough(inst, trueTarget))
+                    {
+                        self.emitter.emit("\t");
+                        self.emitter.emit(jf);
+                        self.emitter.emit(" ");
+                        self.emitBlockLabel(falseTarget);
+                        self.emitter.emitLine("");
+                        return;
+                    }
+                    self.emitter.emit("\t");
+                    self.emitter.emit(jt);
+                    self.emitter.emit(" ");
+                    self.emitBlockLabel(trueTarget);
+                    self.emitter.emitLine("");
+                    self.emitter.emit("\tjmp ");
+                    self.emitBlockLabel(falseTarget);
+                    self.emitter.emitLine("");
+                    return;
+                }
             }
             str cond = self.valueIsSpill(inst->ops[0])
                 ? self.opForReg(inst->ops[0], "r10")

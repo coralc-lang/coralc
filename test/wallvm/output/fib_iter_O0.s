@@ -18,12 +18,8 @@ main:
 	movq %r10, (%r8)
 .Lmain_loop_3:
 	movq (%rsi), %r9
-	movl $0x000000000000000a, %r11d
-	cmpq %r11, %r9
-	setl %r11b
-	movzbq %r11b, %rbx
-	testq %rbx, %rbx
-	je .Lmain_done_5
+	cmpq $0x000000000000000a, %r9
+	jge .Lmain_done_5
 .Lmain_body_4:
 	movq (%rdi), %r9
 	movq (%r8), %rbx

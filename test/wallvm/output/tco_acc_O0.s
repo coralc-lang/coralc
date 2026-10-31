@@ -10,11 +10,8 @@ sumto:
 	movq 0(%rsp), %rbx
 	addq $176, %rsp
 .Lsumto_entry_3:
-	testq %rbx, %rbx
-	setle %r11b
-	movzbq %r11b, %rsi
-	testq %rsi, %rsi
-	je .Lsumto_step_5
+	cmpq $0x0000000000000000, %rbx
+	jg .Lsumto_step_5
 .Lsumto_base_4:
 	movq $0x0000000000000000, %rax
 	addq $8, %rsp

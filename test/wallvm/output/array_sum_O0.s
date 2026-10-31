@@ -13,12 +13,8 @@ main:
 	movq %r10, (%rdi)
 .Lmain_fill_3:
 	movq (%rdi), %r8
-	movl $0x0000000000000005, %r11d
-	cmpq %r11, %r8
-	setl %r11b
-	movzbq %r11b, %r9
-	testq %r9, %r9
-	je .Lmain_sum_pre_5
+	cmpq $0x0000000000000005, %r8
+	jge .Lmain_sum_pre_5
 .Lmain_fill_body_4:
 	movq (%rdi), %r8
 	movq %r8, %r11
@@ -36,12 +32,8 @@ main:
 	movq %r10, (%r8)
 .Lmain_sum_6:
 	movq (%rdi), %r9
-	movl $0x0000000000000005, %r11d
-	cmpq %r11, %r9
-	setl %r11b
-	movzbq %r11b, %rbx
-	testq %rbx, %rbx
-	je .Lmain_done_8
+	cmpq $0x0000000000000005, %r9
+	jge .Lmain_done_8
 .Lmain_sum_body_7:
 	movq (%rdi), %r9
 	movq %r9, %r11

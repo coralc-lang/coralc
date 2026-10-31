@@ -4,7 +4,7 @@ Consolidated from five parallel audits (branch/CFG, loop, SSA/canonical,
 memory/analysis, transform/vectorizer) plus empirical repros (crafted .ir,
 `WALLVM_PRINT_AFTER_PASS`, gdb, valgrind, ASAN). Every entry starts **OPEN**
 and must be *verified against the actual code* before being fixed — an entry
-is only marked FIXED after rebuild + `test/wallvm/run.sh` (target 100/100) is
+is only marked FIXED after rebuild + `test/wallvm/run.sh` (target 116/116) is
 green, or INVALID with a reason.
 
 Status legend: `OPEN` → `VERIFIED` (issue confirmed real) → `FIXED` /
@@ -31,6 +31,20 @@ Status legend: `OPEN` → `VERIFIED` (issue confirmed real) → `FIXED` /
 | P0-15 | sccp: (a) cond folds `createInst(Br)` whose id exceeds the entry scan's `maxId` → phase 1/2 `cells[]` read one past the heap; fixed with bounds guards (out-of-range ⇒ Top ⇒ skip/keep). (b) unreachable-block wipe unhooked+freed per inst → cross-block and producer-before-consumer references chased freed values; fixed with a full unhook pre-pass before any free (trigger: `tco_acc` O2) | sccp.crl (bounds guards + two-phase wipe) |
 | P0-16 | mem2reg promoted allocas with mixed-width accesses: a narrow store REPLACED the wider slot's SSA value (i32 const handed to i64 users; constfold then legitimately folded `lshr i64` with the i32 bit width) → wrong results at O2/O3 (repro `cases/dse_wide.ir`: 0/5 instead of 170 before the fix) | mem2reg.crl (promotability: every load/store type must equal the slot's element type) |
 | P0-17 | mem2reg's promotability check blanket-allowed `Phi` users ("placed by us") though `placePhis` runs *after* the check → an input-level address-escaping `phi %p` was promoted and the alloca freed under the phi (use-def errors, wrong exits). Same repro exposed `AliasAnalysis_walkAddr` with no cycle guard: phi self/mutual cycles recursed forever → stack overflow, irtool SEGV (O1/O2/O3, from dse→analyze→walkAddr) | mem2reg.crl (any phi user ⇒ not promotable) + alias_analysis.crl (`OBJECT_INPROGRESS` marker, self-edge skip, marker always cleared) |
+
+## Also fixed this session — regalloc / IR text / codegen support
+
+| ID | Issue | Where |
+|----|-------|-------|
+| PHI-1 | Phi elimination redesigned to **register form**: every phi home materialized into a register by `lsra.rewrite` via `materializePhis` (per-pred greedy ordering, `Trunc`/`Bitcast` copies carrying the home in valData, `divertEdge` spill-slot saves for deadlock, critical-edge `edgeSplit` blocks — split names `split<funcid>_<n>` because coral `char` is 4 bytes) | lsra.crl; default on (`gKeepPhisEnabled = true`), escape hatch `WALLVM_LOWER_PHIS` |
+| PHI-2 | Interleaved per-function pipeline ran `inl` on already-lsra'd callees: cloned phis had detached valData → dangling `%N` refs → adce deleted the "dead" add → O3 `tco_acc` returned 88 instead of 15 | wallvm.crl (`irCompile`/`irCompileAsm` split into phase 1 = optimize+structure lane for all funcs, phase 2 = regalloc for all funcs) |
+| T-1 | `parseTypeAfter("ptr")` read `peekIdent` without skipping whitespace → every `ptr T` type (globals, params, `ptr ptr` decls) leaked the pointee to the caller ("expected ';' after global declaration") | irParser.crl (`skipWs` before the pointee peek) |
+| T-2 | gep parser rejected aggregate bases (`gep @msg, 1` on a string literal, struct-typed alloca) while `emitGep` decays them — first text-format coverage of strings/globals/structs could not even parse | irParser.crl (same decay as emitGep: pointer → pointee, aggregate → itself) |
+| C-1 | `addrFor` returned a raw rip operand (`counter(%rip)`) that load/store emission wraps in `( … )` → `(counter(%rip))` assembler error; spill/intConst path shared `r11` with store's symbol source | x86_64_base.crl (materialize via `leaq …, %rdx` — reserved, never a value home) |
+| C-2 | `emitGlobalInit` had no branch for symbol initializers → `global @alias: ptr i64 = @counter` emitted `.zero 8` (null-pointer deref at runtime); pointer-variable globals declared `ptr T` got pointee-sized storage | x86_64_base.crl (`.quad label` branch; declaration convention: one deref — a pointer variable is `ptr ptr T`) |
+| C-3 | Emission-time ext-load fold (`iselTryFoldExtLoad`) re-read the *address* register at zext/sext time, but LSRA only keeps the address live until the load — its home may belong to another value (misread / fault) | x86_64_base.crl (fold disabled pending a pre-regalloc fold or RA fold-safe marking) |
+| C-4 | `createStringConst` built its bytes in a scoped `String` whose storage was reclaimed before the caller could read `sc->data` → string pool emitted whatever reused the buffer (e.g. block-name bytes); exposed by the first `string @…` test cases | irtypes.crl (raw `alloc` + `copy` owned by the IrStringConst, same ownership as `irDupStr`) |
+| G-1 | Coverage: `cases/globals.ir` (52), `cases/strings.ir` (96), `cases/structs.ir` (57) — symbol/const globals, pointer alias init, rodata pool bytes, gep decay, memory-loaded pointer byte access, struct field access across padding | gate: rebuild + run.sh = **116/116** (29 cases × O0-O3); ASAN 116/116, valgrind clean |
 
 ---
 
@@ -91,8 +105,8 @@ B1 verification: repro `cases/dist_swap.ir` (expect 54) — loop1 rejected by th
 | C2 | Critical | involution.crl:153-170 | `fptrunc(fpext(x))` identity compares `outW == fpext-output-width` — whenever it fires, replacement operand is narrower than result → type-corrupt uses. (Correct form in constfold.crl:105-118.) | OPEN |
 | C3 | Critical | cast_elim.crl:54-65 | Identity cast null-out without `replaceAllUses`/`removeUser` → users dangle at orphaned inst (never freed = leak + UAF). | OPEN |
 | C4 | Critical | cast_elim.crl:74-89,139-153; constfold.crl:88-103 | fp↔int round-trip "identities" keep the *outer* opcode fed an operand of the wrong type (`sitofp(fptosi(f64))` type-inconsistent; `sitofp(fptosi(1.5))=1.0≠1.5`) — no fast-math gate exists anywhere. | OPEN |
-| C5 | High | sccp.crl:960,1068,1202-1208 | Phase-2 `cells[inst->base.id]` — replacement `Br` created at :1068 has id > maxId ⇒ heap OOB read every cond_br fold. | OPEN |
-| C6 | High | mem2reg.crl:451-454,510 | Pre-existing `Phi` users of the alloca treated as "placed by us" (check runs before placePhis) → alloca erased while phi operand still points at it (UAF). | OPEN |
+| C5 | High | sccp.crl:960,1068,1202-1208 | Phase-2 `cells[inst->base.id]` — replacement `Br` created at :1068 has id > maxId ⇒ heap OOB read every cond_br fold. | FIXED (phase-2 cells reads bounds-guarded `inst->base.id <= maxId ? cells[...] : latticeTop()` at sccp.crl:1065,1227 — same fix as P0-15; row never closed) |
+| C6 | High | mem2reg.crl:451-454,510 | Pre-existing `Phi` users of the alloca treated as "placed by us" (check runs before placePhis) → alloca erased while phi operand still points at it (UAF). | FIXED (mem2reg marks the alloca `promotable = false` for any non-Load/Store user incl. Phi — mem2reg.crl:461-467, repro `cases/addr_phi.ir`; same fix as P0-17; row never closed) |
 | C7 | High | mem2reg.crl:372-384 | Phi update `break`s after first pair for `bb` — parallel edges (`cond_br c,X,X` / dup preds) leave second pair = const placeholder (wrong value). | OPEN |
 | C8 | High | idempotent.crl:64-96,111-132 | Store patterns unreachable: walk `break`s on any Store *before* the store-matching code that can therefore never run — pass's primary purpose dead. | OPEN |
 | C9 | Medium | idempotent.crl:136-149 | Bitcast-chain collapse has no type/width check → uses see inner source type instead of outer result type (contrast cast_elim Pattern 10 which rewires operand and keeps outer type). | OPEN |
@@ -118,7 +132,7 @@ B1 verification: repro `cases/dist_swap.ir` (expect 54) — loop1 rejected by th
 |----|-----|----------|-------|--------|
 | D1 | Critical | memory_ssa.crl:258-319; machine_opt.crl:105-121,188-212,245-267 | MemorySSA versions chained by *block array order* not CFG edges; machine_opt Pass 1 forwards with **no dominance check** (`isStoreKilledBy` scans only killer's block) → forwards a value not on the load's path (loop + single-pred shape). Pass 3 scans only *dominating* blocks, misses non-dominating side-path stores (and ignores `AtomicStore`). | OPEN |
 | D2 | Critical | dse.crl:101-127 | Kills a wider store with a narrower one: `store i64` erased by later `store i32` at same address — no `type->width` comparison anywhere (machine_opt's `isStoreDead` does compare). O1+. | FIXED — both passes compared `store->base.type->width`, but store base.type is **void** (width 0), so machine_opt's check was vacuous `0 == 0` and dse had none: now both compare the *value* operand's width and only kill when a same-address store of >= width covers the earlier one (unknown width never kills). Chasing the repro surfaced P0-16 (mem2reg mixed-width promotion) and P0-17 (address phi + walkAddr stack overflow). `cases/dse_wide.ir`: 170 at all levels. |
-| D3 | Critical | alias_analysis.crl:436-452 vs 292,302 | Multi-object phi caches the *first* incoming object → `phi(gepA,gepB)` permanently "A"; loads through real B answer NoAlias → gvn keeps stale load across store (miscompile). `walkAddr`'s own phi rule returns UNKNOWN on disagreement — cache poisons it. | OPEN |
+| D3 | Critical | alias_analysis.crl:436-452 vs 292,302 | Multi-object phi caches the *first* incoming object → `phi(gepA,gepB)` permanently "A"; loads through real B answer NoAlias → gvn keeps stale load across store (miscompile). `walkAddr`'s own phi rule returns UNKNOWN on disagreement — cache poisons it. | FIXED — the phi arm merge now caches only when *every* incoming arm resolves to the same object; any disagreement/unknown caches nothing, so `walkAddr`'s phi rule answers UNKNOWN (conservative may-alias) at query time; self-edges skipped like walkAddr. Repro `cases/phi_alias.ir`: 50 at O2/O3. |
 | D4 | High | gvn.crl:266-268; machine_opt.crl:53-55; memory_ssa.crl:373-375; licm.crl:318-320; loop_distribute.crl:79-81; alias_analysis.crl:144-149,208-213 | Cache-hit shallow copy (`aa=*aaPtr`) shares 6 buffers; `walkAddr` on a query can *realloc* those buffers (atomic addresses never analyzed → query-time `createObject`) → cache entry poisoned → `destroyCachedAliasAnalysis` double-frees. Invariant "query never allocates" unenforced. | OPEN |
 | D5 | High (dormant) | ipa_cp.crl:204-223,249-274,282-292 | Unwired. If wired: null-deref (`firstConst->id` when first site non-const) + unsound specialization (every entry-block alloca matched to every constant arg, loads RAUW'd module-wide, never erased; cloning steps unimplemented). | OPEN |
 | D6 | Medium | alias_analysis.crl:31,370-375,478,489,507,543-573,618-653 | `defId 0 == OBJECT_UNKNOWN` sentinel collision (first def indistinguishable from "no def"); `objectCount=0` means both "none" and "all"; `blockEntryDef` never populated/read; most MemoryDef/Phi API dead; intra-block-only `currentDefId`; `MemoryPhi.incoming[16]` silent truncation. | OPEN |
@@ -157,10 +171,10 @@ B1 verification: repro `cases/dist_swap.ir` (expect 54) — loop1 rejected by th
 
 ## Fix order (severity-first, verify-before-fix)
 
-1. ~~E1 (compiler hang)~~ ✓ · ~~B2a (unconditional O3 miscompile)~~ ✓ · ~~E14 (peephole br-cycle hang)~~ ✓ — done, plus E7/E8/E9, B1a-e, P0-6…P0-15, and ~~D2~~ ✓ (P0-16/P0-17 found while fixing D2). Next: D3/D1
-2. D2 (O1+ miscompile), D3 (unsound AA), D1 (unsound forwarding)
-3. C1-C4 (critical folds), C5 (OOB), A1-A3 (miscompiles)
-4. E2, E3, E4, C6-C8, A5-A6 (validate/CFG litter)
+1. ~~E1 (compiler hang)~~ ✓ · ~~B2a (unconditional O3 miscompile)~~ ✓ · ~~E14 (peephole br-cycle hang)~~ ✓ — done, plus E7/E8/E9, B1a-e, P0-6…P0-17, ~~D2~~ ✓, ~~D3~~ ✓ (P0-16/P0-17 found while fixing D2). Next: D1
+2. D1 (unsound forwarding) — D2, D3 done
+3. C1-C4 (critical folds), A1-A3 (miscompiles)
+4. E2, E3, E4, C7-C8, A5-A6 (validate/CFG litter)
 5. B3a, B4a/b, A7/A9 (dead/wrong passes), D4 (double-free hazard)
 6. Remaining Medium/Low by area; F1 frontend diagnostic
 7. After register is green: newer-pass adoption candidates (real ADCE, range propagation, loopcse enablement, unroll wiring, ipa_cp completion) and vectorizer extension testing (SSE/AVX feature inventory below).
