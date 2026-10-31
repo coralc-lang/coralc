@@ -3,20 +3,29 @@
 .type main, @function
 main:
 .Lmain_entry_2:
-	movq $0x0000000000000000, %r9
-	movq $0x0000000000000000, %r8
-.Lmain_loop_3:
-	cmpq $0x000000000000000a, %r9
-	jge .Lmain_done_5
-.Lmain_body_4:
-	movq %r9, %rdi
-	addq %r8, %rdi
-	movq $0x0000000000000001, %rsi
-	addq %r9, %rsi
-	movq %rsi, %r9
-	movq %rdi, %r8
-	jmp .Lmain_loop_3
+	jmp .Lmain_preheader_30
 .Lmain_done_5:
 	movl %r8d, %esi
 	movq %rsi, %rax
 	ret
+.Lmain_preheader_30:
+.Lmain__32:
+.Lmain__33:
+.Lmain__34:
+.Lmain__35:
+.Lmain__36:
+.Lmain__37:
+.Lmain__38:
+.Lmain__39:
+.Lmain__40:
+.Lmain__41:
+.Lmain__42:
+.Lmain__43:
+.Lmain__44:
+.Lmain__45:
+.Lmain__46:
+.Lmain__47:
+.Lmain__48:
+.Lmain__49:
+.Lmain__50:
+.Lmain__51:

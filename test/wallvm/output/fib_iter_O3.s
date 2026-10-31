@@ -2,32 +2,30 @@
 .globl main
 .type main, @function
 main:
-	pushq %rbp
-	movq %rsp, %rbp
-	pushq %rbx
-	subq $40, %rsp
 .Lmain_entry_2:
-	leaq -48(%rbp), %rsi
-	movq $0x0000000000000000, %rbx
-	movq $0x0000000000000001, %r9
-	movq $0x0000000000000000, %r8
-.Lmain_loop_3:
-	cmpq $0x000000000000000a, %rbx
-	jge .Lmain_done_5
-.Lmain_body_4:
-	movq %r9, %rdi
-	addq %r8, %rdi
-	movq $0x0000000000000001, %rsi
-	addq %rbx, %rsi
-	movq %rsi, %rbx
-	movq %rdi, -24(%rbp)
-	movq %r8, %r9
-	movq -24(%rbp), %r8
-	jmp .Lmain_loop_3
+	jmp .Lmain_preheader_34
 .Lmain_done_5:
-	movl %r8d, %esi
+	movl %r9d, %esi
 	movq %rsi, %rax
-	addq $40, %rsp
-	popq %rbx
-	leave
 	ret
+.Lmain_preheader_34:
+.Lmain__36:
+.Lmain__37:
+.Lmain__38:
+.Lmain__39:
+.Lmain__40:
+.Lmain__41:
+.Lmain__42:
+.Lmain__43:
+.Lmain__44:
+.Lmain__45:
+.Lmain__46:
+.Lmain__47:
+.Lmain__48:
+.Lmain__49:
+.Lmain__50:
+.Lmain__51:
+.Lmain__52:
+.Lmain__53:
+.Lmain__54:
+.Lmain__55:

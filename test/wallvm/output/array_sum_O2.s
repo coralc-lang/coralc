@@ -13,8 +13,7 @@ main:
 	cmpq $0x0000000000000005, %rdi
 	jge .Lmain_sum_pre_5
 .Lmain_fill_body_4:
-	movq %rdi, %r11
-	leaq (%rsi, %r11, 8), %r8
+	leaq (%rsi, %rdi, 8), %r8
 	incq %rdi
 	movq %rdi, (%r8)
 	jmp .Lmain_fill_3
@@ -25,8 +24,7 @@ main:
 	cmpq $0x0000000000000005, %rdi
 	jge .Lmain_done_8
 .Lmain_sum_body_7:
-	movq %rdi, %r11
-	leaq (%rsi, %r11, 8), %r9
+	leaq (%rsi, %rdi, 8), %r9
 	movq (%r9), %rbx
 	addq %r8, %rbx
 	incq %rdi

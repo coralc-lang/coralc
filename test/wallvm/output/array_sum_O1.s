@@ -16,8 +16,7 @@ main:
 	jge .Lmain_sum_pre_5
 .Lmain_fill_body_4:
 	movq (%rdi), %r8
-	movq %r8, %r11
-	leaq (%rsi, %r11, 8), %r9
+	leaq (%rsi, %r8, 8), %r9
 	incq %r8
 	movq %r8, (%r9)
 	movq (%rdi), %r8
@@ -33,8 +32,7 @@ main:
 	jge .Lmain_done_8
 .Lmain_sum_body_7:
 	movq (%rdi), %r9
-	movq %r9, %r11
-	leaq (%rsi, %r11, 8), %rbx
+	leaq (%rsi, %r9, 8), %rbx
 	movq (%rbx), %r9
 	movq (%r8), %rbx
 	addq %rbx, %r9

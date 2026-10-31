@@ -11,8 +11,7 @@ main:
 	movq $0x0000000000000002, %r8
 	movq $0x0000000000000000, %rsi
 .Lmain_loop_3:
-	movq $0x0000000000000001, %rdi
-	addq %rsi, %rdi
+	leaq 1(%rsi), %rdi
 	cmpq $0x0000000000000004, %rdi
 	jl .Lmain_main.split0_21
 .Lmain_done_4:

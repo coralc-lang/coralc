@@ -11,49 +11,30 @@ main:
 	pushq %r15
 	subq $72, %rsp
 .Lmain_entry_2:
-	leaq -64(%rbp), %r9
-	leaq -80(%rbp), %r8
-	leaq -96(%rbp), %rdi
-	leaq -112(%rbp), %rsi
-	movq $0x000000000000000a, (%r9)
-	leaq 8(%r9), %rbx
+	leaq -64(%rbp), %rsi
+	leaq -80(%rbp), %rdi
+	leaq -96(%rbp), %r8
+	leaq -112(%rbp), %r9
+	movq $0x000000000000000a, (%rsi)
+	leaq 8(%rsi), %rbx
 	movq $0x0000000000000014, (%rbx)
-	movq $0x0000000000000001, (%r8)
-	leaq 8(%r8), %rbx
+	movq $0x0000000000000001, (%rdi)
+	leaq 8(%rdi), %rbx
 	movq $0x0000000000000002, (%rbx)
-	movq $0x0000000000000000, %rbx
-.Lmain_loop1_3:
-	movq %rbx, %r11
-	leaq (%r9, %r11, 8), %r15
-	movq %rbx, %r11
-	leaq (%r8, %r11, 8), %r14
-	movq (%r15), %r13
-	movq (%r14), %r12
-	movq %r13, (%r14)
-	movq %r12, (%r15)
-	cmpq $0x0000000000000002, %rbx
-	jge .Lmain_main.split0_78
-.Lmain_body1_4:
-	movq $0x0000000000000001, %r12
-	addq %rbx, %r12
-	movq %r12, %rbx
-	jmp .Lmain_loop1_3
+	jmp .Lmain_preheader_78
 .Lmain_loop2_6:
-	cmpq $0x0000000000000002, %r15
+	cmpq $0x0000000000000002, %rbx
 	jl .Lmain_loopdist0_64
 .Lmain_done_8:
-	leaq 8(%r9), %rbx
-	movq (%rbx), %r14
-	leaq 8(%rdi), %rbx
-	movq (%rbx), %r13
-	leaq 8(%rsi), %rbx
-	movq (%rbx), %r12
-	movq %r14, %rbx
-	addq %r13, %rbx
-	movq %r12, %r13
-	addq %rbx, %r13
-	movl %r13d, %ebx
-	movq %rbx, %rax
+	leaq 8(%rsi), %r12
+	movq (%r12), %r13
+	leaq 8(%r8), %r12
+	movq (%r12), %r14
+	leaq 8(%r9), %r12
+	movq (%r12), %r15
+	addq %r14, %r13
+	addq %r13, %r15
+	movq %r15, %rax
 	addq $72, %rsp
 	popq %r15
 	popq %r14
@@ -63,27 +44,23 @@ main:
 	leave
 	ret
 .Lmain_loopdist0_64:
-	movq %r15, %r11
-	leaq (%r9, %r11, 8), %r12
-	movq (%r12), %rbx
-	movq $0x000000000000000a, %r12
-	addq %rbx, %r12
-	movq %r15, %r11
-	leaq (%rdi, %r11, 8), %rbx
-	movq %r12, (%rbx)
+	leaq (%rsi, %rbx, 8), %r12
+	movq (%r12), %r13
+	leaq 10(%r13), %r13
+	leaq (%r8, %rbx, 8), %r12
+	movq %r13, (%r12)
 .Lmain_loopdist1_65:
-	movq %r15, %r11
-	leaq (%r8, %r11, 8), %r12
-	movq (%r12), %rbx
-	movq $0x0000000000000014, %r12
-	addq %rbx, %r12
-	movq %r15, %r11
-	leaq (%rsi, %r11, 8), %rbx
-	movq %r12, (%rbx)
-	movq $0x0000000000000001, %rbx
-	addq %r15, %rbx
-	movq %rbx, %r15
+	leaq (%rdi, %rbx, 8), %r12
+	movq (%r12), %r13
+	leaq 20(%r13), %r13
+	leaq (%r9, %rbx, 8), %r12
+	movq %r13, (%r12)
+	leaq 1(%rbx), %rbx
 	jmp .Lmain_loop2_6
-.Lmain_main.split0_78:
-	movq $0x0000000000000000, %r15
-	jmp .Lmain_loop2_6
+.Lmain_preheader_78:
+.Lmain__80:
+	movq $0x0000000000000000, %rbx
+.Lmain__81:
+.Lmain__82:
+	movq $0x0000000000000000, %rbx
+.Lmain__83:

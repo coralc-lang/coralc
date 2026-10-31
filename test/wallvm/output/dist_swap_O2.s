@@ -30,10 +30,8 @@ main:
 	cmpq %r11, %rbx
 	setl %r11b
 	movzbq %r11b, %r12
-	movq %rbx, %r11
-	leaq (%rsi, %r11, 8), %r13
-	movq %rbx, %r11
-	leaq (%rdi, %r11, 8), %r14
+	leaq (%rsi, %rbx, 8), %r13
+	leaq (%rdi, %rbx, 8), %r14
 	movq (%r13), %r15
 	movq (%r14), %r9
 	movq %r15, (%r14)
@@ -50,20 +48,16 @@ main:
 	cmpq %r11, %r9
 	setl %r11b
 	movzbq %r11b, %rbx
-	movq %r9, %r11
-	leaq (%rsi, %r11, 8), %r12
+	leaq (%rsi, %r9, 8), %r12
 	movq (%r12), %r13
 	addq $0x000000000000000a, %r13
-	movq %r9, %r11
-	leaq (%r8, %r11, 8), %r12
+	leaq (%r8, %r9, 8), %r12
 	movq %r13, (%r12)
-	movq %r9, %r11
-	leaq (%rdi, %r11, 8), %r12
+	leaq (%rdi, %r9, 8), %r12
 	movq (%r12), %r13
 	addq $0x0000000000000014, %r13
 	movq -56(%rbp), %r10
-	movq %r9, %r11
-	leaq (%r10, %r11, 8), %r12
+	leaq (%r10, %r9, 8), %r12
 	movq %r13, (%r12)
 	testq %rbx, %rbx
 	je .Lmain_done_8
