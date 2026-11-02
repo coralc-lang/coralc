@@ -26,7 +26,8 @@ main:
 	ret
 .Lmain_main.split0_21:
 	movq %rdi, %rsi
-	movq %r9, -16(%rbp)
+	movq %r9, %r11
+	movq %r11, -16(%rbp)
 	movq %r8, %r9
 	movq -16(%rbp), %r8
 	jmp .Lmain_loop_3

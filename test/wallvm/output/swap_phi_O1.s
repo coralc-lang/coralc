@@ -23,7 +23,8 @@ main:
 	leave
 	ret
 .Lmain_main.split0_21:
-	movq %rsi, -16(%rbp)
+	movq %rsi, %r11
+	movq %r11, -16(%rbp)
 	movq %rdi, %rsi
 	movq -16(%rbp), %rdi
 	jmp .Lmain_loop_3

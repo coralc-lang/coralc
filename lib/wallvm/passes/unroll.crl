@@ -294,6 +294,28 @@ pub struct UnrollPass
         return n;
     }
 
+    // Value an exit block sees on the retargeted last backedge (the
+    // latch copy's jump home, pointed at the exit for the final
+    // iteration): a header phi takes its backedge-pair value, as if the
+    // final header entry had executed; anything else is simply the last
+    // iteration's clone.
+    IrValue* retargetExitVal(IrValue* x, IrBlock* header, IrBlock* latch,
+                             UnrollValMap* vm, UnrollValMap* bm)
+    {
+        if (x == null) return null;
+        if (x->kind == IrValueKind::Inst)
+        {
+            IrInst* xi = (IrInst*)x;
+            if (xi->opcode == IrOpcode::Phi && xi->parent == header)
+            {
+                for (u32 pi = 1; pi < xi->nops; pi += 2)
+                    if (xi->ops[pi] == &latch->base)
+                        return self.remapVal(xi->ops[pi - 1], vm, bm);
+            }
+        }
+        return self.remapVal(x, vm, bm);
+    }
+
     bool tryUnroll(IrFunc* func, IrLoop* lp)
     {
         IrBlock* header = lp->header;
@@ -459,52 +481,47 @@ pub struct UnrollPass
                 blkMaps[i].put(&lp->blocks[bi]->base, &cp->base);
             }
 
-        // Execution order within one iteration, preds before succs.
-        u32* order = alloc<u32>((usize)nb);
-        bool* placed = alloc<bool>((usize)nb);
-        for (u32 bi = 0; bi < nb; bi++) placed[bi] = false;
-        u32 nOrder = 0;
-        while (nOrder < nb)
-        {
-            bool progressed = false;
-            for (u32 bi = 0; bi < nb; bi++)
-            {
-                if (placed[bi]) continue;
-                IrBlock* b = lp->blocks[bi];
-                bool ready = true;
-                for (u32 pi = 0; pi < b->npreds; pi++)
-                {
-                    if (self.isInLoop(lp, b->preds[pi]) &&
-                        !placed[self.loopIndex(lp, null, b->preds[pi])])
-                    { ready = false; break; }
-                }
-                if (ready)
-                {
-                    placed[bi] = true;
-                    order[nOrder++] = bi;
-                    progressed = true;
-                }
-            }
-            if (!progressed) break;
-        }
-
-        // Clone each iteration.
+        // Clone each iteration in two passes. Pass 1 creates an empty
+        // shell for every non-terminator instruction so remapVal can
+        // resolve operands no matter which block is cloned first: a
+        // header or inner-loop phi reads its latch's values "backwards"
+        // within the iteration, and cloning in pred order left those
+        // pointing at the originals (which teardown then freed). Pass 2
+        // fills operands, pass 3 installs terminators.
         for (u32 i = 0; i < (u32)k; i++)
         {
-            for (u32 oi = 0; oi < nOrder; oi++)
+            for (u32 bi = 0; bi < nb; bi++)
             {
-                u32 bi = order[oi];
                 IrBlock* src = lp->blocks[bi];
                 IrBlock* dst = copies[i * nb + bi];
                 for (u32 ii = 0; ii < src->ninsts; ii++)
                 {
                     IrInst* s = src->insts[ii];
                     if (irOpcodeIsTerminator(s->opcode)) break;
+                    // A header phi copy carries a single pair (its one
+                    // predecessor), not the original's pair list.
+                    u32 shellNops = (s->opcode == IrOpcode::Phi && bi == headerIdx)
+                                        ? 2u : s->nops;
+                    IrInst* n = self.ctx->createInst(s->opcode, s->base.type, null,
+                                                     shellNops, (u64)s->icmpPred,
+                                                     (u64)s->fcmpPred);
+                    dst->addInst(n);
+                    valMaps[i].put(&s->base, &n->base);
+                }
+            }
 
-                    IrInst* n = null;
+            for (u32 bi = 0; bi < nb; bi++)
+            {
+                IrBlock* src = lp->blocks[bi];
+                for (u32 ii = 0; ii < src->ninsts; ii++)
+                {
+                    IrInst* s = src->insts[ii];
+                    if (irOpcodeIsTerminator(s->opcode)) break;
+                    IrInst* n = (IrInst*)valMaps[i].get(&s->base);
+                    if (n == null) continue;
                     if (s->opcode == IrOpcode::Phi && bi == headerIdx)
                     {
-                        // Header phi, entry pair in the first iteration,
+                        // Header phi: entry pair in the first iteration,
                         // backedge pair (from the previous iteration) after.
                         IrValue* v = null;
                         IrValue* p = null;
@@ -521,48 +538,43 @@ pub struct UnrollPass
                             v = self.remapVal(v, &valMaps[i - 1], &blkMaps[i - 1]);
                             p = &copies[(i - 1) * nb + latchIdx]->base;
                         }
-                        IrValue** ops = alloc<IrValue*>((usize)2);
-                        ops[0] = v;
-                        ops[1] = p;
-                        n = self.ctx->createInst(IrOpcode::Phi, s->base.type, ops, 2, 0, 0);
-                        dealloc<IrValue*>(ops);
-                        dst->addInst(n);
+                        n->ops[0] = v;
+                        n->ops[1] = p;
                         if (v != null) v->addUser(n);
                         p->addUser(n);
-                        valMaps[i].put(&s->base, &n->base);
                     }
                     else if (s->opcode == IrOpcode::Phi)
                     {
                         // Non-header phi, all predecessors in-loop, same
                         // iteration.
-                        IrValue** ops = alloc<IrValue*>((usize)s->nops);
-                        u32 np = 0;
                         for (u32 pi = 0; pi < s->nops; pi += 2)
                         {
                             IrValue* v = self.remapVal(s->ops[pi], &valMaps[i], &blkMaps[i]);
                             IrValue* p = self.remapVal(s->ops[pi + 1], &valMaps[i], &blkMaps[i]);
-                            ops[np++] = v;
-                            ops[np++] = p;
+                            n->ops[pi] = v;
+                            n->ops[pi + 1] = p;
+                            if (v != null) v->addUser(n);
+                            if (p != null) p->addUser(n);
                         }
-                        n = self.ctx->createInst(IrOpcode::Phi, s->base.type, ops, np, 0, 0);
-                        for (u32 pi = 0; pi < np; pi++)
-                            if (ops[pi] != null)
-                                ops[pi]->addUser(n);
-                        dealloc<IrValue*>(ops);
-                        dst->addInst(n);
-                        valMaps[i].put(&s->base, &n->base);
                     }
                     else
                     {
-                        n = self.cloneInst(s, dst, &valMaps[i], &blkMaps[i]);
+                        for (u32 oi = 0; oi < s->nops; oi++)
+                        {
+                            IrValue* v = self.remapVal(s->ops[oi], &valMaps[i], &blkMaps[i]);
+                            n->ops[oi] = v;
+                            if (v != null) v->addUser(n);
+                        }
                     }
                 }
 
                 // Terminator, backedge targets the next iteration's header
                 // (or the exit for the last one); other in-loop targets map
                 // to the same-iteration copy.
+                if (src->ninsts == 0) continue;
                 IrInst* st = src->insts[src->ninsts - 1];
                 if (!irOpcodeIsTerminator(st->opcode)) continue;
+                IrBlock* dst = copies[i * nb + bi];
                 IrValue** ops = alloc<IrValue*>((usize)(st->nops > 0u ? (usize)st->nops : (usize)1));
                 for (u32 tj = 0; tj < st->nops; tj++)
                 {
@@ -594,11 +606,15 @@ pub struct UnrollPass
                         ops[tj]->addUser(nt);
                 dealloc<IrValue*>(ops);
                 dst->addInst(nt);
-                if (nt->opcode == IrOpcode::Br || nt->opcode == IrOpcode::CondBr)
+                // CondBr operands are [cond, true, false] — the targets
+                // start at ops[1]; treating ops[0] as a block fed an
+                // instruction pointer into addSucc.
+                if (nt->opcode == IrOpcode::Br)
+                    dst->addSucc((IrBlock*)nt->ops[0]);
+                else if (nt->opcode == IrOpcode::CondBr)
                 {
-                    u32 ntgt = (u32)(nt->opcode == IrOpcode::Br ? 1 : 2);
-                    for (u32 tj = 0; tj < ntgt; tj++)
-                        dst->addSucc((IrBlock*)nt->ops[tj]);
+                    dst->addSucc((IrBlock*)nt->ops[1]);
+                    dst->addSucc((IrBlock*)nt->ops[2]);
                 }
             }
         }
@@ -616,58 +632,154 @@ pub struct UnrollPass
             ph->addSucc(copies[0 * nb + headerIdx]);
         }
 
-        // Extend exit-block phis, each in-loop predecessor contributes one
-        // incoming pair per iteration.
+        // Exit-block value flow. Every copy that branches out of the
+        // loop carries its own iteration's values, and the retargeted
+        // last backedge (the latch copy's jump home, pointed at the
+        // exit for the final iteration) carries the values the header
+        // phis would have taken — so each in-loop value reaching the
+        // exit flows through a phi covering the k original-pred edges
+        // plus that one retargeted edge. The original preds are dropped
+        // from the exit block's pred list during teardown below; the
+        // clone terminators already registered their edges via addSucc.
+        IrBlock* s = exitBlock;
+        u32* origPredIdx = alloc<u32>((usize)nb);
+        u32 nOrigPreds = 0;
         for (u32 bi = 0; bi < nb; bi++)
         {
             IrBlock* b = lp->blocks[bi];
             for (u32 si = 0; si < b->nsuccs; si++)
+                if (b->succs[si] == s) { origPredIdx[nOrigPreds++] = bi; break; }
+        }
+
+        // Rebuild existing exit phis: every in-loop incoming pair
+        // becomes k per-iteration pairs plus the retargeted edge.
+        u32 lastIt = (u32)k - 1;
+        for (u32 ii = 0; ii < s->ninsts; ii++)
+        {
+            IrInst* phi = s->insts[ii];
+            if (phi->opcode != IrOpcode::Phi) break;
+            u32 nIn = 0;
+            IrValue* baseV = null;
+            for (u32 pi = 1; pi < phi->nops; pi += 2)
             {
-                IrBlock* s = b->succs[si];
-                if (self.isInLoop(lp, s)) continue;
-                for (u32 ii = 0; ii < s->ninsts; ii++)
+                IrBlock* pb = (IrBlock*)phi->ops[pi];
+                if (pb != null && self.isInLoop(lp, pb))
                 {
-                    IrInst* phi = s->insts[ii];
-                    if (phi->opcode != IrOpcode::Phi) break;
-                    u32 nrep = 0;
-                    for (u32 pi = 1; pi < phi->nops; pi += 2)
-                        if (phi->ops[pi] == &b->base) nrep++;
-                    if (nrep == 0) continue;
-                    u32 newN = phi->nops + nrep * (u32)(k - 1);
-                    IrValue** newOps = alloc<IrValue*>((usize)newN);
-                    #[[maybe_unused]] u32 ni = 0;
-                    for (u32 pi = 0; pi < phi->nops; pi += 2)
-                    {
-                        if (phi->ops[pi + 1] == &b->base)
-                        {
-                            if (phi->ops[pi] != null) phi->ops[pi]->removeUser(phi);
-                            b->base.removeUser(phi);
-                            for (u32 it = 0; it < (u32)k; it++)
-                            {
-                                IrValue* v = self.remapVal(phi->ops[pi], &valMaps[it], &blkMaps[it]);
-                                IrValue* p = &copies[it * nb + bi]->base;
-                                newOps[ni++] = v;
-                                newOps[ni++] = p;
-                                if (v != null) v->addUser(phi);
-                                p->addUser(phi);
-                            }
-                        }
-                        else
-                        {
-                            newOps[ni++] = phi->ops[pi];
-                            newOps[ni++] = phi->ops[pi + 1];
-                        }
-                    }
-                    if (phi->capOps > 0) dealloc<IrValue*>(phi->ops);
-                    phi->ops = newOps;
-                    phi->nops = newN;
-                    phi->capOps = newN;
+                    if (baseV == null) baseV = phi->ops[pi - 1];
+                    nIn++;
                 }
-                s->removePred(b);
-                for (u32 it = 0; it < (u32)k; it++)
-                    s->addPred(copies[it * nb + bi]);
+            }
+            if (nIn == 0) continue;
+            u32 newN = phi->nops - nIn * 2 + nIn * (u32)k * 2 + 2;
+            IrValue** newOps = alloc<IrValue*>((usize)newN);
+            u32 ni = 0;
+            for (u32 pi = 0; pi < phi->nops; pi += 2)
+            {
+                IrBlock* pb = (IrBlock*)phi->ops[pi + 1];
+                if (pb != null && self.isInLoop(lp, pb))
+                {
+                    if (phi->ops[pi] != null) phi->ops[pi]->removeUser(phi);
+                    pb->base.removeUser(phi);
+                    u32 bi = self.loopIndex(lp, null, pb);
+                    for (u32 it = 0; it < (u32)k; it++)
+                    {
+                        IrValue* v = self.remapVal(phi->ops[pi], &valMaps[it], &blkMaps[it]);
+                        IrValue* p = &copies[it * nb + bi]->base;
+                        newOps[ni++] = v;
+                        newOps[ni++] = p;
+                        if (v != null) v->addUser(phi);
+                        p->addUser(phi);
+                    }
+                }
+                else
+                {
+                    newOps[ni++] = phi->ops[pi];
+                    newOps[ni++] = phi->ops[pi + 1];
+                }
+            }
+            // The retargeted last backedge is a real pred of the exit
+            // block with no original counterpart.
+            IrValue* ev = self.retargetExitVal(baseV, header, lp->latch,
+                                               &valMaps[lastIt], &blkMaps[lastIt]);
+            newOps[ni++] = ev;
+            newOps[ni++] = &copies[lastIt * nb + latchIdx]->base;
+            if (ev != null) ev->addUser(phi);
+            newOps[ni - 1]->addUser(phi);
+            if (phi->capOps > 0) dealloc<IrValue*>(phi->ops);
+            phi->ops = newOps;
+            phi->nops = newN;
+            phi->capOps = newN;
+        }
+
+        // In-loop values used by ordinary (non-phi) instructions in the
+        // exit block need a phi of their own: the use is rewritten to
+        // read it, and it is built with the same k-plus-retarget pair
+        // shape as above.
+        u32 capU = 1;
+        for (u32 ii = 0; ii < s->ninsts; ii++) capU += s->insts[ii]->nops;
+        IrValue** usedV = alloc<IrValue*>((usize)capU);
+        u32 nUsed = 0;
+        for (u32 ii = 0; ii < s->ninsts; ii++)
+        {
+            IrInst* ui = s->insts[ii];
+            if (ui->opcode == IrOpcode::Phi) continue;
+            for (u32 oi = 0; oi < ui->nops; oi++)
+            {
+                IrValue* op = ui->ops[oi];
+                if (op == null || op->kind != IrValueKind::Inst) continue;
+                IrBlock* def = ((IrInst*)op)->parent;
+                if (def == null || !self.isInLoop(lp, def)) continue;
+                bool seen = false;
+                for (u32 u2 = 0; u2 < nUsed; u2++)
+                    if (usedV[u2] == op) { seen = true; break; }
+                if (!seen) usedV[nUsed++] = op;
             }
         }
+        for (u32 u2 = 0; u2 < nUsed; u2++)
+        {
+            IrValue* V = usedV[u2];
+            u32 newN = nOrigPreds * (u32)k * 2 + 2;
+            IrValue** newOps = alloc<IrValue*>((usize)newN);
+            #[[maybe_unused]] u32 ni = 0;
+            for (u32 oi = 0; oi < nOrigPreds; oi++)
+            {
+                u32 bi = origPredIdx[oi];
+                for (u32 it = 0; it < (u32)k; it++)
+                {
+                    IrValue* v = self.remapVal(V, &valMaps[it], &blkMaps[it]);
+                    IrValue* p = &copies[it * nb + bi]->base;
+                    newOps[ni++] = v;
+                    newOps[ni++] = p;
+                }
+            }
+            IrValue* ev = self.retargetExitVal(V, header, lp->latch,
+                                               &valMaps[lastIt], &blkMaps[lastIt]);
+            newOps[ni++] = ev;
+            newOps[ni++] = &copies[lastIt * nb + latchIdx]->base;
+            IrInst* np = self.ctx->createInst(IrOpcode::Phi, V->type, newOps, newN, 0, 0);
+            for (u32 oi = 0; oi < newN; oi++)
+                if (newOps[oi] != null) newOps[oi]->addUser(np);
+            dealloc<IrValue*>(newOps);
+            IrInst* anchor = null;
+            for (u32 ii = 0; ii < s->ninsts; ii++)
+                if (s->insts[ii]->opcode != IrOpcode::Phi) { anchor = s->insts[ii]; break; }
+            if (anchor != null) s->insertBefore(np, anchor);
+            else s->addInst(np);
+            for (u32 ii = 0; ii < s->ninsts; ii++)
+            {
+                IrInst* ui = s->insts[ii];
+                if (ui == np || ui->opcode == IrOpcode::Phi) continue;
+                for (u32 oi = 0; oi < ui->nops; oi++)
+                    if (ui->ops[oi] == V)
+                    {
+                        V->removeUser(ui);
+                        np->base.addUser(ui);
+                        ui->ops[oi] = &np->base;
+                    }
+            }
+        }
+        dealloc<u32>(origPredIdx);
+        dealloc<IrValue*>(usedV);
 
         // Tear down every original loop block and remove it.
         for (u32 bi = 0; bi < nb; bi++)
@@ -677,6 +789,13 @@ pub struct UnrollPass
                 b->succs[si]->removePred(b);
             for (u32 pi = 0; pi < b->npreds; pi++)
                 b->preds[pi]->removeSucc(b);
+            // removePred/removeSucc repair only the NEIGHBOR side and
+            // never reciprocate — the original keeps its old counts, and
+            // the removal gate below reads exactly those counts, so every
+            // original block used to survive teardown as a ghost that
+            // later passes still walked (and its insts were never freed).
+            b->npreds = 0;
+            b->nsuccs = 0;
         }
         for (u32 bi = 0; bi < nb; bi++)
         {
@@ -699,8 +818,6 @@ pub struct UnrollPass
         dealloc<UnrollValMap>(valMaps);
         dealloc<UnrollValMap>(blkMaps);
         dealloc<IrBlock*>(copies);
-        dealloc<u32>(order);
-        dealloc<bool>(placed);
     }
 
     bool run(IrFunc* func)

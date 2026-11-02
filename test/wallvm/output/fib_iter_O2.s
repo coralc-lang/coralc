@@ -16,7 +16,8 @@ main:
 .Lmain_body_4:
 	addq %r8, %rdi
 	incq %rsi
-	movq %rdi, -16(%rbp)
+	movq %rdi, %r11
+	movq %r11, -16(%rbp)
 	movq %r8, %rdi
 	movq -16(%rbp), %r8
 	jmp .Lmain_loop_3

@@ -3795,6 +3795,47 @@ pub struct X86_64CodeGen
         str src2 = bv != null ? self.getRegForValue(bv) : "rdx";
         if (width == 64)
         {
+            // add with the immediate in operand 0: one lea from operand
+            // 1's register instead of a materialized constant plus the
+            // two-address op (`movq $1,%rdi; addq %r9,%rdi` →
+            // `leaq 1(%r9),%rdi`). lea's displacement is signed 32 bits,
+            // so only immediates that fit it take this path; a zero
+            // displacement degenerates into the move it would have been.
+            if (inst->opcode == IrOpcode::Add && valueIsIntConst(av) &&
+                bv != null && !valueIsIntConst(bv))
+            {
+                u64 imm = av->valData;
+                u64 hi = imm & 0xFFFFFFFF00000000UL;
+                bool fits = hi == 0 ? (imm <= 0x7FFFFFFFUL)
+                          : (hi == 0xFFFFFFFF00000000UL) && (imm >= 0xFFFFFFFF80000000UL);
+                if (fits)
+                {
+                    str sr = self.valueIsSpill(bv)
+                           ? self.opForReg(bv, "r11")
+                           : self.getRegForValue(bv);
+                    if ((i64)imm == 0)
+                    {
+                        if (!sr.equals(work))
+                        {
+                            self.emitter.emit("\tmovq ");
+                            self.emitter.emit(sr);
+                            self.emitter.emit(", ");
+                            self.emitter.emitLine(work);
+                        }
+                    }
+                    else
+                    {
+                        self.emitter.emit("\tleaq ");
+                        self.emitter.emit(i64ToDec((i64)imm));
+                        self.emitter.emit("(");
+                        self.emitter.emit(sr);
+                        self.emitter.emit("), ");
+                        self.emitter.emitLine(work);
+                    }
+                    if (dstSpill) self.sinkInt(&inst->base, "r10");
+                    return;
+                }
+            }
             str opSrc = src2;
             if (src1.equals(work))
             {
@@ -4189,6 +4230,7 @@ void emitIntExtendTo(str src, str dst32, u32 width, bool isSigned)
         i64 constOff = 0;
         bool haveDyn = false;
         u32 leaScale = 1; // SIB scale deferred to the final lea
+        str idxReg = "r11"; // where the dynamic index rides (its home when nothing needs the scratch)
         for (u32 k = 1; k < inst->nops && rt != null; k++)
         {
             IrValue* iv = inst->ops[k];
@@ -4228,28 +4270,56 @@ void emitIntExtendTo(str src, str dst32, u32 width, bool isSigned)
             }
             else if (!haveDyn)
             {
-                self.opForReg(iv, "r11");
                 u32 iw = iv->type != null ? iv->type->width : 64;
-                if (iw == 32) self.emitter.emitLine("\tmovslq %r11d, %r11");
-                else if (iw == 16) self.emitter.emitLine("\tmovswq %r11w, %r11");
-                else if (iw == 8) self.emitter.emitLine("\tmovsbq %r11b, %r11");
-                if (stride == 2 || stride == 4 || stride == 8)
+                bool last = (k + 1 == inst->nops);
+                bool sibStride = (stride == 2 || stride == 4 || stride == 8);
+                // The first dynamic index can ride in its own home: when
+                // it is full width (no sign-extension), its stride is one
+                // the final lea can express (no pre-lea multiply), and
+                // that home collides with neither base, destination, nor
+                // rax (the scratch a second dynamic index folds through),
+                // nothing downstream needs r11 — one lea, no copy into
+                // the scratch.
+                bool stay = iw == 64 && !self.valueIsSpill(iv) &&
+                            (stride == 1 || (sibStride && last));
+                if (stay)
                 {
-                    // only the last index may ride the lea's SIB scale;
-                    // an index behind it needs its product right now
-                    if (k + 1 == inst->nops) leaScale = stride;
+                    str home = self.getRegForValue(iv);
+                    if (home.equals(base) || home.equals(work) ||
+                        home.equals("rax"))
+                        stay = false;
+                    else
+                        idxReg = home;
+                }
+                if (stay)
+                {
+                    if (sibStride && last) leaScale = stride;
+                }
+                else
+                {
+                    idxReg = "r11";
+                    self.opForReg(iv, "r11");
+                    if (iw == 32) self.emitter.emitLine("\tmovslq %r11d, %r11");
+                    else if (iw == 16) self.emitter.emitLine("\tmovswq %r11w, %r11");
+                    else if (iw == 8) self.emitter.emitLine("\tmovsbq %r11b, %r11");
+                    if (sibStride)
+                    {
+                        // only the last index may ride the lea's SIB scale;
+                        // an index behind it needs its product right now
+                        if (last) leaScale = stride;
+                        else if (stride > 1)
+                        {
+                            self.emitter.emit("\timulq $");
+                            self.emitter.emit(u32ToStr(stride));
+                            self.emitter.emitLine(", %r11");
+                        }
+                    }
                     else if (stride > 1)
                     {
                         self.emitter.emit("\timulq $");
                         self.emitter.emit(u32ToStr(stride));
                         self.emitter.emitLine(", %r11");
                     }
-                }
-                else if (stride > 1)
-                {
-                    self.emitter.emit("\timulq $");
-                    self.emitter.emit(u32ToStr(stride));
-                    self.emitter.emitLine(", %r11");
                 }
                 haveDyn = true;
             }
@@ -4267,7 +4337,8 @@ void emitIntExtendTo(str src, str dst32, u32 width, bool isSigned)
                     self.emitter.emit(u32ToStr(stride));
                     self.emitter.emitLine(", %rax");
                 }
-                self.emitter.emitLine("\taddq %rax, %r11");
+                self.emitter.emit("\taddq %rax, %");
+                self.emitter.emitLine(idxReg);
             }
             rt = rt->elem;
         }
@@ -4305,14 +4376,17 @@ void emitIntExtendTo(str src, str dst32, u32 width, bool isSigned)
             else
             {
                 self.emitImmTo((u64)constOff, "rax");
-                self.emitter.emitLine("\taddq %rax, %r11");
+                self.emitter.emit("\taddq %rax, %");
+                self.emitter.emitLine(idxReg);
             }
         }
         self.emitter.emit("\tleaq ");
         self.emitter.emit(disp);
         self.emitter.emit("(");
         self.emitter.emit(base);
-        self.emitter.emit(", %r11, ");
+        self.emitter.emit(", %");
+        self.emitter.emit(idxReg);
+        self.emitter.emit(", ");
         self.emitter.emit(u32ToStr(leaScale));
         self.emitter.emit("), ");
         self.emitter.emitLine(work);
@@ -4644,10 +4718,25 @@ void emitIntExtendTo(str src, str dst32, u32 width, bool isSigned)
 
     void emitCast(IrInst* inst)
     {
-        str dst = self.getRegForValue(&inst->base);
+        str dstHome = self.getRegForValue(&inst->base);
         str src = (inst->nops > 0) ? self.getRegForValue(inst->ops[0]) : "rax";
         u32 srcWidth = inst->ops[0] != null && inst->ops[0]->type != null ? inst->ops[0]->type->width : 64;
         u32 dstWidth = inst->base.type != null ? inst->base.type->width : 64;
+        // x86 has no mem<-mem encoding, and the widen mnemonics
+        // (movzbl/movslq/…) write a register only: when the destination
+        // renders as memory, stage the finished value in the r11 scratch
+        // and store it once below. Same-home moves are skipped entirely.
+        bool dstMem = false;
+        for (usize q = 0; q < dstHome.len; q++)
+            if (dstHome.ptr[q] == (u8)'(') { dstMem = true; break; }
+        bool stageDst = dstMem && !dstHome.equals(src);
+        str dst = dstHome;
+        if (stageDst)
+        {
+            dst = "r11";
+            // movd takes a 32-bit or xmm destination, never r11 itself
+            if (inst->opcode == IrOpcode::Bitcast && srcWidth == 32) dst = "r11d";
+        }
         switch (inst->opcode)
         {
             IrOpcode::Trunc => {
@@ -4802,6 +4891,16 @@ void emitIntExtendTo(str src, str dst32, u32 width, bool isSigned)
                 self.emitter.emit(", ");
                 self.emitter.emitLine(dst);
             },
+        }
+        // Staged casts left the finished value in %r11; a 32-bit write
+        // into it already zero/sign-extended the full 64 bits, so one
+        // movq stores every width the branches above produce.
+        if (stageDst && (inst->opcode != IrOpcode::Bitcast ||
+                         srcWidth == 64 || srcWidth == 32 ||
+                         srcWidth == 16 || srcWidth == 8))
+        {
+            self.emitter.emit("\tmovq %r11, ");
+            self.emitter.emitLine(dstHome);
         }
     }
 
