@@ -1,0 +1,251 @@
+#[[no_drop_all]]
+// Safety-check instrumentation: debug builds only.
+//
+// irOptimize runs this pass at O0 and nowhere else (O1+ is release; the
+// only optimization O0 keeps is the pipeline's own DCE). It is a plain
+// IR-to-IR rewrite — every check is an ordinary
+//
+//     call void @_trap(kind, a, b, file, line)
+//
+// inserted before the operation that can fail, where _trap lives in each
+// platform's std error.crl (the harness links trap_stub.c instead). The
+// backend learns zero new instructions: emitCall already lowers arguments,
+// constants, and string literals for every ABI, and _trap evaluates the
+// condition — returning when the guarded operation is safe, printing the
+// site + a symbolized backtrace through write_stdout and aborting when it
+// is not. Programs link _trap by importing std::error (coralc must ensure
+// it is linked whenever checks are on — driver TODO).
+//
+//   kind 0 bounds     gep on a fixed array:   a=index b=len, ok a < b
+//   kind 1 null       load/store pointer:     a=ptr,    ok a != 0
+//   kind 2 divzero    sdiv/udiv/srem/urem:    a=divisor, ok a != 0
+//   kind 3 overflow   a=overflow flag:        ok a == 0 (reserved: the
+//                        pass does not insert it yet — needs op pairing)
+//   kind 4 badvariant a=tag b=nvariants:      ok a < b (reserved)
+//
+// Redundancy is removed at insertion time with the cheap proofs only:
+// constant indexes already in range, pointers proven non-null through
+// alloca/gep/bitcast chains (globals and string literals are addresses),
+// literal non-zero divisors. Dominance-based removal can follow if IR
+// dumps show duplicates. WALLVM_CHECKS=0 disables the pass entirely for
+// with/without-checks dump comparisons.
+
+import(lib) wallvm::irOps { IrOpcode };
+import(lib) wallvm::irtypes { IrContext, IrModule, IrFunc, IrBlock, IrInst, IrValue, IrValueKind, IrTypeKind };
+import(lib) std::mman { alloc, dealloc, copy };
+
+// trap kinds — keep in sync with error.crl's _trap and trap_stub.c
+pub const u64 TRAP_BOUNDS = 0;
+pub const u64 TRAP_NULL = 1;
+pub const u64 TRAP_DIVZERO = 2;
+pub const u64 TRAP_OVERFLOW = 3;
+pub const u64 TRAP_BADVARIANT = 4;
+
+struct SafetySite
+{
+    IrBlock* bb;
+    IrInst* anchor;
+    u64 kind;
+    IrValue* a;
+    IrValue* b;
+    str file;
+    u32 line;
+}
+
+struct SafetyPass
+{
+    IrContext* ctx;
+    IrModule* module;
+    SafetySite* sites;
+    u32 nsites;
+    u32 capSites;
+
+    static SafetyPass new(IrContext* ctx, IrModule* module)
+    {
+        return SafetyPass {
+            .ctx = ctx, .module = module, .sites = null, .nsites = 0, .capSites = 0
+        };
+    }
+
+    void deinit()
+    {
+        if (self.sites != null) dealloc<SafetySite>(self.sites);
+        self.sites = null;
+        self.nsites = 0;
+        self.capSites = 0;
+    }
+
+    // A pointer is provably non-null when its provenance bottoms out in
+    // something with an address: an alloca, a global, a string literal, a
+    // function, or a non-zero integer. gep/bitcast preserve the base's
+    // provenance; loads, calls, arguments and phis may be null.
+    bool provenNonNull(IrValue* v)
+    {
+        if (v == null) return true;
+        if (v->kind == IrValueKind::Global ||
+            v->kind == IrValueKind::Func ||
+            v->kind == IrValueKind::StringConst) return true;
+        if (v->kind == IrValueKind::ConstInt) return v->valData != 0;
+        if (v->kind != IrValueKind::Inst) return false;
+        IrInst* i = (IrInst*)v;
+        if (i->opcode == IrOpcode::Alloca) return true;
+        if (i->opcode == IrOpcode::Gep || i->opcode == IrOpcode::Bitcast)
+            return i->nops > 0 && self.provenNonNull(i->ops[0]);
+        return false;
+    }
+
+    void addSite(IrBlock* bb, IrInst* anchor, u64 kind, IrValue* a, IrValue* b)
+    {
+        if (self.nsites >= self.capSites)
+        {
+            u32 nc = self.capSites ? self.capSites * 2 : 16;
+            SafetySite* ns = alloc<SafetySite>((usize)nc);
+            if (self.sites != null)
+            {
+                copy<SafetySite>(ns, self.sites, (usize)self.nsites);
+                dealloc<SafetySite>(self.sites);
+            }
+            self.sites = ns;
+            self.capSites = nc;
+        }
+        str file = anchor->debugLoc.file;
+        if (file.isEmpty()) file = "?";
+        self.sites[self.nsites].bb = bb;
+        self.sites[self.nsites].anchor = anchor;
+        self.sites[self.nsites].kind = kind;
+        self.sites[self.nsites].a = a;
+        self.sites[self.nsites].b = b;
+        self.sites[self.nsites].file = file;
+        self.sites[self.nsites].line = anchor->debugLoc.line;
+        self.nsites++;
+    }
+
+    void scanFunc(IrFunc* func)
+    {
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            if (bb == null) continue;
+            for (u32 i = 0; i < bb->ninsts; i++)
+            {
+                IrInst* inst = bb->insts[i];
+                if (inst == null) continue;
+                switch (inst->opcode)
+                {
+                    IrOpcode::Load => {
+                        if (inst->nops > 0 && !self.provenNonNull(inst->ops[0]))
+                            self.addSite(bb, inst, TRAP_NULL, inst->ops[0], null);
+                    },
+
+                    IrOpcode::Store => {
+                        if (inst->nops > 1 && !self.provenNonNull(inst->ops[1]))
+                            self.addSite(bb, inst, TRAP_NULL, inst->ops[1], null);
+                    },
+
+                    IrOpcode::SDiv | IrOpcode::UDiv |
+                    IrOpcode::SRem | IrOpcode::URem => {
+                        if (inst->nops > 1)
+                        {
+                            IrValue* d = inst->ops[1];
+                            bool lit = d != null && d->kind == IrValueKind::ConstInt;
+                            if (!lit || d->valData == 0)
+                                self.addSite(bb, inst, TRAP_DIVZERO, d, null);
+                        }
+                    },
+
+                    IrOpcode::Gep => {
+                        if (inst->nops == 2)
+                        {
+                            IrValue* base = inst->ops[0];
+                            if (base != null && base->type != null &&
+                                base->type->kind == IrTypeKind::Ptr &&
+                                base->type->elem != null &&
+                                base->type->elem->kind == IrTypeKind::Array)
+                            {
+                                IrValue* idx = inst->ops[1];
+                                u32 len = base->type->elem->count;
+                                bool lit = idx != null && idx->kind == IrValueKind::ConstInt;
+                                if (!lit || idx->valData >= (u64)len)
+                                {
+                                    IrValue* lb = self.ctx.constInt(self.ctx.tyInt(64), (u64)len);
+                                    self.addSite(bb, inst, TRAP_BOUNDS, idx, lb);
+                                }
+                            }
+                        }
+                    },
+
+                    else => { },
+                }
+            }
+        }
+    }
+
+    IrFunc* ensureTrap()
+    {
+        for (u32 i = 0; i < self.module->nfuncs; i++)
+        {
+            IrFunc* f = self.module->funcs[i];
+            if (f != null && f->base.name.len > 0 && f->base.name.equals("_trap"))
+                return f;
+        }
+        IrType** ps = alloc<IrType*>((usize)5);
+        ps[0] = self.ctx.tyInt(64);
+        ps[1] = self.ctx.tyInt(64);
+        ps[2] = self.ctx.tyInt(64);
+        ps[3] = self.ctx.tyPtr(self.ctx.tyInt(8));
+        ps[4] = self.ctx.tyInt(64);
+        IrFunc* f = self.ctx.createFunc("_trap", self.ctx.tyVoid(), ps, 5);
+        f->isExtern = true;
+        f->externSym = "_trap";
+        self.module->addFunc(f);
+        return f;
+    }
+
+    void apply()
+    {
+        IrFunc* trap = self.ensureTrap();
+        IrValue* trapVal = &trap->base;
+        IrType* foo = self.ctx.tyInt(64);
+        IrType* voidTy = self.ctx.tyVoid();
+        IrValue* zero = self.ctx.constInt(foo, 0);
+        for (u32 i = 0; i < self.nsites; i++)
+        {
+            SafetySite s = self.sites[i];
+            IrStringConst* sc = self.ctx.createStringConst(s.file, (u32)s.file.len);
+            self.module->addConstString(sc);
+            IrValue*[6] args;
+            args[0] = trapVal;
+            args[1] = self.ctx.constInt(foo, s.kind);
+            args[2] = s.a != null ? s.a : zero;
+            args[3] = s.b != null ? s.b : zero;
+            args[4] = &sc->base;
+            args[5] = self.ctx.constInt(foo, (u64)s.line);
+            IrInst* call = self.ctx.createInst(IrOpcode::Call, voidTy, args, 6, 0, 0);
+            for (u32 k = 0; k < 6; k++)
+                if (args[k] != null) args[k]->addUser(call);
+            s.bb->insertBefore(call, s.anchor);
+            call->setDebugLoc(s.file, s.line, 0);
+        }
+    }
+
+    bool run(IrFunc* func)
+    {
+        if (func == null || self.module == null) return false;
+        if (func->isExtern || func->nblocks == 0) return false;
+        self.scanFunc(func);
+        if (self.nsites == 0) return false;
+        self.apply();
+        return true;
+    }
+}
+
+pub bool irPassSafety(IrFunc* func, IrContext* ctx)
+{
+    if (func == null || ctx == null) return false;
+    IrModule* module = func->parent;
+    if (module == null) return false;
+    SafetyPass pass = SafetyPass::new(ctx, module);
+    bool r = pass.run(func);
+    pass.deinit();
+    return r;
+}
