@@ -8,7 +8,7 @@ cd "$(dirname "$0")"
 CORALC="${CORALC:-coralc}"
 LEVELS="${LEVELS:-O0 O1 O2 O3}"
 OUT=output
-TMP=/tmp/opencode/wallvm-tests
+TMP=/home/cerie/Documents/coral/test/wallvm/output 
 TIMEOUT="${TIMEOUT:-15}"
 mkdir -p "$TMP" "$OUT"
 

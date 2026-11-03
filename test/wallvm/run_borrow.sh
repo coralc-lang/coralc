@@ -7,7 +7,7 @@
 set -u
 cd "$(dirname "$0")"
 TIMEOUT="${TIMEOUT:-15}"
-OUT=/tmp/opencode/borrow-tests
+OUT=/home/cerie/Documents/coral/test/wallvm/output
 mkdir -p "$OUT"
 
 if [ ! -x ./irtool ] || [ "${REBUILD:-0}" = "1" ]; then
