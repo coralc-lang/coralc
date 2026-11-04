@@ -9,12 +9,12 @@ main:
 	pushq %r13
 	pushq %r14
 	pushq %r15
-	subq $72, %rsp
+	subq $136, %rsp
 .Lmain_entry_2:
-	leaq -64(%rbp), %rsi
-	leaq -80(%rbp), %rdi
-	leaq -96(%rbp), %r8
-	leaq -112(%rbp), %r9
+	leaq -80(%rbp), %rsi
+	leaq -112(%rbp), %rdi
+	leaq -144(%rbp), %r8
+	leaq -176(%rbp), %r9
 	movq $0x000000000000000a, (%rsi)
 	leaq 8(%rsi), %rbx
 	movq $0x0000000000000014, (%rbx)
@@ -32,7 +32,7 @@ main:
 	addq %r13, %r12
 	addq %r12, %r14
 	movq %r14, %rax
-	addq $72, %rsp
+	addq $136, %rsp
 	popq %r15
 	popq %r14
 	popq %r13

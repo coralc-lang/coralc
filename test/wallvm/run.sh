@@ -39,7 +39,7 @@ for case in cases/*.ir; do
             fail=$((fail+1))
             continue
         fi
-        t gcc -o "$TMP/${name}_${lv}" "$OUT/${name}_${lv}.s" 2>"$TMP/${name}_${lv}.link.err"
+        t gcc -o "$TMP/${name}_${lv}" "$OUT/${name}_${lv}.s" trap_stub.c 2>"$TMP/${name}_${lv}.link.err"
         rc=$?
         if [ "$rc" -ne 0 ]; then
             echo "FAIL link $name $lv (exit $rc)"

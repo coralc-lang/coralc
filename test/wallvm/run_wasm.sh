@@ -65,4 +65,4 @@ case "$WASTOOL" in
     /*) ;;
     *) WASTOOL="$(pwd)/$WASTOOL" ;;
 esac
-WASTOOL="$WASTOOL" CASES="$(pwd)/cases" OUT="$TMP/out" LEVELS="$LEVELS" node "$TMP/check.mjs"
+WASTOOL="$WASTOOL" CASES="$(pwd)/cases" OUT="$(pwd)/$TMP/out" LEVELS="$LEVELS" node "$TMP/check.mjs"
