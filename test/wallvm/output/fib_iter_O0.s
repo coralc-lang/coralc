@@ -5,31 +5,85 @@ main:
 	pushq %rbp
 	movq %rsp, %rbp
 	pushq %rbx
-	subq $56, %rsp
+	pushq %r12
+	pushq %r13
+	pushq %r14
+	pushq %r15
+	subq $72, %rsp
 .Lmain_entry_2:
-	leaq -32(%rbp), %rsi
-	leaq -48(%rbp), %rdi
-	leaq -64(%rbp), %r8
-	movq $0x0000000000000000, (%rsi)
-	movq $0x0000000000000001, (%rdi)
-	movq $0x0000000000000000, (%r8)
+	leaq -80(%rbp), %rbx
+	leaq -96(%rbp), %r12
+	leaq -112(%rbp), %r13
+	movq $0x0000000000000000, (%rbx)
+	movq $0x0000000000000001, (%r12)
+	movq $0x0000000000000000, (%r13)
 .Lmain_loop_3:
-	movq (%rsi), %r9
-	cmpq $0x000000000000000a, %r9
+	movq (%rbx), %rsi
+	cmpq $0x000000000000000a, %rsi
 	jge .Lmain_done_5
 .Lmain_body_4:
-	movq (%rdi), %r9
-	movq (%r8), %rbx
-	addq %rbx, %r9
-	movq %rbx, (%rdi)
-	movq %r9, (%r8)
-	movq (%rsi), %r9
-	addq $0x0000000000000001, (%rsi)
+	movq (%r12), %rsi
+	movq (%r13), %r10
+	movq %r10, -56(%rbp)
+	movq %rsi, %r15
+	addq -56(%rbp), %r15
+	xorq %r15, %rsi
+	movq -56(%rbp), %rdi
+	xorq %r15, %rdi
+	andq %rdi, %rsi
+	movq %rsi, %r14
+	movq $0x000000000000003f, %rcx
+	sarq %cl, %r14
+	leaq .Lcs32(%rip), %r11
+	leaq .Lcs32(%rip), %r11
+	leaq .Lcs32(%rip), %r11
+	movq $0x0000000000000003, %rdi
+	movq %r14, %rsi
+	movq $0x0000000000000000, %rdx
+	leaq .Lcs32(%rip), %rcx
+	movq $0x0000000000000000, %r8
+	call _trap@PLT
+	movq %rax, %rsi
+	movq -56(%rbp), %r10
+	movq %r10, (%r12)
+	movq %r15, (%r13)
+	movq (%rbx), %rsi
+	movq %rsi, %r14
+	incq %r14
+	xorq %r14, %rsi
+	movq $0x0000000000000001, %rdi
+	xorq %r14, %rdi
+	andq %rdi, %rsi
+	movq %rsi, %r15
+	movq $0x000000000000003f, %rcx
+	sarq %cl, %r15
+	leaq .Lcs40(%rip), %r11
+	leaq .Lcs40(%rip), %r11
+	leaq .Lcs40(%rip), %r11
+	movq $0x0000000000000003, %rdi
+	movq %r15, %rsi
+	movq $0x0000000000000000, %rdx
+	leaq .Lcs40(%rip), %rcx
+	movq $0x0000000000000000, %r8
+	call _trap@PLT
+	movq %rax, %rsi
+	addq $0x0000000000000001, (%rbx)
 	jmp .Lmain_loop_3
 .Lmain_done_5:
-	movq (%r8), %rsi
+	movq (%r13), %rsi
 	movq %rsi, %rax
-	addq $56, %rsp
+	addq $72, %rsp
+	popq %r15
+	popq %r14
+	popq %r13
+	popq %r12
 	popq %rbx
 	leave
 	ret
+.section .rodata.str1.1,"aM",@progbits,1
+.Lcs32:
+	.byte 63
+	.byte 0
+.Lcs40:
+	.byte 63
+	.byte 0

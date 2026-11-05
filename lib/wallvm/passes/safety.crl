@@ -19,22 +19,35 @@
 //   kind 0 bounds     gep on a fixed array:   a=index b=len, ok a < b
 //   kind 1 null       load/store pointer:     a=ptr,    ok a != 0
 //   kind 2 divzero    sdiv/udiv/srem/urem:    a=divisor, ok a != 0
-//   kind 3 overflow   a=overflow flag:        ok a == 0 (reserved: the
-//                        pass does not insert it yet — needs op pairing)
+//   kind 3 overflow   a=overflow _flag:        ok a == 0
+//                        signed add/sub: branchless sign-bit mask —
+//                          add: ((a^r) & (b^r)) ashr (w-1)
+//                          sub: ((a^b) & (a^r)) ashr (w-1)
+//                        aux-tagged unsigned add/sub (IR_AUX_UNSIGNED,
+//                          set by the frontend or the `add.u` text
+//                          suffix): carry/borrow icmp + select
+//                        mul is reserved — a correct check needs a
+//                        guarded-div CFG split (see
+//                        lib/wallvm/docs/overflow-checks.md)
 //   kind 4 badvariant a=tag b=nvariants:      ok a < b (reserved)
 //
-// Redundancy is removed at insertion time with the cheap proofs only:
-// constant indexes already in range, pointers proven non-null through
-// alloca/gep/bitcast chains (globals and string literals are addresses),
-// literal non-zero divisors. Dominance-based removal can follow if IR
-// dumps show duplicates. WALLVM_CHECKS=0 disables the pass entirely for
-// with/without-checks dump comparisons.
+// Redundancy is removed two ways at insertion time: the cheap proofs only
+// first — constant indexes already in range, pointers proven non-null
+// through alloca/gep/bitcast chains (globals and string literals are
+// addresses), literal non-zero divisors — then dominance-based dedup:
+// a site whose equivalent check (same kind, same SSA operands, same flag
+// formula) already runs strictly before its insertion point — earlier in
+// the same block, or in a block that dominates it — is dropped, because
+// the _trap call is unconditional and a call that returned has proved the
+// property for every later use of those immutable SSA values. Sites
+// where neither dominates the other both stay. WALLVM_CHECKS=0 disables
+// the pass entirely for with/without-checks dump comparisons.
 
-import(lib) wallvm::irOps { IrOpcode };
+import(lib) wallvm::irOps { IrOpcode, IrICmpPred };
 import(lib) wallvm::irtypes { IrContext, IrModule, IrFunc, IrBlock, IrInst, IrValue, IrValueKind, IrTypeKind };
+import(lib) wallvm::domtree { IrDomTree, irDomtreeNew, irDomtreeDominates, irDomtreeFree };
 import(lib) std::mman { alloc, dealloc, copy };
 
-// trap kinds — keep in sync with error.crl's _trap and trap_stub.c
 pub const u64 TRAP_BOUNDS = 0;
 pub const u64 TRAP_NULL = 1;
 pub const u64 TRAP_DIVZERO = 2;
@@ -50,6 +63,13 @@ struct SafetySite
     IrValue* b;
     str file;
     u32 line;
+    // overflow sites insert AFTER the arithmetic: the _flag chain and the
+    // trap call go immediately before this instruction (captured during
+    // scan, before any insertion). null = insert before anchor.
+    IrInst* after;
+    // insertion index in the block's ORIGINAL instruction array (anchor
+    // index, +1 for overflow): position comparisons for same-block dedup
+    u32 pos;
 }
 
 struct SafetyPass
@@ -59,11 +79,13 @@ struct SafetyPass
     SafetySite* sites;
     u32 nsites;
     u32 capSites;
+    bool* skip;
 
     static SafetyPass new(IrContext* ctx, IrModule* module)
     {
         return SafetyPass {
-            .ctx = ctx, .module = module, .sites = null, .nsites = 0, .capSites = 0
+            .ctx = ctx, .module = module, .sites = null, .nsites = 0, .capSites = 0,
+            .skip = null
         };
     }
 
@@ -73,6 +95,8 @@ struct SafetyPass
         self.sites = null;
         self.nsites = 0;
         self.capSites = 0;
+        if (self.skip != null) dealloc<bool>(self.skip);
+        self.skip = null;
     }
 
     // A pointer is provably non-null when its provenance bottoms out in
@@ -94,7 +118,7 @@ struct SafetyPass
         return false;
     }
 
-    void addSite(IrBlock* bb, IrInst* anchor, u64 kind, IrValue* a, IrValue* b)
+    void addSite(IrBlock* bb, IrInst* anchor, u64 kind, IrValue* a, IrValue* b, IrInst* after)
     {
         if (self.nsites >= self.capSites)
         {
@@ -110,6 +134,10 @@ struct SafetyPass
         }
         str file = anchor->debugLoc.file;
         if (file.isEmpty()) file = "?";
+        u32 pos = 0;
+        for (u32 k = 0; k < bb->ninsts; k++)
+            if (bb->insts[k] == anchor) { pos = k; break; }
+        if (kind == TRAP_OVERFLOW) pos++;
         self.sites[self.nsites].bb = bb;
         self.sites[self.nsites].anchor = anchor;
         self.sites[self.nsites].kind = kind;
@@ -117,6 +145,8 @@ struct SafetyPass
         self.sites[self.nsites].b = b;
         self.sites[self.nsites].file = file;
         self.sites[self.nsites].line = anchor->debugLoc.line;
+        self.sites[self.nsites].after = after;
+        self.sites[self.nsites].pos = pos;
         self.nsites++;
     }
 
@@ -134,12 +164,12 @@ struct SafetyPass
                 {
                     IrOpcode::Load => {
                         if (inst->nops > 0 && !self.provenNonNull(inst->ops[0]))
-                            self.addSite(bb, inst, TRAP_NULL, inst->ops[0], null);
+                            self.addSite(bb, inst, TRAP_NULL, inst->ops[0], null, null);
                     },
 
                     IrOpcode::Store => {
                         if (inst->nops > 1 && !self.provenNonNull(inst->ops[1]))
-                            self.addSite(bb, inst, TRAP_NULL, inst->ops[1], null);
+                            self.addSite(bb, inst, TRAP_NULL, inst->ops[1], null, null);
                     },
 
                     IrOpcode::SDiv | IrOpcode::UDiv |
@@ -149,7 +179,23 @@ struct SafetyPass
                             IrValue* d = inst->ops[1];
                             bool lit = d != null && d->kind == IrValueKind::ConstInt;
                             if (!lit || d->valData == 0)
-                                self.addSite(bb, inst, TRAP_DIVZERO, d, null);
+                                self.addSite(bb, inst, TRAP_DIVZERO, d, null, null);
+                        }
+                    },
+
+                    // signedness comes from the aux slot (IR_AUX_UNSIGNED);
+                    // mul is intentionally absent — a correct check needs a
+                    // guarded-div CFG split, see
+                    // lib/wallvm/docs/overflow-checks.md
+                    IrOpcode::Add | IrOpcode::Sub => {
+                        if (inst->nops > 1 && inst->base.type != null &&
+                            inst->base.type->kind == IrTypeKind::Int)
+                        {
+                            // capture the following instruction from the
+                            // block array (index splicing, not a list) so
+                            // the _flag chain lands after the arithmetic
+                            IrInst* after = (i + 1 < bb->ninsts) ? bb->insts[i + 1] : null;
+                            self.addSite(bb, inst, TRAP_OVERFLOW, inst->ops[0], inst->ops[1], after);
                         }
                     },
 
@@ -157,13 +203,24 @@ struct SafetyPass
                         if (inst->nops == 2)
                         {
                             IrValue* base = inst->ops[0];
+                            IrType* arrTy = null;
+                            // two legitimate shapes: an aggregate alloca
+                            // keeps the bare array type on its value (the
+                            // parser/builder convention — gep reads fields
+                            // off it), while bitcasts and pointer locals
+                            // come in as ptr-to-array
                             if (base != null && base->type != null &&
-                                base->type->kind == IrTypeKind::Ptr &&
-                                base->type->elem != null &&
-                                base->type->elem->kind == IrTypeKind::Array)
+                                base->type->kind == IrTypeKind::Array)
+                                arrTy = base->type;
+                            else if (base != null && base->type != null &&
+                                     base->type->kind == IrTypeKind::Ptr &&
+                                     base->type->elem != null &&
+                                     base->type->elem->kind == IrTypeKind::Array)
+                                arrTy = base->type->elem;
+                            if (arrTy != null)
                             {
                                 IrValue* idx = inst->ops[1];
-                                u32 len = base->type->elem->count;
+                                u32 len = arrTy->count;
                                 // A zero-length array type is a decay
                                 // target for unsized buffers (bitcast to
                                 // ptr array i8 0, then gep): there is no
@@ -176,7 +233,7 @@ struct SafetyPass
                                     if (!lit || idx->valData >= (u64)len)
                                     {
                                         IrValue* lb = self.ctx.constInt(self.ctx.tyInt(64), (u64)len);
-                                        self.addSite(bb, inst, TRAP_BOUNDS, idx, lb);
+                                        self.addSite(bb, inst, TRAP_BOUNDS, idx, lb, null);
                                     }
                                 }
                             }
@@ -187,6 +244,73 @@ struct SafetyPass
                 }
             }
         }
+    }
+
+    // Two sites test the same property when the kind matches and both
+    // arguments are the same SSA value (or equal constants of equal
+    // width). Overflow's flag formula additionally depends on the
+    // arithmetic op and its signedness, so the anchor opcode and aux tag
+    // must match too — add/sub and signed/unsigned compute different
+    // flags from the same operands.
+    bool valEq(IrValue* x, IrValue* y)
+    {
+        if (x == y) return true;
+        if (x == null || y == null) return false;
+        if (x->kind == IrValueKind::ConstInt && y->kind == IrValueKind::ConstInt)
+            return x->valData == y->valData &&
+                   x->type != null && y->type != null &&
+                   x->type->width == y->type->width;
+        return false;
+    }
+
+    bool sameCheck(SafetySite* p, SafetySite* q)
+    {
+        if (p->kind != q->kind) return false;
+        if (!self.valEq(p->a, q->a)) return false;
+        if (!self.valEq(p->b, q->b)) return false;
+        if (p->kind == TRAP_OVERFLOW)
+        {
+            if (p->anchor->opcode != q->anchor->opcode) return false;
+            if (p->anchor->isUnsignedArith() != q->anchor->isUnsignedArith()) return false;
+        }
+        return true;
+    }
+
+    // Site p's _trap call provably runs before site q's insertion point:
+    // an earlier position in the same block, or a strictly dominating
+    // block (irDomtreeDominates is reflexive, so same-block pairs must be
+    // decided by position). The call is unconditional — _trap itself
+    // decides — so reaching q means p already returned and proved the
+    // property; SSA values cannot change underneath it.
+    bool covers(IrDomTree* dt, SafetySite* p, SafetySite* q)
+    {
+        if (!self.sameCheck(p, q)) return false;
+        if (p->bb == q->bb) return p->pos < q->pos;
+        return irDomtreeDominates(dt, p->bb, q->bb);
+    }
+
+    // Drop every site covered by another one. Skipping is consistent
+    // without a fixpoint: covers is transitive (check equality and
+    // strict dominance are both transitive), so any covering chain
+    // bottoms out at a site nothing covers. Equal sites where neither
+    // block dominates the other both stay — either path can reach one
+    // without the other having run.
+    void dedup(IrFunc* func)
+    {
+        IrDomTree* dt = irDomtreeNew(func);
+        if (dt == null) return;
+        u32 n = self.nsites;
+        bool* skip = alloc<bool>((usize)n);
+        for (u32 j = 0; j < n; j++)
+        {
+            bool s = false;
+            for (u32 i = 0; i < n && !s; i++)
+                if (i != j && self.covers(dt, &self.sites[i], &self.sites[j]))
+                    s = true;
+            skip[j] = s;
+        }
+        self.skip = skip;
+        irDomtreeFree(dt);
     }
 
     IrFunc* ensureTrap()
@@ -210,6 +334,48 @@ struct SafetyPass
         return f;
     }
 
+    // _flag-chain helpers for kind 3: every instruction is built detached,
+    // linked to its operands, given the site's debug loc, and spliced
+    // immediately before `before` (append when null), preserving creation
+    // order across successive calls.
+    IrInst* splice(SafetySite* s, IrInst* inst, IrValue** ops, u32 nops, IrInst* before)
+    {
+        for (u32 k = 0; k < nops; k++)
+            if (ops[k] != null) ops[k]->addUser(inst);
+        inst->setDebugLoc(s->file, s->line, 0);
+        if (before != null) s->bb->insertBefore(inst, before);
+        else s->bb->addInst(inst);
+        return inst;
+    }
+
+    IrInst* makeBin(IrOpcode op, IrValue* l, IrValue* r, IrType* ty, SafetySite* s, IrInst* before)
+    {
+        IrValue*[2] ops;
+        ops[0] = l;
+        ops[1] = r;
+        IrInst* inst = self.ctx.createInst(op, ty, ops, 2, 0, 0);
+        return self.splice(s, inst, ops, 2, before);
+    }
+
+    IrInst* makeICmp(IrICmpPred p, IrValue* l, IrValue* r, SafetySite* s, IrInst* before)
+    {
+        IrValue*[2] ops;
+        ops[0] = l;
+        ops[1] = r;
+        IrInst* inst = self.ctx.createInst(IrOpcode::ICmp, self.ctx.tyInt(1), ops, 2, (u64)p, 0);
+        return self.splice(s, inst, ops, 2, before);
+    }
+
+    IrInst* makeSelect(IrValue* c, IrValue* t, IrValue* f, IrType* ty, SafetySite* s, IrInst* before)
+    {
+        IrValue*[3] ops;
+        ops[0] = c;
+        ops[1] = t;
+        ops[2] = f;
+        IrInst* inst = self.ctx.createInst(IrOpcode::Select, ty, ops, 3, 0, 0);
+        return self.splice(s, inst, ops, 3, before);
+    }
+
     void apply()
     {
         IrFunc* trap = self.ensureTrap();
@@ -219,21 +385,75 @@ struct SafetyPass
         IrValue* zero = self.ctx.constInt(foo, 0);
         for (u32 i = 0; i < self.nsites; i++)
         {
-            SafetySite s = self.sites[i];
-            IrStringConst* sc = self.ctx.createStringConst(s.file, (u32)s.file.len);
+            if (self.skip != null && self.skip[i]) continue;
+            SafetySite* s = &self.sites[i];
+            IrStringConst* sc = self.ctx.createStringConst(s->file, (u32)s->file.len);
             self.module->addConstString(sc);
+            IrValue* aVal = s->a != null ? s->a : zero;
+            IrValue* bVal = s->b != null ? s->b : zero;
+            IrInst* insertAt = s->anchor;
+            if (s->kind == TRAP_OVERFLOW)
+            {
+                // the _flag must be computed from the arithmetic result, so
+                // the chain (and the call) go after the op: successively
+                // insert before the captured `after`, which keeps creation
+                // order [t1 t2 m _flag call after]
+                IrInst* arith = s->anchor;
+                IrInst* after = s->after;
+                IrType* wty = arith->base.type;
+                if (wty == null || wty->kind != IrTypeKind::Int) wty = foo;
+                u32 w = wty->width > 0 ? wty->width : 64;
+                IrValue* r = (IrValue*)arith;
+                IrValue* _flag;
+                if (!arith->isUnsignedArith())
+                {
+                    // sign-bit mask: nonzero exactly when the result's sign
+                    // differs from the operands' common sign
+                    IrInst* t1;
+                    IrInst* t2;
+                    if (arith->opcode == IrOpcode::Add)
+                    {
+                        t1 = self.makeBin(IrOpcode::Xor, aVal, r, wty, s, after);
+                        t2 = self.makeBin(IrOpcode::Xor, bVal, r, wty, s, after);
+                    }
+                    else
+                    {
+                        t1 = self.makeBin(IrOpcode::Xor, aVal, bVal, wty, s, after);
+                        t2 = self.makeBin(IrOpcode::Xor, aVal, r, wty, s, after);
+                    }
+                    IrInst* m = self.makeBin(IrOpcode::And, (IrValue*)t1, (IrValue*)t2, wty, s, after);
+                    IrValue* sh = self.ctx.constInt(wty, (u64)(w - 1));
+                    _flag = (IrValue*)self.makeBin(IrOpcode::Ashr, (IrValue*)m, sh, wty, s, after);
+                }
+                else
+                {
+                    // carry (add: r <u a) / borrow (sub: a <u b)
+                    IrValue* l;
+                    IrValue* rr;
+                    if (arith->opcode == IrOpcode::Add) { l = r; rr = aVal; }
+                    else { l = aVal; rr = bVal; }
+                    IrInst* c = self.makeICmp(IrICmpPred::Ult, l, rr, s, after);
+                    IrValue* one = self.ctx.constInt(wty, 1);
+                    IrValue* zer = self.ctx.constInt(wty, 0);
+                    _flag = (IrValue*)self.makeSelect((IrValue*)c, one, zer, wty, s, after);
+                }
+                aVal = _flag;
+                bVal = zero;
+                insertAt = after;
+            }
             IrValue*[6] args;
             args[0] = trapVal;
-            args[1] = self.ctx.constInt(foo, s.kind);
-            args[2] = s.a != null ? s.a : zero;
-            args[3] = s.b != null ? s.b : zero;
+            args[1] = self.ctx.constInt(foo, s->kind);
+            args[2] = aVal;
+            args[3] = bVal;
             args[4] = &sc->base;
-            args[5] = self.ctx.constInt(foo, (u64)s.line);
+            args[5] = self.ctx.constInt(foo, (u64)s->line);
             IrInst* call = self.ctx.createInst(IrOpcode::Call, voidTy, args, 6, 0, 0);
             for (u32 k = 0; k < 6; k++)
                 if (args[k] != null) args[k]->addUser(call);
-            s.bb->insertBefore(call, s.anchor);
-            call->setDebugLoc(s.file, s.line, 0);
+            if (insertAt != null) s->bb->insertBefore(call, insertAt);
+            else s->bb->addInst(call);
+            call->setDebugLoc(s->file, s->line, 0);
         }
     }
 
@@ -243,6 +463,7 @@ struct SafetyPass
         if (func->isExtern || func->nblocks == 0) return false;
         self.scanFunc(func);
         if (self.nsites == 0) return false;
+        if (self.nsites > 1) self.dedup(func);
         self.apply();
         return true;
     }

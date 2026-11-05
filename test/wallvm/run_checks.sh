@@ -37,6 +37,13 @@ for case in checks/*.ir; do
     fi
     ok
 
+    # dominance dedup: the dominated duplicate geps collapse into their
+    # dominating original — exactly one unconditional call remains
+    if [ "$name" = "dedup" ]; then
+        n=$(grep -c "call.*_trap" "$OUT/chk_${name}_O0.s" || true)
+        if [ "$n" -eq 1 ]; then ok; else bad "dedup O0: $n trap calls, want 1"; fi
+    fi
+
     # O0 run: trap_stub returns on safe checks, exits 70 on violations
     if ! t gcc -o "$TMP/${name}_O0" "$OUT/chk_${name}_O0.s" trap_stub.c 2>"$TMP/${name}_O0.link"; then
         bad "$name O0 link"; cat "$TMP/${name}_O0.link"; continue

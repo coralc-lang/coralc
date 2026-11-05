@@ -6,12 +6,11 @@ main:
 	movq %rsp, %rbp
 	pushq %rbx
 	pushq %r12
-	pushq %r13
-	subq $56, %rsp
+	subq $48, %rsp
 .Lmain_entry_2:
-	leaq -48(%rbp), %rsi
-	leaq -64(%rbp), %rbx
-	leaq -80(%rbp), %rdi
+	leaq -32(%rbp), %rsi
+	leaq -48(%rbp), %rbx
+	leaq -64(%rbp), %rdi
 	movq $0x0000000000000000, (%rsi)
 	movq $0x0000000000000005, (%rbx)
 	movq $0x0000000000000001, (%rdi)
@@ -37,23 +36,29 @@ main:
 	movq $0x0000000000000000, %r8
 	call _trap@PLT
 	movq %rax, %rsi
-	movq (%r12), %r13
+	movq (%r12), %rsi
 	movq $0x000000000000001e, (%rbx)
+	movq (%r12), %rdi
+	movq %rsi, %rbx
+	addq %rdi, %rbx
+	xorq %rbx, %rsi
+	xorq %rbx, %rdi
+	andq %rdi, %rsi
+	movq %rsi, %r12
+	movq $0x000000000000003f, %rcx
+	sarq %cl, %r12
 	leaq .Lcs37(%rip), %r11
 	leaq .Lcs37(%rip), %r11
 	leaq .Lcs37(%rip), %r11
-	movq $0x0000000000000001, %rdi
+	movq $0x0000000000000003, %rdi
 	movq %r12, %rsi
 	movq $0x0000000000000000, %rdx
 	leaq .Lcs37(%rip), %rcx
 	movq $0x0000000000000000, %r8
 	call _trap@PLT
 	movq %rax, %rsi
-	movq (%r12), %rsi
-	addq %rsi, %r13
-	movq %r13, %rax
-	addq $56, %rsp
-	popq %r13
+	movq %rbx, %rax
+	addq $48, %rsp
 	popq %r12
 	popq %rbx
 	leave
