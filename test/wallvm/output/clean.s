@@ -22,9 +22,6 @@ add:
 	movq %r8, %r12
 	movq $0x000000000000003f, %rcx
 	sarq %cl, %r12
-	leaq .Lcs16(%rip), %r11
-	leaq .Lcs16(%rip), %r11
-	leaq .Lcs16(%rip), %r11
 	movq $0x0000000000000003, %rdi
 	movq %r12, %rsi
 	movq $0x0000000000000000, %rdx

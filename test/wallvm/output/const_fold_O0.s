@@ -3,9 +3,6 @@
 .type main, @function
 main:
 .Lmain_entry_2:
-	leaq .Lcs15(%rip), %r11
-	leaq .Lcs15(%rip), %r11
-	leaq .Lcs15(%rip), %r11
 	movq $0x0000000000000003, %rdi
 	movq $0x0000000000000000, %rsi
 	movq $0x0000000000000000, %rdx
@@ -13,9 +10,6 @@ main:
 	movq $0x0000000000000000, %r8
 	call _trap@PLT
 	movq %rax, %rsi
-	leaq .Lcs22(%rip), %r11
-	leaq .Lcs22(%rip), %r11
-	leaq .Lcs22(%rip), %r11
 	movq $0x0000000000000003, %rdi
 	movq $0x0000000000000000, %rsi
 	movq $0x0000000000000000, %rdx

@@ -3,9 +3,6 @@
 .type main, @function
 main:
 .Lmain_entry_2:
-	leaq .Lcs18(%rip), %r11
-	leaq .Lcs18(%rip), %r11
-	leaq .Lcs18(%rip), %r11
 	movq $0x0000000000000003, %rdi
 	movq $0x0000000000000000, %rsi
 	movq $0x0000000000000000, %rdx

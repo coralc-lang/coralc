@@ -20,9 +20,6 @@ main:
 	jge .Lmain_sum_pre_5
 .Lmain_fill_body_4:
 	movq (%r12), %r13
-	leaq .Lcs48(%rip), %r11
-	leaq .Lcs48(%rip), %r11
-	leaq .Lcs48(%rip), %r11
 	movq $0x0000000000000000, %rdi
 	movq %r13, %rsi
 	movq $0x0000000000000005, %rdx
@@ -39,9 +36,6 @@ main:
 	andq %rsi, %r13
 	movq $0x000000000000003f, %rcx
 	sarq %cl, %r13
-	leaq .Lcs50(%rip), %r11
-	leaq .Lcs50(%rip), %r11
-	leaq .Lcs50(%rip), %r11
 	movq $0x0000000000000003, %rdi
 	movq %r13, %rsi
 	movq $0x0000000000000000, %rdx
@@ -60,9 +54,6 @@ main:
 	movq %rsi, %r14
 	movq $0x000000000000003f, %rcx
 	sarq %cl, %r14
-	leaq .Lcs58(%rip), %r11
-	leaq .Lcs58(%rip), %r11
-	leaq .Lcs58(%rip), %r11
 	movq $0x0000000000000003, %rdi
 	movq %r14, %rsi
 	movq $0x0000000000000000, %rdx
@@ -82,9 +73,6 @@ main:
 	jge .Lmain_done_8
 .Lmain_sum_body_7:
 	movq (%r12), %r14
-	leaq .Lcs64(%rip), %r11
-	leaq .Lcs64(%rip), %r11
-	leaq .Lcs64(%rip), %r11
 	movq $0x0000000000000000, %rdi
 	movq %r14, %rsi
 	movq $0x0000000000000005, %rdx
@@ -103,9 +91,6 @@ main:
 	movq %rsi, %r15
 	movq $0x000000000000003f, %rcx
 	sarq %cl, %r15
-	leaq .Lcs66(%rip), %r11
-	leaq .Lcs66(%rip), %r11
-	leaq .Lcs66(%rip), %r11
 	movq $0x0000000000000003, %rdi
 	movq %r15, %rsi
 	movq $0x0000000000000000, %rdx
@@ -124,9 +109,6 @@ main:
 	movq %rsi, %r15
 	movq $0x000000000000003f, %rcx
 	sarq %cl, %r15
-	leaq .Lcs72(%rip), %r11
-	leaq .Lcs72(%rip), %r11
-	leaq .Lcs72(%rip), %r11
 	movq $0x0000000000000003, %rdi
 	movq %r15, %rsi
 	movq $0x0000000000000000, %rdx

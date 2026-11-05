@@ -14,9 +14,6 @@ main:
 	movq first(%rip), %rsi
 	movq %rsi, %rdi
 	leaq 2(%rdi), %r13
-	leaq .Lcs26(%rip), %r11
-	leaq .Lcs26(%rip), %r11
-	leaq .Lcs26(%rip), %r11
 	movq $0x0000000000000001, %rdi
 	movq %r13, %rsi
 	movq $0x0000000000000000, %rdx

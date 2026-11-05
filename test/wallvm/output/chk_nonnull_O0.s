@@ -5,9 +5,6 @@ main:
 	pushq %rbx
 .Lmain_entry_4:
 	movq z(%rip), %rbx
-	leaq .Lcs10(%rip), %r11
-	leaq .Lcs10(%rip), %r11
-	leaq .Lcs10(%rip), %r11
 	movq $0x0000000000000001, %rdi
 	movq %rbx, %rsi
 	movq $0x0000000000000000, %rdx

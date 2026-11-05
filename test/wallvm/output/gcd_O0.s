@@ -21,9 +21,6 @@ main:
 .Lmain_body_4:
 	movq (%rbx), %r13
 	movq (%r12), %r14
-	leaq .Lcs27(%rip), %r11
-	leaq .Lcs27(%rip), %r11
-	leaq .Lcs27(%rip), %r11
 	movq $0x0000000000000002, %rdi
 	movq %r14, %rsi
 	movq $0x0000000000000000, %rdx

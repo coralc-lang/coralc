@@ -26,9 +26,6 @@ main:
 	movq $0x0000000000000014, (%rbx)
 	movq %rbx, %r12
 .Lmain_merge_5:
-	leaq .Lcs35(%rip), %r11
-	leaq .Lcs35(%rip), %r11
-	leaq .Lcs35(%rip), %r11
 	movq $0x0000000000000001, %rdi
 	movq %r12, %rsi
 	movq $0x0000000000000000, %rdx
@@ -47,9 +44,6 @@ main:
 	movq %rsi, %r12
 	movq $0x000000000000003f, %rcx
 	sarq %cl, %r12
-	leaq .Lcs37(%rip), %r11
-	leaq .Lcs37(%rip), %r11
-	leaq .Lcs37(%rip), %r11
 	movq $0x0000000000000003, %rdi
 	movq %r12, %rsi
 	movq $0x0000000000000000, %rdx

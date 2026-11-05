@@ -24,9 +24,6 @@ main:
 	movq %rsi, %r14
 	movq $0x000000000000003f, %rcx
 	sarq %cl, %r14
-	leaq .Lcs22(%rip), %r11
-	leaq .Lcs22(%rip), %r11
-	leaq .Lcs22(%rip), %r11
 	movq $0x0000000000000003, %rdi
 	movq %r14, %rsi
 	movq $0x0000000000000000, %rdx
@@ -46,9 +43,6 @@ main:
 	andq %r12, %rbx
 	movq $0x000000000000003f, %rcx
 	sarq %cl, %rbx
-	leaq .Lcs30(%rip), %r11
-	leaq .Lcs30(%rip), %r11
-	leaq .Lcs30(%rip), %r11
 	movq $0x0000000000000003, %rdi
 	movq %rbx, %rsi
 	movq $0x0000000000000000, %rdx

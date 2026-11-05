@@ -10,9 +10,6 @@ main:
 	leaq -32(%rbp), %rsi
 	movq $0x0000000000000000, (%rsi)
 	movq (%rsi), %rbx
-	leaq .Lcs12(%rip), %r11
-	leaq .Lcs12(%rip), %r11
-	leaq .Lcs12(%rip), %r11
 	movq $0x0000000000000002, %rdi
 	movq %rbx, %rsi
 	movq $0x0000000000000000, %rdx

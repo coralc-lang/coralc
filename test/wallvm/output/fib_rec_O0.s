@@ -29,9 +29,6 @@ fib:
 	movq %rsi, %r13
 	movq $0x000000000000003f, %rcx
 	sarq %cl, %r13
-	leaq .Lcs25(%rip), %r11
-	leaq .Lcs25(%rip), %r11
-	leaq .Lcs25(%rip), %r11
 	movq $0x0000000000000003, %rdi
 	movq %r13, %rsi
 	movq $0x0000000000000000, %rdx
@@ -49,9 +46,6 @@ fib:
 	movq %rsi, %rbx
 	movq $0x000000000000003f, %rcx
 	sarq %cl, %rbx
-	leaq .Lcs33(%rip), %r11
-	leaq .Lcs33(%rip), %r11
-	leaq .Lcs33(%rip), %r11
 	movq $0x0000000000000003, %rdi
 	movq %rbx, %rsi
 	movq $0x0000000000000000, %rdx
@@ -72,9 +66,6 @@ fib:
 	andq %rsi, %rbx
 	movq $0x000000000000003f, %rcx
 	sarq %cl, %rbx
-	leaq .Lcs39(%rip), %r11
-	leaq .Lcs39(%rip), %r11
-	leaq .Lcs39(%rip), %r11
 	movq $0x0000000000000003, %rdi
 	movq %rbx, %rsi
 	movq $0x0000000000000000, %rdx

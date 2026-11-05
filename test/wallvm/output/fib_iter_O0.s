@@ -34,9 +34,6 @@ main:
 	movq %rsi, %r14
 	movq $0x000000000000003f, %rcx
 	sarq %cl, %r14
-	leaq .Lcs32(%rip), %r11
-	leaq .Lcs32(%rip), %r11
-	leaq .Lcs32(%rip), %r11
 	movq $0x0000000000000003, %rdi
 	movq %r14, %rsi
 	movq $0x0000000000000000, %rdx
@@ -57,9 +54,6 @@ main:
 	movq %rsi, %r15
 	movq $0x000000000000003f, %rcx
 	sarq %cl, %r15
-	leaq .Lcs40(%rip), %r11
-	leaq .Lcs40(%rip), %r11
-	leaq .Lcs40(%rip), %r11
 	movq $0x0000000000000003, %rdi
 	movq %r15, %rsi
 	movq $0x0000000000000000, %rdx

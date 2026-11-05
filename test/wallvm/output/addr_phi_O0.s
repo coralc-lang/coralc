@@ -11,9 +11,6 @@ main:
 	leaq -32(%rbp), %rbx
 	movq %rbx, %r12
 .Lmain_loop_3:
-	leaq .Lcs19(%rip), %r11
-	leaq .Lcs19(%rip), %r11
-	leaq .Lcs19(%rip), %r11
 	movq $0x0000000000000001, %rdi
 	movq %r12, %rsi
 	movq $0x0000000000000000, %rdx

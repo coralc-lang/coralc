@@ -34,9 +34,6 @@ main:
 	cmpq %r11, %r15
 	setl %r11b
 	movzbq %r11b, %r14
-	leaq .Lcs66(%rip), %r11
-	leaq .Lcs66(%rip), %r11
-	leaq .Lcs66(%rip), %r11
 	movq $0x0000000000000000, %rdi
 	movq %r15, %rsi
 	movq $0x0000000000000003, %rdx
@@ -62,9 +59,6 @@ main:
 	andq %rsi, %r15
 	movq $0x000000000000003f, %rcx
 	sarq %cl, %r15
-	leaq .Lcs68(%rip), %r11
-	leaq .Lcs68(%rip), %r11
-	leaq .Lcs68(%rip), %r11
 	movq $0x0000000000000003, %rdi
 	movq %r15, %rsi
 	movq $0x0000000000000000, %rdx
@@ -81,9 +75,6 @@ main:
 	cmpq %r11, %r14
 	setl %r11b
 	movzbq %r11b, %r15
-	leaq .Lcs75(%rip), %r11
-	leaq .Lcs75(%rip), %r11
-	leaq .Lcs75(%rip), %r11
 	movq $0x0000000000000000, %rdi
 	movq %r14, %rsi
 	movq $0x0000000000000003, %rdx
@@ -102,9 +93,6 @@ main:
 	movq %rdi, %r12
 	movq $0x000000000000003f, %rcx
 	sarq %cl, %r12
-	leaq .Lcs77(%rip), %r11
-	leaq .Lcs77(%rip), %r11
-	leaq .Lcs77(%rip), %r11
 	movq $0x0000000000000003, %rdi
 	movq %r12, %rsi
 	movq $0x0000000000000000, %rdx
@@ -127,9 +115,6 @@ main:
 	movq %rdi, %r13
 	movq $0x000000000000003f, %rcx
 	sarq %cl, %r13
-	leaq .Lcs83(%rip), %r11
-	leaq .Lcs83(%rip), %r11
-	leaq .Lcs83(%rip), %r11
 	movq $0x0000000000000003, %rdi
 	movq %r13, %rsi
 	movq $0x0000000000000000, %rdx
@@ -151,9 +136,6 @@ main:
 	andq %rsi, %r14
 	movq $0x000000000000003f, %rcx
 	sarq %cl, %r14
-	leaq .Lcs89(%rip), %r11
-	leaq .Lcs89(%rip), %r11
-	leaq .Lcs89(%rip), %r11
 	movq $0x0000000000000003, %rdi
 	movq %r14, %rsi
 	movq $0x0000000000000000, %rdx
@@ -180,9 +162,6 @@ main:
 	movq %rdi, %r13
 	movq $0x000000000000003f, %rcx
 	sarq %cl, %r13
-	leaq .Lcs95(%rip), %r11
-	leaq .Lcs95(%rip), %r11
-	leaq .Lcs95(%rip), %r11
 	movq $0x0000000000000003, %rdi
 	movq %r13, %rsi
 	movq $0x0000000000000000, %rdx
@@ -197,9 +176,6 @@ main:
 	andq %rbx, %r12
 	movq $0x000000000000003f, %rcx
 	sarq %cl, %r12
-	leaq .Lcs101(%rip), %r11
-	leaq .Lcs101(%rip), %r11
-	leaq .Lcs101(%rip), %r11
 	movq $0x0000000000000003, %rdi
 	movq %r12, %rsi
 	movq $0x0000000000000000, %rdx

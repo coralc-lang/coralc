@@ -42,9 +42,6 @@ nest:
 	movq %rsi, %r13
 	movq $0x000000000000003f, %rcx
 	sarq %cl, %r13
-	leaq .Lcs54(%rip), %r11
-	leaq .Lcs54(%rip), %r11
-	leaq .Lcs54(%rip), %r11
 	movq $0x0000000000000003, %rdi
 	movq %r13, %rsi
 	movq $0x0000000000000000, %rdx
@@ -67,9 +64,6 @@ nest:
 	movq %rsi, %r13
 	movq $0x000000000000003f, %rcx
 	sarq %cl, %r13
-	leaq .Lcs61(%rip), %r11
-	leaq .Lcs61(%rip), %r11
-	leaq .Lcs61(%rip), %r11
 	movq $0x0000000000000003, %rdi
 	movq %r13, %rsi
 	movq $0x0000000000000000, %rdx
@@ -91,9 +85,6 @@ nest:
 	movq %rsi, %r14
 	movq $0x000000000000003f, %rcx
 	sarq %cl, %r14
-	leaq .Lcs67(%rip), %r11
-	leaq .Lcs67(%rip), %r11
-	leaq .Lcs67(%rip), %r11
 	movq $0x0000000000000003, %rdi
 	movq %r14, %rsi
 	movq $0x0000000000000000, %rdx
@@ -114,9 +105,6 @@ nest:
 	movq %rsi, %r13
 	movq $0x000000000000003f, %rcx
 	sarq %cl, %r13
-	leaq .Lcs73(%rip), %r11
-	leaq .Lcs73(%rip), %r11
-	leaq .Lcs73(%rip), %r11
 	movq $0x0000000000000003, %rdi
 	movq %r13, %rsi
 	movq $0x0000000000000000, %rdx
@@ -142,9 +130,6 @@ nest:
 	movq %rsi, %r12
 	movq $0x000000000000003f, %rcx
 	sarq %cl, %r12
-	leaq .Lcs79(%rip), %r11
-	leaq .Lcs79(%rip), %r11
-	leaq .Lcs79(%rip), %r11
 	movq $0x0000000000000003, %rdi
 	movq %r12, %rsi
 	movq $0x0000000000000000, %rdx
@@ -160,9 +145,6 @@ nest:
 	andq %rsi, %rbx
 	movq $0x000000000000003f, %rcx
 	sarq %cl, %rbx
-	leaq .Lcs85(%rip), %r11
-	leaq .Lcs85(%rip), %r11
-	leaq .Lcs85(%rip), %r11
 	movq $0x0000000000000003, %rdi
 	movq %rbx, %rsi
 	movq $0x0000000000000000, %rdx

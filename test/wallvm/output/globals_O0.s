@@ -16,9 +16,6 @@ main:
 	movq %rsi, %r12
 	movq $0x000000000000003f, %rcx
 	sarq %cl, %r12
-	leaq .Lcs18(%rip), %r11
-	leaq .Lcs18(%rip), %r11
-	leaq .Lcs18(%rip), %r11
 	movq $0x0000000000000003, %rdi
 	movq %r12, %rsi
 	movq $0x0000000000000000, %rdx
@@ -28,9 +25,6 @@ main:
 	movq %rax, %rsi
 	movq %rbx, counter(%rip)
 	movq alias(%rip), %rbx
-	leaq .Lcs26(%rip), %r11
-	leaq .Lcs26(%rip), %r11
-	leaq .Lcs26(%rip), %r11
 	movq $0x0000000000000001, %rdi
 	movq %rbx, %rsi
 	movq $0x0000000000000000, %rdx

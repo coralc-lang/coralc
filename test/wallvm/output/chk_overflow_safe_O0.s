@@ -3,9 +3,6 @@
 .type main, @function
 main:
 .Lmain_entry_2:
-	leaq .Lcs16(%rip), %r11
-	leaq .Lcs16(%rip), %r11
-	leaq .Lcs16(%rip), %r11
 	movq $0x0000000000000003, %rdi
 	movq $0x0000000000000000, %rsi
 	movq $0x0000000000000000, %rdx
@@ -13,9 +10,6 @@ main:
 	movq $0x0000000000000000, %r8
 	call _trap@PLT
 	movq %rax, %rsi
-	leaq .Lcs24(%rip), %r11
-	leaq .Lcs24(%rip), %r11
-	leaq .Lcs24(%rip), %r11
 	movq $0x0000000000000003, %rdi
 	movq $0x0000000000000000, %rsi
 	movq $0x0000000000000000, %rdx
@@ -23,9 +17,6 @@ main:
 	movq $0x0000000000000000, %r8
 	call _trap@PLT
 	movq %rax, %rsi
-	leaq .Lcs31(%rip), %r11
-	leaq .Lcs31(%rip), %r11
-	leaq .Lcs31(%rip), %r11
 	movq $0x0000000000000003, %rdi
 	movq $0x0000000000000000, %rsi
 	movq $0x0000000000000000, %rdx
@@ -33,9 +24,6 @@ main:
 	movq $0x0000000000000000, %r8
 	call _trap@PLT
 	movq %rax, %rsi
-	leaq .Lcs37(%rip), %r11
-	leaq .Lcs37(%rip), %r11
-	leaq .Lcs37(%rip), %r11
 	movq $0x0000000000000003, %rdi
 	movq $0x0000000000000000, %rsi
 	movq $0x0000000000000000, %rdx
@@ -43,9 +31,6 @@ main:
 	movq $0x0000000000000000, %r8
 	call _trap@PLT
 	movq %rax, %rsi
-	leaq .Lcs43(%rip), %r11
-	leaq .Lcs43(%rip), %r11
-	leaq .Lcs43(%rip), %r11
 	movq $0x0000000000000003, %rdi
 	movq $0x0000000000000000, %rsi
 	movq $0x0000000000000000, %rdx
