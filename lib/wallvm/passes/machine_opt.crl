@@ -8,11 +8,13 @@ import(lib) wallvm::base::domtree { IrDomTree, irDomtreeNew, irDomtreeFree, irDo
 // Machine-level CSE/DSE pass using MemorySSA.
 //
 // Uses alias analysis and MemorySSA for precise memory optimization:
-// 1. Store-to-load forwarding — if a load reads from a store that definitely
-//    kills all prior stores to the same address, replace the load.
-// 2. Dead store elimination — if a store is overwritten (killed) before any
-//    load reads it, the store is dead and can be removed.
-// 3. Cross-block store-to-load forwarding via dominance.
+// 1. Store-to-load forwarding — a load may take a prior store's value only
+//    when the store must-aliases it (same address SSA value, equal width),
+//    dominates the load, and no aliasing write or barrier sits between
+//    them (canForward). Same-block and cross-block share this check.
+// 2. Dead store elimination — a store overwritten (killed) by a later
+//    must-alias store before any load reads it in the same block is dead
+//    and can be removed.
 //
 // MemorySSA provides precise memory dependency information that replaces
 // the naive back-scan approach, handling aliasing correctly.
@@ -22,7 +24,6 @@ pub struct MachineOptPass
     u64 forwardingDone;
     u64 loadsEliminated;
     u64 storesEliminated;
-    u64 crossBlockOpts;
 
     static MachineOptPass new(IrContext* ctx)
     {
@@ -30,8 +31,7 @@ pub struct MachineOptPass
             .ctx = ctx,
             .forwardingDone = 0,
             .loadsEliminated = 0,
-            .storesEliminated = 0,
-            .crossBlockOpts = 0
+            .storesEliminated = 0
         };
     }
 
@@ -40,7 +40,6 @@ pub struct MachineOptPass
         self.forwardingDone = 0;
         self.loadsEliminated = 0;
         self.storesEliminated = 0;
-        self.crossBlockOpts = 0;
 
         // Check for cached AA
         FunctionAnalysisCache* cache = self.ctx->getOrCreateAnalysisCache(func);
@@ -69,26 +68,27 @@ pub struct MachineOptPass
 
         bool changed = false;
 
-        // Pass 1 — intra-block store-to-load forwarding using MemorySSA
+        // Dominance tree shared by every forwarding decision (canForward).
+        IrDomTree* dt = irDomtreeNew(func);
+
+        // Pass 1 — store-to-load forwarding, same-block and cross-block
         for (u32 bi = 0; bi < func->nblocks; bi++)
         {
             IrBlock* bb = func->blocks[bi];
-            if (self.processBlockWithMemorySSA(bb, &mssa)) changed = true;
+            if (self.processBlockWithMemorySSA(bb, &mssa, dt)) changed = true;
         }
 
         // Pass 2 — dead store elimination using MemorySSA
         if (self.eliminateDeadStores(func, &mssa)) changed = true;
 
-        // Pass 3 — cross-block store-to-load forwarding via dominance
-        if (self.crossBlockLoadForward(func, &mssa)) changed = true;
-
+        irDomtreeFree(dt);
         mssa.deinit();
         if (ownAA) aa.deinit();
         return changed;
     }
 
     // Process a single block — forward stores to loads, eliminate dead stores
-    bool processBlockWithMemorySSA(IrBlock* bb, MemorySSA* mssa)
+    bool processBlockWithMemorySSA(IrBlock* bb, MemorySSA* mssa, IrDomTree* dt)
     {
         bool changed = false;
         u32 i = 0;
@@ -107,10 +107,11 @@ pub struct MachineOptPass
                 if (storeVer > 0 && storeVer < mssa->numMemVersions)
                 {
                     IrInst* killerDef = mssa->memDefInst[storeVer];
-                    if (killerDef != null && self.isStoreToAddr(killerDef, loadAddr) && killerDef->base.type != null && killerDef->base.type->width == loadWidth)
+                    if (killerDef != null && self.isStoreToAddr(killerDef, loadAddr) && self.storeValueWidth(killerDef) == loadWidth)
                     {
-                        // Check that the store definitely kills all prior stores to this address
-                        if (self.isStoreKilledBy(killerDef, loadAddr, mssa))
+                        // D1: dominance + no-intervening-writer check —
+                        // a side-path store must never be forwarded.
+                        if (self.canForward(killerDef, inst, bb->parent, dt, mssa))
                         {
                             inst->base.replaceAllUses(killerDef->ops[0]);
                             inst->erase();
@@ -193,102 +194,84 @@ pub struct MachineOptPass
         return false;
     }
 
-    // Check if a store is killed by a later store (all prior stores are dead)
-    bool isStoreKilledBy(IrInst* storeInst, IrValue* addr, MemorySSA* mssa)
+    // Position of an instruction inside its block, or bb->ninsts if absent.
+    u32 instIndex(IrBlock* bb, IrInst* inst)
     {
-        IrBlock* bb = storeInst->parent;
-        if (bb == null) return false;
-
-        u32 storeIdx = 0;
         for (u32 i = 0; i < bb->ninsts; i++)
-        {
-            if (bb->insts[i] == storeInst) { storeIdx = i; break; }
-        }
-
-        // Check that no aliasing store exists before this one that might be live
-        for (u32 j = 0; j < storeIdx; j++)
-        {
-            IrInst* prev = bb->insts[j];
-            if ((prev->opcode == IrOpcode::Store || prev->opcode == IrOpcode::AtomicStore) &&
-                prev->nops >= 2 && prev->ops[1] != null)
-            {
-                if (!mssa->aliasAnalysis->isNoAlias(prev->ops[1], addr))
-                    return false;
-            }
-        }
-
-        return true;
+            if (bb->insts[i] == inst) return i;
+        return bb->ninsts;
     }
 
-    // Cross-block store-to-load forwarding using dominance
-    bool crossBlockLoadForward(IrFunc* func, MemorySSA* mssa)
+    // May `killer`'s stored value be forwarded to `load`? All conditions
+    // are required (D1):
+    //   C0 — caller-established must-alias: isStoreToAddr (same address
+    //        SSA value) plus equal access widths.
+    //   C1 — the killer dominates the load: same block with the killer
+    //        earlier (straight-line), or the killer's block dominates the
+    //        load's block. Without this a store on a side path that never
+    //        executed would be forwarded — the D1 miscompile.
+    //   C2 — region scan: no aliasing store or barrier between them. Every
+    //        block dominated by the killer's block is scanned — the
+    //        killer's block from after the killer, the load's block up to
+    //        the load, all others in full. If the killer dominates the
+    //        load, any writer on a killer→load path lies in this region:
+    //        a path writer whose block the killer did not dominate would
+    //        give an entry→load path avoiding the killer, contradicting
+    //        dominance. So a clean region means no intervening write can
+    //        reach the load. Writers before the killer are irrelevant —
+    //        the killer must-aliases the load and overwrites them at the
+    //        load's address.
+    bool canForward(IrInst* killer, IrInst* load, IrFunc* func, IrDomTree* dt, MemorySSA* mssa)
     {
-        bool changed = false;
-        IrDomTree* dt = irDomtreeNew(func);
-        if (dt == null) return false;
+        if (killer == null || load == null || func == null) return false;
+        IrBlock* kb = killer->parent;
+        IrBlock* lb = load->parent;
+        if (kb == null || lb == null) return false;
 
-        for (u32 bi = 1; bi < func->nblocks; bi++)
+        u32 kIdx = self.instIndex(kb, killer);
+        u32 lIdx = self.instIndex(lb, load);
+        if (kIdx >= kb->ninsts || lIdx >= lb->ninsts) return false;
+
+        if (kb == lb)
         {
-            IrBlock* bb = func->blocks[bi];
-            if (bb == null || bb->ninsts == 0) continue;
+            if (kIdx >= lIdx) return false;
+        }
+        else
+        {
+            if (dt == null || !irDomtreeDominates(dt, kb, lb)) return false;
+        }
 
-            for (u32 ii = 0; ii < bb->ninsts; ii++)
+        for (u32 pi = 0; pi < func->nblocks; pi++)
+        {
+            IrBlock* pb = func->blocks[pi];
+            if (pb == null) continue;
+            if (pb != kb && !irDomtreeDominates(dt, kb, pb)) continue;
+
+            u32 from = 0;
+            u32 to = pb->ninsts;
+            if (pb == kb)
             {
-                IrInst* inst = bb->insts[ii];
-                if (!self.isMemoryRead(inst->opcode) || inst->nops == 0 || inst->ops[0] == null) continue;
-                if (inst->base.type == null) continue;
+                from = kIdx + 1;
+                if (pb == lb) to = lIdx;
+            }
+            else if (pb == lb)
+            {
+                to = lIdx;
+            }
 
-                IrValue* loadAddr = inst->ops[0];
-                u32 loadWidth = inst->base.type->width;
-
-                // Use MemorySSA to find the nearest defining store
-                u32 storeVer = mssa->findNearestDefForLoad(loadAddr, mssa->getVersionAtInst(inst));
-                if (storeVer > 0 && storeVer < mssa->numMemVersions)
+            for (u32 ii = from; ii < to; ii++)
+            {
+                IrInst* s = pb->insts[ii];
+                if (self.isBarrier(s->opcode)) return false;
+                if (s->opcode == IrOpcode::Store && s->nops >= 2 && s->ops[1] != null)
                 {
-                    IrInst* killerDef = mssa->memDefInst[storeVer];
-                    if (killerDef != null && self.isStoreToAddr(killerDef, loadAddr) && killerDef->base.type != null && killerDef->base.type->width == loadWidth)
-                    {
-                        // The defining store must dominate this block, and no
-                        // aliasing store in another dominating block may sit
-                        // on the path. Block index order is not dominance.
-                        bool safe = irDomtreeDominates(dt, killerDef->parent, bb);
-                        if (safe)
-                        {
-                            for (u32 pi = 0; pi < func->nblocks && safe; pi++)
-                            {
-                                IrBlock* pred = func->blocks[pi];
-                                if (pred == null || pred == killerDef->parent) continue;
-                                if (!irDomtreeDominates(dt, pred, bb)) continue;
-                                for (u32 si = 0; si < pred->ninsts; si++)
-                                {
-                                    IrInst* sinst = pred->insts[si];
-                                    if (sinst->opcode == IrOpcode::Store && sinst->nops >= 2 && sinst->ops[1] != null)
-                                    {
-                                        if (mssa->aliasAnalysis == null ||
-                                            !mssa->aliasAnalysis->isNoAlias(sinst->ops[1], loadAddr))
-                                        {
-                                            safe = false;
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        if (safe)
-                        {
-                            inst->base.replaceAllUses(killerDef->ops[0]);
-                            inst->erase();
-                            self.crossBlockOpts++;
-                            changed = true;
-                        }
-                    }
+                    if (mssa->aliasAnalysis == null ||
+                        !mssa->aliasAnalysis->isNoAlias(s->ops[1], load->ops[0]))
+                        return false;
                 }
             }
         }
-
-        irDomtreeFree(dt);
-        return changed;
+        return true;
     }
 
     // Eliminate dead stores across the function
