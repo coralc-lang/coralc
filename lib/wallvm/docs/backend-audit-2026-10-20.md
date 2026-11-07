@@ -29,7 +29,7 @@ At a glance:
 | x86_64 performance | Far from `1.2x` gcc/clang. The pipeline cannot be benchmarked meaningfully until the P0s are fixed; then register allocation is the largest single gap. |
 | wasm32 | Semantically the best backend in the tested cases, but WAT-only: `irCompile` discards output and one phi path fails. |
 | Assembler | Strong: raw clang GNU/MSVC asm, direct COFF objects, static ELF, and COFF output work. |
-| Linker | Strong: static/shared ELF, dynamic executables, archives, PE exe/DLL, COFF, and short import libraries work, with known limits. |
+| Linker | Strong: static/shared ELF, dynamic executables, archives, PE exe/DLL, COFF, and short use libraries work, with known limits. |
 | IR/parser/passes | Broad IR and pass inventory, but several passes are broken, unsafe, dead, or silently ineffective. Parser-created `Arg` values are not seeded by register allocation. |
 | Default-backend readiness | Not ready. Keep the C backend as default and make WallVM opt-in, target by target. |
 | Immediate priority | Fix memory-safety and wrong-code P0s; make validation fatal; add differential tests. Do not start performance work first. |
@@ -547,13 +547,13 @@ The backend P0s in §6 must be treated as a parallel release gate: fixing the op
 
 - PE is validated under Wine:
   - PE executable with `mov $42,%eax; ret` exits `42`.
-  - PE executable linked with a short import library calls `ExitProcess(42)` and exits `42`; the import directory is emitted correctly.
+  - PE executable linked with a short use library calls `ExitProcess(42)` and exits `42`; the use directory is emitted correctly.
   - PE DLL exporting `get42` loads via `LoadLibraryA`/`GetProcAddress` and returns `42`.
-- PE import caveat: short import libraries work (`llvm-dlltool`), but GNU/Wine-style `libkernel32.a` is treated as ordinary COFF objects, producing no import directory and a runtime fault.
+- PE use caveat: short use libraries work (`llvm-dlltool`), but GNU/Wine-style `libkernel32.a` is treated as ordinary COFF objects, producing no use directory and a runtime fault.
 
 ### 8.3 Assembler and linker positives and limits
 
-- Static ELF, shared ELF plus dynamic executables, static archives, PE exe/DLL, COFF input, and short import libraries all work.
+- Static ELF, shared ELF plus dynamic executables, static archives, PE exe/DLL, COFF input, and short use libraries all work.
 - ELF output still needs `chmod +x`.
 - TLS is rejected.
 - 32-bit PE is not exposed by `linktool`.
@@ -578,7 +578,7 @@ The earlier segfault report is retracted: no-opt main/float are not reproducibly
 | Area | Assessment |
 |---|---|
 | Assembler | Strong: GNU/MSVC asm, COFF, ELF/PE object paths; syntax tolerance is broad. |
-| Linker | Strong: static/shared ELF, dynamic exe, archives, PE exe/DLL, COFF, short import libs. Limits: TLS, 32-bit PE exposure, executable bit. |
+| Linker | Strong: static/shared ELF, dynamic exe, archives, PE exe/DLL, COFF, short use libs. Limits: TLS, 32-bit PE exposure, executable bit. |
 | wasm32 | Best semantic correctness in tested cases; WAT-only and missing an artifact sink. |
 | x86_64 | Not correctness-clean; basic IR miscompiles; performance also limited by spills and ABI gaps. |
 | x86-32 / Win64 | Incomplete/unwired; i386 ABI lowering is not wired; no Win64 end-to-end test. |

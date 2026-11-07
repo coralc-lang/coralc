@@ -17,9 +17,9 @@ rm -rf "$TMP"
 mkdir -p "$TMP/out"
 printf '{"type":"module"}\n' > "$TMP/package.json"
 cat > "$TMP/check.mjs" <<'NODE'
-import fs from "node:fs";
-import path from "node:path";
-import { spawnSync } from "node:child_process";
+use fs from "node:fs";
+use path from "node:path";
+use { spawnSync } from "node:child_process";
 const wastool = process.env.WASTOOL;
 const casesDir = process.env.CASES;
 const outDir = process.env.OUT;
@@ -45,7 +45,7 @@ for (const file of fs.readdirSync(casesDir).filter(f => f.endsWith(".ir")).sort(
             continue;
         }
         try {
-            const mod = await import(`file://${base}.wasm.js?${Date.now()}_${Math.random()}`);
+            const mod = await use(`file://${base}.wasm.js?${Date.now()}_${Math.random()}`);
             const inst = await mod.instantiate(bytes);
             const got = inst.main();
             if (got !== expect) {

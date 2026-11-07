@@ -378,10 +378,10 @@ WallVM is broad but not end-to-end. The strongest pieces are the assembler, link
 - **wasm32 is still WAT-only:** `irCompile` returns success but discards output. `compile2` on the phi fixture fails with `terminator reached the generic dispatcher`; `compile3` returns success/no artifact.
 - **PE is now validated under Wine:**
   - PE executable with `mov $42,%eax; ret` exits `42`.
-  - PE executable linked with a short import library calls `ExitProcess(42)` and exits `42`; the import directory is emitted correctly.
+  - PE executable linked with a short use library calls `ExitProcess(42)` and exits `42`; the use directory is emitted correctly.
   - PE DLL exporting `get42` loads via `LoadLibraryA`/`GetProcAddress` and returns `42`.
-- **PE import caveat:** short import libraries work (`llvm-dlltool`), but GNU/Wine-style `libkernel32.a` is treated as ordinary COFF objects, producing no import directory and a runtime fault.
-- **Linker/assembler positives:** static ELF, shared ELF + dynamic executable, static archives, PE exe/DLL, COFF input, and short import libraries all work. ELF output still needs `chmod +x`; TLS is rejected; 32-bit PE is not exposed by `linktool`.
+- **PE use caveat:** short use libraries work (`llvm-dlltool`), but GNU/Wine-style `libkernel32.a` is treated as ordinary COFF objects, producing no use directory and a runtime fault.
+- **Linker/assembler positives:** static ELF, shared ELF + dynamic executable, static archives, PE exe/DLL, COFF input, and short use libraries all work. ELF output still needs `chmod +x`; TLS is rejected; 32-bit PE is not exposed by `linktool`.
 - **Native x86_64 blockers remain unchanged:** constants decoded as register indices, `IrValueKind::Arg` params never seeded, `lower_phis` alloca inserted after the terminator, duplicate epilogue, bare-register syntax against AT&T, data section never flushed, and silent success for unsupported targets.
 - **Earlier segfault report is retracted:** no-opt main/float are not reproducibly crashing after the harness rebuild.
 

@@ -119,7 +119,7 @@ writing every encoder ourselves.
   arith, comparisons, neg abs ceil floor trunc nearest sqrt), conversions
   (all wrap/trunc/promote/demote/convert signed+unsigned, reinterpret),
   consts, select, nop, plus module-level sections the backend already
-  prints (type/import/func/table/memory/global/export/elem/code/data).
+  prints (type/use/func/table/memory/global/export/elem/code/data).
 
 ## Verification strategy (per phase, non-negotiable)
 
