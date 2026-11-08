@@ -9,10 +9,9 @@ nest:
 	movq %rdi, 0(%rsp)
 	movq 0(%rsp), %rsi
 	addq $8, %rsp
-.Lnest_entry_3:
 	movq $0x0000000000000000, %rdi
-	jmp .Lnest__59
-.Lnest_done_13:
+	jmp .L59
+.L13:
 	imulq $0x000000000000000a, %rdi
 	leaq 3(%rdi), %rdi
 	addq %rdi, %r8
@@ -21,61 +20,60 @@ nest:
 	popq %r12
 	popq %rbx
 	ret
-.Lnest__59:
-.Lnest__60:
+.L59:
+.L60:
 	cmpq $0x0000000000000007, %rsi
-	je .Lnest__62
-.Lnest__61:
-.Lnest__62:
-.Lnest__63:
+	je .L62
+.L61:
+.L62:
+.L63:
 	leaq 1(%rdi), %rdi
 	cmpq $0x0000000000000004, %rdi
-	jl .Lnest_nest.split1_142
-.Lnest__64:
+	jl .L142
+.L64:
 	movq $0x0000000000000000, %rdi
-.Lnest__65:
-.Lnest__66:
+.L65:
+.L66:
 	cmpq $0x0000000000000007, %rsi
-	je .Lnest__68
-.Lnest__67:
-.Lnest__68:
-.Lnest__69:
+	je .L68
+.L67:
+.L68:
+.L69:
 	leaq 1(%rdi), %rdi
 	cmpq $0x0000000000000004, %rdi
-	jl .Lnest_nest.split2_144
-.Lnest__70:
+	jl .L144
+.L70:
 	movq $0x0000000000000000, %rdi
 	movq $0x0000000000000000, %r8
-.Lnest__71:
-.Lnest__72:
+.L71:
+.L72:
 	leaq 1(%r8), %r9
 	cmpq $0x0000000000000007, %rsi
-	je .Lnest_nest.split4_148
-.Lnest__73:
+	je .L148
+.L73:
 	leaq 2(%r8), %rbx
 	movq %rbx, %r12
-.Lnest__74:
-.Lnest__75:
+.L74:
+.L75:
 	leaq 1(%rdi), %r9
 	cmpq $0x0000000000000004, %r9
-	jl .Lnest_nest.split3_146
-.Lnest_nest.split0_140:
-	jmp .Lnest_done_13
-.Lnest_nest.split1_142:
-	jmp .Lnest__59
-.Lnest_nest.split2_144:
-	jmp .Lnest__65
-.Lnest_nest.split3_146:
+	jl .L146
+.L140:
+	jmp .L13
+.L142:
+	jmp .L59
+.L144:
+	jmp .L65
+.L146:
 	movq %r9, %rdi
 	movq %r12, %r8
-	jmp .Lnest__71
-.Lnest_nest.split4_148:
+	jmp .L71
+.L148:
 	movq %r9, %r12
-	jmp .Lnest__74
+	jmp .L74
 .globl main
 .type main, @function
 main:
-.Lmain_entry_49:
 	movq $0x0000000000000007, %rdi
 	call nest
 	movq %rax, %rsi

@@ -2,7 +2,6 @@
 .globl main
 .type main, @function
 main:
-.Lmain_entry_5:
 	leaq msg(%rip), %rsi
 	leaq msg+1(%rip), %rdi
 	movq %rsi, first(%rip)
@@ -21,8 +20,7 @@ main:
 	ret
 .section .rodata.str1.1,"aM",@progbits,1
 msg:
-	.byte 97, 98, 99
-	.byte 0
+	.asciz "abc"
 .section .data
 	.balign 8
 first:

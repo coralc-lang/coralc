@@ -2,7 +2,6 @@
 .globl main
 .type main, @function
 main:
-.Lmain_entry_4:
 	movq z(%rip), %rsi
 	movq (%rsi), %rdi
 	movq %rdi, %rax

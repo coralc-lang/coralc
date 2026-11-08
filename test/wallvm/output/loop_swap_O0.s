@@ -15,23 +15,22 @@ nest:
 	movq 0(%rsp), %r11
 	movq %r11, -56(%rbp)
 	addq $8, %rsp
-.Lnest_entry_3:
 	movq $0x0000000000000000, %r12
 	movq $0x0000000000000000, %r11
 	movq %r11, -88(%rbp)
 	movq $0x0000000000000000, %r11
 	movq %r11, -136(%rbp)
-.Lnest_outer_4:
+.L4:
 	cmpq $0x0000000000000003, %r12
-	jge .Lnest_done_13
-.Lnest_inner_pre_5:
+	jge .L13
+.L5:
 	movq $0x0000000000000000, %r15
 	movq $0x0000000000000000, %rbx
-.Lnest_inner_6:
-.Lnest_ibody_7:
+.L6:
+.L7:
 	cmpq $0x0000000000000007, -56(%rbp)
-	jne .Lnest_ielse_9
-.Lnest_ithen_8:
+	jne .L9
+.L8:
 	movq %rbx, -72(%rbp)
 	incq -72(%rbp)
 	movq %rbx, %rsi
@@ -51,8 +50,8 @@ nest:
 	movq %rax, %rsi
 	movq -72(%rbp), %r11
 	movq %r11, -104(%rbp)
-	jmp .Lnest_imerge_10
-.Lnest_ielse_9:
+	jmp .L10
+.L9:
 	movq %rbx, %r10
 	addq $0x0000000000000002, %r10
 	movq %r10, -120(%rbp)
@@ -73,8 +72,8 @@ nest:
 	movq %rax, %rsi
 	movq -120(%rbp), %r11
 	movq %r11, -104(%rbp)
-.Lnest_imerge_10:
-.Lnest_ilatch_11:
+.L10:
+.L11:
 	movq %r15, -152(%rbp)
 	incq -152(%rbp)
 	movq %r15, %rsi
@@ -93,8 +92,8 @@ nest:
 	call _trap@PLT
 	movq %rax, %rsi
 	cmpq $0x0000000000000004, -152(%rbp)
-	jl .Lnest_nest.split0_91
-.Lnest_olatch_12:
+	jl .L91
+.L12:
 	movq %r12, %r14
 	incq %r14
 	movq %r12, %rsi
@@ -117,8 +116,8 @@ nest:
 	movq %r11, -88(%rbp)
 	movq %rbx, %r11
 	movq %r11, -136(%rbp)
-	jmp .Lnest_outer_4
-.Lnest_done_13:
+	jmp .L4
+.L13:
 	movq -88(%rbp), %r10
 	leaq (%r10,%r10,4), %rsi
 	addq %rsi, %rsi
@@ -161,14 +160,13 @@ nest:
 	popq %rbx
 	leave
 	ret
-.Lnest_nest.split0_91:
+.L91:
 	movq -152(%rbp), %r15
 	movq -104(%rbp), %rbx
-	jmp .Lnest_inner_6
+	jmp .L6
 .globl main
 .type main, @function
 main:
-.Lmain_entry_49:
 	movq $0x0000000000000007, %rdi
 	call nest
 	movq %rax, %rsi
@@ -176,20 +174,14 @@ main:
 	ret
 .section .rodata.str1.1,"aM",@progbits,1
 .Lcs54:
-	.byte 63
-	.byte 0
+	.asciz "?"
 .Lcs61:
-	.byte 63
-	.byte 0
+	.asciz "?"
 .Lcs67:
-	.byte 63
-	.byte 0
+	.asciz "?"
 .Lcs73:
-	.byte 63
-	.byte 0
+	.asciz "?"
 .Lcs79:
-	.byte 63
-	.byte 0
+	.asciz "?"
 .Lcs85:
-	.byte 63
-	.byte 0
+	.asciz "?"

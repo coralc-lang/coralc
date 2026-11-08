@@ -9,15 +9,14 @@ main:
 	pushq %r13
 	pushq %r14
 	subq $64, %rsp
-.Lmain_entry_2:
 	leaq -80(%rbp), %rbx
 	leaq -96(%rbp), %r12
 	movq $0x0000000000000000, (%r12)
-.Lmain_loop_3:
+.L3:
 	movq (%r12), %rsi
 	cmpq $0x0000000000000007, %rsi
-	jge .Lmain_done_5
-.Lmain_body_4:
+	jge .L5
+.L4:
 	movq (%r12), %r13
 	movq $0x0000000000000000, %rdi
 	movq %r13, %rsi
@@ -46,8 +45,8 @@ main:
 	call _trap@PLT
 	movq %rax, %rsi
 	addq $0x0000000000000001, (%r12)
-	jmp .Lmain_loop_3
-.Lmain_done_5:
+	jmp .L3
+.L5:
 	movq $0x0000000000000000, %rax
 	addq $64, %rsp
 	popq %r14
@@ -58,8 +57,6 @@ main:
 	ret
 .section .rodata.str1.1,"aM",@progbits,1
 .Lcs27:
-	.byte 63
-	.byte 0
+	.asciz "?"
 .Lcs29:
-	.byte 63
-	.byte 0
+	.asciz "?"

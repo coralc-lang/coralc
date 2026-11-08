@@ -15,43 +15,42 @@ nest:
 	movq 0(%rsp), %r11
 	movq %r11, -56(%rbp)
 	addq $8, %rsp
-.Lnest_entry_3:
 	movq $0x0000000000000000, %rdi
 	movq $0x0000000000000000, %r8
 	movq $0x0000000000000000, %r9
-.Lnest_outer_4:
+.L4:
 	cmpq $0x0000000000000003, %rdi
-	jge .Lnest_done_13
-.Lnest_inner_pre_5:
+	jge .L13
+.L5:
 	movq $0x0000000000000000, %rbx
 	movq $0x0000000000000000, %r12
-.Lnest_inner_6:
-.Lnest_ibody_7:
+.L6:
+.L7:
 	cmpq $0x0000000000000007, -56(%rbp)
-	jne .Lnest_ielse_9
-.Lnest_ithen_8:
+	jne .L9
+.L8:
 	movq %r12, -72(%rbp)
 	incq -72(%rbp)
 	movq -72(%rbp), %r14
-	jmp .Lnest_imerge_10
-.Lnest_ielse_9:
+	jmp .L10
+.L9:
 	movq %r12, %r15
 	addq $0x0000000000000002, %r15
 	movq %r15, %r14
-.Lnest_imerge_10:
-.Lnest_ilatch_11:
+.L10:
+.L11:
 	movq %rbx, %rsi
 	incq %rsi
 	cmpq $0x0000000000000004, %rsi
-	jl .Lnest_nest.split0_54
-.Lnest_olatch_12:
+	jl .L54
+.L12:
 	movq %rdi, %r13
 	incq %r13
 	movq %r13, %rdi
 	movq %rbx, %r8
 	movq %r12, %r9
-	jmp .Lnest_outer_4
-.Lnest_done_13:
+	jmp .L4
+.L13:
 	leaq (%r8,%r8,4), %r8
 	addq %r8, %r8
 	addq %r8, %rdi
@@ -65,14 +64,13 @@ nest:
 	popq %rbx
 	leave
 	ret
-.Lnest_nest.split0_54:
+.L54:
 	movq %rsi, %rbx
 	movq %r14, %r12
-	jmp .Lnest_inner_6
+	jmp .L6
 .globl main
 .type main, @function
 main:
-.Lmain_entry_49:
 	movq $0x0000000000000007, %rdi
 	call nest
 	movq %rax, %rsi

@@ -6,31 +6,30 @@ main:
 	movq %rsp, %rbp
 	pushq %rbx
 	subq $88, %rsp
-.Lmain_entry_2:
 	leaq -64(%rbp), %rsi
 	leaq -80(%rbp), %rdi
 	movq $0x0000000000000000, (%rdi)
-.Lmain_fill_3:
+.L3:
 	movq (%rdi), %r8
 	cmpq $0x0000000000000005, %r8
-	jge .Lmain_sum_pre_5
-.Lmain_fill_body_4:
+	jge .L5
+.L4:
 	movq (%rdi), %r8
 	leaq (%rsi, %r8, 8), %r9
 	incq %r8
 	movq %r8, (%r9)
 	movq (%rdi), %r8
 	addq $0x0000000000000001, (%rdi)
-	jmp .Lmain_fill_3
-.Lmain_sum_pre_5:
+	jmp .L3
+.L5:
 	movq $0x0000000000000000, (%rdi)
 	leaq -96(%rbp), %r8
 	movq $0x0000000000000000, (%r8)
-.Lmain_sum_6:
+.L6:
 	movq (%rdi), %r9
 	cmpq $0x0000000000000005, %r9
-	jge .Lmain_done_8
-.Lmain_sum_body_7:
+	jge .L8
+.L7:
 	movq (%rdi), %r9
 	leaq (%rsi, %r9, 8), %rbx
 	movq (%rbx), %r9
@@ -39,8 +38,8 @@ main:
 	movq %rbx, (%r8)
 	movq (%rdi), %r9
 	addq $0x0000000000000001, (%rdi)
-	jmp .Lmain_sum_6
-.Lmain_done_8:
+	jmp .L6
+.L8:
 	movq (%r8), %rsi
 	movq %rsi, %rax
 	addq $88, %rsp

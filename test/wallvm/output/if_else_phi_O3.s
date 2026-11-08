@@ -2,7 +2,6 @@
 .globl main
 .type main, @function
 main:
-.Lmain_entry_2:
-.Lmain_merge_5:
+.L5:
 	movq $0x000000000000000e, %rax
 	ret

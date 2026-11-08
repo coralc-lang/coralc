@@ -6,7 +6,6 @@ main:
 	movq %rsp, %rbp
 	pushq %rbx
 	subq $24, %rsp
-.Lmain_entry_2:
 	leaq -32(%rbp), %rsi
 	movq $0x0000000000000000, (%rsi)
 	movq (%rsi), %rbx
@@ -29,5 +28,4 @@ main:
 	ret
 .section .rodata.str1.1,"aM",@progbits,1
 .Lcs12:
-	.byte 63
-	.byte 0
+	.asciz "?"

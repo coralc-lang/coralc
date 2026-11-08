@@ -12,7 +12,8 @@ mkdir -p "$OUT"
 
 if [ ! -x ./irtool ] || [ "${REBUILD:-0}" = "1" ]; then
     echo "building irtool..."
-    CORALC="${CORALC:-coralc}" "$CORALC" irtool.crl -o irtool || exit 1
+    CORALC="${CORALC:-coralc}"
+    "$CORALC" irtool.crl -o irtool || exit 1
 fi
 
 t() { timeout --kill-after=5 "$TIMEOUT" "$@"; }

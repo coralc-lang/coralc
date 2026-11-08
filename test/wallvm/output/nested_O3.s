@@ -6,21 +6,20 @@ main:
 	movq %rsp, %rbp
 	pushq %rbx
 	subq $40, %rsp
-.Lmain_entry_2:
 	leaq -48(%rbp), %rsi
 	movq $0x0000000000000000, %rbx
 	movq $0x0000000000000000, %r8
-.Lmain_outer_3:
+.L3:
 	cmpq $0x0000000000000004, %rbx
-	jl .Lmain_preheader_50
-.Lmain_done_8:
+	jl .L50
+.L8:
 	movl %r8d, %esi
 	movq %rsi, %rax
 	addq $40, %rsp
 	popq %rbx
 	leave
 	ret
-.Lmain_preheader_50:
+.L50:
 	movq %r8, %rdi
 	movq %rbx, %rsi
 	movq %rsi, %r9
@@ -35,4 +34,4 @@ main:
 	movq %r11, -24(%rbp)
 	movq %r8, %rbx
 	movq -24(%rbp), %r8
-	jmp .Lmain_outer_3
+	jmp .L3

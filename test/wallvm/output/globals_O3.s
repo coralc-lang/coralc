@@ -2,7 +2,6 @@
 .globl main
 .type main, @function
 main:
-.Lmain_entry_7:
 	movq counter(%rip), %r8
 	movq answer(%rip), %rdi
 	movq %r8, %rsi

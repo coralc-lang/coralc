@@ -5,7 +5,6 @@ main:
 	pushq %rbx
 	pushq %r12
 	subq $8, %rsp
-.Lmain_entry_7:
 	movq counter(%rip), %rsi
 	movq answer(%rip), %rdi
 	movq %rsi, %rbx
@@ -40,11 +39,9 @@ main:
 	ret
 .section .rodata.str1.1,"aM",@progbits,1
 .Lcs18:
-	.byte 63
-	.byte 0
+	.asciz "?"
 .Lcs26:
-	.byte 63
-	.byte 0
+	.asciz "?"
 .section .data
 	.balign 8
 counter:

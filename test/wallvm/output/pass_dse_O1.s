@@ -5,7 +5,6 @@ main:
 	pushq %rbp
 	movq %rsp, %rbp
 	subq $48, %rsp
-.Lmain_entry_2:
 	leaq -48(%rbp), %rsi
 	leaq (%rsi), %rdi
 	movq $0x0000000000000002, (%rdi)

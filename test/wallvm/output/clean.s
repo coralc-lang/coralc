@@ -11,7 +11,6 @@ add:
 	movq 0(%rsp), %rsi
 	movq 8(%rsp), %rdi
 	addq $16, %rsp
-.Ladd_entry_4:
 	movq %rsi, %rbx
 	addq %rdi, %rbx
 	movq %rsi, %r8
@@ -37,7 +36,6 @@ add:
 .globl main
 .type main, @function
 main:
-.Lmain_entry_8:
 	movq $0x0000000000000014, %rdi
 	movq $0x0000000000000016, %rsi
 	call add
@@ -46,5 +44,4 @@ main:
 	ret
 .section .rodata.str1.1,"aM",@progbits,1
 .Lcs16:
-	.byte 63
-	.byte 0
+	.asciz "?"

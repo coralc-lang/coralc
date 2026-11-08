@@ -10,7 +10,6 @@ main:
 	pushq %r14
 	pushq %r15
 	subq $136, %rsp
-.Lmain_entry_2:
 	leaq -80(%rbp), %rbx
 	leaq -112(%rbp), %r9
 	leaq -144(%rbp), %r8
@@ -21,8 +20,8 @@ main:
 	movq $0x0000000000000001, (%r9)
 	leaq 8(%r9), %rsi
 	movq $0x0000000000000002, (%rsi)
-	jmp .Lmain__80
-.Lmain_done_8:
+	jmp .L80
+.L8:
 	leaq 8(%rbx), %r12
 	movq (%r12), %rsi
 	leaq 8(%r8), %r12
@@ -43,42 +42,42 @@ main:
 	popq %rbx
 	leave
 	ret
-.Lmain__80:
+.L80:
 	leaq (%rbx), %r14
 	leaq (%r9), %r13
 	movq (%r14), %r12
 	movq (%r13), %rsi
 	movq %r12, (%r13)
 	movq %rsi, (%r14)
-.Lmain__82:
+.L82:
 	leaq 8(%rbx), %r14
 	leaq 8(%r9), %r13
 	movq (%r14), %r12
 	movq (%r13), %rsi
 	movq %r12, (%r13)
 	movq %rsi, (%r14)
-.Lmain__110:
+.L110:
 	leaq (%rbx), %r12
 	movq (%r12), %rsi
 	leaq 10(%rsi), %r12
 	leaq (%r8), %rsi
 	movq %r12, (%rsi)
-.Lmain__111:
+.L111:
 	leaq (%r9), %r12
 	movq (%r12), %rsi
 	leaq 20(%rsi), %r12
 	leaq (%rdi), %rsi
 	movq %r12, (%rsi)
-.Lmain__113:
+.L113:
 	leaq 8(%rbx), %r12
 	movq (%r12), %rsi
 	leaq 10(%rsi), %r12
 	leaq 8(%r8), %rsi
 	movq %r12, (%rsi)
-.Lmain__114:
+.L114:
 	leaq 8(%r9), %r12
 	movq (%r12), %rsi
 	leaq 20(%rsi), %r9
 	leaq 8(%rdi), %rsi
 	movq %r9, (%rsi)
-	jmp .Lmain_done_8
+	jmp .L8

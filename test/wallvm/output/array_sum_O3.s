@@ -6,29 +6,28 @@ main:
 	movq %rsp, %rbp
 	pushq %rbx
 	subq $56, %rsp
-.Lmain_entry_2:
 	leaq -64(%rbp), %rsi
-	jmp .Lmain__53
-.Lmain_done_8:
+	jmp .L53
+.L8:
 	movl %r8d, %edi
 	movq %rdi, %rax
 	addq $56, %rsp
 	popq %rbx
 	leave
 	ret
-.Lmain__53:
+.L53:
 	leaq (%rsi), %rdi
 	movq $0x0000000000000001, (%rdi)
-.Lmain__55:
+.L55:
 	leaq 8(%rsi), %rdi
 	movq $0x0000000000000002, (%rdi)
-.Lmain__57:
+.L57:
 	leaq 16(%rsi), %rdi
 	movq $0x0000000000000003, (%rdi)
-.Lmain__59:
+.L59:
 	leaq 24(%rsi), %rdi
 	movq $0x0000000000000004, (%rdi)
-.Lmain__61:
+.L61:
 	leaq 32(%rsi), %rdi
 	movq $0x0000000000000005, (%rdi)
 	leaq (%rsi), %r8
@@ -51,4 +50,4 @@ main:
 	movq %rdi, %rsi
 	addq %r9, %rsi
 	movq %rsi, %r8
-	jmp .Lmain_done_8
+	jmp .L8

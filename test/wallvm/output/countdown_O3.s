@@ -2,21 +2,20 @@
 .globl main
 .type main, @function
 main:
-.Lmain_entry_2:
 	movq $0x000000000000000a, %r9
 	movq $0x0000000000000000, %r8
-.Lmain_loop_3:
+.L3:
 	cmpq $0x0000000000000000, %r9
-	jle .Lmain_done_5
-.Lmain_body_4:
+	jle .L5
+.L4:
 	movq %r9, %rdi
 	addq %r8, %rdi
 	movq %r9, %rsi
 	decq %rsi
 	movq %rsi, %r9
 	movq %rdi, %r8
-	jmp .Lmain_loop_3
-.Lmain_done_5:
+	jmp .L3
+.L5:
 	movl %r8d, %esi
 	movq %rsi, %rax
 	ret

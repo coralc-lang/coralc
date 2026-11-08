@@ -10,7 +10,6 @@ main:
 	pushq %r14
 	pushq %r15
 	subq $152, %rsp
-.Lmain_entry_2:
 	leaq -96(%rbp), %rsi
 	leaq -128(%rbp), %rdi
 	leaq -160(%rbp), %r8
@@ -25,7 +24,7 @@ main:
 	leaq 8(%rdi), %rbx
 	movq $0x0000000000000002, (%rbx)
 	movq $0x0000000000000000, %rbx
-.Lmain_loop1_3:
+.L3:
 	movl $0x0000000000000002, %r11d
 	cmpq %r11, %rbx
 	setl %r11b
@@ -37,13 +36,13 @@ main:
 	movq %r15, (%r14)
 	movq %r9, (%r13)
 	testq %r12, %r12
-	je .Lmain_loop2_pre_5
-.Lmain_body1_4:
+	je .L5
+.L4:
 	incq %rbx
-	jmp .Lmain_loop1_3
-.Lmain_loop2_pre_5:
+	jmp .L3
+.L5:
 	movq $0x0000000000000000, %r9
-.Lmain_loop2_6:
+.L6:
 	movl $0x0000000000000002, %r11d
 	cmpq %r11, %r9
 	setl %r11b
@@ -60,11 +59,11 @@ main:
 	leaq (%r10, %r9, 8), %r12
 	movq %r13, (%r12)
 	testq %rbx, %rbx
-	je .Lmain_done_8
-.Lmain_body2_7:
+	je .L8
+.L7:
 	incq %r9
-	jmp .Lmain_loop2_6
-.Lmain_done_8:
+	jmp .L6
+.L8:
 	leaq 8(%rsi), %rdi
 	movq (%rdi), %rsi
 	leaq 8(%r8), %rdi

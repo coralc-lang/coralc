@@ -3,7 +3,6 @@
 .type main, @function
 main:
 	pushq %rbx
-.Lmain_entry_4:
 	movq z(%rip), %rbx
 	movq $0x0000000000000001, %rdi
 	movq %rbx, %rsi
@@ -18,8 +17,7 @@ main:
 	ret
 .section .rodata.str1.1,"aM",@progbits,1
 .Lcs10:
-	.byte 63
-	.byte 0
+	.asciz "?"
 .section .data
 	.balign 8
 z:

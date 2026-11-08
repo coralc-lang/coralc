@@ -5,7 +5,6 @@ inf:
 	pushq %rbx
 	pushq %r12
 	subq $8, %rsp
-.Linf_entry_3:
 	call inf
 	movq %rax, %rsi
 	movq %rsi, %rbx
@@ -32,10 +31,8 @@ inf:
 .globl main
 .type main, @function
 main:
-.Lmain_entry_8:
 	movq $0x0000000000000000, %rax
 	ret
 .section .rodata.str1.1,"aM",@progbits,1
 .Lcs13:
-	.byte 63
-	.byte 0
+	.asciz "?"

@@ -7,7 +7,6 @@ main:
 	pushq %rbx
 	pushq %r12
 	subq $16, %rsp
-.Lmain_entry_2:
 	leaq -32(%rbp), %rsi
 	leaq (%rsi), %rdi
 	leaq 8(%rsi), %r8
@@ -39,5 +38,4 @@ main:
 	ret
 .section .rodata.str1.1,"aM",@progbits,1
 .Lcs19:
-	.byte 63
-	.byte 0
+	.asciz "?"

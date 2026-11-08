@@ -5,17 +5,16 @@ main:
 	pushq %rbp
 	movq %rsp, %rbp
 	subq $16, %rsp
-.Lmain_entry_2:
 	leaq -16(%rbp), %rsi
 	movq %rsi, %rdi
-.Lmain_loop_3:
+.L3:
 	movq (%rdi), %r8
 	cmpq $0x0000000000000007, %r8
-	jge .Lmain_done_5
-.Lmain_body_4:
+	jge .L5
+.L4:
 	movq $0x0000000000000007, (%rdi)
-	jmp .Lmain_loop_3
-.Lmain_done_5:
+	jmp .L3
+.L5:
 	movq %r8, %rax
 	addq $16, %rsp
 	leave

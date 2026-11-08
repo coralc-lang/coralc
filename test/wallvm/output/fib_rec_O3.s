@@ -5,16 +5,15 @@ fib:
 	pushq %rbx
 	pushq %r12
 	pushq %r13
-.Lfib_entry_3:
 	cmpq $0x0000000000000002, %rdi
-	jge .Lfib_rec_5
-.Lfib_base_4:
+	jge .L5
+.L4:
 	movq %rdi, %rax
 	popq %r13
 	popq %r12
 	popq %rbx
 	ret
-.Lfib_rec_5:
+.L5:
 	movq %rdi, %rbx
 	decq %rbx
 	movq %rdi, %r12
@@ -35,13 +34,12 @@ fib:
 .type main, @function
 main:
 	pushq %rbx
-.Lmain_entry_18:
-	jmp .Lmain_inl25_3_29
-.Lmain_inl25_0_26:
+	jmp .L29
+.L26:
 	movq %rsi, %rax
 	popq %rbx
 	ret
-.Lmain_inl25_3_29:
+.L29:
 	movq $0x0000000000000009, %rdi
 	call fib
 	movq %rax, %rbx
@@ -50,5 +48,5 @@ main:
 	movq %rax, %rsi
 	addq %rsi, %rbx
 	movq %rbx, %rsi
-.Lmain_inl25_4_40:
-	jmp .Lmain_inl25_0_26
+.L40:
+	jmp .L26

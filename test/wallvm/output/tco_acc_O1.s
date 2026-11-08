@@ -9,16 +9,15 @@ sumto:
 	movq %rdi, 0(%rsp)
 	movq 0(%rsp), %rbx
 	addq $8, %rsp
-.Lsumto_entry_3:
 	cmpq $0x0000000000000000, %rbx
-	jg .Lsumto_step_5
-.Lsumto_base_4:
+	jg .L5
+.L4:
 	movq $0x0000000000000000, %rax
 	addq $8, %rsp
 	popq %r12
 	popq %rbx
 	ret
-.Lsumto_step_5:
+.L5:
 	movq %rbx, %r12
 	decq %r12
 	movq %r12, %rdi
@@ -33,7 +32,6 @@ sumto:
 .globl main
 .type main, @function
 main:
-.Lmain_entry_16:
 	movq $0x0000000000000005, %rdi
 	call sumto
 	movq %rax, %rsi

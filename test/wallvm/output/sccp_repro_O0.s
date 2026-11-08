@@ -9,16 +9,15 @@ fib:
 	movq %rdi, 0(%rsp)
 	movq 0(%rsp), %rbx
 	addq $8, %rsp
-.Lfib_entry_3:
 	cmpq $0x0000000000000002, %rbx
-	jge .Lfib_rec_5
-.Lfib_base_4:
+	jge .L5
+.L4:
 	movq %rbx, %rax
 	popq %r13
 	popq %r12
 	popq %rbx
 	ret
-.Lfib_rec_5:
+.L5:
 	movq %rbx, %r12
 	decq %r12
 	movq %rbx, %rsi
@@ -81,7 +80,6 @@ fib:
 .globl main
 .type main, @function
 main:
-.Lmain_entry_18:
 	movq $0x000000000000000a, %rdi
 	call fib
 	movq %rax, %rsi
@@ -89,11 +87,8 @@ main:
 	ret
 .section .rodata.str1.1,"aM",@progbits,1
 .Lcs25:
-	.byte 63
-	.byte 0
+	.asciz "?"
 .Lcs33:
-	.byte 63
-	.byte 0
+	.asciz "?"
 .Lcs39:
-	.byte 63
-	.byte 0
+	.asciz "?"
