@@ -10,7 +10,7 @@ main:
 	call _trap@PLT
 	movq %rax, %rsi
 	movq $0x0000000000000003, %rdi
-	movq $0xffffffffffffffff, %rsi
+	movq $0x00000000ffffffff, %rsi
 	movq $0x0000000000000000, %rdx
 	leaq .Lcs19(%rip), %rcx
 	movq $0x0000000000000000, %r8
