@@ -93,8 +93,9 @@ keeps checks on. Used for with/without-checks asm comparisons.
 - `dedup` — dominance dedup (count == 1);
 - `WALLVM_CHECKS=0` — even O0 inserts nothing.
 
-Gates: `run_checks.sh` 30/30 · `run.sh` 116/116 (O0-O3) ·
-`run_borrow.sh` 8/8 · ASAN-built irtool runs 30+116+8 · self-host
+Gates: `run_checks.sh` 30/30 · `run.sh` 132/132 (33 cases × O0-O3) ·
+`run_borrow.sh` 8/8 · `run_passes.sh` 19/19 ·
+ASAN-built irtool runs 30+132+8 · self-host
 (`coralc -f coral.crlb --force`) rebuilds and runs.
 
 ## Open

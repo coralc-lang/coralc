@@ -4,7 +4,7 @@ Consolidated from five parallel audits (branch/CFG, loop, SSA/canonical,
 memory/analysis, transform/vectorizer) plus empirical repros (crafted .ir,
 `WALLVM_PRINT_AFTER_PASS`, gdb, valgrind, ASAN). Every entry starts **OPEN**
 and must be *verified against the actual code* before being fixed — an entry
-is only marked FIXED after rebuild + `test/wallvm/run.sh` (target 116/116) is
+is only marked FIXED after rebuild + `test/wallvm/run.sh` (target 132/132) is
 green, or INVALID with a reason.
 
 Status legend: `OPEN` → `VERIFIED` (issue confirmed real) → `FIXED` /
@@ -57,6 +57,8 @@ Status legend: `OPEN` → `VERIFIED` (issue confirmed real) → `FIXED` /
 | P-10 | `%p = alloca ptr` (a bare `ptr` as the last word of an instruction) failed with "extra tokens after instruction": `parseTypeAfter("ptr")` did `skipWs`, which crossed the newline and left the cursor on the next line | irParser.crl ptr branch now uses `skipSpaces` (horizontal only); the function-header `{` check crosses the newline itself so `func @f() ptr` + `{` on the next line still parses |
 | P-11 | The borrow checker could never fire on text IR: params are plain `Arg` values (not entry allocas), so `storeCapIndex` found no evidence, `buildCaps` skipped functions with zero entry allocas, and `calleeWrites` was always false for internal callees; the escape rule also exempted *any* entry-block alloca, missing entry-local dangling returns; and nothing ever printed violations (no reporter was wired anywhere) | borrowcheck.crl: `storeCapIndex` accepts stores directly to `Arg`, `buildCaps` runs without entry allocas, escape exemption narrowed to the first-`nparams` entry allocas, new `irPassBorrowCheckPrint` + `borrowKindName`; irtool honors `WALLVM_BORROW_CHECK=1` (prints `borrow: Kind: func: msg`, exit 3 on violations); suite `test/wallvm/borrow/` (8 cases, exact-kind-set assertions) + `run_borrow.sh` — all documented in `lib/wallvm/docs/borrow-check.md` |
 | P-12 | O1 was byte-identical to O0 across the harness (no promotion → L1's scalar passes had almost nothing to work on), which read as "the levels don't differ" | pipelineLevel1 runs `mem2reg` after `abi_lower` (clang -O1 promotes too): gcd O0 568 → O1 354 bytes, fib_iter 640 → 495; harness 116/116, ASAN 116/116 |
+| C-5 | `emitData`/`emitDataLine` wrote into `dataSection`, which was **never flushed** into the output — `emitFabs`' mask and the uitofp-i64 "one" were undefined symbols (link error on the first fabs/uitofp-64 ever compiled; found while landing C1). The same sites also defined the label once per use (duplicate-definition on two fabs), shared one `.Lfabs_mask` across f32/f64 with width-specific data, had no `.balign 16` for the m128 `andpd`/`andps` operand (SIGSEGV on an 8-byte-aligned mask), and omitted `(%rip)` (absolute R_X86_64_32S relocation breaks PIE) | x86_64_base.crl: constants are deferred to `getOutput` via `needFabsMask`/`needUiToOne` flags (one definition each), distinct `.Lfabs_mask_d`/`.Lfabs_mask_s` and `.Lui_to_fp_one_d`/`_s` labels emitted as integer bit patterns (the in-repo assembler has no `.double`/`.float`), `.balign 16` on the masks, `(%rip)` on every reference; repro `passes/involution_fneg.ir` |
+| C-6 | `emitFCmp` wrote the mnemonic with `emitLine("ucomisd\t")` → a newline inside the instruction (`ucomisd\n%xmm2, %xmm0`), invalid asm for **every** fcmp (no test had ever used fcmp) | x86_64_base.crl `emitFCmp`: `emitLine`→`emit` for the mnemonic; repro `cases/fp_roundtrip.ir` |
 
 ---
 
@@ -113,10 +115,10 @@ B1 verification: repro `cases/dist_swap.ir` (expect 54) — loop1 rejected by th
 
 | ID | Sev | Location | Issue | Status |
 |----|-----|----------|-------|--------|
-| C1 | Critical | involution.crl:116-129 | `fabs(fneg(x))` RAUWs with `x` — comment says `fabs(x)`; for x=-3 result -3 instead of 3. O1-O3 unconditional. | OPEN |
-| C2 | Critical | involution.crl:153-170 | `fptrunc(fpext(x))` identity compares `outW == fpext-output-width` — whenever it fires, replacement operand is narrower than result → type-corrupt uses. (Correct form in constfold.crl:105-118.) | OPEN |
-| C3 | Critical | cast_elim.crl:54-65 | Identity cast null-out without `replaceAllUses`/`removeUser` → users dangle at orphaned inst (never freed = leak + UAF). | OPEN |
-| C4 | Critical | cast_elim.crl:74-89,139-153; constfold.crl:88-103 | fp↔int round-trip "identities" keep the *outer* opcode fed an operand of the wrong type (`sitofp(fptosi(f64))` type-inconsistent; `sitofp(fptosi(1.5))=1.0≠1.5`) — no fast-math gate exists anywhere. | OPEN |
+| C1 | Critical | involution.crl:116-129 | `fabs(fneg(x))` RAUWs with `x` — comment says `fabs(x)`; for x=-3 result -3 instead of 3. O1-O3 unconditional. | FIXED (the fabs is kept and its operand rewired to the fneg's source — result is `fabs(x)`, the dead fneg goes to DCE; repro `passes/involution_fneg.ir`) |
+| C2 | Critical | involution.crl:153-170 | `fptrunc(fpext(x))` identity compares `outW == fpext-output-width` — whenever it fires, replacement operand is narrower than result → type-corrupt uses. (Correct form in constfold.crl:105-118.) | FIXED (compares the fptrunc result against the fpext's **source** width, same condition as constfold's correct form; the old check could never match a valid narrowing chain; repro `passes/involution_fpwiden.ir`) |
+| C3 | Critical | cast_elim.crl:54-65 | Identity cast null-out without `replaceAllUses`/`removeUser` → users dangle at orphaned inst (never freed = leak + UAF). | FIXED (`replaceAllUses` first, then null the slot and `erase()` — the slot is already null so erase only unhooks+frees — with a `continue` past the freed inst; repro `cases/cast_bident.ir`, which previously miscompiled at O2/O3 to 2 via an adce-removed load and an isel `%rdi` fallback) |
+| C4 | Critical | cast_elim.crl:74-89,139-153; constfold.crl:88-103 | fp↔int round-trip "identities" keep the *outer* opcode fed an operand of the wrong type (`sitofp(fptosi(f64))` type-inconsistent; `sitofp(fptosi(1.5))=1.0≠1.5`) — no fast-math gate exists anywhere. | FIXED (Pattern 7 deleted and constfold's `SiToFp(FpToSi)` identity deleted — no fast-math/range gate exists to permit them — and same-kind fp↔int chains excluded from Pattern 8; repro `cases/fp_roundtrip.ir`) |
 | C5 | High | sccp.crl:960,1068,1202-1208 | Phase-2 `cells[inst->base.id]` — replacement `Br` created at :1068 has id > maxId ⇒ heap OOB read every cond_br fold. | FIXED (phase-2 cells reads bounds-guarded `inst->base.id <= maxId ? cells[...] : latticeTop()` at sccp.crl:1065,1227 — same fix as P0-15; row never closed) |
 | C6 | High | mem2reg.crl:451-454,510 | Pre-existing `Phi` users of the alloca treated as "placed by us" (check runs before placePhis) → alloca erased while phi operand still points at it (UAF). | FIXED (mem2reg marks the alloca `promotable = false` for any non-Load/Store user incl. Phi — mem2reg.crl:461-467, repro `cases/addr_phi.ir`; same fix as P0-17; row never closed) |
 | C7 | High | mem2reg.crl:372-384 | Phi update `break`s after first pair for `bb` — parallel edges (`cond_br c,X,X` / dup preds) leave second pair = const placeholder (wrong value). | OPEN |
@@ -185,7 +187,7 @@ B1 verification: repro `cases/dist_swap.ir` (expect 54) — loop1 rejected by th
 
 1. ~~E1 (compiler hang)~~ ✓ · ~~B2a (unconditional O3 miscompile)~~ ✓ · ~~E14 (peephole br-cycle hang)~~ ✓ — done, plus E7/E8/E9, B1a-e, P0-6…P0-17, ~~D2~~ ✓, ~~D3~~ ✓ (P0-16/P0-17 found while fixing D2). Next: D1
 2. D1 (unsound forwarding) — D2, D3 done
-3. C1-C4 (critical folds), A1-A3 (miscompiles)
+3. ~~C1-C4 (critical folds)~~ ✓, A1-A3 (miscompiles)
 4. E2, E3, E4, C7-C8, A5-A6 (validate/CFG litter)
 5. B3a, ~~B4a/b~~ ✓, A7/A9 (dead/wrong passes), D4 (double-free hazard)
 6. Remaining Medium/Low by area; F1 frontend diagnostic
