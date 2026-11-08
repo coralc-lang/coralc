@@ -11,6 +11,7 @@
  */
 
 import std::mman { alloc, dealloc, realloc, zero };
+import std::intrinsics { memcpy };
 use ast {
     id { Str, SourceLoc, NodeId },
     types { Ty, TypeEntry, TypeKind },
@@ -25,6 +26,17 @@ pub struct InternEntry
     usize len;
     u32 id;
     u32 hash;
+}
+
+/* one node of a type-index hash chain. `ty` is an index into the type
+ * arena (the slot's content is what the verify reads, so a slot rewound
+ * by a parser restore and reused is simply re-verified against its new
+ * kind), `next` is an index into the same record array (0 = end, record
+ * 0 is reserved as the nil node). */
+pub struct TyIdxRec
+{
+    u32 ty;
+    u32 next;
 }
 
 /* append-buffers for list-ish fields. append reallocs through ctx.grow;
@@ -100,6 +112,20 @@ pub struct AstContext
     DocBlock* docs;
     u32 docsLen;
     u32 docsCap;
+    /* type-arena hash index (see the tyIdx* methods). buckets hash the
+     * accessor-visible key — pure kinds by tag, Named by bare name,
+     * Pointer/Const by base — and chains stay sorted ascending by ty so
+     * the first live match equals what the old linear scans returned. */
+    u32* tyIdxBuckets;
+    u32 tyIdxCap;
+    u32 tyIdxCount;
+    TyIdxRec* tyIdxRecs;
+    u32 tyIdxRecsLen;
+    u32 tyIdxRecsCap;
+    /* lazily interned builtin names: every namedType("str") /
+     * ccharPtrType() used to re-intern its literal on every call */
+    Str tyIdxStrLit;
+    Str tyIdxCcharLit;
 
     void init(u32 internCap, u32 typeCap, u32 nodeCap)
     {
@@ -128,7 +154,15 @@ pub struct AstContext
             .flagsLen = 0,
             .docs = null,
             .docsLen = 0,
-            .docsCap = 0
+            .docsCap = 0,
+            .tyIdxBuckets = null,
+            .tyIdxCap = 0,
+            .tyIdxCount = 0,
+            .tyIdxRecs = null,
+            .tyIdxRecsLen = 0,
+            .tyIdxRecsCap = 0,
+            .tyIdxStrLit = 0,
+            .tyIdxCcharLit = 0
         };
 
         if (internCap > 0)
@@ -197,6 +231,8 @@ pub struct AstContext
         if (self.internIndex != null) dealloc<u32>(self.internIndex);
         if (self.types != null) dealloc<TypeEntry>(self.types);
         if (self.nodes != null) dealloc<Node>(self.nodes);
+        if (self.tyIdxBuckets != null) dealloc<u32>(self.tyIdxBuckets);
+        if (self.tyIdxRecs != null) dealloc<TyIdxRec>(self.tyIdxRecs);
         
         self.interns = null;
         self.internsLen = 0;
@@ -209,10 +245,227 @@ pub struct AstContext
         self.nodes = null;
         self.nodesLen = 0;
         self.nodesCap = 0;
+        self.tyIdxBuckets = null;
+        self.tyIdxCap = 0;
+        self.tyIdxCount = 0;
+        self.tyIdxRecs = null;
+        self.tyIdxRecsLen = 0;
+        self.tyIdxRecsCap = 0;
         self.owned = null;
         self.ownedLen = 0;
         self.ownedCap = 0;
         self.error = 0;
+    }
+
+    /* ── type-arena hash index ─────────────────────────────────────────
+     * find-by-scan accessors (boolType, namedType, slicePtrType, the
+     * parser's internKind, ...) all ask "first entry matching this exact
+     * shape". the index answers in O(1) with the same first-wins result:
+     * chains hold ty values sorted ascending, verification is the query
+     * predicate itself (range: t < typesLen — a slot rewound past
+     * typesLen by a parser restore is dead and skipped), and a miss
+     * falls back to the caller's original linear scan, which stays the
+     * ground truth for anything the index does not cover. */
+
+    bool tyIdxIdxable(TypeKind k)
+    {
+        if (k.tag == TypeKind::Named) return true;
+        if (k.tag == TypeKind::Pointer) return true;
+        if (k.tag == TypeKind::Const) return true;
+        u32 t = (u32)k.tag;
+        return t == (u32)TypeKind::Error || t == (u32)TypeKind::Void ||
+               t == (u32)TypeKind::Bool || t == (u32)TypeKind::Char ||
+               t == (u32)TypeKind::I8 || t == (u32)TypeKind::U8 ||
+               t == (u32)TypeKind::I16 || t == (u32)TypeKind::U16 ||
+               t == (u32)TypeKind::I32 || t == (u32)TypeKind::U32 ||
+               t == (u32)TypeKind::I64 || t == (u32)TypeKind::U64 ||
+               t == (u32)TypeKind::I128 || t == (u32)TypeKind::U128 ||
+               t == (u32)TypeKind::F32 || t == (u32)TypeKind::F64 ||
+               t == (u32)TypeKind::Isize || t == (u32)TypeKind::Usize ||
+               t == (u32)TypeKind::Rawptr || t == (u32)TypeKind::Str;
+    }
+
+    u32 tyIdxHash(TypeKind k)
+    {
+        /* pure kinds carry an uninitialized payload in callers like
+         * internKind (`TypeKind k; k.tag = ...`) — hash only the fields
+         * each shape actually compares */
+        u32 h = 2166136261;
+        h = (h ^ (u32)k.tag) * 16777619;
+        if (k.tag == TypeKind::Named) h = (h ^ k.payload.Named.name) * 16777619;
+        else if (k.tag == TypeKind::Pointer) h = (h ^ k.payload.Pointer.base) * 16777619;
+        else if (k.tag == TypeKind::Const) h = (h ^ k.payload.Const.base) * 16777619;
+        return h;
+    }
+
+    bool tyIdxEq(TypeKind q, TypeKind e)
+    {
+        if (q.tag != e.tag) return false;
+        if (q.tag == TypeKind::Named) return q.payload.Named.name == e.payload.Named.name;
+        if (q.tag == TypeKind::Pointer) return q.payload.Pointer.base == e.payload.Pointer.base;
+        if (q.tag == TypeKind::Const) return q.payload.Const.base == e.payload.Const.base;
+        return true; /* pure: tag equality already held */
+    }
+
+    bool tyIdxEnsureRecs()
+    {
+        if (self.tyIdxRecsLen < self.tyIdxRecsCap) return true;
+        u32 newCap = self.tyIdxRecsCap * 2;
+        if (newCap == 0) newCap = 1024;
+        TyIdxRec* raw = realloc<TyIdxRec>(self.tyIdxRecs, (usize)newCap);
+        if (raw == null) return false;
+        self.tyIdxRecs = raw;
+        self.tyIdxRecsCap = newCap;
+        if (self.tyIdxRecsLen == 0)
+        {
+            /* reserve record 0 as the chain terminator */
+            self.tyIdxRecs[0].ty = 0;
+            self.tyIdxRecs[0].next = 0;
+            self.tyIdxRecsLen = 1;
+        }
+        return true;
+    }
+
+    bool tyIdxGrowBuckets()
+    {
+        u32 newCap = self.tyIdxCap * 2;
+        if (newCap == 0) newCap = 1024;
+        usize bytes = 0;
+        if (!self.byteCount(newCap, @sizeof(u32), &bytes)) return false;
+        u32* nb = (u32*)alloc<u8>(bytes);
+        if (nb == null) return false;
+        zero<u32>(nb, (usize)newCap);
+        u32* ob = self.tyIdxBuckets;
+        self.tyIdxBuckets = nb;
+        self.tyIdxCap = newCap;
+        if (ob != null) dealloc<u32>(ob);
+        /* re-bucket every record against its slot's current kind, keeping
+         * each chain sorted ascending by ty (chains are short; this runs
+         * only when the bucket array doubles) */
+        u32 r = 1;
+        while (r < self.tyIdxRecsLen)
+        {
+            Ty t = self.tyIdxRecs[r].ty;
+            if (t != 0 && t < self.typesCap)
+            {
+                u32 bi = self.tyIdxHash(self.types[t].kind) & (newCap - 1);
+                u32 prev = 0;
+                u32 cur = nb[bi];
+                while (cur != 0 && self.tyIdxRecs[cur].ty < t)
+                {
+                    prev = cur;
+                    cur = self.tyIdxRecs[cur].next;
+                }
+                if (!(cur != 0 && self.tyIdxRecs[cur].ty == t))
+                {
+                    self.tyIdxRecs[r].next = cur;
+                    if (prev == 0) nb[bi] = r;
+                    else self.tyIdxRecs[prev].next = r;
+                }
+                else
+                {
+                    /* duplicate record for the same slot: drop it from the
+                     * rebuilt chains (r keeps a dead next; harmless) */
+                    self.tyIdxRecs[r].next = 0;
+                }
+            }
+            r++;
+        }
+        return true;
+    }
+
+    void tyIdxInsert(TypeKind q, Ty t)
+    {
+        /* only link records that actually match their own key: a tag-only
+         * scan hit whose payload differs (e.g. a hypothetical non-pure
+         * internKind call) must stay on the caller's scan path instead of
+         * entering a chain where eq would never confirm it */
+        if (t == 0 || t >= self.typesLen || !self.tyIdxIdxable(q)) return;
+        if (!self.tyIdxEq(q, self.types[t].kind)) return;
+        if (self.tyIdxBuckets == null)
+        {
+            if (!self.tyIdxGrowBuckets()) return;
+        }
+        else if (self.tyIdxCount >= self.tyIdxCap)
+        {
+            if (!self.tyIdxGrowBuckets()) return;
+        }
+        if (!self.tyIdxEnsureRecs()) return;
+        u32 bi = self.tyIdxHash(q) & (self.tyIdxCap - 1);
+        u32 prev = 0;
+        u32 cur = self.tyIdxBuckets[bi];
+        while (cur != 0 && self.tyIdxRecs[cur].ty < t)
+        {
+            prev = cur;
+            cur = self.tyIdxRecs[cur].next;
+        }
+        if (cur != 0 && self.tyIdxRecs[cur].ty == t) return; /* already linked */
+        u32 nr = self.tyIdxRecsLen;
+        self.tyIdxRecs[nr].ty = t;
+        self.tyIdxRecs[nr].next = cur;
+        if (prev == 0) self.tyIdxBuckets[bi] = nr;
+        else self.tyIdxRecs[prev].next = nr;
+        self.tyIdxRecsLen++;
+        self.tyIdxCount++;
+    }
+
+    /* first live entry structurally matching q (pure: tag, Named: name,
+     * Pointer/Const: base), or 0 — callers fall back to their scan */
+    Ty tyIdxFind(TypeKind q)
+    {
+        if (self.tyIdxBuckets == null || !self.tyIdxIdxable(q)) return 0;
+        u32 bi = self.tyIdxHash(q) & (self.tyIdxCap - 1);
+        u32 r = self.tyIdxBuckets[bi];
+        while (r != 0)
+        {
+            Ty t = self.tyIdxRecs[r].ty;
+            if (t < self.typesLen && self.tyIdxEq(q, self.types[t].kind)) return t;
+            r = self.tyIdxRecs[r].next;
+        }
+        return 0;
+    }
+
+    /* namedType matches by bare name (args ignored — the documented
+     * "first Named wins" quirk); ccharPtr additionally requires a bare
+     * (argsLen == 0) entry. both walk the same name-keyed chain. */
+    Ty tyIdxFindNamed(Str name, bool bareOnly)
+    {
+        if (self.tyIdxBuckets == null || name == 0) return 0;
+        TypeKind q;
+        q.tag = TypeKind::Named;
+        q.payload.Named.name = name;
+        q.payload.Named.genericArgs = null;
+        q.payload.Named.genericArgsLen = 0;
+        u32 bi = self.tyIdxHash(q) & (self.tyIdxCap - 1);
+        u32 r = self.tyIdxBuckets[bi];
+        while (r != 0)
+        {
+            Ty t = self.tyIdxRecs[r].ty;
+            if (t < self.typesLen)
+            {
+                TypeEntry* e = self.types + t;
+                if (e->kind.tag == (i32)TypeKind::Named &&
+                    e->kind.payload.Named.name == name)
+                {
+                    if (!bareOnly || e->kind.payload.Named.genericArgsLen == 0)
+                        return t;
+                }
+            }
+            r = self.tyIdxRecs[r].next;
+        }
+        return 0;
+    }
+
+    Str tyIdxStrLit()
+    {
+        if (self.tyIdxStrLit == 0) self.tyIdxStrLit = self.intern("str");
+        return self.tyIdxStrLit;
+    }
+
+    Str tyIdxCcharLit()
+    {
+        if (self.tyIdxCcharLit == 0) self.tyIdxCcharLit = self.intern("cchar");
+        return self.tyIdxCcharLit;
     }
 
     bool streq(str a, str b)
@@ -434,16 +687,7 @@ pub struct AstContext
         {
             usize oldBytes = 0;
             if (self.byteCount(oldCap, elementSize, &oldBytes))
-            {
-                u8* src = (u8*)data;
-                u8* dst = (u8*)result;
-                usize k = 0;
-                while (k < oldBytes)
-                {
-                    dst[k] = src[k];
-                    k++;
-                }
-            }
+                memcpy(result, data, oldBytes);
         }
         if (data != null && oldCap != 0)
         {
