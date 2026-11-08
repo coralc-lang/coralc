@@ -133,3 +133,85 @@ Items known pending:
 - Test: `cd test/wallvm && timeout --kill-after=10 600 ./run.sh` (64/64).
 - Do not resume/discuss: mimalloc, `__`-rename error API, std @assert
   migration, macos/android work, `@toStr` 8-byte-garbage bug.
+
+## Issue queue extracted from wallvm_api_doc.md §10–13 (2026-11-08)
+
+All items below are verified in that doc (§13 "What's missing / gotchas").
+Tags: **[quick]** small and safe, **[med]** needs care, **[design]** needs a
+user decision first. Build-system/manifest items (G13) and wasm-assembler
+work are excluded by standing rules. IR-text/printer look-and-feel issues
+live in `ir-vs-llvm.md` (new).
+
+### Quick wins
+
+- **G2** — unsupported CCs fail silently, sometimes wrong-target:
+  `irCodegen`'s else compiles unknown CCs **as x86-64 bare** and returns
+  success (`wallvm.crl:679`); `irCompileAsm` returns `str::empty()`
+  (`:649-661`). Make both paths return an explicit error.
+- **G6** — `irCodegenX86_64BareAsm` unreachable through `irCompileAsm`'s
+  switch (bare only via the bool path). Add the case or document.
+- **G-cc-syntax** — `formatForCc` says Intel for the 32-bit family but
+  `irCodegenX86` takes no syntax parameter (`x86/linux/linux.crl:34`);
+  flag is ignored. Thread it through.
+- **G-print5** — extern vs zero-init globals print identically while
+  codegen treats them oppositely; also struct decl/use naming.
+- **G-print1 (cheap part)** — dumps hide `IrGlobal.isExtern`,
+  programmatic `alignment`, `IrFunc.paramTypes` (and `debugLoc` entirely).
+  Print them (debugLoc at least as a `; line N` comment).
+- **G-print3 (cheap part)** — unsigned constants print signed; f32
+  literals show f64 precision. (i128+ truncation is a model issue — med.)
+- **G-type6** — builder/string gaps: `insertValue` missing from
+  `IrBuilder`; `createStringConstant` always names globals `.str`
+  (duplicate labels if used twice, `irStrings.crl:30`);
+  `getStringPointer` ignores the builder insert point (`:72`).
+- **G-type4** — `constInt` doesn't mask to width; `constFloat` dedups
+  ignoring `ty` (f32/f64 confusion, order-dependent).
+- **G-type3** — `irTypeAlignOf(Struct)` hardcoded 8 disagrees with
+  `createStructType`'s natural layout (`{i8}` size 1, align 8).
+- **G11** — `metadataInit()`/`metadataShutdown()` have zero callers;
+  verify-or-wire the debug-metadata store.
+- **memorySSA never published** to the analysis cache by design
+  (`irtypes.crl:655-656`) — publish it or document loudly.
+- **Printer quick wins** (see `ir-vs-llvm.md` §Suggested order): print
+  `; preds = ...` from `bb->preds`; suppress `%<id> = ` on terminators.
+
+### Medium
+
+- **G1** — `irCompile`/`irCodegen` bool variants assemble into a String
+  and **discard it** (`linux.crl:52` vs twin `:102`); the "sink" comment
+  (`wallvm.crl:602-604`) describes something that does not exist. Give
+  them output or delete/deprecate them.
+- **G8** — `irPassIPAConstProp` public but unwired
+  (`passes/ipa_cp.crl:289` TODO). Wire at L2/L3 or mark clearly.
+- **G7** — assembler hard caps: 512 symbols / 1024 relocs per object
+  (`obj.crl:12-14`). Grow dynamically.
+- **G-print4** — no dump options: no reset(), no file writer, no
+  analysis/regalloc dumps, fixed formatting.
+- **G-type1** — `createFunc` produces an incomplete function (no arg
+  values, `isVararg` always false, no cc field, args/paramTypes dual
+  truth). Add `createArg` helper + fields.
+- **G-type2** — layout is target-blind (ptr/func size fixed 8; wasm32
+  backend needs 4 → IR-computed struct layouts wrong on wasm32). Needs a
+  DataLayout object.
+- **IR text (from ir-vs-llvm.md)** — opaque-pointer migration; `switch`
+  opcode (none exists); `align`/`nsw`/`nuw`/`inbounds` printing.
+
+### Design (user decision first)
+
+- **G3/G4** — ABI tables for ~14 archs, backends for 3; the rules-driven
+  selector (`AsmRule` tables) has zero consumers — cannot retarget by
+  supplying rules. Arm64/riscv backends = big projects.
+- **G9** — no exception lowering on x86-64 (`LandingPad` 0 matches in
+  the backend); no DWARF/eh_frame path found **[?]**.
+- **G5** — no single-call IR→object/exe entry; consumers hand-chain
+  `irCompileAsm → assembleText → emitElf → Linker`.
+- **G15** — configuration is process-global (`g*` flags); no options
+  object, no thread safety, no per-compile isolation.
+- **G10** — no IR ownership story (no destroy functions; `irCtxDestroy`
+  frees only pointer arrays). Plan process-lifetime or write teardown.
+- **G-type5** — type-feature gaps: unions, bitfields, packed/aligned,
+  address spaces, enums, volatile, gep inbounds, count-0 array sizing.
+- Assembler/linker format gaps (no PE object emit from assembler, TLS /
+  compressed-debug / extended-section limits, no Mach-O) — linker scope,
+  likely never.
+
