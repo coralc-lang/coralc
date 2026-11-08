@@ -7,7 +7,10 @@ main:
 	je .L7
 .L6:
 .L7:
-	movq $0x0000000000000006, %rax
+	movl $0x0000000000000001, %r10d
+	movl %r10d, %esi
+	addl %edi, %esi
+	movq %rsi, %rax
 	ret
 .section .data
 	.balign 4

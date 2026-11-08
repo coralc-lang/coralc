@@ -9,7 +9,8 @@ main:
 	jmp .L7
 .L6:
 .L7:
-	movq $0x0000000000000006, %rax
+	incq %rsi
+	movq %rsi, %rax
 	ret
 .section .data
 	.balign 4
