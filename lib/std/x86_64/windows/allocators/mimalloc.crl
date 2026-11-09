@@ -1,6 +1,6 @@
 #[[no_drop_all]]
 use allocator { Allocator };
-import std::intrinsics { mmap, munmap, memcpy };
+import std::intrinsics::memory { mmap, munmap, memcpy };
 import std::error { __report, __panic };
 import platform::libc { printf };
 import platform::win32 { GetCurrentThreadId, SwitchToThread };
@@ -20,7 +20,7 @@ const u32 MI_SMALL_PAGE_MAX = 64 * 1024;          // max size for small pages
 const u32 MI_MEDIUM_PAGE_MAX = 512 * 1024;        // max size for medium pages
 const usize MI_HUGE_THRESHOLD = 128 * 1024;         // 128 KiB huge page threshold
 const usize MI_INITIAL_CAPACITY = 4;                // start with 4 blocks
-const u32 MI_SEGMENT_MAP_SIZE = 64;               // hash table size for O(1) lookup
+const u32 MI_SEGMENT_MAP_SIZE = 4096;              // power-of-two page map (mask, not div)
 
 // Size classes (44 total):
 // Small: 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256
@@ -296,12 +296,39 @@ u32 _miSegmentMapHash(u8* addr)
 {
     u64 val = (u64)addr >> 22;
     val ^= (val >> 16);
-    return (u32)(val % (u64)MI_SEGMENT_MAP_SIZE);
+    return (u32)(val & (u64)(MI_SEGMENT_MAP_SIZE - 1));
+}
+
+// Map entries come from bump-allocated 16 KiB slabs instead of one mmap
+// each: the old path did a mmap per insert and a munmap per remove — two
+// syscalls on every page create/destroy. remove now only unlinks;
+// orphaned entries stay mapped (32 B each, bounded by cumulative page
+// creations) because a lock-free reader may still hold a pointer to a
+// just-unlinked entry — recycling or unmapping it underneath that reader
+// is exactly the fault the old munmap path could hit. callers hold
+// _miMapLockWord, so the bump state needs no extra synchronization.
+const u32 MI_MAP_SLAB_ENTRIES = 512;
+static u8* _miMapSlabCur = null;
+static u32 _miMapSlabUsed = 0;
+
+MiSegmentMapEntry* _miMapEntryAlloc()
+{
+    if (_miMapSlabCur == null || _miMapSlabUsed >= MI_MAP_SLAB_ENTRIES)
+    {
+        usize sz = (usize)MI_MAP_SLAB_ENTRIES * @sizeof(MiSegmentMapEntry);
+        rawptr s = mmap(null, sz, 3, 0x22, -1, 0);
+        if (s == null) return null;
+        _miMapSlabCur = (u8*)s;
+        _miMapSlabUsed = 0;
+    }
+    MiSegmentMapEntry* e = (MiSegmentMapEntry*)(_miMapSlabCur + (usize)_miMapSlabUsed * @sizeof(MiSegmentMapEntry));
+    _miMapSlabUsed++;
+    return e;
 }
 
 void _miMapInsertChain(MiSegmentMap* map, u32 idx, u8* pageBase, MiPage* page)
 {
-    MiSegmentMapEntry* entry = (MiSegmentMapEntry*)mmap(null, @sizeof(MiSegmentMapEntry), 3, 0x22, -1, 0);
+    MiSegmentMapEntry* entry = _miMapEntryAlloc();
     if (entry == null) return;
     entry->pageBase = pageBase;
     entry->page = page;
@@ -319,7 +346,6 @@ void _miMapRemoveChain(MiSegmentMap* map, u32 idx, u8* pageBase)
         {
             if (prev != null) prev->next = entry->next;
             else map->buckets[idx] = entry->next;
-            munmap((rawptr)entry, @sizeof(MiSegmentMapEntry));
             return;
         }
         prev = entry;
@@ -869,12 +895,17 @@ MiPage* _miPageFind(MiHeap* heap, rawptr ptr)
     MiSegmentMapEntry* entry = _miGlobalPages.buckets[idx];
     while (entry != null)
     {
-        u8* pageEnd = entry->page->base + (u64)entry->page->capacity * entry->page->blockSize;
-        if (p >= entry->page->base && p < pageEnd)
+        MiPage* page = entry->page;
+        u8* base = page->base;
+        if (p >= base && p < base + (u64)page->capacity * page->blockSize)
         {
-            usize offset = (usize)(p - entry->page->base);
-            if (offset % entry->page->blockSize == 0)
-                return entry->page;
+            usize offset = (usize)(p - base);
+            usize bs = page->blockSize;
+            /* power-of-two size classes (8..16384) skip the div */
+            bool aligned;
+            if ((bs & (bs - 1)) == 0) aligned = (offset & (bs - 1)) == 0;
+            else aligned = (offset % bs) == 0;
+            if (aligned) return page;
         }
         entry = entry->next;
     }

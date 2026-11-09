@@ -3,7 +3,15 @@
 /* scope.crl: the lexical scope stack: one Scope per block, symbols in a
  * growable array, lookup walks parent pointers. top-level decls remember
  * their source file so same-named decls merged from different files stay
- * distinct (the backend mangles them apart). */
+ * distinct (the backend mangles them apart).
+ *
+ * every Scope carries an inline 64-bucket name index: symbols are
+ * appended to the array (never removed) and linked tail-first into their
+ * bucket's chain, so a chain walks in array order — lookup/lookupFrom/
+ * lookupAll/declare's dup-check all see exactly the sequence the old
+ * full scans produced, in O(chain) instead of O(symbols). Scope structs
+ * and their symbol arrays are pooled across enter/leave (properly
+ * nested, so a LIFO freelist fits). */
 use ast::id { Str, NodeId };
 use ast::types { Ty };
 
@@ -24,6 +32,9 @@ pub struct Symbol
      * with the same name from different files are distinct (the backend
      * mangles their names apart); see coral-docs/mangle_asm.md */
     u32 fileId;
+    /* next symbol in this scope's bucket chain, stored as index+1
+     * (0 = end); chains ascend in array order (tail-linked at declare) */
+    u32 next;
 }
 
 pub struct Scope
@@ -32,6 +43,10 @@ pub struct Scope
     u32 symbolsLen;
     u32 symbolsCap;
     Scope* parent;
+    /* name → index+1 of the first symbol in that bucket (0 = empty) */
+    u32[64] buckets;
+    /* ScopeStack's freelist link once the scope has been left */
+    Scope* poolNext;
 }
 
 pub struct ScopeStack
@@ -45,6 +60,33 @@ pub struct ScopeStack
     u8 lastDeclFail;
     // the symbol the last declare() conflicted with (lastDeclFail == 1)
     Symbol* dupSymbol;
+    /* freelist of Scope structs from leave() (properly nested → LIFO) */
+    Scope* scopePool;
+    /* freed symbol arrays keyed by log2(capacity): slot 2 = cap 4,
+     * slot 3 = cap 8, … the block's first word carries the next pointer */
+    rawptr[16] symPool;
+}
+
+/* golden-ratio mix of the interned id, top6 bits: the 64-bit constant is
+ * essential — with the 32-bit one, dense Str ids (< ~1e8) never reach
+ * bit58 and every name lands in bucket 0 */
+u32 symBucket(Str name)
+{
+    u64 h = (u64)name * 0x9E3779B97F4A7C15;
+    return (u32)((h >> 58) & 63);
+}
+
+// log2 of a power-of-two capacity (4 → 2, 8 → 3, …)
+u32 symCapSlot(u32 cap)
+{
+    u32 s = 0;
+    u32 c = cap;
+    while (c > 1)
+    {
+        c >>= 1;
+        s++;
+    }
+    return s;
 }
 
 pub extend ScopeStack
@@ -60,6 +102,13 @@ pub extend ScopeStack
         self.errors = 0;
         self.lastDeclFail = 0;
         self.dupSymbol = null;
+        self.scopePool = null;
+        u32 s = 0;
+        while (s < 16)
+        {
+            self.symPool[s] = null;
+            s++;
+        }
         if (cap == 0) return;
         self.scopes = alloc<rawptr>((usize)cap);
         if (self.scopes != null)
@@ -77,14 +126,70 @@ pub extend ScopeStack
         {
             self.len--;
             Scope* scope = (Scope*)self.scopes[self.len];
-            if (scope->symbols != null) dealloc<Symbol>(scope->symbols);
-            dealloc<Scope>(scope);
+            self.scopes[self.len] = null;
+            self.poolScope(scope);
         }
+        /* sweep the symbol-array freelists */
+        u32 s = 0;
+        while (s < 16)
+        {
+            rawptr blk = self.symPool[s];
+            while (blk != null)
+            {
+                rawptr next = ((rawptr*)blk)[0];
+                dealloc<Symbol>((Symbol*)blk);
+                blk = next;
+            }
+            self.symPool[s] = null;
+            s++;
+        }
+        /* sweep the scope freelist */
+        Scope* sc = self.scopePool;
+        while (sc != null)
+        {
+            Scope* next = sc->poolNext;
+            dealloc<Scope>(sc);
+            sc = next;
+        }
+        self.scopePool = null;
         if (self.scopes != null) dealloc<rawptr>(self.scopes);
         self.scopes = null;
         self.len = 0;
         self.cap = 0;
         self.errors = 0;
+    }
+
+    /* return a scope's memory to the pools: symbols by capacity class,
+     * then the struct itself (used by leave() and deinit()) */
+    void poolScope(Scope* scope)
+    {
+        if (scope == null) return;
+        if (scope->symbols != null)
+        {
+            u32 slot = symCapSlot(scope->symbolsCap);
+            if (scope->symbolsCap >= 4 && slot < 16)
+            {
+                ((rawptr*)scope->symbols)[0] = self.symPool[slot];
+                self.symPool[slot] = (rawptr)scope->symbols;
+            }
+            else dealloc<Symbol>(scope->symbols);
+            scope->symbols = null;
+        }
+        scope->poolNext = self.scopePool;
+        self.scopePool = scope;
+    }
+
+    // take a symbol array of exactly newCap slots from the pool, else alloc
+    Symbol* takeSymBlock(u32 newCap)
+    {
+        u32 slot = symCapSlot(newCap);
+        if (slot < 16 && self.symPool[slot] != null)
+        {
+            Symbol* blk = (Symbol*)self.symPool[slot];
+            self.symPool[slot] = ((rawptr*)blk)[0];
+            return blk;
+        }
+        return alloc<Symbol>((usize)newCap);
     }
 
     Scope* current()
@@ -112,11 +217,20 @@ pub extend ScopeStack
             self.scopes = raw;
             self.cap = newCap;
         }
-        Scope* scope = alloc<Scope>(1);
-        if (scope == null)
+        Scope* scope = null;
+        if (self.scopePool != null)
         {
-            self.errors++;
-            return false;
+            scope = self.scopePool;
+            self.scopePool = scope->poolNext;
+        }
+        else
+        {
+            scope = alloc<Scope>(1);
+            if (scope == null)
+            {
+                self.errors++;
+                return false;
+            }
         }
         zero<Scope>(scope, 1);
         scope->parent = self.current();
@@ -134,9 +248,8 @@ pub extend ScopeStack
         }
         self.len--;
         Scope* scope = (Scope*)self.scopes[self.len];
-        if (scope->symbols != null) dealloc<Symbol>(scope->symbols);
-        dealloc<Scope>(scope);
         self.scopes[self.len] = null;
+        self.poolScope(scope);
         return true;
     }
 
@@ -156,62 +269,94 @@ pub extend ScopeStack
             self.errors++;
             return false;
         }
-        u32 i = 0;
-        while (i < scope->symbolsLen)
+        u32 b = symBucket(name);
+        u32 i = scope->buckets[b];
+        while (i != 0)
         {
-            if (scope->symbols[i].name == name)
+            Symbol* sym = scope->symbols + (i - 1);
+            if (sym->name == name)
             {
                 /* different source file: distinct (mangled) symbols are
                  * allowed; this also lets an use binding coexist with
                  * the real merged declaration it points at */
-                if (scope->symbols[i].fileId != fileId)
+                if (sym->fileId != fileId)
                 {
-                    i++;
+                    i = sym->next;
                     continue;
                 }
-                if (scope->symbols[i].declaration.index == declaration.index) return true; // same node: idempotent
+                if (sym->declaration.index == declaration.index) return true; // same node: idempotent
                 self.lastDeclFail = 1;
-                self.dupSymbol = scope->symbols + i;
+                self.dupSymbol = sym;
                 self.errors++;
                 return false;
             }
-            i++;
+            i = sym->next;
         }
         if (scope->symbolsLen >= scope->symbolsCap)
         {
             u32 newCap = scope->symbolsCap * 2;
             if (newCap == 0) newCap = 4;
-            Symbol* raw = realloc<Symbol>(scope->symbols, (usize)newCap);
+            Symbol* raw = self.takeSymBlock(newCap);
             if (raw == null)
             {
                 self.lastDeclFail = 2;
                 self.errors++;
                 return false;
             }
+            if (scope->symbols != null)
+            {
+                /* carry the live symbols (and their chain links) into the
+                 * new block — the pool swap is not realloc, nothing copies
+                 * for us */
+                u32 c = 0;
+                while (c < scope->symbolsLen)
+                {
+                    raw[c] = scope->symbols[c];
+                    c++;
+                }
+                /* old block goes back to its capacity pool instead of
+                 * realloc (same move semantics, but no free) */
+                u32 slot = symCapSlot(scope->symbolsCap);
+                if (slot < 16)
+                {
+                    ((rawptr*)scope->symbols)[0] = self.symPool[slot];
+                    self.symPool[slot] = (rawptr)scope->symbols;
+                }
+                else dealloc<Symbol>(scope->symbols);
+            }
             scope->symbols = raw;
             scope->symbolsCap = newCap;
         }
-        Symbol* symbol = scope->symbols + scope->symbolsLen;
+        u32 idx = scope->symbolsLen;
+        Symbol* symbol = scope->symbols + idx;
         symbol->name = name;
         symbol->kind = kind;
         symbol->typeNode = typeNode;
         symbol->declaration = declaration;
         symbol->flags = flags;
         symbol->fileId = fileId;
+        symbol->next = 0;
         scope->symbolsLen++;
+        /* tail-link keeps the chain in array order (walk above and every
+         * lookup then see exactly what the old linear scans saw) */
+        u32* link = &scope->buckets[b];
+        while (*link != 0) link = &scope->symbols[*link - 1].next;
+        *link = idx + 1;
         return true;
     }
 
     Symbol* lookup(Str name)
     {
         Scope* scope = self.current();
+        u32 b = symBucket(name);
         while (scope != null)
         {
-            u32 i = 0;
-            while (i < scope->symbolsLen)
+            u32 i = scope->buckets[b];
+            while (i != 0)
             {
-                if (scope->symbols[i].name == name) return scope->symbols + i;
-                i++;
+                Symbol* sym = scope->symbols + (i - 1);
+                if (sym->name == name) return sym;
+                i = sym->next;
             }
             scope = scope->parent;
         }
@@ -224,18 +369,20 @@ pub extend ScopeStack
     Symbol* lookupFrom(Str name, u32 fileId)
     {
         Scope* scope = self.current();
+        u32 b = symBucket(name);
         while (scope != null)
         {
             Symbol* first = null;
-            u32 i = 0;
-            while (i < scope->symbolsLen)
+            u32 i = scope->buckets[b];
+            while (i != 0)
             {
-                if (scope->symbols[i].name == name)
+                Symbol* sym = scope->symbols + (i - 1);
+                if (sym->name == name)
                 {
-                    if (scope->symbols[i].fileId == fileId) return scope->symbols + i;
-                    if (first == null) first = scope->symbols + i;
+                    if (sym->fileId == fileId) return sym;
+                    if (first == null) first = sym;
                 }
-                i++;
+                i = sym->next;
             }
             if (first != null) return first;
             scope = scope->parent;
@@ -251,17 +398,19 @@ pub extend ScopeStack
     {
         u32 n = 0;
         Scope* scope = self.current();
+        u32 b = symBucket(name);
         while (scope != null)
         {
-            u32 i = 0;
-            while (i < scope->symbolsLen)
+            u32 i = scope->buckets[b];
+            while (i != 0 && n < max)
             {
-                if (scope->symbols[i].name == name && n < max)
+                Symbol* sym = scope->symbols + (i - 1);
+                if (sym->name == name)
                 {
-                    out[n] = scope->symbols + i;
+                    out[n] = sym;
                     n++;
                 }
-                i++;
+                i = sym->next;
             }
             scope = scope->parent;
         }
