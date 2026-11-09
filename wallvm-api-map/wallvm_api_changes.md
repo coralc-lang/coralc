@@ -12,8 +12,8 @@ I'm going only by this doc, not the code, so treat the specifics as things to ch
 - Extend `validate` or `borrowcheck` to check alloc/free pairing per path. `borrowcheck` already runs in the structure lane as a diagnostic.
 
 **Things that will bite you early**
-- **`constFloat` dedups ignoring type (§4.14).** That's a f32/f64 confusion bug in a language full of floats, and the fix is one comparison at `irtypes.crl:960-962`. Do this first.
-- **`irTypeAlignOf(struct)` is hardcoded to 8.** Anything with 16-byte-aligned vec types will be wrong at the Coral/Mu extern boundary. Check that Coral's layout rules match `createStructType`.
+- **`constFloat` dedups ignoring type (§4.14).** That's a f32/f64 confusion bug in a language full of floats, and the fix is one comparison at `irtypes.crl:960-962`. Do this first. **[done 2026-11-09 — see map §4.14/§13-G-type4]**
+- **`irTypeAlignOf(struct)` is hardcoded to 8.** Anything with 16-byte-aligned vec types will be wrong at the Coral/Mu extern boundary. Check that Coral's layout rules match `createStructType`. **[done 2026-11-09 — see map §4.11/§13-G-type3]**
 - **The assembler caps at 512 symbols and 1024 relocs per object.** A big script module will hit that fast. I can't tell from the doc whether local labels count against the limit.
 - **G10: IR is never freed.** If the compiler runs in-process for hot reload, every recompile leaks. Give each `IrContext` its own arena and destroy it wholesale after emitting.
 - **There's no single IR-to-object entry (G5).** For fast hot reload, add a wrapper that skips the text round trip. `emitRaw(base)` plus `FMT_RAW` looks like most of the way to loading straight into executable memory.
@@ -28,9 +28,9 @@ Here's how I'd do each one, in the order I'd do them. I'm working from your doc 
 
 ## Tier 1: small and independent
 
-- **`constFloat` type confusion (`:960-962`).** Compare the type like `constInt` does: `if (c->base.type == ty && c->valData == bits) return c;`. Test by creating an f64 1.0 and then an f32 1.0, and assert the pointers differ.
-- **`constInt` masking.** Mask to width on creation (`if (w < 64) v &= (1<<w)-1`). In the printer, sign-extend from the type's width before printing. That fixes P3 and P4's "u64 prints as -1" case without a signedness model. Check the parser reads negatives back.
-- **Struct alignment.** Add `alignment` to `IrType`, set it in `createStructType` to the max field alignment (1 for empty), and have `irTypeAlignOf(Struct)` return it. Then grep for callers that depended on the hardcoded 8 (the global-alignment fallbacks you cite).
+- **`constFloat` type confusion (`:960-962`).** Compare the type like `constInt` does: `if (c->base.type == ty && c->valData == bits) return c;`. Test by creating an f64 1.0 and then an f32 1.0, and assert the pointers differ. **[done 2026-11-09 — type+bits dedup at `irtypes.crl:987`; e2e case `test/wallvm/pending/const_float_type.ir` awaits the deferred `opFor` float-const materialization]**
+- **`constInt` masking.** Mask to width on creation (`if (w < 64) v &= (1<<w)-1`). In the printer, sign-extend from the type's width before printing. That fixes P3 and P4's "u64 prints as -1" case without a signedness model. Check the parser reads negatives back. **[done 2026-11-09 — mask at `irtypes.crl:957-958`, printer sign-extend `irPrinter.crl:341-354`; parser negatives verified by suite]**
+- **Struct alignment.** Add `alignment` to `IrType`, set it in `createStructType` to the max field alignment (1 for empty), and have `irTypeAlignOf(Struct)` return it. Then grep for callers that depended on the hardcoded 8 (the global-alignment fallbacks you cite). **[done 2026-11-09 — field `IrType.align` (`:51`), set at `:901`, returned at `:840-851` with derive-fallback; fallbacks refreshed in map §4.11 quirk 1]
 - **`createFuncWithArgs(name, ret, params, argNames, n, isVararg)`.** Wrap your §4.13 loop and set `base.type` with the vararg flag in the same function. That keeps `args[]` and `paramTypes` in sync in one place.
 - **`IrBuilder.insertValue`.** Copy `extractValue` and use `createInst(InsertValue, ...)`.
 - **`.str` collisions.** Name them `.str`, then `.str.<n>` from a per-module counter. Make a builder-aware `getStringPointer` that respects the insert point.

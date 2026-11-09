@@ -52,7 +52,7 @@ alias in its parent's `lib.crl` **or** directly by file name (proved by
 - Only `pub` items are API. Files are `#[[no_drop_all]]` (e.g. `wallvm.crl:1`).
 - Struct *methods* carry no `pub` marker yet are callable cross-module:
   `IrPrinter.output()` is un-marked (`irPrinter.crl:44`) but called from
-  `wallvm.crl:102`. Conversely `printModule` is marked `pub` (`irPrinter.crl:1013`).
+  `wallvm.crl:102`. Conversely `printModule` is marked `pub` (`irPrinter.crl:1054`).
   The marker on methods is inconsistent; treat all methods of a `pub` struct as
   accessible.
 - `pub` does **not** mean *wired* or *safe to use*: several public symbols are
@@ -176,11 +176,11 @@ Source: `test/wallvm/irtool.crl:5-13, 69-80` (+ run at O0..O3, `:25-37`).
 ### 3.2 Programmatic IR construction → assembly
 
 ```coral
-IrContext* ctx = irCtxCreate();                    // irtypes.crl:1082
-IrModule*  m   = ctx->createModule("name");        // irtypes.crl:1074
-IrFunc*    f   = ctx->createFunc("main", retTy, params, nparams); // :1063
+IrContext* ctx = irCtxCreate();                    // irtypes.crl:1110
+IrModule*  m   = ctx->createModule("name");        // irtypes.crl:1102
+IrFunc*    f   = ctx->createFunc("main", retTy, params, nparams); // :1091
 f->addArg(...); m->addFunc(f);
-IrBlock* entry = ctx->createBlock("entry");        // :1053
+IrBlock* entry = ctx->createBlock("entry");        // :1081
 f->addBlock(entry);
 IrBuilder b = IrBuilder::new(ctx);                 // irBuilder.crl:20
 b.pos(entry, null);                                // insert point = block, before=null (append)
@@ -269,14 +269,14 @@ tyDouble /*f64*/, tyPtr(IrType* elem) /*width hardcoded 64*/,
 tyArray(elem,count), tyFunc(ret,params,nparams,isVararg),
 tyVector(elem,count), tyStruct(IrStructType*)` — all interned.
 
-Object creators: `createGlobal(name,ty,isConst,isExtern,init,alignment)` (`:767`),
-`stringConstLabel(id)` (`:782`), `createStringConst(data,length)` (`:801`),
-`createStructType(name, fields, fieldNames, nfields)` (`:866`),
-`constInt/constFloat/constArray/createStructConst` (`:933-1003`),
-`createInst(op,ty,ops,nops,icmpP,fcmpP)` (`:1027`), `createBlock(name)` (`:1053`),
-`createFunc(name,ret,params,nparams)` (`:1063`), `createModule(name)` (`:1074`).
-Free helpers: `irTypeAlignOf` (`:820`), `irTypeSizeOf` (`:842`), `irTypeEqual`
-(`:1129`), `irTypeStr` (`:1161`), `wallvmClz64/wallvmCtz64` (`:1188,1200`).
+Object creators: `createGlobal(name,ty,isConst,isExtern,init,alignment)` (`:771`),
+`stringConstLabel(id)` (`:786`), `createStringConst(data,length)` (`:805`),
+`createStructType(name, fields, fieldNames, nfields)` (`:882`),
+`constInt/constFloat/constArray/createStructConst` (`:952-1038`),
+`createInst(op,ty,ops,nops,icmpP,fcmpP)` (`:1055`), `createBlock(name)` (`:1081`),
+`createFunc(name,ret,params,nparams)` (`:1091`), `createModule(name)` (`:1102`).
+Free helpers: `irTypeAlignOf` (`:824`), `irTypeSizeOf` (`:858`), `irTypeEqual`
+(`:1157`), `irTypeStr` (`:1189`), `wallvmClz64/wallvmCtz64` (`:1216,1228`).
 
 ### 4.3 `IrModule` (`:538`)
 
@@ -514,7 +514,7 @@ IrBlock* entry = ctx->createBlock("entry"); f->addBlock(entry);
 - **`constArray(ty, elems, n)` / `createStructConst(elems, n)` (`:1008-1038`)** —
   `IrArrayConst`/`IrStructConst` hold per-element `IrValue*`s, each carrying its
   own type; struct elems in **declaration order**, placement uses precomputed
-  offsets (comment `irtypes.crl:188-192`).
+  offsets (comment `irtypes.crl:192-196`).
 - **Aggregates in SSA:** opcodes `ExtractValue`/`InsertValue` exist
   (`irOps.crl:93-94`). Builder has `extractValue(agg, idx)` (`irBuilder.crl:481`)
   but **no `insertValue` method** (grep = 0) — use
@@ -638,19 +638,19 @@ print without `%` (`br b1`), value refs with `%` (`%2`).
   dropped**. f32 constants carry f64 bits (§4.12), so an `f32` literal dumps with
   double precision (e.g. `f32 3.14159265358979`).
 - **P6 — `debugLoc` is never printed.** `IrInst.debugLoc` / `setDebugLoc`
-  (`irtypes.crl:205`, `:221-227`) has **zero references in `irPrinter.crl`**
+  (`irtypes.crl:209`, `:225-231`) has **zero references in `irPrinter.crl`**
   (grep) — source file/line set by the frontend is invisible in dumps; only
   `!var` clauses and generic `metadata` print.
 - **P7 — extern globals are indistinguishable from zero-initialized ones.**
   `printGlobal` (`:947-963`) has no `isExtern` branch: `global @x: ty;` is what
   both an extern import and a defined-but-uninitialized global print as — while
-  codegen treats them oppositely (skips externs, `x86_64_base.crl:747`, emits
+  codegen treats them oppositely (skips externs, `x86_64_base.crl:802`, emits
   `.zero` for the latter).
 - **P8 — programmatic global alignment is invisible.** `createGlobal(..., alignment=N)`
-  sets only the struct field (`irtypes.crl:767-776`); the dump shows alignment
+  sets only the struct field (`irtypes.crl:771-780`); the dump shows alignment
   only when it was also attached as `!alignment` metadata (what the text frontend
-  does, `irParser.crl:2493-2501`). Codegen honors the field
-  (`x86_64_base.crl:756-757`).
+  does, `irParser.crl:2526-2532`). Codegen honors the field
+  (`x86_64_base.crl:811-812`).
 - **P9 — struct naming in dumps can be internally inconsistent.** Types intern by
   shape (§4.10), so two named records (`@A`, `@B`) with identical fields share
   one `IrType`. `printModule` prints **both** `type @A`/`type @B` decls
@@ -681,7 +681,7 @@ print without `%` (`br b1`), value refs with `%` (`%2`).
   (`:1015-1050`); `paramTypes` is never shown — a `createFunc`-built function
   (never vararg unless patched, §4.13), or one whose `args[]` and `paramTypes`
   diverge, dumps as whatever `args[]` says.
-- **P16 — string decls print name + payload only** (`:964-973`) — no type, no
+- **P16 — string decls print name + payload only** (`:1005-1014`) — no type, no
   length, no NUL information (the model type is `[len+1 x i8]`, §4.12).
 
 **Missing from the dump (not modeled → never printable)**
@@ -693,7 +693,7 @@ print without `%` (`br b1`), value refs with `%` (`%2`).
 - Load/store **volatile** flag and **alignment** — no `IrInst` fields exist.
 - `gep` inbounds; `exact`/`nsw`/`nuw` for anything besides add/sub/mul (those
   three ride the `IR_AUX_UNSIGNED` aux slot and print as `add.u` —
-  `irtypes.crl:232-239`).
+  `irtypes.crl:236-243`).
 - Function attributes (`nounwind`, `readnone`, …); branch weights (only via
   generic `!metadata` if you attach it yourself).
 - Analysis/regalloc state: domtrees, alias sets, live intervals / `valData`
@@ -739,12 +739,12 @@ print without `%` (`br b1`), value refs with `%` (`%2`).
 `irDomtreeLevel` (`:270`). Built from the CFG; any CFG mutation invalidates it
 (consumers rebuild per use).
 
-### 6.3 `FunctionAnalysisCache` (`irtypes.crl:657`)
+### 6.3 `FunctionAnalysisCache` (`irtypes.crl:661`)
 
 `aliasAnalysis, memorySSA, func, generation, destroyAliasAnalysis,
 destroyMemorySSA`. Ownership protocol is documented first-person at
-`:650-670`: publishing pass owns the heap object, `clearAnalysisCaches` runs
-registered destroyers. Comment at `:655-656`: *memorySSA "is optional and
+`:654-674`: publishing pass owns the heap object, `clearAnalysisCaches` runs
+registered destroyers. Comment at `:659-660`: *memorySSA "is optional and
 currently never published, hence always null in practice."*
 
 ---
@@ -1120,7 +1120,7 @@ and const-expr restrictions (`:208,219,648`).
 - **G8 — `irPassIPAConstProp` is public but unwired**: `// TODO, implement
   module-level entry point` (`passes/ipa_cp.crl:289`); not in any pipeline.
 - `memorySSA` is documented as never published to the analysis cache
-  (`irtypes.crl:655-656`) — cached memory-SSA consumers get `null` by design.
+  (`irtypes.crl:659-660`) — cached memory-SSA consumers get `null` by design.
 - Safety instrumentation requires the host to link a `_trap` symbol at O0
   ("driver TODO", `passes/safety.crl:17`), and is skipped for wasm because
   "wasm has no error.crl to link" (`wallvm.crl:351`).
@@ -1177,7 +1177,7 @@ and const-expr restrictions (`:208,219,648`).
 
 - **G10 — no ownership story for IR.** No `irModuleDestroy`/`irFuncDestroy`/
   `irBlockDestroy` exist (grep); `irCtxDestroy` frees only the context's pointer
-  arrays (`irtypes.crl:1089-1099`), not interned types/constants or any IR
+  arrays (`irtypes.crl:1120-1127`), not interned types/constants or any IR
   object. Everything is `#[[no_drop_all]]`. `irCompileAsm`'s buffer is
   never freed by design (`wallvm.crl:602-604`). Plan for process-lifetime
   memory or write your own teardown walking the IR.
@@ -1192,10 +1192,10 @@ and const-expr restrictions (`:208,219,648`).
   consumer path **[?]**.
 - **Runtime contract for the host**: generated code expects `_start`
   (linker default entry, `link.crl:54`), `_trap` (safety, O0), `sqrt`
-  (`pub extern f64 sqrt` in `irtypes.crl:1186`), per-arch exit snippets from
+  (`pub extern f64 sqrt` in `irtypes.crl:1214`), per-arch exit snippets from
   `noret`, and whatever externs you declared with `isExtern`/`externSym`.
 - **`IrType` field/method name collision** (`kind`, `width` exist as both field
-  and method, `irtypes.crl:41,49-50`) — semantics of `t.kind` vs `t.kind()` are
+  and method, `irtypes.crl:40-51,53-55`) — semantics of `t.kind` vs `t.kind()` are
   **[?]**.
 - Known *code-quality* gaps (miscompiles, ABI edges, machine-level TODOs) are
   tracked in `lib/wallvm/docs/pipeline-gaps.md` and `next-todos.md`; they are
