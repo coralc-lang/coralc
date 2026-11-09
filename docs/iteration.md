@@ -68,8 +68,6 @@ indexed protocol. The methods belong in the extend block, not in the struct
 body:
 
 ```coral
-import(lib) std::collections::range { IterRange };
-
 struct CountTo
 {
     usize n;
@@ -87,12 +85,12 @@ pub extend CountTo : @iter
         return (i32)i;
     }
 
-    IterRange range(usize start, usize end)
+    struct(usize, usize) range(usize start, usize end)
     {
         if (start > self.n) start = self.n;
         if (end > self.n) end = self.n;
         if (end < start) end = start;
-        return IterRange { .start = start, .end = end };
+        return (start, end);
     }
 }
 
@@ -112,32 +110,24 @@ void main()
 | --- | --- | --- |
 | `usize count()` | Always | Number of elements. Plain for-in calls it once. |
 | `T at(usize i)` | Always | Element at `0 <= i < count()`. Called once per element, in increasing index order. |
-| `IterRange range(usize start, usize end)` | Bounded form only | Clamps and returns the half-open interval `[start, end)`. Must return `IterRange`. |
+| `struct(usize, usize) range(usize start, usize end)` | Bounded form only | Clamps and returns the half-open interval `[start, end)` as the tuple `struct(usize, usize)` — element 0 is start, element 1 is end. |
 
 `range()` is O(1) for the built-in collections. The bounded loop still costs
 `O(end - start)` calls to `at()`.
 
-`IterRange` is declared in `std::collections::range`:
+The bounds type is the built-in tuple `struct(usize, usize)`. It is the tuple
+syntax already used by `at()` for multi-binding — no import, no library type:
 
 ```coral
-pub struct IterRange
+struct(usize, usize) range(usize start, usize end)
 {
-    usize start;
-    usize end;
+    ...
+    return (start, end);
 }
 ```
 
-It is deliberately non-generic so importing a collection does not implicitly
-instantiate a container such as `Vec<T>` just because `range()` is declared.
-
-`IterRange` is an ordinary struct, not a builtin type like `str`, and it is
-not force-imported by the prelude. A bounded `for-in` does not need to name it:
-the compiler desugars the bounds to `range()` plus `at()`. Import it only when
-a declaration spells the return type:
-
-```coral
-import(lib) std::collections::range { IterRange };
-```
+A bounded `for-in` does not need to name the type: the compiler desugars the
+bounds to `range()` plus `at()`.
 
 ## Built-in implementations
 
@@ -170,7 +160,7 @@ method, and the `@iter` protocol. For example:
 
 A bounded loop additionally requires `range()`. A missing or incorrectly typed
 `range()` produces the same kind of method-not-found error, with the required
-signature and `IterRange` return type.
+signature and `struct(usize, usize)` return type.
 
 Using for-in on a type that is neither an array/slice nor marked `@iter`
 reports:
