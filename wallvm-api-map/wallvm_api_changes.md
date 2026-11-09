@@ -232,3 +232,110 @@ Jumping straight to an e-graph is the big rewrite. A cheaper intermediate step:
 5. Then the big components (e-graph, SSA regalloc, MIR, layout), one at a time.
 
 If you paste `peephole.crl` and `pipelineLevel3`, I can tell you how hard the visitor conversion would be.
+## Landed 2026-11-09 — front-end additions and printer beautification
+
+All of the following are in the source and verified against the two suites
+(`run.sh` 144/144, `run_passes.sh` 22 pass / 1 pre-existing `involution_fneg`
+PIE-link failure). Line numbers tracked in `wallvm_api_map.md`.
+
+**Tier-1 correctness (tagged in place above).**
+- `constInt` masks constants to their declared width; `constFloat` keys
+  dedup on **type + bits** (no f32/f64 collisions); `IrType.align` field,
+  set by `createStructType` and returned by `irTypeAlignOf` (was hardcoded 8);
+  printer sign-extends ConstInt to the type width and prints `i1` as
+  `true`/`false`.
+
+**Calling conventions (from LLVM's ~40-CC list, trimmed to wallvm's 30).**
+- `IrFunc.cc: u32` field (`irtypes.crl:471`) — ordinals are
+  `asm_rules::CallingConvention`; 0 = driver default.
+- Printer emits `!cc = N` from the field on both extern and normal funcs
+  (`irPrinter.crl` `emitFuncHead`); parser intercepts `!cc` into the field
+  without creating metadata (`irParser.crl:2178-2182`).
+- `IrModule.externs` registry: `collectExterns()` auto-fills from
+  `addFunc`/parser (`irtypes.crl:555-582`).
+- `ccFromId(u32) -> CallingConvention` (`asm_rules.crl:82-119`);
+  `ffi/extern.crl`'s `externCallingConvention` honors `f->cc` first.
+
+**Printer beautification (idempotence fixpoint verified byte-identical).**
+- Per-function `=` column alignment: `refWidth` + `eqWidth` computed in
+  `printBlocksWithDefsFirst`, pads result slots so `=` lands on one column
+  per block; slotless instructions stay at plain indent.
+- `printGlobal` prints `!alignment = N` from the `IrGlobal.alignment` field
+  and suppresses the metadata duplicate (`emitMetaSkip`); map P8 closed.
+- Verified with a scratch parse→print tool: print(parse(print(parse(x))))
+  is byte-identical on the case corpus + an extern/`!cc`/alignment scratch.
+
+**Float-constant pool (RIP-relative codegen fix, 2026-11-09).**
+- Root cause: `opFor` decoded a `ConstFloat`'s raw f64 bits as a register/
+  spill home encoding, so any float constant that reached an emitter
+  un-folded produced garbage operands (`addsd %rsi, %xmm2` → assembler
+  error, or worse, silently wrong registers).
+- Fix: `ConstFloat` now resolves to a pool label — `opFor`/`homeOf` return
+  `label(%rip)`, and `emitFloatConsts` (called next to `emitConstStrings` in
+  the linux/windows drivers) writes every consulted constant as
+  `.Lcf<valueId>:` + `.balign 8` + `.quad` in mergeable `.rodata.cst8`
+  (`.rdata` on Windows). Entries are 8 bytes for **both** widths because
+  float bits also travel through GPRs (`movq`); f32 narrows to its low 32
+  bits first, matching `emitGlobalConstValue`.
+- Consumers audited against `/usr/bin/gcc`/`clang` output shapes:
+  float binops/FpToSi/Fcvt/ret/store take the memory operand directly;
+  call args (`mvKind==5`) load the pool with one `movsd/movss`;
+  positions that require an xmm register (`emitFabs` andpd data,
+  `vfmadd` second source, gep-store fold, insertelement, generic store
+  source) materialize through `opForRegF` into xmm14/xmm15.
+- Verification: `pending/const_float_type.ir` moved to `cases/` —
+  **148/148** at O0–O3; negative control (reverting `constFloat`'s type
+  check) fails exactly those 4 runs (144/4) and nothing else; scratch
+  f32/fabs/fma cases pass at all four levels; pass suite 22/1
+  (pre-existing `involution_fneg` PIE failure untouched).
+
+**Docs.** `wallvm_api_map.md` reference sweep re-anchored (§3-§13, all
+`irtypes/irPrinter/irParser/asm_rules/extern.crl` citations re-greped against
+current sources).
+
+## From LLVM: candidate front-end API/type additions (researched 2026-11-09)
+
+Statuses: **landed** / **candidate** / **n/a** (deliberately out of scope).
+Empirical check rule applies: verify against `/usr/bin/gcc` 16.2.1 and
+`/usr/bin/clang` 23.1.3 output before adopting any lowering.
+
+**Types**
+- Half (`f16`) / bfloat — **candidate**: `IrTypeKind` is
+  `Void,Int,Float,Ptr,Array,Func,Vector,Struct` with `Float` = 32/64 only.
+  Needed only if Coral targets fp16 hardware; otherwise keep as a
+  compile-time-only narrow type.
+- Address spaces on pointers — **n/a** for now: single-AS target set
+  (x86/x86-64/wasm); revisit with GPU targets.
+- Packed structs — **candidate**: no `packed` flag; layout is natural-align
+  max-field (`createStructType`). Needed for packed wire formats only.
+- Opaque/nominal structs — **candidate** (already on the doc's roadmap as
+  "nominal structs + DataLayout"); current structs intern by shape, which
+  is also map P9's source of confusion.
+- Zero-size arrays / `GetElementPtr` semantics — **candidate**: check
+  `tyArray(_, 0)` behavior when the struct-layout work lands.
+
+**Functions and ABI**
+- `nounwind`/`readonly`/`noreturn` fn attrs — **candidate**: no attribute
+  system exists; would ride on `IrFunc` or a metadata group. `isLeaf`
+  is the only current query.
+- `byval`/`sret`/`signext`/`zeroext` param attrs — **n/a as IR attrs**:
+  wallvm derives the classification from the ABI tables
+  (`abiForCc` covers all 30 CCs), so per-param attrs would duplicate it.
+  Revisit only if per-param overrides become a requirement.
+- Remaining CCs (~10 of LLVM's) — **landed in spirit**: all 30 enum
+  variants have ABI/format entries + `ccFromId` round trip.
+
+**Metadata**
+- `!range`, `!tbaa` — **candidate** (the doc already lists "facts as
+  metadata with merge policies" as infrastructure-first); print/parse
+  plumbing exists generically for unknown keys.
+- `!dbg` — **partially landed**: `debugLoc` fields exist on insts and
+  round-trip in text (`debug.file/line/col`), but the printer never emits
+  inline `// file:line` comments (map P6).
+- Attribute groups (`#0 = {...}`) — **n/a**: no attr system yet; add
+  together with the fn-attrs candidate, not before.
+
+**Linkage / symbols**
+- `dllimport`/`dllexport`, weak/common/external visibility — **n/a**:
+  ELF-only hosts today; `isExtern` + `emitLinkerDirectives` cover current
+  needs.

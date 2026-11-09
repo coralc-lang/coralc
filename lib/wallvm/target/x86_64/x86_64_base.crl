@@ -542,6 +542,15 @@ pub struct X86_64CodeGen
     str[16] asmTaken;
     u32 asmTakenN;
 
+    // Float constants whose labels the emitters have consulted, in
+    // first-use order. The label is id-derived (floatConstLabel), so
+    // every consumer and the pool writer spell it the same way without
+    // a side table; this array only decides which entries get written.
+    // Freed by emitFloatConsts once the pool is out.
+    IrValue** fcConsts;
+    u32 nfcConsts;
+    u32 capfcConsts;
+
     // Param-seeding plan: classification runs once into these records
     // and both emission walks replay them, so the stage and commit
     // phases can agree on skip decisions and on staging layout. The
@@ -569,6 +578,9 @@ pub struct X86_64CodeGen
         self.currentFunc = null;
         self.allocaBase = 0;
         self.allocaBytes = 0;
+        self.fcConsts = null;
+        self.nfcConsts = 0;
+        self.capfcConsts = 0;
         self.emitter.init(ctx, modd, useAtt, feats);
     }
 
@@ -783,6 +795,80 @@ pub struct X86_64CodeGen
             }
             self.emitter.emitLine("\"");
         }
+    }
+
+    /* label for a float constant's pool entry: id-derived, so opFor,
+     * homeOf, call-argument moves and the pool writer all spell it the
+     * same way, and a consult registers the constant for emission.
+     * constFloat interns per type+bits, so one value == one entry. */
+    str floatConstLabel(IrValue* v)
+    {
+        if (v == null) return str::empty();
+        bool seen = false;
+        for (u32 i = 0; i < self.nfcConsts; i++)
+            if (self.fcConsts[i] == v) { seen = true; break; }
+        if (!seen)
+        {
+            if (self.nfcConsts >= self.capfcConsts)
+            {
+                u32 newCap = self.capfcConsts ? self.capfcConsts * 2 : 8;
+                IrValue** arr = alloc<IrValue*>((usize)newCap);
+                if (self.fcConsts != null)
+                {
+                    copy<IrValue*>(arr, self.fcConsts, (usize)self.nfcConsts);
+                    dealloc<IrValue*>(self.fcConsts);
+                }
+                self.fcConsts = arr;
+                self.capfcConsts = newCap;
+            }
+            self.fcConsts[self.nfcConsts] = v;
+            self.nfcConsts++;
+        }
+        String* b = textBufNext();
+        b->pushView(".Lcf");
+        b->pushView(u32ToStr(v->id));
+        return b->asView();
+    }
+
+    /* the float constant pool: every constant the emitters consulted,
+     * written after the code the way emitConstStrings writes the string
+     * pool (forward rip-relative references resolve at link time).
+     * Entries are .quad and 8-aligned for both widths — float bits also
+     * travel through GPRs (movq) and over 64-bit slots, and an 8-byte
+     * record keeps every one of those loads inside the entry; f32
+     * narrows to its low 32 bits first, exactly like emitGlobalConstValue
+     * does for initialised data. */
+    void emitFloatConsts()
+    {
+        if (self.fcConsts == null || self.nfcConsts == 0) return;
+        if (self.isWindows)
+            self.emitter.emitLine(".section .rdata,\"dr\"");
+        else
+            self.emitter.emitLine(".section .rodata.cst8,\"aM\",@progbits,8");
+        for (u32 i = 0; i < self.nfcConsts; i++)
+        {
+            IrValue* v = self.fcConsts[i];
+            if (v == null || v->kind != IrValueKind::ConstFloat) continue;
+            u64 bits = v->valData;
+            if (v->type != null && v->type->width == 32)
+            {
+                f64 d = 0;
+                copy<u8>((u8*)&d, (u8*)&v->valData, 8);
+                f32 f = (f32)d;
+                u32 b32 = 0;
+                copy<u8>((u8*)&b32, (u8*)&f, 4);
+                bits = (u64)b32;
+            }
+            self.emitter.emitLine("\t.balign 8");
+            self.emitter.emit(self.floatConstLabel(v));
+            self.emitter.emitLine(":");
+            self.emitter.emit("\t.quad ");
+            self.emitter.emitLine(u64ToHex(bits));
+        }
+        dealloc<IrValue*>(self.fcConsts);
+        self.fcConsts = null;
+        self.nfcConsts = 0;
+        self.capfcConsts = 0;
     }
 
     /* file-scope variables: one record per defined global, initialised
@@ -2701,8 +2787,10 @@ pub struct X86_64CodeGen
                 ? (width <= 32 ? "movd " : width <= 64 ? "movq " : "movdqu ")
                 : (width == 64 ? "movq " : "movd ");
             // memory to memory has no encoding — a spilled source
-            // reloads into xmm15 first
-            str s = self.valueIsSpill(sv) ? self.opForRegF(sv, "xmm15") : self.opFor(sv);
+            // reloads into xmm15 first, and a pool constant comes up
+            // through the same path
+            str s = (self.valueIsSpill(sv) || (sv != null && sv->kind == IrValueKind::ConstFloat))
+                            ? self.opForRegF(sv, "xmm15") : self.opFor(sv);
             str operand = self.memOperandFor(av, "rbx");
             self.emitter.emit("\t");
             self.emitter.emit(mn);
@@ -3121,15 +3209,31 @@ pub struct X86_64CodeGen
         // reloads through rax, and a constant has no register form here
         // (the generic store path emits it as an immediate).
         if (valueIsIntConst(inst->ops[0])) return false;
-        str src = self.valueIsSpill(inst->ops[0])
-            ? self.opForReg(inst->ops[0], "rax")
+        // floats travel through an xmm: a spill or a pool constant
+        // reloads into xmm15, and the store mnemonic stays width-typed
+        // (movss/movq) instead of the integer toReg32/reg-name wrapping
+        bool srcFlt = self.valueIsFloatClass(inst->ops[0]);
+        u32 width = inst->ops[0] != null && inst->ops[0]->type != null ? inst->ops[0]->type->width : 64;
+        if (srcFlt && width != 32 && width != 64) return false;
+        str src = (self.valueIsSpill(inst->ops[0]) || (srcFlt && inst->ops[0]->kind == IrValueKind::ConstFloat))
+            ? (srcFlt ? self.opForRegF(inst->ops[0], "xmm15") : self.opForReg(inst->ops[0], "rax"))
             : self.getRegForValue(inst->ops[0]);
         // sib parts are register-only, spills reload into the scratches
         str base = self.opForReg(addrInst->ops[0], "r10");
         str idx = self.opForReg(addrInst->ops[1], "r11");
-        u32 width = inst->ops[0] != null && inst->ops[0]->type != null ? inst->ops[0]->type->width : 64;
 
         self.emitter.emit("\t");
+        if (srcFlt)
+        {
+            self.emitter.emit(width == 32 ? "movss " : "movq ");
+            self.emitter.emit(src);
+            self.emitter.emit(", (");
+            self.emitter.emit(base);
+            self.emitter.emit(", ");
+            self.emitter.emit(idx);
+            self.emitter.emitLine(width == 32 ? ", 4)" : ", 8)");
+            return true;
+        }
         switch (width)
         {
             8 => {
@@ -3366,6 +3470,13 @@ pub struct X86_64CodeGen
             self.emitter.emitLine(", %r11");
             return "r11";
         }
+        if (v->kind == IrValueKind::ConstFloat)
+        {
+            // the pool entry is a memory operand every float consumer
+            // accepts (movsd/movss/addsd read mem directly); the label
+            // consult registers the constant for the pool writer
+            return self.ripOperand(self.floatConstLabel(v), 0);
+        }
         if (valueIsIntConst(v)) return intImmText(v);
         u64 vd = v->valData;
         if (vd & 0x80000000UL)
@@ -3392,6 +3503,8 @@ pub struct X86_64CodeGen
         if (v == null) return "rax";
         if (v->kind == IrValueKind::StringConst) return "r11";
         if (v->kind == IrValueKind::Global) return "r11";
+        if (v->kind == IrValueKind::ConstFloat)
+            return self.ripOperand(self.floatConstLabel(v), 0);
         if (valueIsIntConst(v)) return intImmText(v);
         u64 vd = v->valData;
         if (vd & 0x80000000UL)
@@ -5056,12 +5169,23 @@ void emitIntExtendTo(str src, str dst32, u32 width, bool isSigned)
     {
         str dst = self.getRegForValue(&inst->base);
         str src1 = (inst->nops > 0) ? self.getRegForValue(inst->ops[0]) : "xmm0";
-        str src2 = (inst->nops > 1) ? self.getRegForValue(inst->ops[1]) : "xmm1";
+        bool useFma = self.emitter.features != null && self.emitter.features.fma;
+        str src2 = "xmm1";
+        if (inst->nops > 1 && inst->ops[1] != null)
+        {
+            IrValue* v2 = inst->ops[1];
+            // vfmadd's second source must be an xmm register: a spill
+            // reloads into the scratch, and a pool constant comes up
+            // the same way (the non-FMA mul/add read memory fine)
+            src2 = (useFma && (self.valueIsSpill(v2) || v2->kind == IrValueKind::ConstFloat))
+                          ? self.opForRegF(v2, "xmm14")
+                          : self.getRegForValue(v2);
+        }
         str src3 = (inst->nops > 2) ? self.getRegForValue(inst->ops[2]) : "xmm2";
 
         bool isDouble = inst->base.type != null && inst->base.type->width == 64;
 
-        if (self.emitter.features != null && self.emitter.features.fma)
+        if (useFma)
         {
             if (isDouble)
             {
@@ -5120,7 +5244,17 @@ void emitIntExtendTo(str src, str dst32, u32 width, bool isSigned)
     void emitFabs(IrInst* inst)
     {
         str dst = self.getRegForValue(&inst->base);
-        str src = (inst->nops > 0) ? self.getRegForValue(inst->ops[0]) : "xmm0";
+        str src = "xmm0";
+        if (inst->nops > 0 && inst->ops[0] != null)
+        {
+            IrValue* sv = inst->ops[0];
+            // andps/andpd takes its data operand in an xmm register: a
+            // spill reloads into the scratch, and a pool constant comes
+            // up the same way (neither can sit in the mask position)
+            src = (self.valueIsSpill(sv) || sv->kind == IrValueKind::ConstFloat)
+                          ? self.opForRegF(sv, "xmm14")
+                          : self.getRegForValue(sv);
+        }
         bool isDouble = inst->ops[0] != null && inst->ops[0]->type != null && inst->ops[0]->type->width == 64;
         // Float: mask off sign bit of lower 32-bit element
         // Double: mask off sign bit of lower 64-bit element
@@ -6201,8 +6335,14 @@ void emitIntExtendTo(str src, str dst32, u32 width, bool isSigned)
                 }
                 else if (mvKind[m] == 5)
                 {
-                    self.emitImmTo(arg->valData, "r11");
-                    self.emitter.emit("\tmovq r11, ");
+                    // f32/f64 immediate through the pool: one rip-relative
+                    // load instead of movabs+movq through the GPR scratch
+                    str mn = arg->type != null && arg->type->width == 64
+                                     ? "movsd " : "movss ";
+                    self.emitter.emit("\t");
+                    self.emitter.emit(mn);
+                    self.emitter.emit(self.ripOperand(self.floatConstLabel(arg), 0));
+                    self.emitter.emit(", ");
                     self.emitter.emitLine(dst);
                 }
                 else if (mvKind[m] == 3)
@@ -7250,7 +7390,8 @@ void emitIntExtendTo(str src, str dst32, u32 width, bool isSigned)
         self.emitter.emitLine(", -16(%rsp)");
         if (self.valueIsFloatClass(ev))
         {
-            str s = self.valueIsSpill(ev) ? self.opForRegF(ev, "xmm0") : self.opFor(ev);
+            str s = (self.valueIsSpill(ev) || ev->kind == IrValueKind::ConstFloat)
+                        ? self.opForRegF(ev, "xmm0") : self.opFor(ev);
             self.emitter.emit(ew == 64 ? "\tmovsd " : "\tmovd ");
             self.emitter.emit(s);
             self.emitter.emit(", ");

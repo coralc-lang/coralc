@@ -52,7 +52,7 @@ alias in its parent's `lib.crl` **or** directly by file name (proved by
 - Only `pub` items are API. Files are `#[[no_drop_all]]` (e.g. `wallvm.crl:1`).
 - Struct *methods* carry no `pub` marker yet are callable cross-module:
   `IrPrinter.output()` is un-marked (`irPrinter.crl:44`) but called from
-  `wallvm.crl:102`. Conversely `printModule` is marked `pub` (`irPrinter.crl:1054`).
+  `wallvm.crl:102`. Conversely `printModule` is marked `pub` (`irPrinter.crl:1107`).
   The marker on methods is inconsistent; treat all methods of a `pub` struct as
   accessible.
 - `pub` does **not** mean *wired* or *safe to use*: several public symbols are
@@ -176,9 +176,9 @@ Source: `test/wallvm/irtool.crl:5-13, 69-80` (+ run at O0..O3, `:25-37`).
 ### 3.2 Programmatic IR construction → assembly
 
 ```coral
-IrContext* ctx = irCtxCreate();                    // irtypes.crl:1110
-IrModule*  m   = ctx->createModule("name");        // irtypes.crl:1102
-IrFunc*    f   = ctx->createFunc("main", retTy, params, nparams); // :1091
+IrContext* ctx = irCtxCreate();                    // irtypes.crl:1139
+IrModule*  m   = ctx->createModule("name");        // irtypes.crl:1131
+IrFunc*    f   = ctx->createFunc("main", retTy, params, nparams); // :1120
 f->addArg(...); m->addFunc(f);
 IrBlock* entry = ctx->createBlock("entry");        // :1081
 f->addBlock(entry);
@@ -189,7 +189,7 @@ b.ret(c);
 str asmText = irCompileAsm(m, ctx, cc, 2);
 ```
 Types come from `ctx->tyInt(bits)/tyPtr/tyFloat/tyDouble/tyArray/tyFunc/tyVector`
-(`irtypes.crl:758-765`) — structs need `createStructType` (`:882`) — constants
+(`irtypes.crl:787-794`) — structs need `createStructType` (`:911`) — constants
 from `ctx->constInt/constFloat/constArray/createStructConst` (`:952-1038`),
 globals from `ctx->createGlobal(...)` (`:771`). There is no
 separate module registration step — `createModule` is enough, then `m->addFunc`.
@@ -239,9 +239,9 @@ assembly text (`wastool.crl` then assembles it).
 
 ### 4.1 Containers & ownership
 
-- `irCtxCreate()` / `irCtxDestroy(ctx)` — `irtypes.crl:1110,1117`.
+- `irCtxCreate()` / `irCtxDestroy(ctx)` — `irtypes.crl:1139,1146`.
   Destroy frees only the context's own arrays (types/consts/caches pointer
-  tables, `:1120-1127`) — **not** the pointed-to `IrType`/`IrValue` objects, not
+  tables, `:1146-1153`) — **not** the pointed-to `IrType`/`IrValue` objects, not
   modules/functions/blocks/instructions. There is **no** destroy API for
   Module/Func/Block (grep: none). The whole library is `#[[no_drop_all]]`;
   teardown is partial by design (§13-G10).
@@ -250,7 +250,7 @@ assembly text (`wastool.crl` then assembles it).
   `IrInst.erase()` (`:260-298`, unlinks + frees one instruction).
 - Strings created inside IR are duplicated via `irDupStr` (`:6-10`, heap).
 
-### 4.2 `IrContext` (`:677`)
+### 4.2 `IrContext` (`:706`)
 
 Fields: type table (`types/ntypes/capTypes`, uniqued via `tyGetOrCreate`),
 `nextId` (value id counter, `nextValueId()`), constant pools
@@ -269,27 +269,37 @@ tyDouble /*f64*/, tyPtr(IrType* elem) /*width hardcoded 64*/,
 tyArray(elem,count), tyFunc(ret,params,nparams,isVararg),
 tyVector(elem,count), tyStruct(IrStructType*)` — all interned.
 
-Object creators: `createGlobal(name,ty,isConst,isExtern,init,alignment)` (`:771`),
-`stringConstLabel(id)` (`:786`), `createStringConst(data,length)` (`:805`),
-`createStructType(name, fields, fieldNames, nfields)` (`:882`),
+Object creators: `createGlobal(name,ty,isConst,isExtern,init,alignment)` (`:800`),
+`stringConstLabel(id)` (`:815`), `createStringConst(data,length)` (`:834`),
+`createStructType(name, fields, fieldNames, nfields)` (`:911`),
 `constInt/constFloat/constArray/createStructConst` (`:952-1038`),
-`createInst(op,ty,ops,nops,icmpP,fcmpP)` (`:1055`), `createBlock(name)` (`:1081`),
-`createFunc(name,ret,params,nparams)` (`:1091`), `createModule(name)` (`:1102`).
-Free helpers: `irTypeAlignOf` (`:824`), `irTypeSizeOf` (`:858`), `irTypeEqual`
-(`:1157`), `irTypeStr` (`:1189`), `wallvmClz64/wallvmCtz64` (`:1216,1228`).
+`createInst(op,ty,ops,nops,icmpP,fcmpP)` (`:1084`), `createBlock(name)` (`:1110`),
+`createFunc(name,ret,params,nparams)` (`:1120`), `createModule(name)` (`:1131`).
+Free helpers: `irTypeAlignOf` (`:853`), `irTypeSizeOf` (`:887`), `irTypeEqual`
+(`:1186`), `irTypeStr` (`:1218`), `wallvmClz64/wallvmCtz64` (`:1245,1257`).
 
-### 4.3 `IrModule` (`:538`)
+### 4.3 `IrModule` (`:539`)
 
 `ctx, name, funcs/nfuncs/capFuncs, globals/nglobals, constStrings/nconstStrings,
-structs/nstructs`. Methods: `addFunc, getFunc(name), addGlobal, addConstString,
-findConstString(data,length) /*dedup, only looks*/ , addStruct`.
+structs/nstructs, externs/nexterns/capExterns`. Methods: `addFunc` (appends to
+the extern registry when `f->isExtern` already set), `getFunc(name), addGlobal,
+addConstString, findConstString(data,length) /*dedup, only looks*/ , addStruct,
+collectExterns()` — rebuilds `externs[]` from `funcs[]` (call it after flipping
+`isExtern` post-add; the text parser does, `irParser.crl:2302`). The registry is
+the import-table/linker consumption surface: `{isExtern, externLib, externSym,
+cc}` per entry.
 
 ### 4.4 `IrFunc` (`:458`)
 
 `base(IrValue), parent, blocks/nblocks/capBlocks, retType, paramTypes/nparams,
-isExtern, externLib, externSym, metadata(rawptr), args/nargs/capArgs`.
-Methods: `addBlock, addArg, removeBlock, isLeaf()` (no `Call` anywhere, `:525`).
-Calling convention is **not** stored on the function — cc is a driver argument.
+isExtern, externLib, externSym, cc(u32, `:471`), metadata(rawptr),
+args/nargs/capArgs`.
+Methods: `addBlock, addArg, removeBlock, isLeaf()` (no `Call` anywhere, `:526`).
+Calling convention is stored per-function as `cc` — u32 ordinals of
+`asm_rules::CallingConvention`, `0` = unset (fall back to the driver argument).
+Text: `!cc = N` clause parses into the field (`irParser.crl:2178-2182`), the
+printer always emits it from the field (`irPrinter.crl:1058-1066`);
+`ffi::externCallingConvention` consumes it via `ccFromId` (§12).
 `isExtern` functions are skipped by every compile phase.
 
 ### 4.5 `IrBlock` (`:305`)
@@ -338,11 +348,11 @@ Fields: `kind, width, elem, count, ret, params, nparams, isVararg, align`;
 methods `kind(), width(), isEqual(other)` (`:53-55` — same names as fields,
 **[?]** how Coral disambiguates `t.kind` field vs `t.kind()` method).
 `align` (`:51`) is the struct's natural alignment — recorded by
-`createStructType` (`:901`, max field align, 1 for empty); `0` = unset, in
+`createStructType` (`:930`, max field align, 1 for empty); `0` = unset, in
 which case `irTypeAlignOf(Struct)` derives it from the field list (§4.11;
 G-type3 fixed 2026-11-09).
 `Float` width 32/64 only (`tyFloat`/`tyDouble`); `Ptr` width hardcoded 64;
-vector = `tyVector(elem,count)` with `width = elem->width*count` (`:765`).
+vector = `tyVector(elem,count)` with `width = elem->width*count` (`:794`).
 No x86-specific or arbitrary-precision float kinds exist.
 
 ### 4.9 Debug support types
@@ -354,7 +364,7 @@ col, argIndex /* ~0u if not an arg */}` (`:65`).
 
 ### 4.10 Type construction & identity (for in-memory generation)
 
-All type constructors are methods on `IrContext` (`irtypes.crl:758-765`):
+All type constructors are methods on `IrContext` (`irtypes.crl:787-794`):
 
 ```
 tyVoid()  tyInt(bits)  tyFloat()  tyDouble()  tyPtr(elem)
@@ -362,19 +372,19 @@ tyArray(elem, count)  tyVector(elem, count)
 tyFunc(ret, params, nparams, isVararg)  tyStruct(st)
 ```
 
-- **`tyStruct` takes an `IrStructType*`** (`:769`) — there is no "make a struct
+- **`tyStruct` takes an `IrStructType*`** (`:798`) — there is no "make a struct
   type from a bare field list" entry. The record from
   `createStructType(name, fields, fieldNames, nfields)` (`:882-906`) is the front
   door; it computes field offsets (each field `alignUpTo(cur, alignOf(field))`)
   and `size = alignUpTo(end, maxFieldAlign)`, interns the `IrType`, records the
-  natural alignment on it (`irTy->align = maxAlign`, `:901`), and stores
+  natural alignment on it (`irTy->align = maxAlign`, `:930`), and stores
   name/fields/size/offsets on the record. `fieldNames` may be `null` (the printer
-  then synthesizes `f0:`, `f1:` — `irPrinter.crl:976-984`). Register with
+  then synthesizes `f0:`, `f1:` — `irPrinter.crl:1013-1021`). Register with
   `m->addStruct(st)` so dumps resolve `struct @Name`; unregistered struct types
   print inline at every use site (§5.3 P9).
 - **Interning → pointer identity.** `tyGetOrCreate` (`:907-946`) linearly scans
   `ctx->types` and returns the existing type when the shape matches. Within one
-  context, `IrType* == IrType*` **is** the equality test; `irTypeEqual` (`:1157`)
+  context, `IrType* == IrType*` **is** the equality test; `irTypeEqual` (`:1186`)
   is the explicit structural compare (also for cross-context). Consequences: hold
   one pointer per shape and reuse it; you *cannot* create two distinct types of
   identical shape — a source-language `typedef`/alias collapses for free, but so
@@ -389,7 +399,7 @@ tyFunc(ret, params, nparams, isVararg)  tyStruct(st)
   no typedef records, no address-space or packed/aligned wrappers, no bitfield
   or union kinds (§4.12, §13 G-type5).
 
-### 4.11 Layout rules (`irTypeAlignOf` `:824-856`, `irTypeSizeOf` `:858-874`)
+### 4.11 Layout rules (`irTypeAlignOf` `:853-885`, `irTypeSizeOf` `:887-903`)
 
 | kind | align | size |
 |---|---|---|
@@ -397,7 +407,7 @@ tyFunc(ret, params, nparams, isVararg)  tyStruct(st)
 | Int / Float | `ceil(width/8)` min 1 → **i1 = 1 byte** | same as align |
 | Ptr / Func | **8** (always) | **8** (always) |
 | Array / Vector | `alignOf(elem)` | `sizeOf(elem) × count`, **`count==0` treated as 1** (`:851`) |
-| Struct | **`t->align`** — natural max-field align recorded by `createStructType` (`:901`; 1 for empty; derives from the field list when 0, §4.8) | `t->width` as precomputed by `createStructType` (natural) |
+| Struct | **`t->align`** — natural max-field align recorded by `createStructType` (`:930`; 1 for empty; derives from the field list when 0, §4.8) | `t->width` as precomputed by `createStructType` (natural) |
 
 Verified quirks:
 
@@ -406,8 +416,8 @@ Verified quirks:
    field recorded by `createStructType` (max field align, 1 for empty),
    deriving from the field list when unset — `struct { i8 }` → size 1 /
    align 1 (was: align 8, exceeding the size). The consumer fallbacks (the
-   text frontend's global alignment, `irParser.crl:2512`; codegen's align
-   fallback, `x86_64_base.crl:811-812`) now report natural alignment
+   text frontend's global alignment, `irParser.crl:2518`; codegen's align
+   fallback, `x86_64_base.crl:898-899`) now report natural alignment
    instead of over-aligning.
 2. **Pointer size is target-blind: 8 at IR level, 4 in the wasm32 backend**
    (`target/wasm/wasm.crl:296,303` size Ptr/Func as 4). Any struct containing a
@@ -431,12 +441,12 @@ Verified quirks:
 |---|---|---|
 | `bool` | `ctx->tyInt(1)` | 1 byte in memory (§4.11); `icmp`/`fcmp` results are `i1`; pass 0/1 to `constInt` (dump shows `true`/`false` for width 1) |
 | `i8…i64` / `u8…u64` | `ctx->tyInt(bits)` | **signedness is not in the type.** Pick `sext`/`zext` at the frontend; mark `add/sub/mul` on unsigned operands — the model keeps `IR_AUX_UNSIGNED` in the `icmpPred` aux slot (`isUnsignedArith`, `irtypes.crl:236-243`), which the dump prints as `add.u`/`sub.u`/`mul.u` |
-| integer constant | `ctx->constInt(ty, val)` (`:952`) | **masked to `ty->width` on creation** (fits u64; `i1` stores 0/1); dedup key = (type, masked bits); consumers sign-extend from width on demand (`constfold` `_signExt`); the printer sign-extends for display — sub-64 negatives print correctly, `i1` prints `true`/`false` (`irPrinter.crl:334-336`) |
-| `float` | `ctx->tyFloat()` | f32 constants are stored as **f64 value bits** (`constFloat` takes f64; x86 emitter narrows at emission, `x86_64_base.crl:847-850`) |
-| `double` | `ctx->tyDouble()` | `constFloat(ty, v)` dedups on **type and bits** (`:987`) — the order-dependent f32/f64 confusion is fixed (G-type4, 2026-11-09); values are still f64 bit patterns even for `f32` (§4.14) |
+| integer constant | `ctx->constInt(ty, val)` (`:981`) | **masked to `ty->width` on creation** (fits u64; `i1` stores 0/1); dedup key = (type, masked bits); consumers sign-extend from width on demand (`constfold` `_signExt`); the printer sign-extends for display — sub-64 negatives print correctly, `i1` prints `true`/`false` (`irPrinter.crl:346-351`) |
+| `float` | `ctx->tyFloat()` | f32 constants are stored as **f64 value bits** (`constFloat` takes f64; x86 emitter narrows at emission, `x86_64_base.crl:933-936`) |
+| `double` | `ctx->tyDouble()` | `constFloat(ty, v)` dedups on **type and bits** (`:1016`) — the order-dependent f32/f64 confusion is fixed (G-type4, 2026-11-09); values are still f64 bit patterns even for `f32` (§4.14) |
 | `enum` | any `tyInt(bits)` | no enum type; names/values live in your own metadata (`wallvm::irMetadata`) or side tables |
 | `T*` / `void*` | `ctx->tyPtr(ty)` / `tyPtr(null)` | `elem` documents gep/load typing; size fixed 8 at IR level (§4.11) |
-| `T[N]` | `ctx->tyArray(ty, N)` | `N==0` sizes as 1 element (`:869`) |
+| `T[N]` | `ctx->tyArray(ty, N)` | `N==0` sizes as 1 element (`:899`) |
 | named `struct` | `ctx->createStructType(...)` + `m->addStruct(st)` | natural layout only (§4.11); same-shape structs share one `IrType`; two named records with equal shape → dump shows the first name everywhere (§5.3 P9) |
 | anonymous struct | `createStructType` with empty `name` | never printed as `type @…`; appears inline at each use |
 | `union` | **no representation** | manual: max-size byte array (`tyArray(tyInt(8), size)`) + `bitcast`/typed `load` per variant; no punning type exists |
@@ -444,23 +454,23 @@ Verified quirks:
 | `packed` struct / field alignment | **no representation** | `createStructType` always uses natural alignment; no override hooks (only `IrGlobal.alignment` for whole globals, `setAlignment` metadata on some insts) |
 | function | `ctx->createFunc(...)` | **incomplete on its own** — recipe in §4.13 |
 | function pointer | `ctx->tyPtr(ctx->tyFunc(...))` | `call` takes any callee atom; function-typed *values* are `IrValueKind::Func` (dump prints `@name`) |
-| vararg function | `createFunc`, then patch `f->base.type = ctx->tyFunc(ret, params, n, true)` | `createFunc` hardcodes `isVararg=false` in the func type (`:1095`); full reference setup in the text frontend: `irParser.crl:2237-2251` |
-| extern declaration (`printf`) | `createFunc` + `f->isExtern=true; f->externLib="libc"; f->externSym="printf"` | fields on `IrFunc` (`irtypes.crl:468-470`) |
+| vararg function | `createFunc`, then patch `f->base.type = ctx->tyFunc(ret, params, n, true)` | `createFunc` hardcodes `isVararg=false` in the func type (`:1124`); full reference setup in the text frontend: `irParser.crl:2267-2281` |
+| extern declaration (`printf`) | `createFunc` + `f->isExtern=true; f->externLib="libc"; f->externSym="printf"`, optional `f->cc` (§4.4) | fields on `IrFunc` (`irtypes.crl:468-471`) |
 | string literal | two representations — see below | |
-| SIMD vector | `ctx->tyVector(elem, lanes)` | `width = elem.width×lanes` (`:765`); backend support varies per opcode **[?]** |
-| local `alloca T` | `builder.alloca(ty)` → result type **`ptr T`** (`irBuilder.crl:178-182`) | the printer also tolerates aggregate-typed alloca results (comment `irPrinter.crl:551-557`), i.e. a manually created `createInst(Alloca, structTy, …)` |
+| SIMD vector | `ctx->tyVector(elem, lanes)` | `width = elem.width×lanes` (`:794`); backend support varies per opcode **[?]** |
+| local `alloca T` | `builder.alloca(ty)` → result type **`ptr T`** (`irBuilder.crl:178-182`) | the printer also tolerates aggregate-typed alloca results (comment `irPrinter.crl:571-576`), i.e. a manually created `createInst(Alloca, structTy, …)` |
 | debug info | `inst->setDebugLoc(file,line,col)` (`irtypes.crl:225-231`), `inst->addVarDebug(...)`, `MetadataSet` | **`debugLoc` is never printed** (§5.3 P6) |
 
 **String literals — two representations:**
 
 - **Path A (module string constant):** `ctx->createStringConst(data, len)`
-  (`irtypes.crl:805`) → `IrStringConst`, type `[len+1 x i8]` with NUL appended,
-  auto-label `.Lcs<id>` (`:782`). **No dedup** — call `m->findConstString(data,
+  (`irtypes.crl:834`) → `IrStringConst`, type `[len+1 x i8]` with NUL appended,
+  auto-label `.Lcs<id>` (`:815`). **No dedup** — call `m->findConstString(data,
   len)` first (§4.3) and reuse the record, then `m->addConstString(sc)`.
 - **Path B (global with byte-array init):** `wallvm::irStrings::createStringConstant(ctx, m, data)`
   (`irStrings.crl:18`) → a `const` global **always named `.str`** (`:30`), type
   `ptr [len+1 x i8]`, `constArray` init. Calling it twice yields two globals with
-  the   same name; `emitGlobals` prints names raw (`x86_64_base.crl:817`) — the
+  the   same name; `emitGlobals` prints names raw (`x86_64_base.crl:900`) — the
   assembly text then contains two `.str:` labels, with no uniquifier found
   anywhere **[?]** (likely duplicate-label failure).
 - `getStringPointer(ctx, sv, block)` (`irStrings.crl:52`) **appends the GEP to
@@ -469,25 +479,24 @@ Verified quirks:
 
 ### 4.13 Function signatures, args, varargs, externs — the manual recipe
 
-`createFunc(name, ret, params, nparams)` (`irtypes.crl:1091-1099`) sets
+`createFunc(name, ret, params, nparams)` (`irtypes.crl:1120-1128`) sets
 `base.type = tyFunc(ret, params, nparams, false)`, copies `retType/paramTypes/
-nparams` onto the `IrFunc`, and leaves **`args[]` empty, `blocks[]` empty, no
-calling-convention field** (cc is a driver-level per-compile argument, §2.1).
-There is **no `createArg` helper anywhere in `lib/wallvm`** (grep) — every
-in-memory consumer hand-rolls this loop (the text frontend does exactly the
-same, `irParser.crl:2242-2251`):
+nparams` onto the `IrFunc`, and leaves **`args[]` empty, `blocks[]` empty**
+(per-function `cc` exists, §4.4 — `0` = unset). There is **no `createArg`
+helper anywhere in `lib/wallvm`** (grep) — every in-memory consumer hand-rolls
+this loop (the text frontend does exactly the same, `irParser.crl:2271-2280`):
 
 ```coral
 IrFunc* f = ctx->createFunc("main", retTy, params, nparams);
 // vararg? patch the type:
-// f->base.type = ctx->tyFunc(retTy, params, nparams, true);   // irParser.crl:2238
+// f->base.type = ctx->tyFunc(retTy, params, nparams, true);   // irParser.crl:2268
 for (u32 i = 0; i < nparams; i++) {
     IrValue* a = alloc<IrValue>(1);
     *a = IrValue { IrValueKind::Arg, params[i], ctx->nextValueId(), 0,
                    str::empty(), null, 0, 0 };   // named: slot 4 = irDupStr(name)
-    f->addArg(a);                                // irParser.crl:2244-2249
+    f->addArg(a);                                // irParser.crl:2273-2278
 }
-f->isExtern = false;   // extern? true + f->externLib / f->externSym
+f->isExtern = false;   // extern? true + f->externLib / f->externSym (+ f->cc)
 m->addFunc(f);
 IrBlock* entry = ctx->createBlock("entry"); f->addBlock(entry);
 ```
@@ -564,20 +573,21 @@ pub IrParser new(IrContext* ctx)                               // :104
 pub void    destroy(IrParser* p)                               // :133
 pub str     getError(IrParser* p)                              // :149
 pub u32     getErrorLine(IrParser* p)                          // :150
-pub IrModule* parseModule(IrParser* p, str text)               // :2569
+pub IrModule* parseModule(IrParser* p, str text)               // :2607
 ```
 Whole-module string input; resets line/position/error state per call
-(`:2570-2584`). Returns `null` on error; diagnostics via `getError*`.
-Known rejection: `"unsupported aggregate element type"` (`:2390`).
+(`:2608-2622`). Returns `null` on error; diagnostics via `getError*`.
+Known rejection: `"unsupported aggregate element type"` (`:2428`).
 
 ### 5.3 `IrPrinter` (`wallvm::irPrinter`, `text/irPrinter.crl`) — the IR dump
 
 **API** — `static IrPrinter new()` (`:34`), `destroy()` (`:39`, frees the buffer),
 `str output()` (`:44`, view into the internal `String`), `pub void printModule(IrModule*)`
-(`:1054`). Per-unit entry points are plain methods (callable cross-module per §1.3):
-`printInst` (`:844`), `printBlock` (`:926`), `printStructDecl` (`:964`),
-`printGlobal` (`:988`), `printStringDecl` (`:1005`), `printFunc` (`:1015-1050`),
-plus emitters `emitType` (`:184`), `emitValueRef` (`:277`), `emitAtom` (`:323`),
+(`:1107`). Per-unit entry points are plain methods (callable cross-module per §1.3):
+`printInst(m,inst,eqWidth)` (`:863`), `printBlock(m,bb,eqWidth)` (`:964`),
+`printStructDecl` (`:1002`),
+`printGlobal` (`:1026`), `printStringDecl` (`:1048`), `printFunc` (`:1068-1103`),
+plus emitters `emitType` (`:184`), `emitValueRef` (`:277`), `emitAtom` (`:336`),
 `emitFloat` (`:120`). Nothing is written to disk/stdout — take `output()` and write it.
 
 **Usage notes**
@@ -603,7 +613,9 @@ b1:
 ```
 
 4-space instruction indent, labels at column 0, one blank line between top-level
-decls; ` = ` is printed only for non-void results (`:844-854`); metadata rides as
+decls; result slots are padded so every `=` in a block lands on one column
+(width computed per function, `refWidth :284`, pad in `printInst :863-880`);
+` = ` is printed only for non-void results; metadata rides as
 `!key` / `!key = v` clauses after the instruction/decl (`emitMetaEntry :391-406`;
 bare `!key` means value 1, except `alignment`); per-variable debug prints
 ` !var = "name", ty, line, col[, argIdx]` (`emitVarDebug :402-419`). Block refs
@@ -611,7 +623,7 @@ print without `%` (`br b1`), value refs with `%` (`%2`).
 
 **Problems in the output (verified)**
 
-- **P1 — block order is rewritten.** `printBlocksWithDefsFirst` (`:863-924`)
+- **P1 — block order is rewritten.** `printBlocksWithDefsFirst` (`:888-961`)
   Kahn-sorts blocks so every def precedes its uses; the printed sequence is
   generally **not** `f->blocks[]` order — i.e. not what a pass left behind. Bad
   for eyeballing block-order effects of the inliner/structure passes. Entry is
@@ -623,7 +635,7 @@ print without `%` (`br b1`), value refs with `%` (`%2`).
   Two logically identical modules dump with different numbers unless the exact
   same allocation history occurred; diffs are noisy.
 - **P3 — high-bit constants print signed.** `emitAtom` ConstInt sign-extends
-  the low `ty->width` bits before printing (`irPrinter.crl:341-354`): an `i32`
+  the low `ty->width` bits before printing (`irPrinter.crl:355-368`): an `i32`
   `-1` (stored as `0xFFFF…FFFF`) dumps as `-1` — correct, and the parser reads
   it back. A `u64` constant `0xFFFF…FF` still dumps as `-1`: the literal
   carries no type suffix, so without surrounding context the sign is a lie.
@@ -642,26 +654,29 @@ print without `%` (`br b1`), value refs with `%` (`%2`).
   (grep) — source file/line set by the frontend is invisible in dumps; only
   `!var` clauses and generic `metadata` print.
 - **P7 — extern globals are indistinguishable from zero-initialized ones.**
-  `printGlobal` (`:947-963`) has no `isExtern` branch: `global @x: ty;` is what
+  `printGlobal` (`:1026-1046`) has no `isExtern` branch: `global @x: ty;` is what
   both an extern import and a defined-but-uninitialized global print as — while
-  codegen treats them oppositely (skips externs, `x86_64_base.crl:802`, emits
+  codegen treats them oppositely (skips externs, `x86_64_base.crl:888`, emits
   `.zero` for the latter).
-- **P8 — programmatic global alignment is invisible.** `createGlobal(..., alignment=N)`
-  sets only the struct field (`irtypes.crl:771-780`); the dump shows alignment
-  only when it was also attached as `!alignment` metadata (what the text frontend
-  does, `irParser.crl:2526-2532`). Codegen honors the field
-  (`x86_64_base.crl:811-812`).
+- **P8 — programmatic global alignment — FIXED (2026-11-09).**
+  `printGlobal` now emits `!alignment = N` from the `IrGlobal.alignment` field
+  (`irPrinter.crl:1041-1044`) and suppresses any duplicate `alignment` key in
+  the generic metadata print (`emitMetaSkip :423-431`); the parser keeps its
+  dual-write (field + metadata, `irParser.crl:2532-2540`), so parsed and
+  programmatically built globals both round-trip. Codegen honored the field all
+  along (`x86_64_base.crl:898-899`). (Was: field-only alignment was invisible
+  in dumps unless separately attached as metadata.)
 - **P9 — struct naming in dumps can be internally inconsistent.** Types intern by
   shape (§4.10), so two named records (`@A`, `@B`) with identical fields share
   one `IrType`. `printModule` prints **both** `type @A`/`type @B` decls
-  (`:1057-1066`, no dedup), while `emitType` resolves `struct @Name` by scanning
+  (`:1113-1125`, no dedup), while `emitType` resolves `struct @Name` by scanning
   for the **first** record whose `irType` pointer matches (`:247-256`) — every use
   prints `@A`, and `@B`'s decl is dead text. Unregistered struct types
   (in-memory build without `m->addStruct`) print inline `struct { … }` at
   **every** use site.
 - **P10 — broken IR prints plausible-looking symbols.** Null operand → `@missing`
-  (`:327`), unknown value kind → `%missing` (`:366`), null typed-arg slot →
-  `void @missing` (`:460`) — no slot index, no marker that the IR is malformed.
+  (`:340`), unknown value kind → `%missing` (`:379`), null typed-arg slot →
+  `void @missing` (`:477`) — no slot index, no marker that the IR is malformed.
 - **P11 — inline-asm value-mode operands print self-references.** A null asm
   output slot prints as the instruction's own result (`emitTypedArgs :439-460`) —
   the dump shows `%7 = inlineasm … (%7)`, which looks like a cyclic def.
@@ -671,17 +686,17 @@ print without `%` (`br b1`), value refs with `%` (`%2`).
   decls, struct fields in declaration order, funcs/globals/structs in array
   (insertion) order. No compact mode, no "print blocks in array order" option,
   no stable-renumbering option, no type-alias folding control.
-- **P14 — `irTypeStr` (`irtypes.crl:1189-1211`) is not the printer's spelling
+- **P14 — `irTypeStr` (`irtypes.crl:1218-1240`) is not the printer's spelling
   and is lossy**: `Float` width 32 → `"float"` (printer says `f32`), `Struct` →
   `"unknown"`, `Array`/`Func`/`Vector` → bare words with no payload, unusual int
   widths → `iN`. Fine for logs; never use it where the string must identify a
   type.
 - **P15 — vararg and parameter list come from different fields.** `printFunc`
   prints `...` from `base.type->isVararg` and parameters from `args[]`
-  (`:1015-1050`); `paramTypes` is never shown — a `createFunc`-built function
+  (`:1068-1103`); `paramTypes` is never shown — a `createFunc`-built function
   (never vararg unless patched, §4.13), or one whose `args[]` and `paramTypes`
   diverge, dumps as whatever `args[]` says.
-- **P16 — string decls print name + payload only** (`:1005-1014`) — no type, no
+- **P16 — string decls print name + payload only** (`:1048-1057`) — no type, no
   length, no NUL information (the model type is `[len+1 x i8]`, §4.12).
 
 **Missing from the dump (not modeled → never printable)**
@@ -739,12 +754,12 @@ print without `%` (`br b1`), value refs with `%` (`%2`).
 `irDomtreeLevel` (`:270`). Built from the CFG; any CFG mutation invalidates it
 (consumers rebuild per use).
 
-### 6.3 `FunctionAnalysisCache` (`irtypes.crl:661`)
+### 6.3 `FunctionAnalysisCache` (`irtypes.crl:690`)
 
 `aliasAnalysis, memorySSA, func, generation, destroyAliasAnalysis,
 destroyMemorySSA`. Ownership protocol is documented first-person at
 `:654-674`: publishing pass owns the heap object, `clearAnalysisCaches` runs
-registered destroyers. Comment at `:659-660`: *memorySSA "is optional and
+registered destroyers. Comment at `:688-693`: *memorySSA "is optional and
 currently never published, hence always null in practice."*
 
 ---
@@ -759,33 +774,36 @@ SyscallMacOS, SyscallWin64, Ppc64, Ppc, Mips64, Mips, SparcV9, Aapcs64MacOs,
 Aapcs64Ios, WinX86_32, SyscallPpc64, SyscallPpc, SyscallMips64, SyscallMips,
 SyscallSparc64, Wasm32, Wasm64`. (No explicit values — ordinal enum.)
 
-### 7.2 `ABIRules` (`:93-123`)
+### 7.2 `ABIRules` (`:131-161`)
 
 `cc, name, argRegs/numArgRegs, floatArgRegs/numFloatArgRegs, returnReg,
 floatReturnReg, stackArgReg, calleeSaveRegs/num, callerSaveRegs/num, frameReg,
 stackAlignment, hasRedZone, calleeCleanupStack, shadowSpaceBytes, syscallInst,
 syscallNumberReg, syscallArgRegs/num, syscallNumberShift`.
 
-- `abiForCc(cc)` (`:841-877`) covers **all 30** variants (falls through to
-  `sysvAbi()`); `formatForCc(cc)` (`:821-839`): 64-bit x86 ccs → AT&T,
+- `abiForCc(cc)` (`:879-915`) covers **all 30** variants (falls through to
+  `sysvAbi()`); `formatForCc(cc)` (`:859-877`): 64-bit x86 ccs → AT&T,
   Cdecl/Stdcall/Fastcall/SyscallX86/WinX86_32 → Intel (x86LinuxRules format,
-  `:1087`), **everything else defaults to x86_64/AT&T** (`:837`).
+  `:1125`), **everything else defaults to x86_64/AT&T** (`:875`).
+- `ccFromId(u32) -> CallingConvention` (`:82-119`) maps `IrFunc.cc` ordinals
+  (and `!cc = N` text) back to the enum — added 2026-11-09, kept adjacent to
+  the enum so ordinal drift stays visible.
 - Named constructors: `sysvAbi win64Abi aapcs64Abi aapcs64MacOsAbi aapcs64IosAbi
   aapcsAbi cdeclAbi stdcallAbi fastcallAbi winX86_32Abi riscv64Abi ppc64Abi
   ppcAbi mips64Abi mipsAbi sparcV9Abi x86_64SyscallAbi x86_64MacOSSyscallAbi
   x86SyscallAbi arm64SyscallAbi armSyscallAbi riscv64SyscallAbi ppc64SyscallAbi
   ppcSyscallAbi mips64SyscallAbi mipsSyscallAbi sparc64SyscallAbi wasm32Abi
-  wasm64Abi` (`:223-817`).
-  Quirk: `SyscallWin64` maps to plain `win64Abi()` (`:859`), not a dedicated
+  wasm64Abi` (`:261-855`).
+  Quirk: `SyscallWin64` maps to plain `win64Abi()` (`:897`), not a dedicated
   syscall table.
-- SysV facts worth knowing (`:223-250`): 6 int arg regs (rdi..r9), 8 xmm, return
+- SysV facts worth knowing (`:261-288`): 6 int arg regs (rdi..r9), 8 xmm, return
   rax/xmm0, 16-byte align, red zone on, callee-saves rbx/rbp/r12-r15.
-- `noretTemplate(ABIRules*)` (`:881`) → syscall exit snippet (used by
+- `noretTemplate(ABIRules*)` (`:919`) → syscall exit snippet (used by
   `noret/noret.crl:99`).
 - Rule tables (`AsmRule/AsmRuleTable/findRule`, `AsmRuleOperand/OperandKind`,
-  `RegisterInfo`; `:13-42,82,198`) and `x86_64LinuxRules/arm64LinuxRules/
+  `RegisterInfo`; `:13-42,120,236`) and `x86_64LinuxRules/arm64LinuxRules/
   x86LinuxRules/armLinuxRules/riscv64LinuxRules/ppc*/mips*/sparc64LinuxRules`
-  (`:966-1353`): public, but **no caller outside `asm_rules.crl`** (grep
+  (`:1004-1391`): public, but **no caller outside `asm_rules.crl`** (grep
   verified) — the actual selectors are hand-written (§13-G4).
 
 ---
@@ -868,8 +886,11 @@ x86_64_base, x86_base}` (`target/lib.crl:6-12`).
 - Input: fully optimized, phi-resolved (or lsra-phi-materialized), regalloc'd
   IR; `valData` per §8.4 when `backendHandlesSpills`.
 - Output shape: GAS-style assembly text with `.section .text` prologue
-  (`x86_64_base.crl:690-693`), const strings emitted as mergeable, read-only,
-  string-sized records (`emitConstStrings`, `x86_64_base.crl` ~696 — SHF_MERGE +
+  (`x86_64_base.crl:747`), then the code; after it a float-constant pool
+  (`emitFloatConsts` — `.Lcf<valueId>` labels, `.balign 8` + `.quad` records
+  in mergeable `.rodata.cst8`, f32 narrowed to its low 32 bits; every
+  `ConstFloat` use loads `label(%rip)`), const strings emitted as mergeable, read-only,
+  string-sized records (`emitConstStrings`, `x86_64_base.crl:754` — SHF_MERGE +
   SHF_STRINGS per its comment), then globals. CPU features are hardwired in the driver:
   SSE2…AVX2/FMA/BMI/POPCNT/LZCNT always on for Linux x86-64
   (`linux.crl:11-24`); `CpuFeatures`/`defaultCpuFeatures` are public if you call
@@ -1044,8 +1065,9 @@ and const-expr restrictions (`:208,219,648`).
 
 - **`wallvm::ffi`** (`ffi/extern.crl`): `ExternLib` (`:14`), `FfiCtx` (`:22`),
   `irFuncIsExtern(IrFunc*)` (`:111`), `externCallingConvention(f, hostCc)`
-  (`:117`), `emitLinkerDirectives(ffi, buf, cap, cc) -> u32` (`:141`).
-  Import-path caveat §1.2.
+  (`:117` — honors a per-function `f->cc` first via `ccFromId`, §7, before the
+  host→library heuristic), `emitLinkerDirectives(ffi, buf, cap, cc) -> u32`
+  (`:142`). Import-path caveat §1.2.
 - **`wallvm::gc`** (`gc/gc.crl`) — runtime support for generated programs:
   `GcConfig/defaultGcConfig` (`:8,18`), `GcHeader/GcRoot/GcState` (`:33-61`),
   `gcInit/gcShutdown`, `gcAlloc/gcAllocWithFinalizer`, `gcRootAdd/Remove`,
@@ -1088,21 +1110,21 @@ and const-expr restrictions (`:208,219,648`).
 
 - **G3 — ABI tables exist for ~14 architectures; backends exist for 3**
   (x86-64, x86-32, wasm32). `abiForCc` covers all 30 CCs
-  (`asm_rules.crl:841-877`) but `target/` contains only x86_64/x86/wasm.
+  (`asm_rules.crl:879-915`) but `target/` contains only x86_64/x86/wasm.
   `arm64LinuxRules/riscv64LinuxRules/ppc*/mips*/sparc64LinuxRules` and their ABI
   constructors have **zero callers outside `asm_rules.crl`** (grep-verified;
   `noret.crl` only uses the ABI constructors for exit snippets).
 - **G4 — the rules-driven selector is not wired.** `AsmRule/AsmRuleTable/
   findRule` are public but nothing consumes them; instruction selection is
-  hand-written across `target/x86_64/x86_64_base.crl` (7.4k lines). You cannot
+  hand-written across `target/x86_64/x86_64_base.crl` (7.6k lines). You cannot
   retarget wallvm by supplying rule tables.
 - **G9 — no exception lowering on x86-64.** `IrInst` can build `landingPad`
   (`irBuilder.crl:472`) but `IrOpcode::LandingPad` has **0 matches** in
   `target/x86_64/x86_64_base.crl` (1 match in wasm only). No DWARF/eh_frame
   emission path found either **[?]**.
 - **G-cc-syntax** — `formatForCc` returns **Intel** for the Cdecl/Stdcall/
-  Fastcall/SyscallX86/WinX86_32 family (x86LinuxRules format, `asm_rules.crl:1087`)
-  and AT&T for x86-64 (`:1001`), defaulting AT&T (`:837`); yet
+  Fastcall/SyscallX86/WinX86_32 family (x86LinuxRules format, `asm_rules.crl:1125`)
+  and AT&T for x86-64 (`:1039`), defaulting AT&T (`:875`); yet
   `irCodegenX86(modd, userdata)` takes **no** syntax parameter
   (`x86/linux/linux.crl:34`) — for 32-bit the flag is ignored by the entry.
 
@@ -1120,7 +1142,7 @@ and const-expr restrictions (`:208,219,648`).
 - **G8 — `irPassIPAConstProp` is public but unwired**: `// TODO, implement
   module-level entry point` (`passes/ipa_cp.crl:289`); not in any pipeline.
 - `memorySSA` is documented as never published to the analysis cache
-  (`irtypes.crl:659-660`) — cached memory-SSA consumers get `null` by design.
+  (`irtypes.crl:688-693`) — cached memory-SSA consumers get `null` by design.
 - Safety instrumentation requires the host to link a `_trap` symbol at O0
   ("driver TODO", `passes/safety.crl:17`), and is skipped for wasm because
   "wasm has no error.crl to link" (`wallvm.crl:351`).
@@ -1128,8 +1150,10 @@ and const-expr restrictions (`:208,219,648`).
 **Printer & dump output** (full audit §5.3)
 
 - **G-print1 — dumps hide state the model has**: `debugLoc` (never printed),
-  `IrGlobal.isExtern`, programmatic `alignment`, `IrFunc.paramTypes` — you
-  cannot fully reconstruct codegen intent from a dump.
+  `IrGlobal.isExtern`, `IrFunc.paramTypes` — you cannot fully reconstruct
+  codegen intent from a dump. (`alignment` and per-func `cc` now print from
+  their fields — P8 FIXED, §4.4 — and result slots pad to a per-function `=`
+  column; beautification landed 2026-11-09.)
 - **G-print2 — dumps lie about order and numbers**: blocks Kahn-reordered (not
   `f->blocks[]`/pass order); context-global monotonic value ids (churn across
   runs, never recycled).
@@ -1146,14 +1170,14 @@ and const-expr restrictions (`:208,219,648`).
 
 - **G-type1 — `createFunc` produces an incomplete function**: no argument values
   (hand-roll `IrValueKind::Arg` + `addArg`; no `createArg` helper exists),
-  `isVararg` always false (patch `base.type` yourself), no calling-convention
-  field, `args[]`/`paramTypes` dual source of truth.
+  `isVararg` always false (patch `base.type` yourself), `args[]`/`paramTypes`
+  dual source of truth. (Per-function `cc` exists since 2026-11-09 — §4.4.)
 - **G-type2 — layout is target-blind**: `tyPtr`/`Func` size and align fixed at 8;
   the wasm32 backend uses 4 (`wasm.crl:296,303`) → IR-computed struct layouts are
   wrong on wasm32; i386 ptr handling **[?]**; no DataLayout object to ask.
 - **G-type3 — `irTypeAlignOf(Struct)` is hardcoded 8** — **FIXED
   (2026-11-09):** `IrType.align` records the natural max-field align in
-  `createStructType` (`:901`); `irTypeAlignOf(Struct)` returns it, deriving
+  `createStructType` (`:930`); `irTypeAlignOf(Struct)` returns it, deriving
   from the field list when 0; verified against the full suite (144/144).
   (Was: reported align could exceed size — `{i8}` = size 1, align 8.)
 - **G-type4 — constants**: `constInt` masks to width and `constFloat` dedups
@@ -1177,7 +1201,7 @@ and const-expr restrictions (`:208,219,648`).
 
 - **G10 — no ownership story for IR.** No `irModuleDestroy`/`irFuncDestroy`/
   `irBlockDestroy` exist (grep); `irCtxDestroy` frees only the context's pointer
-  arrays (`irtypes.crl:1120-1127`), not interned types/constants or any IR
+  arrays (`irtypes.crl:1146-1153`), not interned types/constants or any IR
   object. Everything is `#[[no_drop_all]]`. `irCompileAsm`'s buffer is
   never freed by design (`wallvm.crl:602-604`). Plan for process-lifetime
   memory or write your own teardown walking the IR.
@@ -1192,7 +1216,7 @@ and const-expr restrictions (`:208,219,648`).
   consumer path **[?]**.
 - **Runtime contract for the host**: generated code expects `_start`
   (linker default entry, `link.crl:54`), `_trap` (safety, O0), `sqrt`
-  (`pub extern f64 sqrt` in `irtypes.crl:1214`), per-arch exit snippets from
+  (`pub extern f64 sqrt` in `irtypes.crl:1243`), per-arch exit snippets from
   `noret`, and whatever externs you declared with `isExtern`/`externSym`.
 - **`IrType` field/method name collision** (`kind`, `width` exist as both field
   and method, `irtypes.crl:40-51,53-55`) — semantics of `t.kind` vs `t.kind()` are
