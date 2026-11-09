@@ -1,6 +1,0 @@
-.section .text
-.globl main
-.type main, @function
-main:
-	movq $0x0000000080000000, %rax
-	ret
