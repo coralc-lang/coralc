@@ -96,13 +96,15 @@ struct MiSegment
 // Arena: large OS region, shared across threads
 struct MiArena
 {
-    MiArena* next;
+    MiArena* next;           // per-heap list (slice allocation)
+    MiArena* gNext;          // global registry (pageFind walks this)
     u8* base;
     usize size;
     u64* bitmap;
     usize bitmapWords;
     u32 sliceCount;
     u32 usedSlices;
+    MiPage** sliceDir;       // O(1): 64 KiB slice idx -> covering page
 }
 
 // Thread-local heap
@@ -258,6 +260,7 @@ void _miLockRelease(u64* p)
 // lookups are lock-free.
 static MiSegmentMap _miGlobalPages;
 static u64 _miMapLockWord = 0;
+static MiArena* _miGlobalArenas = null;
 
 // Encode a free list pointer using per-page keys:
 //   set:   rotl(next ^ key2, key1) + key1
@@ -418,15 +421,20 @@ MiArena* _miArenaAlloc(MiHeap* heap, usize minSize)
     arena->sliceCount = (u32)(arenaSize / MI_SLICE_SIZE);
     arena->bitmapWords = ((usize)arena->sliceCount + 63) / 64;
     arena->bitmap = (u64*)(mem + @sizeof(MiArena));
+    arena->sliceDir = (MiPage**)((u8*)mem + @sizeof(MiArena) + arena->bitmapWords * 8);
     arena->usedSlices = 0;
     arena->next = heap->arenas;
+    arena->gNext = null;
 
     // Initialize bitmap to all free (0)
     for (usize i = 0; i < arena->bitmapWords; i++)
         arena->bitmap[i] = 0;
+    for (u32 i = 0; i < arena->sliceCount; i++)
+        arena->sliceDir[i] = null;
 
-    // Mark header slices as used
-    usize headerSlices = (@sizeof(MiArena) + arena->bitmapWords * 8 + MI_SLICE_SIZE - 1) / MI_SLICE_SIZE;
+    // Mark header slices as used (arena header + bitmap + slice directory)
+    usize headerBytes = @sizeof(MiArena) + arena->bitmapWords * 8 + (usize)arena->sliceCount * @sizeof(MiPage*);
+    usize headerSlices = (headerBytes + MI_SLICE_SIZE - 1) / MI_SLICE_SIZE;
     for (u32 i = 0; i < (u32)headerSlices && i < arena->sliceCount; i++)
     {
         arena->bitmap[i / 64] |= (1u << (i % 64));
@@ -435,6 +443,13 @@ MiArena* _miArenaAlloc(MiHeap* heap, usize minSize)
 
     heap->arenas = arena;
     heap->mapped += arenaSize;
+
+    // publish to the global registry; pageFind walks it lock-free, so
+    // the fields above are written before the head swap (x86 TSO)
+    _miLockAcquire(&_miMapLockWord);
+    arena->gNext = _miGlobalArenas;
+    _miGlobalArenas = arena;
+    _miLockRelease(&_miMapLockWord);
     return arena;
 }
 
@@ -469,6 +484,36 @@ void _miArenaSliceFree(MiArena* arena, rawptr ptr, u32 count)
     for (u32 j = 0; j < count; j++)
         arena->bitmap[(startIdx + j) / 64] &= ~(1u << ((startIdx + j) % 64));
     arena->usedSlices -= count;
+}
+
+// Arena slice directory: map every 64 KiB slice the page's reserved
+// extent touches to the page, so _miPageFind resolves arena-backed
+// pointers in O(1) without hashing. mirrors the hash insert extent.
+// single writer (the owning heap's thread); readers are lock-free.
+void _miArenaSliceDirSet(MiArena* arena, u8* pageBase, usize size, MiPage* page)
+{
+    if (size == 0) size = 1;
+    u64 start = (u64)pageBase & ~(u64)0xFFFF;
+    u64 end = ((u64)pageBase + (u64)size - 1) & ~(u64)0xFFFF;
+    u64 abase = (u64)arena->base;
+    for (u64 s = start; s <= end; s += (u64)0x10000)
+    {
+        u32 idx = (u32)((s - abase) >> 16);
+        if (idx < arena->sliceCount) arena->sliceDir[idx] = page;
+    }
+}
+
+void _miArenaSliceDirClear(MiArena* arena, u8* pageBase, usize size)
+{
+    if (size == 0) size = 1;
+    u64 start = (u64)pageBase & ~(u64)0xFFFF;
+    u64 end = ((u64)pageBase + (u64)size - 1) & ~(u64)0xFFFF;
+    u64 abase = (u64)arena->base;
+    for (u64 s = start; s <= end; s += (u64)0x10000)
+    {
+        u32 idx = (u32)((s - abase) >> 16);
+        if (idx < arena->sliceCount) arena->sliceDir[idx] = null;
+    }
 }
 
 // Segment Management
@@ -608,6 +653,8 @@ MiPage* _miPageAlloc(MiHeap* heap, u32 sc)
 
     // Add to global page map (foreign frees resolve here)
     _miSegmentMapInsert(&_miGlobalPages, page->base, page);
+    if (seg->arena != null)
+        _miArenaSliceDirSet(seg->arena, page->base, page->reserved * page->blockSize, page);
 
     return page;
 }
@@ -636,6 +683,8 @@ bool _miPageExtend(MiHeap* heap, MiPage* page)
 void _miPageFree(MiHeap* heap, MiPage* page, u32 sc)
 {
     // Remove from segment map (same full reserved extent insert used)
+    if (page->segment != null && page->segment->arena != null)
+        _miArenaSliceDirClear(page->segment->arena, page->base, page->reserved * page->blockSize);
     _miSegmentMapRemove(&_miGlobalPages, page->base, page->reserved * page->blockSize);
 
     // Unlink from heap
@@ -887,11 +936,43 @@ void _miFreeFast(MiHeap* heap, MiPage* page, rawptr ptr)
         _miPageMaybeRetire(heap, page, page->sizeClass);
 }
 
-// Find which page a pointer belongs to: hash the address into its
-// 4 MiB window bucket in the global page map, then range-check.
+// Find which page a pointer belongs to: arena-backed pages resolve
+// through the arena's slice directory (O(1), no hash); huge pages and
+// direct-mmap segments fall back to the 4 MiB-window hash chain.
 MiPage* _miPageFind(MiHeap* heap, rawptr ptr)
 {
     u8* p = (u8*)ptr;
+
+    MiArena* arena = _miGlobalArenas;
+    while (arena != null)
+    {
+        if (p >= arena->base && p < arena->base + arena->size)
+        {
+            usize off = (usize)(p - arena->base);
+            u32 sidx = (u32)(off >> 16); // 64 KiB slices
+            if (sidx < arena->sliceCount)
+            {
+                MiPage* page = arena->sliceDir[sidx];
+                if (page != null)
+                {
+                    if (p >= page->base && p < page->base + page->capacity * page->blockSize)
+                    {
+                        usize offset = (usize)(p - page->base);
+                        usize bs = page->blockSize;
+                        /* power-of-two size classes (8..16384) skip the div */
+                        bool aligned;
+                        if ((bs & (bs - 1)) == 0) aligned = (offset & (bs - 1)) == 0;
+                        else aligned = (offset % bs) == 0;
+                        if (aligned) return page;
+                    }
+                    return null;
+                }
+            }
+            break; // free/header slice: let the hash chain confirm
+        }
+        arena = arena->gNext;
+    }
+
     u32 idx = _miSegmentMapHash(p);
     MiSegmentMapEntry* entry = _miGlobalPages.buckets[idx];
     while (entry != null)

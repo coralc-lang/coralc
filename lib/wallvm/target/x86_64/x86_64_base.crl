@@ -64,6 +64,7 @@ pub struct CpuFeatures
     bool avx;
     bool avx2;
     bool avx512f;
+    bool avx512bw;
     bool fma;
     bool bmi1;
     bool bmi2;
@@ -76,7 +77,8 @@ pub CpuFeatures defaultCpuFeatures()
     return CpuFeatures {
         .sse = true, .sse2 = true, .sse3 = false, .ssse3 = false,
         .sse41 = false, .sse42 = false, .avx = false, .avx2 = false,
-        .avx512f = false, .fma = false, .bmi1 = false, .bmi2 = false,
+        .avx512f = false, .avx512bw = false,
+        .fma = false, .bmi1 = false, .bmi2 = false,
         .popcnt = false, .lzcnt = false
     };
 }
@@ -372,6 +374,15 @@ pub str rspSlotText(u32 disp)
     return b->asView();
 }
 
+// Scratch-window address at or above rsp: "0(%rsp)", "32(%rsp)", ...
+pub str rspPosText(u32 disp)
+{
+    String* b = textBufNext();
+    b->pushView(u32ToStr(disp));
+    b->pushView("(%rsp)");
+    return b->asView();
+}
+
 // Indexed window address: "-16(%rsp, r10, 4)"
 pub str sibText(u32 disp, str idxReg, u32 scale)
 {
@@ -541,6 +552,9 @@ pub struct X86_64CodeGen
     bool hasDeferredFrame;
     u32 spillSlotCount;
     u32 spillFrameBytes;
+    u32* spillSlotSizes;
+    u32* spillSlotOffsets;
+    u32 spillRegionBytes;
     bool spillRbpPushed;
     IrFunc* currentFunc;
     u32 allocaBase;
@@ -587,6 +601,9 @@ pub struct X86_64CodeGen
         self.fcConsts = null;
         self.nfcConsts = 0;
         self.capfcConsts = 0;
+        self.spillSlotSizes = null;
+        self.spillSlotOffsets = null;
+        self.spillRegionBytes = 0;
         self.emitter.init(ctx, modd, useAtt, feats);
     }
 
@@ -813,19 +830,23 @@ pub struct X86_64CodeGen
         return val->type->kind == IrTypeKind::Vector;
     }
 
-    // Slot layout: every spilled vreg gets one slot of 16 bytes so vector
-    // values fit; scalar ints store their 8-byte register with movq and
-    // f32/f64 store 4/8 bytes with movss/movsd into the slot head. The
-    // prologue pushes the saved callee saves first, then subtracts the
-    // spill+alloca region, so slot i lives at -8*numCalleeSaves-16*(i+1)
-    // (%rbp): the saves sit between rbp and the spill region. rbp is
-    // established in the prologue whenever hasAny spill slot exists, so
-    // the homes are stable for the whole function.
+    // Slot layout: every spilled vreg gets a slot wide enough for its IR
+    // type — 16 bytes for scalars and 128-bit vectors, 32 for 256-bit and
+    // 64 for 512-bit vectors. Scalar ints store their 8-byte register with
+    // movq, f32/f64 store 4/8 bytes with movss/movsd, and vectors store
+    // their whole width. The prologue pushes the saved callee saves first,
+    // then subtracts the spill+alloca region, so slot i starts at
+    // -8*numCalleeSaves-spillSlotOffsets[i] (%rbp): the saves sit between
+    // rbp and the spill region. rbp is established whenever hasAny spill
+    // slot exists, so the homes are stable for the whole function.
     str slotText(u32 slot)
     {
+        u32 off = 8 * self.numCalleeSaves + (slot + 1) * 16;
+        if (self.spillSlotOffsets != null && slot < self.spillSlotCount)
+            off = 8 * self.numCalleeSaves + self.spillSlotOffsets[slot];
         String* b = textBufNext();
         b->pushChar('-');
-        b->pushView(u32ToStr(8 * self.numCalleeSaves + (slot + 1) * 16));
+        b->pushView(u32ToStr(off));
         b->pushView("(%rbp)");
         return b->asView();
     }
@@ -1019,29 +1040,30 @@ pub struct X86_64CodeGen
     str opForRegF(IrValue* v, str scratch)
     {
         if (v == null) return scratch;
+        bool isVec = self.valueIsVec(v);
+        u32 w = v->type != null ? v->type->width : 64;
+        str dst = isVec ? self.vecReg(scratch, w) : scratch;
         if (self.valueIsSpill(v))
         {
-            bool isVec = self.valueIsVec(v);
-            bool dbl = v->type != null && v->type->width == 64;
+            bool dbl = w == 64;
             self.emitter.emit("\t");
-            self.emitter.emit(isVec ? "movdqa " : (dbl ? "movsd " : "movss "));
+            self.emitter.emit(isVec ? self.vecMoveMn(w) : (dbl ? "movsd " : "movss "));
             self.emitter.emit(self.slotText((u32)(v->valData & 0x3FFFFFFF)));
             self.emitter.emit(", ");
-            self.emitter.emitLine(scratch);
-            return scratch;
+            self.emitter.emitLine(dst);
+            return dst;
         }
-        str home = self.opFor(v);
-        if (!home.equals(scratch))
+        str home = isVec ? self.vecReg(self.opFor(v), w) : self.opFor(v);
+        if (!home.equals(dst))
         {
-            bool isVec = self.valueIsVec(v);
-            bool dbl = v->type != null && v->type->width == 64;
+            bool dbl = w == 64;
             self.emitter.emit("\t");
-            self.emitter.emit(isVec ? "movdqa " : (dbl ? "movsd " : "movss "));
+            self.emitter.emit(isVec ? self.vecMoveMn(w) : (dbl ? "movsd " : "movss "));
             self.emitter.emit(home);
             self.emitter.emit(", ");
-            self.emitter.emitLine(scratch);
+            self.emitter.emitLine(dst);
         }
-        return scratch;
+        return dst;
     }
 
     // Destination for producing a value: a spill slot's value is
@@ -1126,6 +1148,82 @@ pub struct X86_64CodeGen
         return hasAny ? max + 1 : 0;
     }
 
+    // A spill slot must hold the whole IR value: 16 bytes covers every
+    // scalar and a 128-bit vector, wider vectors take 32/64 bytes.
+    u32 spillSlotBytes(IrType* ty)
+    {
+        u32 bytes = 16;
+        if (ty != null && ty->kind == IrTypeKind::Vector && ty->width > 128)
+            bytes = (ty->width + 127) / 128 * 16;
+        return bytes;
+    }
+
+    void freeSpillPlan()
+    {
+        if (self.spillSlotSizes != null)
+        {
+            dealloc<u32>(self.spillSlotSizes);
+            self.spillSlotSizes = null;
+        }
+        if (self.spillSlotOffsets != null)
+        {
+            dealloc<u32>(self.spillSlotOffsets);
+            self.spillSlotOffsets = null;
+        }
+        self.spillRegionBytes = 0;
+    }
+
+    // Size each spill slot from the type of the value that owns it and
+    // lay the slots out consecutively. Slot indices are vreg indices, so
+    // the arrays are sparse-tolerant; unused entries stay at the minimum.
+    void planSpillSlots(IrFunc* func, u32 count)
+    {
+        self.freeSpillPlan();
+        if (count == 0 || func == null) return;
+        self.spillSlotSizes = alloc<u32>((usize)count);
+        self.spillSlotOffsets = alloc<u32>((usize)count);
+        for (u32 i = 0; i < count; i++)
+            self.spillSlotSizes[i] = 16;
+
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                u64 vd = inst->base.valData;
+                if ((vd & 0x80000000UL) != 0)
+                {
+                    u32 idx = (u32)(vd & 0x3FFFFFFF);
+                    if (idx < count)
+                    {
+                        u32 b = self.spillSlotBytes(inst->base.type);
+                        if (b > self.spillSlotSizes[idx]) self.spillSlotSizes[idx] = b;
+                    }
+                }
+                for (u32 oi = 0; oi < inst->nops; oi++)
+                {
+                    IrValue* o = inst->ops[oi];
+                    if (o == null || o->kind != IrValueKind::Inst) continue;
+                    u64 ov = o->valData;
+                    if ((ov & 0x80000000UL) == 0) continue;
+                    u32 idx = (u32)(ov & 0x3FFFFFFF);
+                    if (idx >= count) continue;
+                    u32 b = self.spillSlotBytes(o->type);
+                    if (b > self.spillSlotSizes[idx]) self.spillSlotSizes[idx] = b;
+                }
+            }
+        }
+
+        u32 cum = 0;
+        for (u32 i = 0; i < count; i++)
+        {
+            cum += self.spillSlotSizes[i];
+            self.spillSlotOffsets[i] = cum;
+        }
+        self.spillRegionBytes = cum;
+    }
+
 void emitIntExtendTo(str src, str dst32, u32 width, bool isSigned)
 {
     if (width == 32)
@@ -1156,20 +1254,38 @@ void emitIntExtendTo(str src, str dst32, u32 width, bool isSigned)
         self.emitter.emit(i64ToDec((i64)bb->base.id));
     }
 
+    // Resize a vector register name to the width: xmmN for <=128 bits,
+    // ymmN for 256 and zmmN for 512. The rotating String pool gives a
+    // three-operand op room for three distinct conversions without slots
+    // going stale.
+    str vecReg(str reg, u32 bits)
+    {
+        if (bits <= 128) return reg;
+        bool wide = reg.len >= 3 && reg.ptr[1] == 'm' && reg.ptr[2] == 'm';
+        if (!wide) return reg;
+        u8 first = bits > 256 ? 'z' : 'y';
+        String* b = textBufNext();
+        b->pushChar(first);
+        for (u32 i = 1; i < (u32)reg.len && i < 8; i++)
+            b->pushChar(reg.ptr[i]);
+        return b->asView();
+    }
+
     str xmmToYmm(str xmmReg)
     {
-        // Convert xmmN to ymmN by replacing the first character. The
-        // rotating String pool gives a three-operand vex op room for
-        // three distinct conversions without slots going stale.
-        if (xmmReg.len >= 3 && xmmReg.ptr[0] == 'x' && xmmReg.ptr[1] == 'm' && xmmReg.ptr[2] == 'm')
-        {
-            String* b = textBufNext();
-            b->pushChar('y');
-            for (u32 i = 1; i < (u32)xmmReg.len && i < 8; i++)
-                b->pushChar(xmmReg.ptr[i]);
-            return b->asView();
-        }
-        return xmmReg;
+        return self.vecReg(xmmReg, 256);
+    }
+
+    // Full-register move/load/store mnemonic for a vector width. The VEX
+    // 256-bit forms are `vmovdqu`; the 512-bit forms use the EVEX
+    // `vmovdqu64` (AVX512F covers 32/64-bit lanes without AVX512BW).
+    str vecMoveMn(u32 bits)
+    {
+        if (bits <= 32) return "movd ";
+        if (bits <= 64) return "movq ";
+        if (bits <= 128) return "movdqu ";
+        if (bits <= 256) return "vmovdqu ";
+        return "vmovdqu64 ";
     }
 
     // Write a float or vector result home: the scratch carries it when
@@ -1179,25 +1295,24 @@ void emitIntExtendTo(str src, str dst32, u32 width, bool isSigned)
     {
         if (v == null) return;
         u32 w = v->type != null ? v->type->width : 64;
-        str mv = self.valueIsVec(v)
-            ? (w <= 32 ? "movd " : w <= 64 ? "movq " : "movdqu ")
-            : (w == 64 ? "movq " : "movd ");
+        bool isVec = self.valueIsVec(v);
+        str mv = isVec ? self.vecMoveMn(w) : (w == 64 ? "movq " : "movd ");
+        str r = isVec ? self.vecReg(reg, w) : reg;
         if (self.valueIsSpill(v))
         {
-            if (w > 128) self.emitter.emitComment("256-bit value spill truncates to the 16-byte slot");
             self.emitter.emit("\t");
             self.emitter.emit(mv);
-            self.emitter.emit(reg);
+            self.emitter.emit(r);
             self.emitter.emit(", ");
             self.emitter.emitLine(self.slotText((u32)(v->valData & 0x3FFFFFFF)));
             return;
         }
-        str home = self.opFor(v);
-        if (!home.equals(reg))
+        str home = isVec ? self.vecReg(self.opFor(v), w) : self.opFor(v);
+        if (!home.equals(r))
         {
             self.emitter.emit("\t");
             self.emitter.emit(mv);
-            self.emitter.emit(reg);
+            self.emitter.emit(r);
             self.emitter.emit(", ");
             self.emitter.emitLine(home);
         }

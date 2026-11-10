@@ -1,7 +1,7 @@
 #!/bin/sh
-# Internal release packaging: emit the windows compiler as C, and copy the
-# prebuilt linux compiler binary into dist/. Building the C into an
-# executable is the Makefile's job (make windows).
+# Internal release packaging: emit the compiler as C for both platforms,
+# with the default std platform baked in. This script produces C files only;
+# building executables is the Makefile's job (make linux / make windows).
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -41,5 +41,5 @@ emit() {
     echo "package: dist/coralc-$plat.c"
 }
 
-cp "$ROOT/compiler/build/coralc" "$DIST/coralc"
-echo "package: dist/coralc (copied from compiler/build/coralc)"
+emit linux linux
+emit windows windows
