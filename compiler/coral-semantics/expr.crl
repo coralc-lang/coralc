@@ -215,6 +215,17 @@ pub extend Sema
         if (expr->kind.tag == ExprKind::Field)
         {
             if (!self.checkExpr(expr->kind.payload.Field.obj)) return false;
+                if (!self.dotReceiverIsSelf(expr->kind.payload.Field.obj) &&
+                    self.dotOnPointer(self.exprType(expr->kind.payload.Field.obj)))
+                {
+                    String msg = String::new();
+                    msg.pushView("cannot access field '");
+                    msg.pushView(self.nameTextView(expr->kind.payload.Field.field));
+                    msg.pushView("' with `.` on a pointer; use `->`");
+                    self.semaErrorNodeHelp(ErrorCode::SemaUnknownMember, id, msg.asView(),
+                        "`.` only works on values; `ptr->field` dereferences the pointer first");
+                    return false;
+                }
             NodeId fieldObj = expr->kind.payload.Field.obj;
             if (self.isPayloadAccessNode(fieldObj))
             {
@@ -241,6 +252,37 @@ pub extend Sema
             MemberInfo member = self.findMember(self.exprType(expr->kind.payload.Field.obj), expr->kind.payload.Field.field);
             if (member.typeNode == 0) return false;
             self.setExprType(id, self.substituteFieldTy(member.typeNode, self.exprType(expr->kind.payload.Field.obj)));
+            return true;
+        }
+        if (expr->kind.tag == ExprKind::DerefField)
+        {
+            if (!self.checkExpr(expr->kind.payload.DerefField.obj)) return false;
+            NodeId fieldObj = expr->kind.payload.DerefField.obj;
+            if (self.isPayloadAccessNode(fieldObj))
+            {
+                Ty baseTy = self.exprType(self.fieldAccessObj(fieldObj));
+                if (self.isVariantNamedTy(baseTy))
+                {
+                    if (!self.variantHasCase(baseTy, expr->kind.payload.DerefField.field)) return false;
+                    self.setExprType(id, self.stripType(baseTy));
+                    return true;
+                }
+            }
+            else if (self.isVariantCaseAccess(fieldObj))
+            {
+                NodeId payloadId = self.fieldAccessObj(fieldObj);
+                Ty baseTy = self.exprType(self.fieldAccessObj(payloadId));
+                if (self.isVariantNamedTy(baseTy))
+                {
+                    Ty ft = self.findVariantCaseFieldTy(baseTy, self.fieldAccessName(fieldObj), expr->kind.payload.DerefField.field);
+                    if (ft == 0) return false;
+                    self.setExprType(id, self.substituteFieldTy(ft, baseTy));
+                    return true;
+                }
+            }
+            MemberInfo member = self.findMember(self.exprType(expr->kind.payload.DerefField.obj), expr->kind.payload.DerefField.field);
+            if (member.typeNode == 0) return false;
+            self.setExprType(id, self.substituteFieldTy(member.typeNode, self.exprType(expr->kind.payload.DerefField.obj)));
             return true;
         }
         if (expr->kind.tag == ExprKind::Index)
@@ -382,6 +424,41 @@ pub extend Sema
             if (ce->kind.tag == TypeKind::Named && ce->kind.payload.Named.genericArgsLen == decl->kind.payload.Func.genericParamsLen)
             {
                 sflag = 1;
+            }
+        }
+        /* a generic call with no explicit typeargs must be inferable by
+         * mono from direct parameter positions; otherwise no instance is
+         * ever collected (G0002) and codegen runs on a phantom call */
+        if (decl->kind.payload.Func.genericParamsLen > 0 && sflag == 0)
+        {
+            u32 gcount = decl->kind.payload.Func.genericParamsLen;
+            u8* slots = alloc<u8>((usize)gcount);
+            if (slots != null)
+            {
+                zero<u8>(slots, (usize)gcount);
+                self.markInferableGenericSlots(decl, argsLen, slots);
+                u32 gi = 0;
+                while (gi < gcount)
+                {
+                    if (slots[gi] == 0)
+                    {
+                        Node* gpn = self.ctx.nodes + decl->kind.payload.Func.genericParams[gi].index;
+                        String msg = String::new();
+                        msg.pushView("cannot infer generic type argument `");
+                        if (gpn->kind.tag == NodeKind::GenericParam)
+                            msg.pushView(self.nameTextView(gpn->kind.payload.GenericParam.value.name));
+                        else msg.pushView("?");
+                        msg.pushView("` in call to '");
+                        msg.pushView(self.nameTextView(decl->kind.payload.Func.name));
+                        msg.pushView("' from the argument types");
+                        self.semaErrorNodeHelp(ErrorCode::SemaBrokenDeclaration, callId, msg.asView(),
+                            "pass the type explicitly, e.g. `callee<i32>(...)` or make it a comptime generic to have inference.");
+                        dealloc<u8>(slots);
+                        return false;
+                    }
+                    gi++;
+                }
+                dealloc<u8>(slots);
             }
         }
         u32 i = 0;
@@ -1267,19 +1344,54 @@ pub extend Sema
             ExprKind::Ident => {
                 if (!self.checkIdent(id, expr->kind.payload.Ident.name)) return false;
                 Symbol* symbol = self.lookupAt(expr->kind.payload.Ident.name, id);
-                if (symbol != null) self.setExprType(id, symbol->typeNode);
+                if (symbol != null)
+                {
+                    /* a bare type name is a comptime type value inside a
+                     * comptime block (`@typeof(x) == i32`); anywhere else
+                     * it is not a runtime value (`twoNum.new(...)`). */
+                    if (symbol->kind == 3)
+                    {
+                        if (self.comptimeDepth > 0)
+                        {
+                            self.setExprType(id, self.u64Type());
+                            return true;
+                        }
+                        String msg = String::new();
+                        msg.pushView("type '");
+                        msg.pushView(self.nameTextView(symbol->name));
+                        msg.pushView("' is not a value");
+                        self.semaErrorNodeHelp(ErrorCode::SemaTypeMismatch, id, msg.asView(),
+                            "use `Type::method(...)` for an associated function, or an instance for a method call");
+                        return false;
+                    }
+                    self.setExprType(id, symbol->typeNode);
+                }
                 return true;
             },
             ExprKind::TypeRef => {
-                if (!self.checkIdent(id, expr->kind.payload.TypeRef.name)) return false;
-                /* `pick<self>(…)`: a type argument spelled `self` means the
-                 * receiver type, so resolve it before validation and before
-                 * the call binds generic params */
-                if (self.currentSelfType != 0)
-                    expr->kind.payload.TypeRef.typeNode =
-                        self.resolveSelfTy(expr->kind.payload.TypeRef.typeNode, self.currentSelfType);
+                if (expr->kind.payload.TypeRef.name != 0)
+                {
+                    if (!self.checkIdent(id, expr->kind.payload.TypeRef.name)) return false;
+                    /* `pick<self>(…)`: a type argument spelled `self` means the
+                     * receiver type, so resolve it before validation and before
+                     * the call binds generic params */
+                    if (self.currentSelfType != 0)
+                        expr->kind.payload.TypeRef.typeNode =
+                            self.resolveSelfTy(expr->kind.payload.TypeRef.typeNode, self.currentSelfType);
+                    if (!self.checkType(expr->kind.payload.TypeRef.typeNode)) return false;
+                    self.setExprType(id, expr->kind.payload.TypeRef.typeNode);
+                    return true;
+                }
+                /* primitive type keyword in expression position: a type
+                 * value, only meaningful in a comptime block */
                 if (!self.checkType(expr->kind.payload.TypeRef.typeNode)) return false;
-                self.setExprType(id, expr->kind.payload.TypeRef.typeNode);
+                if (self.comptimeDepth == 0)
+                {
+                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, id,
+                        "a type is not a runtime value");
+                    return false;
+                }
+                self.setExprType(id, self.u64Type());
                 return true;
             },
             ExprKind::Path => { return self.checkPath(id); },
@@ -1531,6 +1643,18 @@ pub extend Sema
             },
             ExprKind::MethodCall => {
                 if (!self.checkExpr(expr->kind.payload.MethodCall.receiver)) return false;
+                /* `.` never auto-derefs: `ptr.method()` must be `ptr->method()` */
+                if (!self.dotReceiverIsSelf(expr->kind.payload.MethodCall.receiver) &&
+                    self.dotOnPointer(self.exprType(expr->kind.payload.MethodCall.receiver)))
+                {
+                    String msg = String::new();
+                    msg.pushView("cannot call method '");
+                    msg.pushView(self.nameTextView(expr->kind.payload.MethodCall.method));
+                    msg.pushView("' with `.` on a pointer; use `->`");
+                    self.semaErrorNodeHelp(ErrorCode::SemaUnknownMember, id, msg.asView(),
+                        "`.` only works on values; `ptr->method()` dereferences the pointer first");
+                    return false;
+                }
                 MemberInfo methodInfo = self.findMethod(self.exprType(expr->kind.payload.MethodCall.receiver), expr->kind.payload.MethodCall.method);
                 if (methodInfo.declaration.index == 0)
                 {
@@ -1648,6 +1772,17 @@ pub extend Sema
             },
             ExprKind::Field => {
                 if (!self.checkExpr(expr->kind.payload.Field.obj)) return false;
+            if (!self.dotReceiverIsSelf(expr->kind.payload.Field.obj) &&
+                self.dotOnPointer(self.exprType(expr->kind.payload.Field.obj)))
+            {
+                String msg = String::new();
+                msg.pushView("cannot access field '");
+                msg.pushView(self.nameTextView(expr->kind.payload.Field.field));
+                msg.pushView("' with `.` on a pointer; use `->`");
+                self.semaErrorNodeHelp(ErrorCode::SemaUnknownMember, id, msg.asView(),
+                    "`.` only works on values; `ptr->field` dereferences the pointer first");
+                return false;
+            }
                 NodeId fieldObj = expr->kind.payload.Field.obj;
                 if (self.isPayloadAccessNode(fieldObj))
                 {
