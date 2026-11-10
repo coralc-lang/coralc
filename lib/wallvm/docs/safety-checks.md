@@ -8,7 +8,7 @@ rule: the backend learns zero new instructions — every check is an
 ordinary
 
 ```
-call void @_trap(kind, a, b, file, line)
+call void @_trap(kind, a, b, file, line, fn)
 ```
 
 placed before the operation that can fail. `_trap` lives in each
@@ -68,7 +68,7 @@ the other having run.
 
 `test/wallvm/checks/dedup.ir` pins the behavior: three geps on the same
 index (first in `entry`, two in the dominated `body`) must leave
-**exactly one** `call _trap@PLT` in the O0 asm (run_checks asserts the
+**exactly one** `call _CNl4core5error5_trapEFmmmKPNl4core5cchar5ccharEmKPNl4core5cchar5ccharE_v` in the O0 asm (run_checks asserts the
 count, not just presence).
 
 ## Kill-switch

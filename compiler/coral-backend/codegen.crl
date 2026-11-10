@@ -10,7 +10,7 @@
  */
 use context::context { AstContext, InternEntry };
 use build::arena { Arena };
-import std::error { __panic };
+import core::error { __panic };
 use common::slice { Slice };
 use mono::mono { MonoContext, MonoSubstitution, MonoInstance, MonoInstanceKind };
 use diag { engine { DiagnosticEngine }, code { ErrorCode } };
@@ -23,7 +23,12 @@ use ast {
     id { Str, NodeId, locFile, SourceLoc },
     types { Ty, TypeEntry, TypeKind },
     node { Node, NodeKind },
-    expr { Expr, ExprKind, BUILTIN_ASSERT, BUILTIN_ASSERTOUT },
+    expr { Expr, ExprKind, builtinImplHash,
+           BUILTIN_ASSERT, BUILTIN_ASSERTOUT, BUILTIN_PANIC, BUILTIN_UNREACHABLE,
+           BUILTIN_REPORT, BUILTIN_REPORTHEX, BUILTIN_ABORTNOW, BUILTIN_ASSERTEQ,
+           BUILTIN_ASSERTNE, BUILTIN_ASSERTLT, BUILTIN_ASSERTLE, BUILTIN_ASSERTGT,
+           BUILTIN_ASSERTGE, BUILTIN_ASSERTRANGE, BUILTIN_ASSERTNONNULL,
+           BUILTIN_ASSERTALIGNED, BUILTIN_BACKTRACETO },
     stmt { Stmt, StmtKind, SwitchCase },
     decl { Decl, DeclKind, File, Param, Field, EnumVariant, VariantVariant,
            ATTR_INLINE, ATTR_INLINE_ALWAYS, ATTR_NO_MANGLE },
@@ -2655,6 +2660,79 @@ u8 cgMethodRecvKind(Codegen* cg, Ty recvTy, Str method, bool* found)
 
 /* ── expressions ─────────────────────────────────────────────── */
 
+/* the Func decl in the module tree whose interned name matches a
+ * precomputed FNV hash+length; 0 when the unit does not contain it.
+ * no probe string is interned. */
+NodeId cgFindDeclByHash(Codegen* cg, u32 hash, u32 len)
+{
+    NodeId none;
+    none.index = 0;
+    if (cg.file == null) return none;
+    u32 i = 0;
+    while (i < cg.file.declsLen)
+    {
+        NodeId did = cg.file.decls[i];
+        Node* n = cg.ctx->nodes + did.index;
+        if (n.kind.tag == NodeKind::Decl &&
+            n.kind.payload.Decl.value.kind.tag == DeclKind::Func)
+        {
+            Decl* d = &n.kind.payload.Decl.value;
+            if (cg.ctx->internEqHashLen(d.kind.payload.Func.name, hash, len)) return did;
+        }
+        i++;
+    }
+    return none;
+}
+
+/* comma-separated argument text for a call against `fdecl`'s parameter
+ * list (0 = unknown): comptime params are skipped, str→ptr and
+ * array→slice params decay, by-value args are moved. */
+Slice cgCallArgsText(Codegen* cg, NodeId fdecl, NodeId* args, u32 argsLen)
+{
+    Stream abuf = stNew(cg.arena, 64);
+    bool first = true;
+    u32 i = 0;
+    while (i < argsLen && i < 16) {
+        bool skip = false;
+        bool dec = false;
+        Ty sliceTy = 0;
+        if (fdecl.index != 0) {
+            Node* fdn = cgNode(cg, fdecl);
+            Decl* fd = &fdn.kind.payload.Decl.value;
+            if (i < fd.kind.payload.Func.paramsLen) {
+                Node* pn = cgNode(cg, fd.kind.payload.Func.params[i]);
+                if (pn.kind.tag == NodeKind::Param) {
+                    Param* pp = &pn.kind.payload.Param.value;
+                    if ((pp->flags & 8) != 0) skip = true;
+                    else dec = cgStrToPtr(cg, pp->typeNode, args[i]);
+                    if (!dec) sliceTy = cgArrayToSliceParam(cg, pp->typeNode, args[i]);
+                }
+            }
+        }
+        if (!skip) {
+            if (first) first = false;
+            else stP(&abuf, ", ");
+            if (sliceTy != 0)
+            {
+                Node* san = cgNode(cg, args[i]);
+                Ty sat = cgSubstTy(cg, san.kind.payload.Expr.value.resolvedType);
+                cgEmitSliceFromArr(cg, sliceTy, sat, cgExpr(cg, args[i]));
+            }
+            else
+            {
+                /* str→ptr decay borrows the buffer; a plain by-value
+                 * arg moves it */
+                if (!dec) cgMoveArg(cg, args[i]);
+                stPS(&abuf, cgExpr(cg, args[i]));
+                if (dec) stP(&abuf, ".ptr");
+            }
+        }
+        i++;
+    }
+    if (argsLen > 16) cgError(cg, "too many arguments (cap 16)");
+    return stTail(&abuf, 0);
+}
+
 extern("C") Slice cgExpr(Codegen* cg, NodeId id);
 extern("C") Slice cgLvalue(Codegen* cg, NodeId id);
 extern("C") Slice cgValBody(Codegen* cg, NodeId id);
@@ -3421,57 +3499,8 @@ Slice cgExpr(Codegen* cg, NodeId id)
             }
             /* comptime (type-level) parameters are erased from the C
                signature: skip their arguments here as well */
-            Slice argTexts = Slice::from(null, 0);
-            u32 n = 0;
-            {
-                Stream abuf = stNew(cg.arena, 64);
-                bool first = true;
-                NodeId* args = e.kind.payload.Call.args;
-                u32 argsLen = e.kind.payload.Call.argsLen;
-                u32 i = 0;
-                /* hard cap of 16 call args; overflow is reported as an
-                 * error after the loop */
-                while (i < argsLen && i < 16) {
-                    bool skip = false;
-                    bool dec = false;
-                    Ty sliceTy = 0;
-                    if (fdecl.index != 0) {
-                        Node* fdn = cgNode(cg, fdecl);
-                        Decl* fd = &fdn.kind.payload.Decl.value;
-                        if (i < fd.kind.payload.Func.paramsLen) {
-                            Node* pn = cgNode(cg, fd.kind.payload.Func.params[i]);
-                            if (pn.kind.tag == NodeKind::Param) {
-                                Param* pp = &pn.kind.payload.Param.value;
-                                if ((pp->flags & 8) != 0) skip = true;
-                                else dec = cgStrToPtr(cg, pp->typeNode, args[i]);
-                                if (!dec) sliceTy = cgArrayToSliceParam(cg, pp->typeNode, args[i]);
-                            }
-                        }
-                    }
-                    if (!skip) {
-                        if (first) first = false;
-                        else stP(&abuf, ", ");
-                        if (sliceTy != 0)
-                        {
-                            Node* san = cgNode(cg, args[i]);
-                            Ty sat = cgSubstTy(cg, san.kind.payload.Expr.value.resolvedType);
-                            cgEmitSliceFromArr(cg, sliceTy, sat, cgExpr(cg, args[i]));
-                        }
-                        else
-                        {
-                            /* str→ptr decay borrows the buffer; a plain
-                             * by-value arg moves it */
-                            if (!dec) cgMoveArg(cg, args[i]);
-                            stPS(&abuf, cgExpr(cg, args[i]));
-                            if (dec) stP(&abuf, ".ptr");
-                        }
-                        n++;
-                    }
-                    i++;
-                }
-                if (argsLen > 16) cgError(cg, "too many arguments (cap 16)");
-                argTexts = stTail(&abuf, 0);
-            }
+            Slice argTexts = cgCallArgsText(cg, fdecl, e.kind.payload.Call.args,
+                                            e.kind.payload.Call.argsLen);
             usize ccs = cg.ebuf.len;
             stPS(&cg.ebuf, calleeText);
             stCh(&cg.ebuf, '(');
@@ -4009,50 +4038,42 @@ Slice cgExpr(Codegen* cg, NodeId id)
 
         ExprKind::BuiltinCall => {
             u32 bn = e.kind.payload.BuiltinCall.builtin;
-            if (bn == BUILTIN_ASSERT && e.kind.payload.BuiltinCall.argsLen == 1) {
-                Slice a = cgExpr(cg, e.kind.payload.BuiltinCall.args[0]);
-                stNL(&cg.body, cg.ind);
-                stP(&cg.body, "assert(");
-                stPS(&cg.body, a);
-                stP(&cg.body, ");");
-                usize rs = cg.ebuf.len;
+            u32 implHash = 0;
+            u32 implLen = 0;
+            if (!builtinImplHash(bn, &implHash, &implLen)) {
+                /* compile-time builtins (compileError / isFormatLiteral /
+                 * typeof) are consumed by sema and mono and must never
+                 * arrive here */
+                cgError(cg, "unsupported builtin call");
                 stP(&cg.ebuf, "0");
-                return stTail(&cg.ebuf, rs);
+                return stTail(&cg.ebuf, es);
             }
-            /* @assertOut(cond) / @assertOut(cond, "msg"): like @assert; with a
-             * message the msg text appears in the assertion failure output */
-            if (bn == BUILTIN_ASSERTOUT && e.kind.payload.BuiltinCall.argsLen >= 1) {
-                Slice a = cgExpr(cg, e.kind.payload.BuiltinCall.args[0]);
-                stNL(&cg.body, cg.ind);
-                stP(&cg.body, "assert((");
-                stPS(&cg.body, a);
-                if (e.kind.payload.BuiltinCall.argsLen >= 2) {
-                    NodeId mid2 = e.kind.payload.BuiltinCall.args[1];
-                    Slice m = cgExpr(cg, mid2);
-                    bool mIsStr = false;
-                    Node* mnn = cgNode(cg, mid2);
-                    if (mnn.kind.tag == NodeKind::Expr && mnn.kind.payload.Expr.value.resolvedType != 0 &&
-                        (cg.ctx->types + mnn.kind.payload.Expr.value.resolvedType)->kind.tag == TypeKind::Str)
-                        mIsStr = true;
-                    stP(&cg.body, ") && ");
-                    if (mIsStr) stP(&cg.body, "_coral_strtruth(");
-                    else stCh(&cg.body, '(');
-                    stPS(&cg.body, m);
-                    stCh(&cg.body, ')');
-                    stP(&cg.body, ");");
-                } else {
-                    stP(&cg.body, "));");
-                }
-                usize rs = cg.ebuf.len;
+            /* @assertOut(cond) without a message is @assert(cond) */
+            if (bn == BUILTIN_ASSERTOUT && e.kind.payload.BuiltinCall.argsLen < 2)
+                builtinImplHash(BUILTIN_ASSERT, &implHash, &implLen);
+            /* the tag only names the implementation; resolve its decl in
+             * the module tree and emit the resolved mangled symbol */
+            NodeId implId = cgFindDeclByHash(cg, implHash, implLen);
+            if (implId.index == 0) {
+                cgErrorAt(cg, id, "the @-error builtins are not in this unit (import core::error)");
                 stP(&cg.ebuf, "0");
-                return stTail(&cg.ebuf, rs);
+                return stTail(&cg.ebuf, es);
             }
-            /* compile-time builtins (compileError / isFormatLiteral /
-             * typeof) are consumed by sema and mono and must never
-             * arrive here */
-            cgError(cg, "unsupported builtin call");
-            stP(&cg.ebuf, "0");
-            return stTail(&cg.ebuf, es);
+            Ty rty = 0;
+            bool found = false;
+            NodeId fdecl;
+            fdecl.index = 0;
+            Slice callee = cgCallFromDecl(cg, implId, 0, e.kind.payload.BuiltinCall.args,
+                                          e.kind.payload.BuiltinCall.argsLen,
+                                          &rty, &found, &fdecl);
+            Slice argTexts = cgCallArgsText(cg, fdecl, e.kind.payload.BuiltinCall.args,
+                                            e.kind.payload.BuiltinCall.argsLen);
+            usize ccs = cg.ebuf.len;
+            stPS(&cg.ebuf, callee);
+            stCh(&cg.ebuf, '(');
+            stPS(&cg.ebuf, argTexts);
+            stCh(&cg.ebuf, ')');
+            return stTail(&cg.ebuf, ccs);
         },
 
         ExprKind::SwitchExpr => {

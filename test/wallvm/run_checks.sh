@@ -32,7 +32,7 @@ for case in checks/*.ir; do
     if ! t ./irtool "$case" "$OUT/chk_${name}_O0.s" O0 2>"$TMP/${name}_O0.err"; then
         bad "$name O0 compile"; cat "$TMP/${name}_O0.err"; continue
     fi
-    if ! grep -q "_trap" "$OUT/chk_${name}_O0.s"; then
+    if ! grep -q "5_trap" "$OUT/chk_${name}_O0.s"; then
         bad "$name O0: no _trap in instrumented asm"; continue
     fi
     ok
@@ -40,7 +40,7 @@ for case in checks/*.ir; do
     # dominance dedup: the dominated duplicate geps collapse into their
     # dominating original — exactly one unconditional call remains
     if [ "$name" = "dedup" ]; then
-        n=$(grep -c "call.*_trap" "$OUT/chk_${name}_O0.s" || true)
+        n=$(grep -c "call.*5_trap" "$OUT/chk_${name}_O0.s" || true)
         if [ "$n" -eq 1 ]; then ok; else bad "dedup O0: $n trap calls, want 1"; fi
     fi
 
@@ -55,7 +55,7 @@ for case in checks/*.ir; do
     if ! t ./irtool "$case" "$OUT/chk_${name}_O2.s" O2 2>"$TMP/${name}_O2.err"; then
         bad "$name O2 compile"; cat "$TMP/${name}_O2.err"; continue
     fi
-    if grep -q "_trap" "$OUT/chk_${name}_O2.s"; then
+    if grep -q "5_trap" "$OUT/chk_${name}_O2.s"; then
         bad "$name O2: _trap present at release"
         continue
     fi
@@ -74,7 +74,7 @@ done
 # WALLVM_CHECKS=0: even O0 inserts nothing (direct invocation so the
 # environment does not leak through a shell function)
 if timeout --kill-after=5 "$TIMEOUT" env WALLVM_CHECKS=0 ./irtool checks/clean.ir "$OUT/chk_off_O0.s" O0 2>"$TMP/off.err"; then
-    if grep -q "_trap" "$OUT/chk_off_O0.s"; then
+    if grep -q "5_trap" "$OUT/chk_off_O0.s"; then
         bad "WALLVM_CHECKS=0: _trap still present"
     else
         ok

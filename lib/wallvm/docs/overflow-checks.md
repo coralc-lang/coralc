@@ -53,7 +53,7 @@ add:  select(r  <u a, 1, 0)      // carry out
 sub:  select(a  <u b, 1, 0)      // borrow
 ```
 
-The chain ends in `_trap(3, _flag, 0, file, line)`; `_flag == 0` means
+The chain ends in `_trap(3, _flag, 0, file, line, fn)`; `_flag == 0` means
 the result is fine and the call returns.
 
 ## `mul` is reserved
@@ -97,7 +97,7 @@ merge:
     ... phi carries %ov/%ov1        // real branch — this is the point
     br merge2
 merge2:
-    call void @_trap(3, flag, 0, file, line)
+    call void @_trap(3, flag, 0, file, line, fn)
     <original next>
 ```
 
