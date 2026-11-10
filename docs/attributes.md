@@ -92,8 +92,13 @@ These parse, are stored by name, and do nothing:
   name (e.g. `no_mangle`/`extern` colliding) are a compile-time error.
 - `#[[generate(...)]]` — derive-style boilerplate generator; planned
   spelling `#[[generate(Drop, Add)]]`. Arguments are skipped by the parser.
-- `#[[no_std]]`, `#[[extern]]` — future slots; `extern` already exists as
-  a keyword form.
+- `#[[freestanding]]` — file-level attribute: disables the builtin prelude
+  (no implicit `core::str`, `core::error`, `std::ios`, `std::string`,
+  `std::option`, `std::result`, `std::vec`, `std::arr`). Explicit imports
+  still work. `assert`/`assertOut` and the runtime error builtins (`@panic`,
+  `@unreachable`, `@report`, `@reportHex`, `@abortNow`, `@assertEq`, …,
+  `@backtraceTo`) are rejected in a freestanding file.
+- `#[[extern]]` — future slot; `extern` already exists as a keyword form.
 - `#[[test]]`, `#[[bench]]`, `#[[cfg]]`, `#[[link]]`, `#[[simd]]` — future
   slots, accepted and ignored.
 - `#[[pub]]` — deliberately **not** an attribute; `pub` is the visibility
