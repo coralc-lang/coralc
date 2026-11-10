@@ -16,11 +16,11 @@ Four forms, nothing else. **Never write a string path** (`import "x"`) —
 that syntax is being removed. Never write `.crl` in an import.
 
 ```crl
-import token { TokenKind, Token };          // sibling: ./token.crl next to this file
-import lexer::table { TokenTable };         // module import (builder-resolved)
-import(lib) std::mman { alloc, dealloc };   // import from the lib surface
-import(lib) core;                           // whole surface, no item list
-import(lib) std::allocator { Allocator, mimalloc { MiAlloc }, tlsf { Tlsf } };  // nested items
+use token { TokenKind, Token };          // sibling: ./token.crl next to this file
+use lexer::table { TokenTable };         // module import (builder-resolved)
+import std::mman { alloc, dealloc };   // import from the lib surface
+import core;                           // whole surface, no item list
+import std::allocator { Allocator, mimalloc { MiAlloc }, tlsf { Tlsf } };  // nested items
 ```
 
 Nested item braces are supported: `mimalloc::{ MiAlloc }` inside an item
