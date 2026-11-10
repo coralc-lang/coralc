@@ -1,0 +1,953 @@
+#[[no_drop_all]]
+import wallvm::irtypes { IrContext, IrModule, IrFunc, IrBlock, IrInst, IrValue, IrValueKind, IrType, IrTypeKind, IrStringConst, IrGlobal, IrArrayConst, IrStructConst };
+import wallvm::irOps { IrOpcode, IrICmpPred, IrFCmpPred };
+import wallvm::irMetadata { funcIsEntry, funcIsNaked, hasFuncAttr, funcAttrInt };
+import wallvm::assembly::x86::common { lookupReg };
+import std::string { String };
+import std::mman { alloc, dealloc };
+import std::ios { eprintln };
+import wallvm::assembly::common { parseConstraints, AsmConstraint, AsmConClass, AsmParseError };
+import wallvm::target::x86_64_base { X86_64CodeGen, X86_64Emitter, CpuFeatures, ElfMetadata, defaultCpuFeatures, defaultFuncMeta, X86_64_RESERVED_INT, X86_64_RESERVED_FLOAT, X86_64_INT_REGS, X86_64_INT_REGS_WIN64, X86_64_FLOAT_REGS, u32ToStr, u64ToHex, valueIsIntConst, intImmText, i64ToDec, i64ToHex, stageText, rspSlotText, sibText, isRnReg, toReg32, toReg16, narrowOp, toReg8, textBufNext, setccIntOp, jccIntTrueOp, jccIntFalseOp };
+
+
+pub extend X86_64CodeGen
+{
+
+    // Core packed op: the sse form copies src1 into the work register
+    // (dst's home when it did not spill, xmm15 when it did) and folds
+    // src2 in — lsra keeps dst live until after its srcs' uses, so src1
+    // is never the work register and the copy is always safe. A width
+    // above 128 takes the three-operand vex form when the feature bit
+    // allows it (the middle source must be a register, so a spilled
+    // src1 reloads into xmm0); without the bit the low half still
+    // computes and a comment marks the truncation.
+    void emitVecTwoOp(IrInst* inst, str mn, bool avxReady)
+    {
+        IrValue* dv = &inst->base;
+        IrValue* av = (inst->nops > 0) ? inst->ops[0] : null;
+        IrValue* bv = (inst->nops > 1) ? inst->ops[1] : null;
+        if (av == null || bv == null)
+        {
+            self.emitter.emitComment("vec op missing an operand");
+            return;
+        }
+        str dst = self.getRegForValue(dv);
+        bool dstSpill = self.valueIsSpill(dv);
+        str work = dstSpill ? "xmm15" : dst;
+        u32 w = dv->type != null ? dv->type->width : 128;
+        bool vex = w > 128 && avxReady && self.emitter.features != null;
+        if (w > 128 && !vex)
+            self.emitter.emitComment("256-bit vector op without avx2 — low half only");
+        if (vex)
+        {
+            str s1 = self.valueIsSpill(av) ? self.opForRegF(av, "xmm0") : self.getRegForValue(av);
+            str s2 = self.getRegForValue(bv);
+            self.emitter.emit("\tv");
+            self.emitter.emit(mn);
+            self.emitter.emit(" ");
+            self.emitter.emit(self.xmmToYmm(s2));
+            self.emitter.emit(", ");
+            self.emitter.emit(self.xmmToYmm(s1));
+            self.emitter.emit(", ");
+            self.emitter.emitLine(self.xmmToYmm(work));
+        }
+        else
+        {
+            str s1 = self.getRegForValue(av);
+            str s2 = self.getRegForValue(bv);
+            if (!s1.equals(work))
+            {
+                self.emitter.emit("\tmovdqa ");
+                self.emitter.emit(s1);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(work);
+            }
+            self.emitter.emit("\t");
+            self.emitter.emit(mn);
+            self.emitter.emit(" ");
+            self.emitter.emit(s2);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(work);
+        }
+        if (dstSpill) self.sinkF(dv, "xmm15");
+    }
+
+    // Integer packed op: the mnemonic comes from the element width —
+    // paddb/paddw/paddd/paddq and friends — while the muls with no
+    // packed form (8-bit, 64-bit, pmulld before sse4.1) walk their
+    // lanes instead, because pmuludq is a u32 product, not i64.
+    void emitVecBinOp(IrInst* inst, str stem)
+    {
+        IrValue* av = (inst->nops > 0) ? inst->ops[0] : null;
+        u32 ew = 32;
+        if (av != null && av->type != null && av->type->elem != null && av->type->elem->width > 0)
+            ew = av->type->elem->width;
+        bool avx2 = self.emitter.features != null && self.emitter.features->avx2;
+        bool sse41 = self.emitter.features != null && self.emitter.features->sse41;
+
+        if (stem.equals("mul"))
+        {
+            if (ew == 16)
+            {
+                self.emitVecTwoOp(inst, "pmullw", avx2);
+                return;
+            }
+            if (ew == 32 && sse41)
+            {
+                self.emitVecTwoOp(inst, "pmulld", avx2);
+                return;
+            }
+            self.emitVecLaneOp(inst, 1);
+            return;
+        }
+
+        char[8] mnbuf;
+        mnbuf[0] = 'p';
+        u32 i = 1;
+        while (stem.ptr[i - 1] != 0 && i < 7)
+        {
+            mnbuf[i] = (char)stem.ptr[i - 1];
+            i++;
+        }
+        str sfx = ew == 64 ? "q" : ew == 16 ? "w" : ew == 8 ? "b" : "d";
+        u32 k = 0;
+        while (sfx.ptr[k] != 0 && i < 7)
+        {
+            mnbuf[i++] = (char)sfx.ptr[k++];
+        }
+        mnbuf[i] = 0;
+        self.emitVecTwoOp(inst, str::fromParts((const u8*)mnbuf, (usize)i), avx2);
+    }
+
+    void emitVecFloatBinOp(IrInst* inst, str psOp, str pdOp)
+    {
+        // the pd spelling belongs to the 64-bit element lanes — the old
+        // emitter ignored pdOp and sent <2 x f64> through addps
+        IrValue* av = (inst->nops > 0) ? inst->ops[0] : null;
+        bool isDbl = av != null && av->type != null && av->type->elem != null &&
+                     av->type->elem->width == 64;
+        self.emitVecTwoOp(inst, isDbl ? pdOp : psOp,
+                     self.emitter.features != null && self.emitter.features->avx);
+    }
+
+    void emitBroadcast(IrInst* inst)
+    {
+        // splat the source scalar across every lane. The 256-bit width
+        // takes vpbroadcastd/q (xmm/m32 source, ymm is the only
+        // destination); narrow int scalars first rebuild a clean dword
+        // in r10 — a spilled i8/i16 slot only stores its own bytes, so
+        // broadcasting the raw dword would replicate stale slot bytes.
+        IrValue* dv = &inst->base;
+        IrValue* sv = (inst->nops > 0) ? inst->ops[0] : null;
+        if (sv == null)
+        {
+            self.emitter.emitComment("broadcast missing a source");
+            return;
+        }
+        str dst = self.getRegForValue(dv);
+        bool dstSpill = self.valueIsSpill(dv);
+        str work = dstSpill ? "xmm15" : dst;
+        u32 w = dv->type != null ? dv->type->width : 128;
+        u32 ew = 32;
+        if (sv->type != null && sv->type->width > 0 && sv->type->width <= 64)
+            ew = sv->type->width;
+        bool isFlt = self.valueIsFloatClass(sv);
+        bool vex = w > 128 && self.emitter.features != null && self.emitter.features->avx2;
+        if (vex)
+        {
+            str s;
+            if (isFlt)
+            {
+                s = self.getRegForValue(sv);
+            }
+            else if (ew == 64)
+            {
+                s = self.valueIsSpill(sv) ? self.getRegForValue(sv) : "xmm0";
+                if (!self.valueIsSpill(sv))
+                {
+                    self.emitter.emit("\tmovq ");
+                    self.emitter.emit(self.getRegForValue(sv));
+                    self.emitter.emitLine(", xmm0");
+                }
+            }
+            else if (ew == 32)
+            {
+                s = self.valueIsSpill(sv) ? self.getRegForValue(sv) : "xmm0";
+                if (!self.valueIsSpill(sv))
+                {
+                    self.emitter.emit("\tmovd ");
+                    self.emitter.emit(toReg32(self.getRegForValue(sv)));
+                    self.emitter.emitLine(", xmm0");
+                }
+            }
+            else
+            {
+                self.emitBcastDword(sv, ew);
+                self.emitter.emitLine("\tmovd r10d, xmm0");
+                s = "xmm0";
+            }
+            self.emitter.emit("\tvpbroadcast");
+            self.emitter.emit(ew == 64 ? "q " : "d ");
+            self.emitter.emit(s);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(self.xmmToYmm(work));
+        }
+        else
+        {
+            if (w > 128) self.emitter.emitComment("256-bit broadcast without avx2 — low half only");
+            if (ew == 64)
+            {
+                self.emitter.emit(isFlt ? "\tmovsd " : "\tmovq ");
+                self.emitter.emit(self.getRegForValue(sv));
+                self.emitter.emit(", ");
+                self.emitter.emitLine(work);
+                self.emitter.emit("\tshufpd $1, ");
+                self.emitter.emit(work);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(work);
+            }
+            else if (ew == 32)
+            {
+                if (isFlt)
+                {
+                    self.emitter.emit("\tmovss ");
+                    self.emitter.emit(self.getRegForValue(sv));
+                    self.emitter.emit(", ");
+                    self.emitter.emitLine(work);
+                }
+                else if (self.valueIsSpill(sv))
+                {
+                    self.emitter.emit("\tmovd ");
+                    self.emitter.emit(self.getRegForValue(sv));
+                    self.emitter.emit(", ");
+                    self.emitter.emitLine(work);
+                }
+                else
+                {
+                    self.emitter.emit("\tmovd ");
+                    self.emitter.emit(toReg32(self.getRegForValue(sv)));
+                    self.emitter.emit(", ");
+                    self.emitter.emitLine(work);
+                }
+                self.emitter.emit("\tshufps $0, ");
+                self.emitter.emit(work);
+                self.emitter.emit(", ");
+                self.emitter.emit(work);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(work);
+            }
+            else if (ew == 16)
+            {
+                // the dword pattern [W W] out of a repeated-word imul,
+                // then duplicate it across the qword
+                self.emitBcastDword(sv, 16);
+                self.emitter.emit("\tmovd r10d, ");
+                self.emitter.emitLine(work);
+                self.emitter.emit("\tpunpcklqdq ");
+                self.emitter.emit(work);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(work);
+            }
+            else
+            {
+                // byte lanes: the 0x01010101 pattern, widened by
+                // punpcklbw and then punpcklqdq
+                self.emitBcastDword(sv, 8);
+                self.emitter.emit("\tmovd r10d, ");
+                self.emitter.emitLine(work);
+                self.emitter.emit("\tpunpcklbw ");
+                self.emitter.emit(work);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(work);
+                self.emitter.emit("\tpunpcklqdq ");
+                self.emitter.emit(work);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(work);
+            }
+        }
+        if (dstSpill) self.sinkF(dv, "xmm15");
+    }
+
+    // Build the replicated dword for a narrow scalar into r10d: the
+    // value zero-extends into r10d, then imul repeats it across all
+    // four bytes (8-bit) or two words (16-bit).
+    void emitBcastDword(IrValue* sv, u32 ew)
+    {
+        if (self.valueIsSpill(sv))
+        {
+            self.emitter.emit(ew == 8 ? "\tmovzbl " : "\tmovzwl ");
+            self.emitter.emit(self.opFor(sv));
+            self.emitter.emitLine(", r10d");
+        }
+        else
+        {
+            str home = self.opFor(sv);
+            self.emitter.emit(ew == 8 ? "\tmovzbl " : "\tmovzwl ");
+            self.emitter.emit(ew == 8 ? toReg8(home) : toReg16(home));
+            self.emitter.emitLine(", r10d");
+        }
+        if (ew == 8)
+            self.emitter.emitLine("\timul $0x01010101, r10d");
+        else
+            self.emitter.emitLine("\timul $0x00010001, r10d");
+    }
+
+    // Lane walk for the packed ops with no hardware form: the operands
+    // park in a 16-byte window below rsp (pure sse2 — no pextr/pinsr
+    // gate, so no sse4.1 dependency), each lane travels r10/r11 — and
+    // rax/rdx for idiv, pushed and popped around the walk because lsra
+    // hands those out like hasAny other allocatable — and the result
+    // rides back through the window into the work register. The window
+    // sits below rsp, inside a leaf's red zone; nothing calls while it
+    // is live.
+    // kind: 0 = signed divide, 1 = multiply low, 2 = unsigned min, 3 = unsigned max
+    void emitVecLaneOp(IrInst* inst, u32 kind)
+    {
+        IrValue* dv = &inst->base;
+        IrValue* av = (inst->nops > 0) ? inst->ops[0] : null;
+        IrValue* bv = (inst->nops > 1) ? inst->ops[1] : null;
+        if (av == null || bv == null)
+        {
+            self.emitter.emitComment("vec lane op missing an operand");
+            return;
+        }
+        u32 ew = 32;
+        if (av->type != null && av->type->elem != null && av->type->elem->width > 0)
+            ew = av->type->elem->width;
+        u32 lanes = ew == 64 ? 2 : ew == 32 ? 4 : ew == 16 ? 8 : 16;
+        u32 esz = ew / 8;
+        if (esz == 0) esz = 1;
+        str dst = self.getRegForValue(dv);
+        bool dstSpill = self.valueIsSpill(dv);
+        str work = dstSpill ? "xmm15" : dst;
+        if (kind == 0)
+        {
+            self.emitter.emitLine("\tpushq %rax");
+            self.emitter.emitLine("\tpushq %rdx");
+        }
+        str s1 = self.valueIsSpill(av) ? self.opForRegF(av, "xmm0") : self.getRegForValue(av);
+        str s2 = self.valueIsSpill(bv) ? self.opForRegF(bv, "xmm1") : self.getRegForValue(bv);
+        self.emitter.emit("\tmovdqu ");
+        self.emitter.emit(s1);
+        self.emitter.emitLine(", -32(%rsp)");
+        self.emitter.emit("\tmovdqu ");
+        self.emitter.emit(s2);
+        self.emitter.emitLine(", -16(%rsp)");
+        for (u32 i = 0; i < lanes; i++)
+        {
+            str aT = "";
+            str bT = "";
+            aT = rspSlotText(32 - i * esz);
+            bT = rspSlotText(16 - i * esz);
+            if (kind == 0)
+            {
+                // signed divide: narrow lanes sign-extend, the quotient
+                // lands in rax/eax, and only the lane's own width goes
+                // back so the neighbors survive
+                if (ew == 64)
+                {
+                    self.emitter.emit("\tmovq ");
+                    self.emitter.emit(aT);
+                    self.emitter.emitLine(", r10");
+                    self.emitter.emit("\tmovq ");
+                    self.emitter.emit(bT);
+                    self.emitter.emitLine(", r11");
+                    self.emitter.emitLine("\tmovq r10, rax");
+                    self.emitter.emitLine("\tcqto");
+                    self.emitter.emitLine("\tidivq r11");
+                    self.emitter.emit("\tmovq rax, ");
+                    self.emitter.emitLine(aT);
+                }
+                else
+                {
+                    str lmv = ew == 32 ? "\tmovl " : ew == 16 ? "\tmovswl " : "\tmovsbl ";
+                    self.emitter.emit(lmv);
+                    self.emitter.emit(aT);
+                    self.emitter.emitLine(", r10d");
+                    self.emitter.emit(lmv);
+                    self.emitter.emit(bT);
+                    self.emitter.emitLine(", r11d");
+                    self.emitter.emitLine("\tmovl r10d, eax");
+                    self.emitter.emitLine("\tcltd");
+                    self.emitter.emitLine("\tidivl r11d");
+                    str smv = ew == 32 ? "\tmovl eax, " : ew == 16 ? "\tmovw ax, " : "\tmovb al, ";
+                    self.emitter.emit(smv);
+                    self.emitter.emitLine(aT);
+                }
+            }
+            else if (kind == 1)
+            {
+                // multiply: only the low bits of the product matter, so
+                // zero-extension is enough for hasAny signedness
+                if (ew == 64)
+                {
+                    self.emitter.emit("\tmovq ");
+                    self.emitter.emit(aT);
+                    self.emitter.emitLine(", r10");
+                    self.emitter.emit("\tmovq ");
+                    self.emitter.emit(bT);
+                    self.emitter.emitLine(", r11");
+                    self.emitter.emitLine("\timulq r11, r10");
+                    self.emitter.emit("\tmovq r10, ");
+                    self.emitter.emitLine(aT);
+                }
+                else
+                {
+                    str lmv = ew == 32 ? "\tmovl " : ew == 16 ? "\tmovzwl " : "\tmovzbl ";
+                    self.emitter.emit(lmv);
+                    self.emitter.emit(aT);
+                    self.emitter.emitLine(", r10d");
+                    self.emitter.emit(lmv);
+                    self.emitter.emit(bT);
+                    self.emitter.emitLine(", r11d");
+                    self.emitter.emitLine("\timul r11d, r10d");
+                    str smv = ew == 32 ? "\tmovl r10d, " : ew == 16 ? "\tmovw r10w, " : "\tmovb r10b, ";
+                    self.emitter.emit(smv);
+                    self.emitter.emitLine(aT);
+                }
+            }
+            else
+            {
+                // unsigned min/max by compare + cmov: covers 64-bit
+                // lanes and hasAny machine without sse4.1's pminuw/pminud
+                // (8-bit pminub/pmaxub are sse2 and take the packed path)
+                if (ew == 64)
+                {
+                    self.emitter.emit("\tmovq ");
+                    self.emitter.emit(aT);
+                    self.emitter.emitLine(", r10");
+                    self.emitter.emit("\tmovq ");
+                    self.emitter.emit(bT);
+                    self.emitter.emitLine(", r11");
+                    self.emitter.emitLine("\tcmpq r10, r11");
+                    self.emitter.emitLine(kind == 2 ? "\tcmovb r11, r10" : "\tcmova r11, r10");
+                    self.emitter.emit("\tmovq r10, ");
+                    self.emitter.emitLine(aT);
+                }
+                else
+                {
+                    str lmv = ew == 32 ? "\tmovl " : ew == 16 ? "\tmovzwl " : "\tmovzbl ";
+                    self.emitter.emit(lmv);
+                    self.emitter.emit(aT);
+                    self.emitter.emitLine(", r10d");
+                    self.emitter.emit(lmv);
+                    self.emitter.emit(bT);
+                    self.emitter.emitLine(", r11d");
+                    self.emitter.emitLine("\tcmpl r10d, r11d");
+                    self.emitter.emitLine(kind == 2 ? "\tcmovb r11d, r10d" : "\tcmova r11d, r10d");
+                    str smv = ew == 32 ? "\tmovl r10d, " : ew == 16 ? "\tmovw r10w, " : "\tmovb r10b, ";
+                    self.emitter.emit(smv);
+                    self.emitter.emitLine(aT);
+                }
+            }
+        }
+        self.emitter.emit("\tmovdqu -32(%rsp), ");
+        self.emitter.emitLine(work);
+        if (kind == 0)
+        {
+            self.emitter.emitLine("\tpopq %rdx");
+            self.emitter.emitLine("\tpopq %rax");
+        }
+        if (dstSpill) self.sinkF(dv, "xmm15");
+    }
+
+    void emitVecMinMax(IrInst* inst, bool isMin)
+    {
+        IrValue* av = (inst->nops > 0) ? inst->ops[0] : null;
+        u32 ew = 32;
+        bool isFloat = false;
+        if (av != null && av->type != null && av->type->elem != null)
+        {
+            if (av->type->elem->width > 0) ew = av->type->elem->width;
+            isFloat = av->type->elem->kind == IrTypeKind::Float;
+        }
+        if (isFloat)
+        {
+            str mn = isMin
+                ? (ew == 64 ? "minpd" : "minps")
+                : (ew == 64 ? "maxpd" : "maxps");
+            self.emitVecTwoOp(inst, mn,
+                         self.emitter.features != null && self.emitter.features->avx);
+            return;
+        }
+        // integer lanes compare unsigned — simd_vec must keep signed
+        // int min/max out of VecMin/VecMax, the signed packed forms
+        // arrived only with sse42
+        bool sse41 = self.emitter.features != null && self.emitter.features->sse41;
+        bool avx2 = self.emitter.features != null && self.emitter.features->avx2;
+        if (ew == 8)
+        {
+            self.emitVecTwoOp(inst, isMin ? "pminub" : "pmaxub", avx2);
+            return;
+        }
+        if ((ew == 16 || ew == 32) && sse41)
+        {
+            str mn = ew == 16
+                ? (isMin ? "pminuw" : "pmaxuw")
+                : (isMin ? "pminud" : "pmaxud");
+            self.emitVecTwoOp(inst, mn, avx2);
+            return;
+        }
+        self.emitVecLaneOp(inst, isMin ? 2 : 3);
+    }
+
+    void emitShuffle(IrInst* inst)
+    {
+        // the mask rides in the trailing const operands (irBuilder puts
+        // v1, v2, then one ConstInt per lane); fast paths cover what a
+        // single pshufd/shufps/shufpd can do and everything else —
+        // other element widths, mixed sources, a non-const mask —
+        // walks memory. An unsupported shape leaves the result home
+        // untouched, the same as an unhandled opcode.
+        if (inst->nops < 2)
+        {
+            self.emitter.emitComment("shufflevector missing operands");
+            return;
+        }
+        IrValue* dv = &inst->base;
+        IrValue* v1 = inst->ops[0];
+        IrValue* v2 = inst->ops[1];
+        u32 nmask = inst->nops - 2;
+        u32 ew = 32;
+        if (v1->type != null && v1->type->elem != null && v1->type->elem->width > 0)
+            ew = v1->type->elem->width;
+        u32 lanes = ew == 64 ? 2 : ew == 32 ? 4 : ew == 16 ? 8 : 16;
+        if (nmask != lanes)
+        {
+            self.emitter.emitComment("shufflevector mask length mismatch");
+            return;
+        }
+        u32[16] m;
+        bool allOne = true;
+        bool allTwo = true;
+        for (u32 i = 0; i < nmask; i++)
+        {
+            IrValue* e = inst->ops[2 + i];
+            if (e == null || e->kind != IrValueKind::ConstInt)
+            {
+                self.emitter.emitComment("shufflevector non-constant mask");
+                return;
+            }
+            u64 val = e->valData;
+            if (val >= (u64)(2 * lanes))
+            {
+                self.emitter.emitComment("shufflevector lane out of range");
+                return;
+            }
+            m[i] = (u32)val;
+            if (m[i] >= lanes) allOne = false;
+            else allTwo = false;
+        }
+        u32 w = dv->type != null ? dv->type->width : 128;
+        if (w > 128) self.emitter.emitComment("256-bit shuffle handled for the low half only");
+        str dst = self.getRegForValue(dv);
+        bool dstSpill = self.valueIsSpill(dv);
+        str work = dstSpill ? "xmm15" : dst;
+        str s1 = self.getRegForValue(v1);
+        str s2 = self.getRegForValue(v2);
+
+        // one pshufd covers hasAny pattern living in a single source —
+        // 32-bit lanes select dwords, 64-bit lanes select dword pairs
+        if (lanes <= 4 && (allOne || allTwo))
+        {
+            u32 imm = 0;
+            for (u32 i = 0; i < nmask; i++)
+            {
+                u32 sel = allOne ? m[i] : m[i] - lanes;
+                u32 d0 = ew == 64 ? sel * 2 : sel;
+                imm |= (d0 & 3) << (4 * i);
+                if (ew == 64) imm |= ((d0 + 1) & 3) << (4 * i + 2);
+            }
+            self.emitter.emit("\tpshufd $");
+            self.emitter.emitU32(imm);
+            self.emitter.emit(", ");
+            self.emitter.emit(allOne ? s1 : s2);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(work);
+            if (dstSpill) self.sinkF(dv, "xmm15");
+            return;
+        }
+
+        // the dword split: v1 supplies lanes 0-1, v2 lanes 2-3, one
+        // shufps after a copy of the left half
+        if (ew == 32 && lanes == 4 && m[0] < 4 && m[1] < 4 && m[2] >= 4 && m[3] >= 4)
+        {
+            u32 imm = m[0] | (m[1] << 2) | ((m[2] - 4) << 4) | ((m[3] - 4) << 6);
+            self.emitter.emit("\tmovdqa ");
+            self.emitter.emit(s1);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(work);
+            self.emitter.emit("\tshufps $");
+            self.emitter.emitU32(imm);
+            self.emitter.emit(", ");
+            self.emitter.emit(s2);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(work);
+            if (dstSpill) self.sinkF(dv, "xmm15");
+            return;
+        }
+
+        // the qword split: either side may hold either lane
+        if (ew == 64 && lanes == 2)
+        {
+            if (m[0] < 2)
+            {
+                u32 imm = m[0] | ((m[1] - 2) << 1);
+                self.emitter.emit("\tmovdqa ");
+                self.emitter.emit(s1);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(work);
+                self.emitter.emit("\tshufpd $");
+                self.emitter.emitU32(imm);
+                self.emitter.emit(", ");
+                self.emitter.emit(s2);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(work);
+                if (dstSpill) self.sinkF(dv, "xmm15");
+                return;
+            }
+            if (m[1] < 2)
+            {
+                u32 imm = (m[0] - 2) | (m[1] << 1);
+                self.emitter.emit("\tmovdqa ");
+                self.emitter.emit(s2);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(work);
+                self.emitter.emit("\tshufpd $");
+                self.emitter.emitU32(imm);
+                self.emitter.emit(", ");
+                self.emitter.emit(s1);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(work);
+                if (dstSpill) self.sinkF(dv, "xmm15");
+                return;
+            }
+        }
+
+        // general path: park both inputs, copy each selected lane into
+        // a result window below them, then lift the result back out —
+        // hasAny element width, hasAny const mask, sse2 only
+        str s1s = self.valueIsSpill(v1) ? self.opForRegF(v1, "xmm0") : self.getRegForValue(v1);
+        str s2s = self.valueIsSpill(v2) ? self.opForRegF(v2, "xmm1") : self.getRegForValue(v2);
+        self.emitter.emit("\tmovdqu ");
+        self.emitter.emit(s1s);
+        self.emitter.emitLine(", -32(%rsp)");
+        self.emitter.emit("\tmovdqu ");
+        self.emitter.emit(s2s);
+        self.emitter.emitLine(", -16(%rsp)");
+        u32 esz = ew / 8;
+        if (esz == 0) esz = 1;
+        for (u32 i = 0; i < nmask; i++)
+        {
+            u32 base = m[i] < lanes ? 32 : 16;
+            u32 laneIdx = m[i] < lanes ? m[i] : m[i] - lanes;
+            str srcA = "";
+            str resA = "";
+            srcA = rspSlotText(base - laneIdx * esz);
+            resA = rspSlotText(48 - i * esz);
+            str mv = esz == 1 ? "\tmovb " : esz == 2 ? "\tmovw " : esz == 4 ? "\tmovl " : "\tmovq ";
+            str r = esz == 1 ? "r10b" : esz == 2 ? "r10w" : esz == 4 ? "r10d" : "r10";
+            self.emitter.emit(mv);
+            self.emitter.emit(srcA);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(r);
+            self.emitter.emit(mv);
+            self.emitter.emit(r);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(resA);
+        }
+        self.emitter.emit("\tmovdqu -48(%rsp), ");
+        self.emitter.emitLine(work);
+        if (dstSpill) self.sinkF(dv, "xmm15");
+    }
+
+    void emitExtractElem(IrInst* inst)
+    {
+        // the vector parks in a window below rsp so a dynamic index
+        // addresses it with a SIB form (an rbp displacement cannot
+        // scale), and the loaded lane rides in r11 (int) or xmm15
+        // (float) into its home
+        if (inst->nops < 2)
+        {
+            self.emitter.emitComment("extractelement missing operands");
+            return;
+        }
+        IrValue* dv = &inst->base;
+        IrValue* vv = inst->ops[0];
+        IrValue* iv = inst->ops[1];
+        u32 ew = 32;
+        if (vv->type != null && vv->type->elem != null && vv->type->elem->width > 0)
+            ew = vv->type->elem->width;
+        u32 lanes = ew == 64 ? 2 : ew == 32 ? 4 : ew == 16 ? 8 : 16;
+        u32 esz = ew / 8;
+        if (esz == 0) esz = 1;
+        str addr = "";
+        if (iv->kind == IrValueKind::Inst)
+        {
+            str ix = self.opForReg(iv, "r10");
+            addr = sibText(16, ix, esz);
+        }
+        else if (iv->kind == IrValueKind::ConstInt)
+        {
+            u64 val = iv->valData;
+            if (val >= (u64)lanes)
+            {
+                self.emitter.emitComment("extractelement lane out of range");
+                return;
+            }
+            addr = rspSlotText(16 - (u32)val * esz);
+        }
+        else
+        {
+            self.emitter.emitComment("extractelement index not constant");
+            return;
+        }
+        str vs = self.valueIsSpill(vv) ? self.opForRegF(vv, "xmm1") : self.getRegForValue(vv);
+        self.emitter.emit("\tmovdqu ");
+        self.emitter.emit(vs);
+        self.emitter.emitLine(", -16(%rsp)");
+        if (self.valueIsFloatClass(dv))
+        {
+            self.emitter.emit(ew == 64 ? "\tmovsd " : "\tmovd ");
+            self.emitter.emit(addr);
+            self.emitter.emitLine(", xmm15");
+            self.sinkF(dv, "xmm15");
+            return;
+        }
+        str lmv = ew == 8 ? "\tmovzbl " : ew == 16 ? "\tmovzwl " : ew == 32 ? "\tmovl " : "\tmovq ";
+        str lr = ew == 64 ? "r11" : "r11d";
+        self.emitter.emit(lmv);
+        self.emitter.emit(addr);
+        self.emitter.emit(", ");
+        self.emitter.emitLine(lr);
+        self.sinkInt(dv, "r11");
+    }
+
+    void emitInsertElem(IrInst* inst)
+    {
+        // symmetric to extract: the vector parks in a window, the
+        // element lands at its lane offset (dynamic index in r11, a
+        // spilled element reloads through xmm0), and the windowed
+        // vector comes back out through the work register
+        if (inst->nops < 3)
+        {
+            self.emitter.emitComment("insertelement missing operands");
+            return;
+        }
+        IrValue* dv = &inst->base;
+        IrValue* vv = inst->ops[0];
+        IrValue* iv = inst->ops[1];
+        IrValue* ev = inst->ops[2];
+        u32 ew = 32;
+        if (vv->type != null && vv->type->elem != null && vv->type->elem->width > 0)
+            ew = vv->type->elem->width;
+        u32 lanes = ew == 64 ? 2 : ew == 32 ? 4 : ew == 16 ? 8 : 16;
+        u32 esz = ew / 8;
+        if (esz == 0) esz = 1;
+        str addr = "";
+        if (iv->kind == IrValueKind::Inst)
+        {
+            str ix = self.opForReg(iv, "r11");
+            addr = sibText(16, ix, esz);
+        }
+        else if (iv->kind == IrValueKind::ConstInt)
+        {
+            u64 val = iv->valData;
+            if (val >= (u64)lanes)
+            {
+                self.emitter.emitComment("insertelement lane out of range");
+                return;
+            }
+            addr = rspSlotText(16 - (u32)val * esz);
+        }
+        else
+        {
+            self.emitter.emitComment("insertelement index not constant");
+            return;
+        }
+        str vs = self.valueIsSpill(vv) ? self.opForRegF(vv, "xmm1") : self.getRegForValue(vv);
+        self.emitter.emit("\tmovdqu ");
+        self.emitter.emit(vs);
+        self.emitter.emitLine(", -16(%rsp)");
+        if (self.valueIsFloatClass(ev))
+        {
+            str s = (self.valueIsSpill(ev) || ev->kind == IrValueKind::ConstFloat)
+                        ? self.opForRegF(ev, "xmm0") : self.opFor(ev);
+            self.emitter.emit(ew == 64 ? "\tmovsd " : "\tmovd ");
+            self.emitter.emit(s);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(addr);
+        }
+        else
+        {
+            str s = self.valueIsSpill(ev) ? self.opForReg(ev, "r10") : self.opFor(ev);
+            str mv = ew == 8 ? "movb " : ew == 16 ? "movw " : ew == 32 ? "movl " : "movq ";
+            str r = ew == 8 ? toReg8(s) : ew == 16 ? toReg16(s) : ew == 32 ? toReg32(s) : s;
+            self.emitter.emit("\t");
+            self.emitter.emit(mv);
+            self.emitter.emit(r);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(addr);
+        }
+        str dst = self.getRegForValue(dv);
+        bool dstSpill = self.valueIsSpill(dv);
+        str work = dstSpill ? "xmm15" : dst;
+        self.emitter.emit("\tmovdqu -16(%rsp), ");
+        self.emitter.emitLine(work);
+        if (dstSpill) self.sinkF(dv, "xmm15");
+    }
+
+    void emitAbs(IrInst* inst)
+    {
+        str dst = self.getRegForValue(&inst->base);
+        str src = (inst->nops > 0) ? self.getRegForValue(inst->ops[0]) : "rax";
+        self.emitter.emit("\tmovq ");
+        self.emitter.emit(src);
+        self.emitter.emit(", ");
+        self.emitter.emitLine(dst);
+        self.emitter.emit("\tmovq ");
+        self.emitter.emit(src);
+        self.emitter.emitLine(", %r10");
+        self.emitter.emitTab("negq %r10");
+        self.emitter.emit("\tcmovns %r10, ");
+        self.emitter.emitLine(dst);
+    }
+
+    void emitCtPop(IrInst* inst)
+    {
+        str dst = self.getRegForValue(&inst->base);
+        str src = (inst->nops > 0) ? self.getRegForValue(inst->ops[0]) : "rax";
+        if (self.emitter.features != null && self.emitter.features->popcnt)
+        {
+            self.emitter.emit("\tpopcntq ");
+            self.emitter.emit(src);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(dst);
+        }
+        else
+        {
+            // Software fallback: x &= x-1 pattern
+            self.emitter.emit("\tmovq ");
+            self.emitter.emit(src);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(dst);
+            self.emitter.emitTab("xorq %r10, %r10");
+            self.emitter.emitTab(".Lctpop:");
+            self.emitter.emit("\ttestq ");
+            self.emitter.emit(dst);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(dst);
+            self.emitter.emitTab("jz .Lctpop_done");
+            self.emitter.emitTab("incq %r10");
+            self.emitter.emit("\tmovq ");
+            self.emitter.emit(dst);
+            self.emitter.emitLine(", %rcx");
+            self.emitter.emitTab("decq %rcx");
+            self.emitter.emit("\tandq %rcx, ");
+            self.emitter.emitLine(dst);
+            self.emitter.emitTab("jmp .Lctpop");
+            self.emitter.emitTab(".Lctpop_done:");
+            self.emitter.emit("\tmovq %r10, ");
+            self.emitter.emitLine(dst);
+        }
+    }
+
+    void emitCtLz(IrInst* inst)
+    {
+        str dst = self.getRegForValue(&inst->base);
+        str src = (inst->nops > 0) ? self.getRegForValue(inst->ops[0]) : "rax";
+        if (self.emitter.features != null && self.emitter.features->lzcnt)
+        {
+            self.emitter.emit("\tlzcntq ");
+            self.emitter.emit(src);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(dst);
+        }
+        else
+        {
+            // Fallback: use bsr (bit scan reverse)
+            self.emitter.emit("\tmovq $63, ");
+            self.emitter.emitLine(dst);
+            self.emitter.emit("\tbsrq ");
+            self.emitter.emit(src);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(dst);
+        }
+    }
+
+    void emitCtTz(IrInst* inst)
+    {
+        str dst = self.getRegForValue(&inst->base);
+        str src = (inst->nops > 0) ? self.getRegForValue(inst->ops[0]) : "rax";
+        self.emitter.emit("\tbsfq ");
+        self.emitter.emit(src);
+        self.emitter.emit(", ");
+        self.emitter.emitLine(dst);
+    }
+
+    void emitBswap(IrInst* inst)
+    {
+        str dst = self.getRegForValue(&inst->base);
+        str src = (inst->nops > 0) ? self.getRegForValue(inst->ops[0]) : "rax";
+        self.emitter.emit("\tmovq ");
+        self.emitter.emit(src);
+        self.emitter.emit(", ");
+        self.emitter.emitLine(dst);
+        self.emitter.emit("\tbswapq ");
+        self.emitter.emitLine(dst);
+    }
+
+    void emitRot(IrInst* inst, str op)
+    {
+        str dst = self.getRegForValue(&inst->base);
+        str src = (inst->nops > 0) ? self.getRegForValue(inst->ops[0]) : "rax";
+        str amt = (inst->nops > 1) ? self.getRegForValue(inst->ops[1]) : "rcx";
+        self.emitter.emit("\tmovq ");
+        self.emitter.emit(src);
+        self.emitter.emit(", ");
+        self.emitter.emitLine(dst);
+        // Rotate amount must be in %cl
+        if (!amt.equals("rcx") && !amt.equals("cl"))
+        {
+            self.emitter.emit("\tmovq ");
+            self.emitter.emit(amt);
+            self.emitter.emitLine(", %rcx");
+        }
+        self.emitter.emit("\t");
+        self.emitter.emit(op);
+        self.emitter.emit(" %cl, ");
+        self.emitter.emitLine(dst);
+    }
+
+    void emitMinMax(IrInst* inst, str cmpOp, bool isMin, bool isUnsigned)
+    {
+        str dst = self.getRegForValue(&inst->base);
+        str src1 = (inst->nops > 0) ? self.getRegForValue(inst->ops[0]) : "xmm0";
+        str src2 = (inst->nops > 1) ? self.getRegForValue(inst->ops[1]) : "xmm1";
+        // cmp and cmov destinations are register-only, a spill works in r10
+        bool dstSpill = self.valueIsSpill(&inst->base);
+        str work = dstSpill ? "r10" : dst;
+        self.emitter.emit("\tmovq ");
+        self.emitter.emit(src1);
+        self.emitter.emit(", ");
+        self.emitter.emitLine(work);
+        self.emitter.emit("\tcmpq ");
+        self.emitter.emit(src2);
+        self.emitter.emit(", ");
+        self.emitter.emitLine(work);
+        self.emitter.emit("\t");
+        // Use unsigned comparison for UMin/UMax
+        if (isUnsigned)
+            self.emitter.emit(isMin ? "cmovbe " : "cmovae ");
+        else
+            self.emitter.emit(isMin ? "cmovle " : "cmovge ");
+        self.emitter.emit(src2);
+        self.emitter.emit(", ");
+        self.emitter.emitLine(work);
+        if (dstSpill)
+        {
+            self.emitter.emit("\tmovq r10, ");
+            self.emitter.emitLine(dst);
+        }
+    }
+}

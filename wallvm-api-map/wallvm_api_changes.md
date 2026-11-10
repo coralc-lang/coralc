@@ -300,24 +300,28 @@ Empirical check rule applies: verify against `/usr/bin/gcc` 16.2.1 and
 `/usr/bin/clang` 23.1.3 output before adopting any lowering.
 
 **Types**
-- Half (`f16`) / bfloat — **candidate**: `IrTypeKind` is
-  `Void,Int,Float,Ptr,Array,Func,Vector,Struct` with `Float` = 32/64 only.
-  Needed only if Coral targets fp16 hardware; otherwise keep as a
-  compile-time-only narrow type.
-- Address spaces on pointers — **n/a** for now: single-AS target set
-  (x86/x86-64/wasm); revisit with GPU targets.
-- Packed structs — **candidate**: no `packed` flag; layout is natural-align
-  max-field (`createStructType`). Needed for packed wire formats only.
-- Opaque/nominal structs — **candidate** (already on the doc's roadmap as
-  "nominal structs + DataLayout"); current structs intern by shape, which
-  is also map P9's source of confusion.
+- Half (`f16`) / bfloat — **LANDED 2026-11-10**: `tyHalf()` (Float/16,
+  tflags 0) and `tyBfloat()` (Float/16, tflags bit1); text `f16`/`bf16`
+  round-trips. `IrType.tflags` is part of the intern key (`tyGetOrCreate`).
+- Address spaces on pointers — **LANDED 2026-11-10**: `tyPtrAS(elem, as)`
+  reuses Ptr `count` as the address space (intern key includes it); text
+  `ptr addrspace(N) T`, printer emits it only when N != 0.
+- Packed structs — **LANDED 2026-11-10**: `createStructTypeFlags(..., tflags
+  bit0)` sequential layout, align 1; `createStructType` remains the natural
+  layout wrapper. Text `type @N = struct packed { ... };`.
+- Opaque/nominal structs — **LANDED 2026-11-10**: `tflags` bit2 = opaque
+  (`struct opaque;`, no body, size 0/align 1); bit3 = nominal (distinct intern
+  identity from an unnamed same-shape twin). Names still live on
+  `IrStructType` only; there is no typedef registry.
 - Zero-size arrays / `GetElementPtr` semantics — **candidate**: check
   `tyArray(_, 0)` behavior when the struct-layout work lands.
 
 **Functions and ABI**
-- `nounwind`/`readonly`/`noreturn` fn attrs — **candidate**: no attribute
-  system exists; would ride on `IrFunc` or a metadata group. `isLeaf`
-  is the only current query.
+- `nounwind`/`readonly`/`noreturn` fn attrs — **partially landed 2026-11-10**:
+  the existing `setFuncAttr*`/`hasFuncAttr*` API gained attribute-group support
+  (`IrFunc.attrGroup`, 1-based `IrModule.attrGroups`, `!attrgroup = N` in text)
+  and a `funcIsNoUnwind` shorthand. `isLeaf` still does not consult attributes;
+  the group contents are builder-side only (not serialized).
 - `byval`/`sret`/`signext`/`zeroext` param attrs — **n/a as IR attrs**:
   wallvm derives the classification from the ABI tables
   (`abiForCc` covers all 30 CCs), so per-param attrs would duplicate it.
@@ -326,16 +330,75 @@ Empirical check rule applies: verify against `/usr/bin/gcc` 16.2.1 and
   variants have ABI/format entries + `ccFromId` round trip.
 
 **Metadata**
-- `!range`, `!tbaa` — **candidate** (the doc already lists "facts as
-  metadata with merge policies" as infrastructure-first); print/parse
-  plumbing exists generically for unknown keys.
+- `!range`, `!tbaa` — **LANDED 2026-11-10** as helpers: `setRange` (existing)
+  plus `setTbaa(inst, u32)` / `tbaaOf(inst)`; generic `!tbaa = N` text plumbing
+  already round-trips. No consumer pass reads either yet.
 - `!dbg` — **partially landed**: `debugLoc` fields exist on insts and
   round-trip in text (`debug.file/line/col`), but the printer never emits
   inline `// file:line` comments (map P6).
-- Attribute groups (`#0 = {...}`) — **n/a**: no attr system yet; add
-  together with the fn-attrs candidate, not before.
+- Attribute groups (`#0 = {...}`) — **LANDED 2026-11-10**: `IrModule.attrGroups`
+  (rawptr table) + `irModuleAddAttrGroup` / `irModuleAttrGroup` (1-based),
+  `setFuncAttrGroup` / `funcAttrGroup`; `IrFunc.attrGroup`; text
+  `!attrgroup = N` (index only; contents are not serialized).
 
 **Linkage / symbols**
-- `dllimport`/`dllexport`, weak/common/external visibility — **n/a**:
-  ELF-only hosts today; `isExtern` + `emitLinkerDirectives` cover current
-  needs.
+- `dllimport`/`dllexport`, weak/common/external visibility — **helpers landed
+  2026-11-10**: `setFuncLinkage`/`funcLinkage` and
+  `setGlobalLinkage`/`globalLinkage` (0 external, 1 internal, 2 private,
+  3 weak, 4 common) as metadata ints. Codegen/linker still ignore them;
+  `isExtern` + `emitLinkerDirectives` remain the only enforced mechanism.
+
+
+## Implementation log — 2026-11-10 (attribute/type/tooling batch)
+
+All of the following is in `~/.coral/lib` after `./mv` and is covered by the
+map (§4.2-4.12, §5.2-5.3, §6.1, §13 P17/P19/G-type5):
+
+- **`IrType.tflags`** (after `align`): bit0 packed, bit1 bfloat, bit2 opaque,
+  bit3 nominal; accessors `isPacked/isBfloat/isOpaque/isNominal`; included in
+  `tyGetOrCreate`'s intern comparison (`t->tflags != tflags`).
+- **New constructors**: `tyHalf()`, `tyBfloat()`, `tyPtrAS(elem, addrSpace)`
+  (Ptr `count` = AS); `createStructTypeFlags(name, fields, fieldNames,
+  nfields, tflags)` — packed layout (sequential, align 1), opaque (no fields,
+  size 0); `createStructType` is the tflags=0 wrapper (signature unchanged for
+  `compiler/coral-ir/types.crl`).
+- **Attribute groups**: `IrModule.attrGroups/nAttrGroups/capAttrGroups`
+  (rawptr because irtypes cannot import irMetadata), `IrFunc.attrGroup` (1-based),
+  `irModuleAddAttrGroup`, `irModuleAttrGroup`, `setFuncAttrGroup`,
+  `funcAttrGroup`; `hasFuncAttr/funcAttrInt/funcAttrStr` consult the group;
+  `funcIsNoUnwind`.
+- **Linkage / tbaa**: `setFuncLinkage/funcLinkage`, `setGlobalLinkage/
+  globalLinkage` (`"linkage"` int), `setTbaa/tbaaOf` (`"tbaa"` int).
+- **Parser**: `f16`/`bf16`; `ptr addrspace(N) T`; struct decl modifiers
+  (`packed`, `opaque`, `nominal`; opaque prints/parses as `struct opaque;`);
+  `!attrgroup = N` sets `IrFunc.attrGroup`. Note `as` is a Coral keyword
+  (P0026), so the parser local is `asp`.
+- **Printer**: bf16 marker, ` addrspace(N)`, `!attrgroup = N`, packed/nominal
+  keywords and the bodyless opaque form; **`ret` no longer gets a bogus
+  `%N = ` prefix** (P17).
+- **irtool**: `--emit-ir <file>` prints the canonical module dump;
+  `test/wallvm/run_roundtrip.sh` is a new fixed-point gate (parse → print →
+  reparse → print, sha256 compare; 48/48 inputs).
+- **Gates**: `./mv` green, irtool rebuilt, roundtrip 48/48. `run.sh` and
+  `run_passes.sh` were not re-run after this batch (next gate before more
+  codegen work).
+
+Still open from this batch: attribute-group contents are not serialized
+(map P19), anonymous struct types still expand inline unless registered
+(map P18/P9), no linker/codegen consumer of `linkage`, and the x86 codegen is
+still one 7.6k-line file (split requested next).
+
+### Printer beautification (2026-11-10, follow-up)
+
+- **`%62 = ret i32 %61` fixed**: `printInst` never emits a result prefix for
+  `Ret` (non-void type, no SSA result); the column-width scan skips it too.
+- **Anonymous struct explosion fixed**: `printModule` synthesizes stable
+  `type @anon.N = struct { ... };` declarations for every unregistered struct
+  type (context interner order = nested-before-parent) and prints uses as
+  `struct @anon.N`. Deep frontend globals (mimalloc shapes) are now compact;
+  packed/nominal/opaque are preserved; roundtrip fixed point remains green
+  (48/48). Synthetic names only exist during a module dump — direct
+  `printGlobal`/`printFunc` calls still inline (register structs to name them).
+- **Gates after these fixes**: `./mv` green, irtool rebuilt, `run.sh`
+  148/0, `run_passes.sh` 22/1 (known `involution_fneg` PIE link failure),
+  roundtrip 48/0.

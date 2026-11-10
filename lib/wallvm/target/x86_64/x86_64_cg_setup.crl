@@ -1,0 +1,1438 @@
+#[[no_drop_all]]
+import wallvm::irtypes { IrContext, IrModule, IrFunc, IrBlock, IrInst, IrValue, IrValueKind, IrType, IrTypeKind, IrStringConst, IrGlobal, IrArrayConst, IrStructConst };
+import wallvm::irOps { IrOpcode, IrICmpPred, IrFCmpPred };
+import wallvm::irMetadata { funcIsEntry, funcIsNaked, hasFuncAttr, funcAttrInt };
+import wallvm::assembly::x86::common { lookupReg };
+import std::string { String };
+import std::mman { alloc, dealloc };
+import std::ios { eprintln };
+import wallvm::assembly::common { parseConstraints, AsmConstraint, AsmConClass, AsmParseError };
+import wallvm::target::x86_64_base { X86_64CodeGen, X86_64Emitter, CpuFeatures, ElfMetadata, defaultCpuFeatures, defaultFuncMeta, X86_64_RESERVED_INT, X86_64_RESERVED_FLOAT, X86_64_INT_REGS, X86_64_INT_REGS_WIN64, X86_64_FLOAT_REGS, u32ToStr, u64ToHex, valueIsIntConst, intImmText, i64ToDec, i64ToHex, stageText, rspSlotText, sibText, isRnReg, toReg32, toReg16, narrowOp, toReg8, textBufNext, setccIntOp, jccIntTrueOp, jccIntFalseOp };
+import wallvm::target::x86_64::x86_64_cg_call;
+
+pub extend X86_64CodeGen
+{
+
+    void emitPushCalleeSave(str reg)
+    {
+        if (self.emitter.useAtt)
+        {
+            self.emitter.emit("\tpushq %");
+            self.emitter.emit(reg);
+            self.emitter.emit("\n");
+        }
+        else
+        {
+            self.emitter.emit("\tpush ");
+            self.emitter.emit(reg);
+            self.emitter.emit("\n");
+        }
+    }
+
+    void emitDeferredCalleeSaves(IrBlock* bb)
+    {
+        if (self.calleeSavesPushed) return;
+
+        str[8] calleeSaveRegs;
+        u32 nCSaveRegs;
+        if (self.isWindows)
+        {
+            calleeSaveRegs = {"rbx", "rdi", "rsi", "r12", "r13", "r14", "r15", "rbp"};
+            nCSaveRegs = 8;
+        }
+        else
+        {
+            calleeSaveRegs = {"rbx", "r12", "r13", "r14", "r15", "rbp"};
+            nCSaveRegs = 6;
+        }
+        bool needed = false;
+        for (u32 i = 0; i < nCSaveRegs; i++)
+        {
+            if (self.savedCalleeSaves[i])
+            {
+                if (self.blockUsesReg(bb, calleeSaveRegs[i]))
+                {
+                    needed = true;
+                    break;
+                }
+            }
+        }
+
+        if (!needed) return;
+
+        self.calleeSavesPushed = true;
+        for (u32 i = 0; i < nCSaveRegs; i++)
+        {
+            if (self.savedCalleeSaves[i])
+                self.emitPushCalleeSave(calleeSaveRegs[i]);
+        }
+
+        if (self.hasDeferredFrame)
+        {
+            self.hasDeferredFrame = false;
+            self.currentFuncHasFrame = true;
+            if (self.emitter.useAtt)
+            {
+                self.emitter.emitTab("pushq %rbp");
+                self.emitter.emitTab("movq %rsp, %rbp");
+            }
+            else
+            {
+                self.emitter.emitTab("push rbp");
+                self.emitter.emitTab("mov rbp, rsp");
+            }
+        }
+    }
+
+    void emitElfPrologue()
+    {
+        self.emitter.emitLine(".section .text");
+    }
+    void emitConstStrings()
+    {
+        if (self.modd == null || self.modd->nconstStrings == 0) return;
+        // mergeable, read-only, string-sized records: the linker folds
+        // identical ones. PE/COFF spells the same idea as .rdata.
+        if (self.isWindows)
+            self.emitter.emitLine(".section .rdata,\"dr\"");
+        else
+            self.emitter.emitLine(".section .rodata.str1.1,\"aM\",@progbits,1");
+        for (u32 i = 0; i < self.modd->nconstStrings; i++)
+        {
+            IrStringConst* sc = self.modd->constStrings[i];
+            if (sc == null) continue;
+            str lbl = self.stringLabel(&sc->base);
+            if (lbl.len == 0) continue;
+            self.emitter.emit(lbl);
+            self.emitter.emitLine(":");
+            // one .asciz per string, gas-style: printable ASCII runs
+            // literal, quote/backslash escape, everything else exactly
+            // three octal digits (unambiguous for gas and our lexer)
+            self.emitter.emit("\t.asciz \"");
+            for (u32 j = 0; j < sc->length; j++)
+            {
+                u8 c = sc->data[j];
+                if (c == (u8)'"') self.emitter.emit("\\\"");
+                else if (c == (u8)'\\') self.emitter.emit("\\\\");
+                else if (c >= 0x20 && c < 0x7F)
+                {
+                    u8[1] piece;
+                    piece[0] = c;
+                    self.emitter.emit(str::fromParts((const u8*)piece, 1));
+                }
+                else
+                {
+                    u8[4] esc;
+                    esc[0] = (u8)'\\';
+                    esc[1] = (u8)('0' + ((c >> 6) & 7));
+                    esc[2] = (u8)('0' + ((c >> 3) & 7));
+                    esc[3] = (u8)('0' + (c & 7));
+                    self.emitter.emit(str::fromParts((const u8*)esc, 4));
+                }
+            }
+            self.emitter.emitLine("\"");
+        }
+    }
+    void emitFloatConsts()
+    {
+        if (self.fcConsts == null || self.nfcConsts == 0) return;
+        if (self.isWindows)
+            self.emitter.emitLine(".section .rdata,\"dr\"");
+        else
+            self.emitter.emitLine(".section .rodata.cst8,\"aM\",@progbits,8");
+        for (u32 i = 0; i < self.nfcConsts; i++)
+        {
+            IrValue* v = self.fcConsts[i];
+            if (v == null || v->kind != IrValueKind::ConstFloat) continue;
+            u64 bits = v->valData;
+            if (v->type != null && v->type->width == 32)
+            {
+                f64 d = 0;
+                copy<u8>((u8*)&d, (u8*)&v->valData, 8);
+                f32 f = (f32)d;
+                u32 b32 = 0;
+                copy<u8>((u8*)&b32, (u8*)&f, 4);
+                bits = (u64)b32;
+            }
+            self.emitter.emitLine("\t.balign 8");
+            self.emitter.emit(self.floatConstLabel(v));
+            self.emitter.emitLine(":");
+            self.emitter.emit("\t.quad ");
+            self.emitter.emitLine(u64ToHex(bits));
+        }
+        dealloc<IrValue*>(self.fcConsts);
+        self.fcConsts = null;
+        self.nfcConsts = 0;
+        self.capfcConsts = 0;
+    }
+    void emitGlobals()
+    {
+        if (self.modd == null || self.modd->nglobals == 0) return;
+        bool started = false;
+        u32 i = 0;
+        while (i < self.modd->nglobals)
+        {
+            IrGlobal* g = self.modd->globals[i];
+            i++;
+            if (g == null || g->isExtern) continue;
+            if (!started)
+            {
+                self.emitter.emitLine(".section .data");
+                started = true;
+            }
+            IrType* dt = g->base.type;
+            if (dt != null && dt->kind == IrTypeKind::Ptr && dt->elem != null) dt = dt->elem;
+            u32 size = dt != null ? self.ctx->irTypeSizeOf(dt) : 8;
+            u32 align = g->alignment != 0 ? g->alignment
+                       : (dt != null ? self.ctx->irTypeAlignOf(dt) : 8);
+            if (align == 0) align = 1;
+            if (align > 64) align = 8;
+            self.emitter.emit("\t.balign ");
+            self.emitter.emitLine(u32ToStr(align));
+            self.emitter.emit(g->base.name);
+            self.emitter.emitLine(":");
+            self.emitGlobalInit(g->initVal, size);
+        }
+    }
+    void emitGlobalInit(IrValue* iv, u32 size)
+    {
+        if (iv == null)
+        {
+            self.emitter.emit("\t.zero ");
+            self.emitter.emitLine(u32ToStr(size));
+            return;
+        }
+        if (iv->kind == IrValueKind::StructConst)
+        {
+            self.emitStructConstData(iv, size);
+            return;
+        }
+        if (iv->kind == IrValueKind::ConstInt)
+        {
+            self.emitScalarConst(iv, size);
+            return;
+        }
+        if (iv->kind == IrValueKind::ConstFloat)
+        {
+            if (size == 4)
+            {
+                /* the constant carries f64 bits: narrow to f32 first */
+                f64 d = 0;
+                copy<u8>((u8*)&d, (u8*)&iv->valData, 8);
+                f32 f = (f32)d;
+                u32 bits = 0;
+                copy<u8>((u8*)&bits, (u8*)&f, 4);
+                self.emitter.emit("\t.long ");
+                self.emitter.emitLine(u64ToHex((u64)bits));
+            }
+            else
+            {
+                self.emitter.emit("\t.quad ");
+                self.emitter.emitLine(u64ToHex(iv->valData));
+            }
+            return;
+        }
+        if (iv->kind == IrValueKind::ConstArray)
+        {
+            IrArrayConst* ac = (IrArrayConst*)iv;
+            IrType* et = iv->type != null ? iv->type->elem : null;
+            u32 esz = et != null ? self.ctx->irTypeSizeOf(et) : 1;
+            if (esz == 1)
+            {
+                u32 j = 0;
+                while (j < ac->nelems)
+                {
+                    self.emitter.emit("\t.byte ");
+                    u32 row = 0;
+                    while (j < ac->nelems && row < 16)
+                    {
+                        u64 b = 0;
+                        if (ac->elems[j] != null && ac->elems[j]->kind == IrValueKind::ConstInt)
+                            b = ac->elems[j]->valData & 0xFFUL;
+                        if (row > 0) self.emitter.emit(", ");
+                        self.emitter.emit(u64ToHex(b));
+                        j++;
+                        row++;
+                    }
+                    self.emitter.emitLine("");
+                }
+                if (size > ac->nelems)
+                {
+                    self.emitter.emit("\t.zero ");
+                    self.emitter.emitLine(u32ToStr(size - ac->nelems));
+                }
+                return;
+            }
+            /* multi-byte elements: one directive per element */
+            for (u32 j = 0; j < ac->nelems; j++)
+            {
+                IrValue* ev = ac->elems[j];
+                u64 b = 0;
+                if (ev != null && ev->kind == IrValueKind::ConstInt) b = ev->valData;
+                if (esz == 2) { self.emitter.emit("\t.short "); self.emitter.emitLine(u64ToHex(b & 0xFFFFUL)); }
+                else if (esz == 4) { self.emitter.emit("\t.long "); self.emitter.emitLine(u64ToHex(b & 0xFFFFFFFFUL)); }
+                else { self.emitter.emit("\t.quad "); self.emitter.emitLine(u64ToHex(b)); }
+            }
+            if (size > ac->nelems * esz)
+            {
+                self.emitter.emit("\t.zero ");
+                self.emitter.emitLine(u32ToStr(size - ac->nelems * esz));
+            }
+            return;
+        }
+        // a symbol initializer stores the address itself — same as
+        // emitScalarConst's tail (fixups resolve `= @other` into an
+        // IrGlobal/Func/StringConst value)
+        if (iv->kind == IrValueKind::Func ||
+            iv->kind == IrValueKind::Global ||
+            iv->kind == IrValueKind::StringConst)
+        {
+            str lbl = iv->kind == IrValueKind::StringConst
+                ? self.stringLabel(iv) : iv->name;
+            if (lbl.len == 0)
+            {
+                self.emitter.emit("\t.zero ");
+                self.emitter.emitLine(u32ToStr(size));
+                return;
+            }
+            self.emitter.emit("\t.quad ");
+            self.emitter.emitLine(lbl);
+            return;
+        }
+        self.emitter.emit("\t.zero ");
+        self.emitter.emitLine(u32ToStr(size));
+    }
+    void emitScalarConst(IrValue* iv, u32 size)
+    {
+        u64 v = iv->valData;
+        str txt;
+        if (size <= 1)
+        {
+            self.emitter.emit("\t.byte ");
+            txt = u64ToHex(v & 0xFFUL);
+        }
+        else if (size == 2)
+        {
+            self.emitter.emit("\t.short ");
+            txt = u64ToHex(v & 0xFFFFUL);
+        }
+        else if (size == 4)
+        {
+            self.emitter.emit("\t.long ");
+            txt = u64ToHex(v & 0xFFFFFFFFUL);
+        }
+        else if (size == 8)
+        {
+            self.emitter.emit("\t.quad ");
+            txt = u64ToHex(v);
+        }
+        else
+        {
+            self.emitter.emit("\t.zero ");
+            txt = u32ToStr(size);
+        }
+        self.emitter.emitLine(txt);
+    }
+    void emitStructConstData(IrValue* iv, u32 size)
+    {
+        IrStructConst* sc = (IrStructConst*)iv;
+        IrType* st = iv->type;
+        u32 off = 0;
+        u32 i = 0;
+        while (i < sc->nelems && st != null && i < st->nparams)
+        {
+            IrValue* fv = sc->elems[i];
+            IrType* ft = st->params[i];
+            if (ft == null) { i++; continue; }
+            u32 fal = self.ctx->irTypeAlignOf(ft);
+            if (fal == 0) fal = 1;
+            u32 fsz = self.ctx->irTypeSizeOf(ft);
+            if ((off % fal) != 0)
+            {
+                u32 pad = fal - (off % fal);
+                self.emitter.emit("\t.zero ");
+                self.emitter.emitLine(u32ToStr(pad));
+                off += pad;
+            }
+            self.emitGlobalConstValue(fv, ft, fsz);
+            off += fsz;
+            i++;
+        }
+        if (size > off)
+        {
+            self.emitter.emit("\t.zero ");
+            self.emitter.emitLine(u32ToStr(size - off));
+        }
+    }
+    void emitGlobalConstValue(IrValue* fv, IrType* ft, u32 fsz)
+    {
+        if (fv == null)
+        {
+            self.emitter.emit("\t.zero ");
+            self.emitter.emitLine(u32ToStr(fsz));
+            return;
+        }
+        if (fv->kind == IrValueKind::ConstInt) { self.emitScalarConst(fv, fsz); return; }
+        if (fv->kind == IrValueKind::ConstFloat)
+        {
+            if (fsz == 4)
+            {
+                f64 d = 0;
+                copy<u8>((u8*)&d, (u8*)&fv->valData, 8);
+                f32 f = (f32)d;
+                u32 bits = 0;
+                copy<u8>((u8*)&bits, (u8*)&f, 4);
+                self.emitter.emit("\t.long ");
+                self.emitter.emitLine(u64ToHex((u64)bits));
+            }
+            else
+            {
+                self.emitter.emit("\t.quad ");
+                self.emitter.emitLine(u64ToHex(fv->valData));
+            }
+            return;
+        }
+        if (fv->kind == IrValueKind::StructConst) { self.emitStructConstData(fv, fsz); return; }
+        if (fv->kind == IrValueKind::ConstArray) { self.emitGlobalInit(fv, fsz); return; }
+        if (fv->kind == IrValueKind::Func ||
+            fv->kind == IrValueKind::Global ||
+            fv->kind == IrValueKind::StringConst)
+        {
+            str lbl = fv->kind == IrValueKind::StringConst
+                ? self.stringLabel(fv) : fv->name;
+            if (lbl.len == 0)
+            {
+                self.emitter.emit("\t.zero ");
+                self.emitter.emitLine(u32ToStr(fsz));
+                return;
+            }
+            self.emitter.emit("\t.quad ");
+            self.emitter.emitLine(lbl);
+            return;
+        }
+        self.emitter.emit("\t.zero ");
+        self.emitter.emitLine(u32ToStr(fsz));
+    }
+
+    // One alloca's frame footprint. The allocated type is compile-time
+    // known (the instruction carries no count operand), so the size is
+    // static and the whole region can be reserved in the prologue.
+    // Rounded to 16 so the reservation cannot disturb the frame's
+    // 16-byte alignment.
+    u32 allocaSlotSize(IrInst* inst)
+    {
+        u32 sz = 0;
+        if (inst->base.type != null)
+        {
+            // a pointer alloca sizes to its element; an aggregate alloca
+            // (one whose result IS the value's address) sizes to itself
+            IrType* at = inst->base.type;
+            IrType* st = (at->kind == IrTypeKind::Ptr && at->elem != null) ? at->elem : at;
+            sz = self.ctx->irTypeSizeOf(st);
+        }
+        if (sz == 0) sz = 16;
+        if ((sz % 16) != 0) sz = (sz / 16 + 1) * 16;
+        return sz;
+    }
+
+    // The prologue's total alloca reservation: scanAllocas and
+    // allocaSlotOf replay the same walk, so the lea each emitAlloca
+    // emits always lands inside the frame the prologue cut out.
+    u32 scanAllocas(IrFunc* func)
+    {
+        u32 total = 0;
+        if (func == null) return 0;
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst->opcode == IrOpcode::Alloca)
+                    total += self.allocaSlotSize(inst);
+            }
+        }
+        return total;
+    }
+
+    // The rbp-relative offset of one alloca: walk the same sequence
+    // scanAllocas summed, stop at the wanted value, and add the base
+    // the reservation started from. No side table, so there is nothing
+    // to keep alive across emitRet's mid-function epilogue.
+    bool allocaSlotOf(IrFunc* func, IrValue* target, u32* outOff)
+    {
+        u32 cum = 0;
+        if (func == null || target == null) return false;
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst->opcode != IrOpcode::Alloca) continue;
+                cum += self.allocaSlotSize(inst);
+                if (&inst->base == target)
+                {
+                    // the saved callee saves sit between rbp and the
+                    // region the prologue subtracted, so the slot's
+                    // rbp-relative offset starts past them
+                    *outOff = 8 * self.numCalleeSaves + self.allocaBase + cum;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // True when hasAny parameter can land on the stack: the banks are
+    // counted exactly the way classifyCallArg assigns them, so an
+    // integer word past the int bank or an fp word past the fp bank
+    // ends up at 16(%rbp) and forces a frame. Called only for the
+    // frame gates, so a false positive merely costs a frame.
+    bool funcHasStackParams(IrFunc* func)
+    {
+        if (func == null || func->base.type == null) return false;
+        IrType* ft = func->base.type;
+        u32 maxInt = self.isWindows ? 4 : 6;
+        u32 maxFp = self.isWindows ? 4 : 8;
+        u32 intWords = 0;
+        u32 fpWords = 0;
+        for (u32 i = 0; i < ft->nparams; i++)
+        {
+            IrType* p = ft->params[i];
+            if (p == null) continue;
+            if (p->kind == IrTypeKind::Float || p->kind == IrTypeKind::Vector)
+                fpWords += p->width > 64 ? 2 : 1;
+            else if (p->kind == IrTypeKind::Struct)
+                intWords += (p->width > 8 && p->width <= 16) ? 2 : 1;
+            else
+                intWords += 1;
+        }
+        return intWords > maxInt || fpWords > maxFp;
+    }
+
+    void emitPrologue(IrFunc* func, ElfMetadata* meta)
+    {
+        if (meta != null && meta->isGlobal)
+        {
+            if (self.isWindows)
+            {
+                self.emitter.emit("public ");
+                self.emitter.emitLine(func->base.name);
+            }
+            else
+            {
+                self.emitter.emit(".globl ");
+                self.emitter.emitLine(func->base.name);
+            }
+        }
+        if (!self.isWindows)
+        {
+            self.emitter.emit(".type ");
+            self.emitter.emit(func->base.name);
+            self.emitter.emitLine(", @function");
+        }
+
+        self.emitter.emit(func->base.name);
+        self.emitter.emitLine(":");
+
+        // Bare-metal entry contract (docs/baremetal-attributes.md):
+        // !entry aliases __coral_entry to this function's address;
+        // !entry.addr = N emits the absolute __coral_entry_addr symbol.
+        // The linker prefers these over its default entry selection.
+        if (!self.isWindows)
+        {
+            if (funcIsEntry(func))
+            {
+                self.emitter.emit(".globl __coral_entry\n");
+                self.emitter.emit(".set __coral_entry, ");
+                self.emitter.emitLine(func->base.name);
+            }
+            if (hasFuncAttr(func, "entry.addr"))
+            {
+                self.emitter.emit(".globl __coral_entry_addr\n");
+                self.emitter.emit(".set __coral_entry_addr, ");
+                self.emitter.emitLine(u64ToHex((u64)funcAttrInt(func, "entry.addr", 0)));
+            }
+        }
+
+        self.useRedZone = false;
+        self.numCalleeSaves = 0;
+        self.redZoneSpillOffset = 0;
+        self.lastCallTarget = "";
+        self.lastCallResult = null;
+        self.tailJmpCall = null;
+        self.varargAllocSize = 0;
+        self.shadowAllocSize = 0;
+        self.spillSlotCount = self.countSpillSlots(func);
+        self.spillFrameBytes = self.spillSlotCount * 16;
+        self.spillRbpPushed = false;
+        self.currentFunc = func;
+        self.allocaBase = 0;
+        self.allocaBytes = self.scanAllocas(func);
+        self.numCalleeSaves = 0;
+        self.spillFrameBytes = 0;
+        self.calleeSavesPushed = false;
+        for (u32 si = 0; si < 16; si++)
+            self.savedCalleeSaves[si] = false;
+
+        // #[[naked]]: no prologue, no frame, no callee saves — the body
+        // transfers control itself (docs/baremetal-attributes.md). The
+        // spill/alloca scans above still ran, so a body that would need a
+        // frame gets caught by the allocator/backend rather than silently
+        // emitting rbp-relative accesses into raw code.
+        if (funcIsNaked(func))
+        {
+            self.currentFuncHasFrame = false;
+            self.varargAllocSize = 0;
+            self.spillFrameBytes = 0;
+            self.calleeSavesPushed = false;
+            return;
+        }
+
+        bool isLeaf = func->isLeaf();
+        bool isVararg = func->base.type != null && func->base.type->isVararg;
+        bool hasStackParams = self.funcHasStackParams(func);
+
+        if (isVararg)
+            isLeaf = false;
+
+        // Callee-save scan runs before ANY early return: every path that
+        // writes a home in a callee-save register (param seeding included)
+        // must push the caller's value first, so the red-zone and frame
+        // gates below all consult usesAnyCalleeSave. The list is the
+        // platform's callee set; on Windows rdi/rsi are callee-save too
+        // (WIN64_CALLEE_SAVE), and rbp is listed for symmetry even though
+        // lsra never assigns it (reserved) — the frame's pushq %rbp covers
+        // it whenever a frame exists.
+        str[8] calleeSaveRegs;
+        u32 nCSaveRegs;
+        if (self.isWindows)
+        {
+            calleeSaveRegs = {"rbx", "rdi", "rsi", "r12", "r13", "r14", "r15", "rbp"};
+            nCSaveRegs = 8;
+        }
+        else
+        {
+            calleeSaveRegs = {"rbx", "r12", "r13", "r14", "r15", "rbp"};
+            nCSaveRegs = 6;
+        }
+        bool usesAnyCalleeSave = false;
+        for (u32 i = 0; i < nCSaveRegs; i++)
+        {
+            if (self.funcUsesReg(func, calleeSaveRegs[i]))
+            {
+                self.savedCalleeSaves[i] = true;
+                self.numCalleeSaves++;
+                usesAnyCalleeSave = true;
+            }
+            else
+            {
+                self.savedCalleeSaves[i] = false;
+            }
+        }
+
+        // The red zone is only safe when nothing needs a frame: no
+        // spills (they address rbp-relative), no allocas (their region
+        // lives in the frame) and no stack parameters (they are read
+        // through rbp too). Callee-save homes disqualify it as well —
+        // the pushes below move rsp, and the zone must stay empty.
+        if (isLeaf && !self.isWindows && self.spillSlotCount == 0 &&
+            self.allocaBytes == 0 && !hasStackParams && !usesAnyCalleeSave)
+        {
+            self.currentFuncHasFrame = false;
+            self.useRedZone = true;
+            self.emitParamSeeding(func);
+            return;
+        }
+
+        if (isVararg)
+        {
+            // System V ABI: Save registers to a dedicated register save area
+            // using rbp-relative offsets. Conditionally save XMM based on AL.
+            // Windows x64: va_list is just a pointer to the stack - shadow
+            // space handles argument passing.
+            if (!self.isWindows)
+            {
+                // System V: allocate 176 bytes (48 GP save + 128 XMM save)
+                // Layout: [gp_save:48] [xmm_save:128]
+                self.varargAllocSize = 176;
+                self.emitter.emitTab("subq $176, %rsp");
+
+                // Save GP registers to register save area (rbp-relative)
+                // Note: rbp is not set yet, so use rsp-relative offsets
+                // that will remain valid after frame setup
+                self.emitter.emit("\tmovq %rdi, ");
+                self.emitter.emitU32(self.varargAllocSize);
+                self.emitter.emitLine("(%rsp)");
+                self.emitter.emit("\tmovq %rsi, ");
+                self.emitter.emitU32(self.varargAllocSize + 8);
+                self.emitter.emitLine("(%rsp)");
+                self.emitter.emit("\tmovq %rdx, ");
+                self.emitter.emitU32(self.varargAllocSize + 16);
+                self.emitter.emitLine("(%rsp)");
+                self.emitter.emit("\tmovq %rcx, ");
+                self.emitter.emitU32(self.varargAllocSize + 24);
+                self.emitter.emitLine("(%rsp)");
+                self.emitter.emit("\tmovq %r8, ");
+                self.emitter.emitU32(self.varargAllocSize + 32);
+                self.emitter.emitLine("(%rsp)");
+                self.emitter.emit("\tmovq %r9, ");
+                self.emitter.emitU32(self.varargAllocSize + 40);
+                self.emitter.emitLine("(%rsp)");
+
+                // Conditionally save XMM registers based on AL (count of FP args)
+                self.emitter.emitLine("testb %al, %al");
+                u32 xmmSkip = self.emitter.nextLabel();
+                self.emitter.emit("\tje .Lskip_xmm_");
+                self.emitter.emitU32(xmmSkip);
+                self.emitter.emitLine("");
+
+                u32 xmmBase = self.varargAllocSize + 48;
+                self.emitter.emit("\tmovaps %xmm0, ");
+                self.emitter.emitU32(xmmBase);
+                self.emitter.emitLine("(%rsp)");
+                self.emitter.emit("\tmovaps %xmm1, ");
+                self.emitter.emitU32(xmmBase + 16);
+                self.emitter.emitLine("(%rsp)");
+                self.emitter.emit("\tmovaps %xmm2, ");
+                self.emitter.emitU32(xmmBase + 32);
+                self.emitter.emitLine("(%rsp)");
+                self.emitter.emit("\tmovaps %xmm3, ");
+                self.emitter.emitU32(xmmBase + 48);
+                self.emitter.emitLine("(%rsp)");
+                self.emitter.emit("\tmovaps %xmm4, ");
+                self.emitter.emitU32(xmmBase + 64);
+                self.emitter.emitLine("(%rsp)");
+                self.emitter.emit("\tmovaps %xmm5, ");
+                self.emitter.emitU32(xmmBase + 80);
+                self.emitter.emitLine("(%rsp)");
+                self.emitter.emit("\tmovaps %xmm6, ");
+                self.emitter.emitU32(xmmBase + 96);
+                self.emitter.emitLine("(%rsp)");
+                self.emitter.emit("\tmovaps %xmm7, ");
+                self.emitter.emitU32(xmmBase + 112);
+                self.emitter.emitLine("(%rsp)");
+
+                self.emitter.emit(".Lskip_xmm_");
+                self.emitter.emitU32(xmmSkip);
+                self.emitter.emitLine(":");
+            }
+            else
+            {
+                // Windows x64: va_list is just a pointer to the stack.
+                // Arguments are passed via shadow space (32 bytes).
+                // We save all 4 GP + 4 XMM registers to the shadow area.
+                self.varargAllocSize = 32;
+                self.emitter.emitTab("subq $32, %rsp");
+                self.emitter.emitTab("movq %rcx, 0(%rsp)");
+                self.emitter.emitTab("movq %rdx, 8(%rsp)");
+                self.emitter.emitTab("movq %r8, 16(%rsp)");
+                self.emitter.emitTab("movq %r9, 24(%rsp)");
+            }
+        }
+
+        self.calleeSavesPushed = false;
+        self.hasDeferredFrame = false;
+
+        // Spill slots are addressed rbp-relative, so a frame is
+        // mandatory whenever the allocator spilled anything — a leaf
+        // or an omitFramePointer path cannot use spill slots safely.
+        // The alloca region hangs off rbp the same way, and stack
+        // parameters are read through rbp too, so both force a frame
+        // even in a leaf.
+        bool needFrame = !isLeaf || self.spillSlotCount > 0 ||
+                         self.allocaBytes > 0 || hasStackParams;
+
+        // Shrink-wrap (deferred pushes at first use) is not enabled: the
+        // deferred path runs AFTER param seeding has already written the
+        // incoming values into their homes, so a home that landed on a
+        // callee-save register would clobber the caller's value before
+        // the push saved it. Pushing in the prologue is always correct;
+        // the per-block emitDeferredCalleeSaves calls early-return on
+        // calleeSavesPushed.
+        if (!isLeaf && self.omitFramePointer && self.spillSlotCount == 0 &&
+            self.allocaBytes == 0 && !hasStackParams)
+        {
+            self.currentFuncHasFrame = false;
+            if (self.isWindows)
+                self.shadowAllocSize = 32;
+        }
+        else if (needFrame)
+        {
+            if (self.emitter.useAtt)
+            {
+                self.emitter.emitTab("pushq %rbp");
+                self.emitter.emitTab("movq %rsp, %rbp");
+            }
+            else
+            {
+                self.emitter.emitTab("push rbp");
+                self.emitter.emitTab("mov rbp, rsp");
+            }
+            self.currentFuncHasFrame = true;
+        }
+        else
+        {
+            self.currentFuncHasFrame = false;
+        }
+
+        // Save the caller's registers the allocator handed out, whenever
+        // any were handed out — including frameless leaves, which the old
+        // !canShrinkWrap && needFrame gate skipped (needFrame is false
+        // for a spill-free leaf, so its callee-save homes were silently
+        // clobbered).
+        if (usesAnyCalleeSave)
+        {
+            self.calleeSavesPushed = true;
+            for (u32 i = 0; i < nCSaveRegs; i++)
+            {
+                if (self.savedCalleeSaves[i])
+                    self.emitPushCalleeSave(calleeSaveRegs[i]);
+            }
+
+            // Without a frame nothing else adjusts rsp: the entry value
+            // was 8 mod 16, so an even save count leaves the body
+            // misaligned at every call site. Take exactly one word —
+            // after the pushes, so the epilogue's spill-area addq (which
+            // runs before the pops) undoes it in the right order.
+            if (!self.currentFuncHasFrame && (self.numCalleeSaves % 2) == 0)
+            {
+                self.spillFrameBytes = 8;
+                self.emitter.emitLine("\tsubq $8, %rsp");
+            }
+        }
+
+        if (self.currentFuncHasFrame)
+        {
+            // Reserve the spill slots and the alloca region below the
+            // saved callee saves; slots address it rbp-relative, and
+            // allocas find their base in allocaBase. Padding to an odd
+            // 8 keeps the call instruction's stack 16-byte aligned —
+            // allocaBytes is a multiple of 16, so it cannot disturb
+            // that.
+            u32 n = self.spillSlotCount;
+            u32 pad = (self.numCalleeSaves % 2) == 1 ? 8 : 0;
+            self.allocaBase = n * 16 + pad;
+            self.spillFrameBytes = self.allocaBase + self.allocaBytes;
+            if (self.spillFrameBytes > 0)
+            {
+                str buf2 = u32ToStr(self.spillFrameBytes);
+                self.emitter.emit("\tsubq $");
+                self.emitter.emit(buf2);
+                self.emitter.emitLine(", %rsp");
+            }
+        }
+
+        self.emitParamSeeding(func);
+    }
+
+    // Move the ABI's incoming parameter registers into the homes lsra
+    // chose, walking the entry block's parameter stores in order — the
+    // same walk the caller makes over its arguments, so register banks
+    // and stack slots stay in lockstep on both sides of every call.
+    // Called from every non-vararg path; the gate that picked the path
+    // already ruled out the cases this walk cannot serve (stack params
+    // and allocas without a frame).
+    //
+    // The walk runs twice over the same stores. Phase one moves every
+    // incoming bank word into a staging area on this function's own
+    // stack; phase two commits staging into homes and allocas. The
+    // split is required for correctness, not tidiness: lsra gives each
+    // parameter a home from whatever the scan left free, and that set
+    // is drawn from the same bank the caller passes arguments in —
+    // SysV's first free homes tend to be rcx/rdx/rsi/rdi, and rdx is
+    // argument 2's incoming register, so a one-pass walk can store one
+    // parameter over the top of another before it has been read.
+    // Reading every bank word before writing hasAny home makes every
+    // ordering safe, for either ABI, and also covers a struct whose
+    // word0 lands in a home that a later word of the same struct
+    // arrives in. Stack parameters read from memory (16(%rbp) upward,
+    // past the Win64 shadow), which no home write can clobber, so they
+    // commit directly from there.
+    void emitParamSeeding(IrFunc* func)
+    {
+        if (func == null || func->base.type == null) return;
+        if (func->base.type->isVararg) return;
+        if (func->nblocks == 0 || func->base.type->nparams == 0) return;
+
+        // classifyCallArg never hands out more than maxInt integer
+        // words or maxFp fp words from registers, and each word stages
+        // in at most 8 (integer) or 16 (fp, vectors included) bytes,
+        // so that pair is the ceiling the plan can never exceed. The
+        // plan itself sizes the region exactly: seeds whose home
+        // already is the register the value arrives in stage nothing,
+        // and a function where every seed lands that way gets no
+        // region at all. The pair is balanced before hasAny call or
+        // return; the only path that touches the red zone is the
+        // frameless one, where the gates above guarantee the zone is
+        // still empty.
+        self.planParamSeeds(func);
+        str stageBuf = u32ToStr(self.sdStageBytes);
+        if (self.sdStageBytes > 0)
+        {
+            self.emitter.emit("\tsubq $");
+            self.emitter.emit(stageBuf);
+            self.emitter.emitLine(", %rsp");
+        }
+
+        self.walkParamSeeds(func, true);
+        self.walkParamSeeds(func, false);
+
+        if (self.sdStageBytes > 0)
+        {
+            self.emitter.emit("\taddq $");
+            self.emitter.emit(stageBuf);
+            self.emitter.emitLine(", %rsp");
+        }
+    }
+
+    // Incoming ABI bank register by index — the one source both the
+    // plan's skip test and the stage walk's source operands read.
+    str seedIntReg(u32 idx)
+    {
+        str[6] sysv = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
+        str[4] win = {"rcx", "rdx", "r8", "r9"};
+        if (self.isWindows)
+        {
+            if (idx < 4) return win[idx];
+            return "";
+        }
+        if (idx < 6) return sysv[idx];
+        return "";
+    }
+
+    str seedFpReg(u32 idx)
+    {
+        str[8] sysv = {"xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"};
+        str[4] win = {"xmm0", "xmm1", "xmm2", "xmm3"};
+        if (self.isWindows)
+        {
+            if (idx < 4) return win[idx];
+            return "";
+        }
+        if (idx < 8) return sysv[idx];
+        return "";
+    }
+
+    // Classification for the seeding walks: resolve every parameter
+    // seed once (Arg values today; the entry-store walk covers legacy
+    // Inst-kind parameters), classify its ABI placement, then decide
+    // which seeds can drop the staging round trip and lay out the slots
+    // the survivors use. Both emission walks replay these records, so
+    // stage and commit can never disagree.
+    void planParamSeeds(IrFunc* func)
+    {
+        self.nSeedsPlanned = 0;
+        self.sdStageBytes = 0;
+        if (func == null || func->base.type == null) return;
+        if (func->nblocks == 0) return;
+
+        u32 intIdx = 0;
+        u32 fpIdx = 0;
+        u32 stackOff = self.isWindows ? 32 : 0;
+        u32 found = 0;
+        IrBlock* eb = func->blocks[0];
+        // Current IR models parameters as IrValueKind::Arg values. The
+        // entry-store walk below remains for legacy Inst-kind parameters.
+        u32 nSeeds = func->nargs > 0 ? func->nargs : eb->ninsts;
+        for (u32 i = 0; i < nSeeds && found < func->base.type->nparams; i++)
+        {
+            IrValue* src = null;
+            IrValue* dstv = null;
+            if (func->nargs > 0)
+            {
+                src = func->args[i];
+                if (src == null) continue;
+            }
+            else
+            {
+                IrInst* inst = eb->insts[i];
+                if (inst->opcode != IrOpcode::Store || inst->nops < 1) continue;
+                src = inst->ops[0];
+                if (src == null || src->kind != IrValueKind::Inst) continue;
+
+                bool srcDefined = false;
+                for (u32 b = 0; b < func->nblocks && !srcDefined; b++)
+                {
+                    IrBlock* bb = func->blocks[b];
+                    for (u32 j = 0; j < bb->ninsts && !srcDefined; j++)
+                    {
+                        if (b == 0 && j == i) continue;
+                        IrInst* other = bb->insts[j];
+                        if (other->base.id == src->id) srcDefined = true;
+                    }
+                }
+                if (srcDefined) continue;
+                dstv = inst->nops > 1 ? inst->ops[1] : null;
+            }
+
+            u32 slot = self.nSeedsPlanned;
+            if (slot >= 128) break;
+            found++;
+
+            u32 outReg = 0;
+            u32 outOff = 0;
+            u32 outWords = 1;
+            u32 kind = self.classifyCallArg(src, &intIdx, &fpIdx, &stackOff,
+                                             &outReg, &outOff, &outWords);
+            self.sdKind[slot] = kind;
+            self.sdReg[slot] = outReg;
+            self.sdOff[slot] = outOff;
+            self.sdWords[slot] = outWords;
+            self.sdSlot[slot] = 0;
+            self.sdSkip[slot] = false;
+            self.sdSrc[slot] = src;
+            self.sdDst[slot] = dstv;
+            self.nSeedsPlanned++;
+        }
+
+        // A scalar seed can drop staging only when its home already is
+        // the register the caller passes it in: the stage and its
+        // commit would move the value out of that register and straight
+        // back. That stays safe only while NO other seed's register
+        // home is that same register — any other commit writing it
+        // (including a memory-sourced seed committed straight from the
+        // stack) would otherwise overwrite the value we left in place.
+        // Struct seeds (kind 3) always stage: their commit also fills
+        // the alloca. Memory homes cannot skip either — the value has
+        // to reach the slot.
+        for (u32 i = 0; i < self.nSeedsPlanned; i++)
+        {
+            u32 k = self.sdKind[i];
+            if (k != 1 && k != 2) continue;
+            str home = self.getRegName(self.sdSrc[i]);
+            if (home.len == 0) continue;
+            str inc = (k == 2) ? self.seedFpReg(self.sdReg[i])
+                               : self.seedIntReg(self.sdReg[i]);
+            if (!home.equals(inc)) continue;
+            bool alone = true;
+            for (u32 j = 0; j < self.nSeedsPlanned && alone; j++)
+            {
+                if (j == i) continue;
+                str other = self.getRegName(self.sdSrc[j]);
+                if (other.len > 0 && other.equals(home)) alone = false;
+            }
+            if (alone) self.sdSkip[i] = true;
+        }
+
+        // Slot layout over the survivors — both walks read it, so the
+        // stage and commit phases agree on where each word lives.
+        u32 stageOff = 0;
+        for (u32 i = 0; i < self.nSeedsPlanned; i++)
+        {
+            if (self.sdSkip[i]) continue;
+            u32 k = self.sdKind[i];
+            if (k == 1)
+            {
+                self.sdSlot[i] = stageOff;
+                stageOff += 8;
+            }
+            else if (k == 2)
+            {
+                self.sdSlot[i] = stageOff;
+                stageOff += 16;
+            }
+            else if (k == 3)
+            {
+                self.sdSlot[i] = stageOff;
+                stageOff += 8 * self.sdWords[i];
+            }
+        }
+        self.sdStageBytes = stageOff;
+    }
+
+    // One pass of emitParamSeeding. Both walks replay the records
+    // planParamSeeds built: stagePhase collects the incoming bank words
+    // into their planned slots, the commit pass reads them back out
+    // into homes and allocas — same records, same slots, so every stage
+    // slot lines up word for word between them, and a seed the plan
+    // skipped (its home already is the register it arrives in) emits
+    // nothing in either phase.
+    void walkParamSeeds(IrFunc* func, bool stagePhase)
+    {
+        for (u32 si = 0; si < self.nSeedsPlanned; si++)
+        {
+            if (self.sdSkip[si]) continue;
+            IrValue* src = self.sdSrc[si];
+            IrValue* dstv = self.sdDst[si];
+            u32 kind = self.sdKind[si];
+            u32 outReg = self.sdReg[si];
+            u32 outOff = self.sdOff[si];
+            u32 outWords = self.sdWords[si];
+            u32 stageOff = self.sdSlot[si];
+
+            if (stagePhase)
+            {
+                str stg = "";
+                if (kind == 2)
+                {
+                    stg = stageText(stageOff);
+                    self.emitter.emit("\tmovdqu ");
+                    self.emitter.emit(self.seedFpReg(outReg));
+                    self.emitter.emit(", ");
+                    self.emitter.emitLine(stg);
+                    stageOff += 16;
+                }
+                else if (kind == 1)
+                {
+                    stg = stageText(stageOff);
+                    self.emitter.emit("\tmovq ");
+                    self.emitter.emit(self.seedIntReg(outReg));
+                    self.emitter.emit(", ");
+                    self.emitter.emitLine(stg);
+                    stageOff += 8;
+                }
+                else if (kind == 3)
+                {
+                    for (u32 w = 0; w < outWords; w++)
+                    {
+                        stg = stageText(stageOff);
+                        self.emitter.emit("\tmovq ");
+                        self.emitter.emit(self.seedIntReg(outReg + w));
+                        self.emitter.emit(", ");
+                        self.emitter.emitLine(stg);
+                        stageOff += 8;
+                    }
+                }
+                // kinds 0 and 4 read from memory — nothing to stage
+                continue;
+            }
+            str stg = "";
+
+            if (kind == 2)
+            {
+                // xmm parameter, committed from staging. movdqu carries
+                // the whole register either way; its 16-byte transfer
+                // fits a spill slot exactly (slots are 16 apart), and
+                // only the bits the type asks for are ever read back.
+                stg = stageText(stageOff);
+                if (self.valueIsSpill(src))
+                {
+                    self.emitter.emit("\tmovdqu ");
+                    self.emitter.emit(stg);
+                    self.emitter.emitLine(", xmm15");
+                    self.emitter.emit("\tmovdqu xmm15, ");
+                    self.emitter.emitLine(self.opFor(src));
+                }
+                else
+                {
+                    self.emitter.emit("\tmovdqu ");
+                    self.emitter.emit(stg);
+                    self.emitter.emit(", ");
+                    self.emitter.emitLine(self.opFor(src));
+                }
+                stageOff += 16;
+            }
+            else if (kind == 1)
+            {
+                // integer parameter — the full 8 bytes the caller put
+                // in the register, spill slots included, read back out
+                // of staging (the incoming register may already have
+                // been consumed as an earlier parameter's home)
+                stg = stageText(stageOff);
+                if (self.valueIsSpill(src))
+                {
+                    self.emitter.emit("\tmovq ");
+                    self.emitter.emit(stg);
+                    self.emitter.emitLine(", r11");
+                    self.emitter.emit("\tmovq r11, ");
+                    self.emitter.emitLine(self.opFor(src));
+                }
+                else
+                {
+                    self.emitter.emit("\tmovq ");
+                    self.emitter.emit(stg);
+                    self.emitter.emit(", ");
+                    self.emitter.emitLine(self.opFor(src));
+                }
+                stageOff += 8;
+            }
+            else if (kind == 3)
+            {
+                // struct words in registers: word0 also lands in the
+                // value's home, because the body's store rewrites that
+                // word of the alloca from there, and every word lands
+                // in the alloca itself. All words come out of staging,
+                // so word0 sitting in a home that a later word arrives
+                // in can no longer eat that word.
+                u32 baseOff = stageOff;
+                stg = stageText(stageOff);
+                if (self.valueIsSpill(src))
+                {
+                    self.emitter.emit("\tmovq ");
+                    self.emitter.emit(stg);
+                    self.emitter.emitLine(", r11");
+                    self.emitter.emit("\tmovq r11, ");
+                    self.emitter.emitLine(self.opFor(src));
+                }
+                else
+                {
+                    self.emitter.emit("\tmovq ");
+                    self.emitter.emit(stg);
+                    self.emitter.emit(", ");
+                    self.emitter.emitLine(self.opFor(src));
+                }
+                u32 aoff = 0;
+                if (dstv != null && self.allocaSlotOf(func, dstv, &aoff))
+                {
+                    self.emitter.emit("\tleaq -");
+                    self.emitter.emitU32(aoff);
+                    self.emitter.emitLine("(%rbp), r10");
+                    for (u32 w = 0; w < outWords; w++)
+                    {
+                        stg = stageText(baseOff + 8 * w);
+                        self.emitter.emit("\tmovq ");
+                        self.emitter.emit(stg);
+                        self.emitter.emitLine(", r11");
+                        self.emitter.emit("\tmovq r11, ");
+                        if (w == 0)
+                        {
+                            self.emitter.emitLine("(r10)");
+                        }
+                        else
+                        {
+                            self.emitter.emitU32(8 * w);
+                            self.emitter.emitLine("(r10)");
+                        }
+                    }
+                }
+                stageOff = baseOff + 8 * outWords;
+            }
+            else if (kind == 4)
+            {
+                // struct words on the stack: word0 into the value's
+                // home, every word into the alloca
+                if (self.valueIsSpill(src))
+                {
+                    self.emitter.emit("\tmovq ");
+                    self.emitter.emitU32(16 + outOff);
+                    self.emitter.emit("(%rbp), r11");
+                    self.emitter.emit("\tmovq r11, ");
+                    self.emitter.emitLine(self.opFor(src));
+                }
+                else
+                {
+                    self.emitter.emit("\tmovq ");
+                    self.emitter.emitU32(16 + outOff);
+                    self.emitter.emit("(%rbp), ");
+                    self.emitter.emitLine(self.opFor(src));
+                }
+                u32 aoff = 0;
+                if (dstv != null && self.allocaSlotOf(func, dstv, &aoff))
+                {
+                    self.emitter.emit("\tleaq -");
+                    self.emitter.emitU32(aoff);
+                    self.emitter.emitLine("(%rbp), r10");
+                    for (u32 w = 0; w < outWords; w++)
+                    {
+                        self.emitter.emit("\tmovq ");
+                        self.emitter.emitU32(16 + outOff + 8 * w);
+                        self.emitter.emit("(%rbp), r11");
+                        self.emitter.emit("\tmovq r11, ");
+                        if (w == 0)
+                        {
+                            self.emitter.emitLine("(r10)");
+                        }
+                        else
+                        {
+                            self.emitter.emitU32(8 * w);
+                            self.emitter.emitLine("(r10)");
+                        }
+                    }
+                }
+            }
+            else
+            {
+                // stack-passed scalar: the first stack argument lives
+                // at 16(%rbp), the Win64 shadow reserves the first 32
+                bool isFp = src->type != null &&
+                            (src->type->kind == IrTypeKind::Float ||
+                             src->type->kind == IrTypeKind::Vector);
+                if (isFp)
+                {
+                    bool isV = src->type->kind == IrTypeKind::Vector;
+                    str mn = isV ? "movdqu " : (src->type->width == 64 ? "movsd " : "movss ");
+                    if (self.valueIsSpill(src))
+                    {
+                        self.emitter.emit("\t");
+                        self.emitter.emit(mn);
+                        self.emitter.emitU32(16 + outOff);
+                        self.emitter.emitLine("(%rbp), xmm15");
+                        self.emitter.emit("\t");
+                        self.emitter.emit(mn);
+                        self.emitter.emit("xmm15, ");
+                        self.emitter.emitLine(self.opFor(src));
+                    }
+                    else
+                    {
+                        self.emitter.emit("\t");
+                        self.emitter.emit(mn);
+                        self.emitter.emitU32(16 + outOff);
+                        self.emitter.emit("(%rbp), ");
+                        self.emitter.emitLine(self.opFor(src));
+                    }
+                }
+                else if (self.valueIsSpill(src))
+                {
+                    self.emitter.emit("\tmovq ");
+                    self.emitter.emitU32(16 + outOff);
+                    self.emitter.emitLine("(%rbp), r11");
+                    self.emitter.emit("\tmovq r11, ");
+                    self.emitter.emitLine(self.opFor(src));
+                }
+                else
+                {
+                    self.emitter.emit("\tmovq ");
+                    self.emitter.emitU32(16 + outOff);
+                    self.emitter.emit("(%rbp), ");
+                    self.emitter.emitLine(self.opFor(src));
+                }
+            }
+        }
+    }
+
+    void emitEpilogue()
+    {
+        // Mirror the prologue's stack adjustments in reverse: spill
+        // area first (it sits below the saved callee saves), then the
+        // callee-save pops, then the frame teardown frees rbp's slot,
+        // then the vararg area that was allocated below the frame.
+        if (self.spillFrameBytes > 0)
+        {
+            str buf3 = u32ToStr(self.spillFrameBytes);
+            self.emitter.emit("\taddq $");
+            self.emitter.emit(buf3);
+            self.emitter.emitLine(", %rsp");
+        }
+
+        if (self.calleeSavesPushed)
+        {
+            // Same list as emitPrologue's scan, popped in reverse so each
+            // register comes back in undo order. Windows saves rdi/rsi too.
+            str[8] calleeSaveRegs;
+            u32 nCSaveRegs;
+            if (self.isWindows)
+            {
+                calleeSaveRegs = {"rbx", "rdi", "rsi", "r12", "r13", "r14", "r15", "rbp"};
+                nCSaveRegs = 8;
+            }
+            else
+            {
+                calleeSaveRegs = {"rbx", "r12", "r13", "r14", "r15", "rbp"};
+                nCSaveRegs = 6;
+            }
+            for (u32 i = nCSaveRegs; i > 0; i--)
+            {
+                u32 idx = i - 1;
+                if (self.savedCalleeSaves[idx])
+                {
+                    str reg = calleeSaveRegs[idx];
+                    if (self.emitter.useAtt)
+                    {
+                        self.emitter.emit("\tpopq %");
+                        self.emitter.emit(reg);
+                        self.emitter.emit("\n");
+                    }
+                    else
+                    {
+                        self.emitter.emit("\tpop ");
+                        self.emitter.emit(reg);
+                        self.emitter.emit("\n");
+                    }
+                }
+            }
+        }
+
+        if (self.currentFuncHasFrame)
+        {
+            self.emitter.emitTab("leave");
+        }
+
+        if (self.varargAllocSize > 0)
+        {
+            str buf2 = u32ToStr(self.varargAllocSize);
+            if (self.emitter.useAtt)
+            {
+                self.emitter.emit("\taddq $");
+                self.emitter.emit(buf2);
+                self.emitter.emit(", %rsp\n");
+            }
+            else
+            {
+                self.emitter.emit("\tadd rsp, ");
+                self.emitter.emit(buf2);
+                self.emitter.emit("\n");
+            }
+        }
+
+        self.emitter.emitTab("ret");
+    }
+
+    void emitRet(IrInst* inst)
+    {
+        // G34: a tail-position call already jumped to the callee, so this
+        // ret emits nothing — no value sink (the callee's own ret returns
+        // to our caller with the result in rax/xmm0), no epilogue
+        if (self.tailJmpCall != null && inst->nops > 0 && inst->ops[0] == &self.tailJmpCall->base)
+        {
+            self.emitter.emitComment("tail call, the jump returns to our caller");
+            return;
+        }
+
+        if (inst->nops > 0 && inst->ops[0] != null)
+        {
+            IrValue* retVal = inst->ops[0];
+            bool isStruct = retVal->type != null && retVal->type->kind == IrTypeKind::Struct;
+
+            if (isStruct)
+            {
+                u32 sz = retVal->type->width;
+                str src = self.opForReg(retVal, "r10");
+
+                if (sz <= 8)
+                {
+                    self.emitter.emit("\tmovq (");
+                    self.emitter.emit(src);
+                    self.emitter.emitLine("), %rax");
+                }
+                else if (sz <= 16)
+                {
+                    self.emitter.emit("\tmovq (");
+                    self.emitter.emit(src);
+                    self.emitter.emitLine("), %rax");
+                    self.emitter.emit("\tmovq 8(");
+                    self.emitter.emit(src);
+                    self.emitter.emitLine("), %rdx");
+                }
+                else
+                {
+                    self.emitter.emit("\tmovq ");
+                    self.emitter.emit(src);
+                    self.emitter.emitLine(", %rax");
+                }
+            }
+            else if (self.valueIsFloatClass(retVal))
+            {
+                str src = self.opFor(retVal);
+                if (!src.equals("xmm0"))
+                {
+                    self.emitter.emit("\tmovsd ");
+                    self.emitter.emit(src);
+                    self.emitter.emitLine(", %xmm0");
+                }
+            }
+            else
+            {
+                str src = self.opFor(retVal);
+                if (!src.equals("rax"))
+                {
+                    self.emitter.emit("\tmovq ");
+                    self.emitter.emit(src);
+                    self.emitter.emit(", %rax\n");
+                }
+            }
+        }
+        self.emitEpilogue();
+    }
+}
