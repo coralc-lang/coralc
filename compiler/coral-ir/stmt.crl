@@ -7,8 +7,8 @@
  * current function via the builder; the `term` flag tracks terminators
  * so dead statements after Return/Break/Continue are skipped. No phis —
  * locals are alloca+load/store. */
-use lower { Wv, wvNode, wvErr, wvStr, wvResolved, wvFindLocal, wvPushLocal,
-               wvBlock, wvSetBlock, wvTerm, wvPos, wvArr };
+use lower { Wv, WvDrop, wvNode, wvErr, wvStr, wvResolved, wvFindLocal, wvPushLocal,
+               wvBlock, wvSetBlock, wvTerm, wvPos, wvArr, wvSlotTy };
 use types { wvTy, wvFindTypeDecl };
 use expr { wvExpr, wvAddrOf, wvCond, wvAssignCommon, wvIsAgg, wvCopyAgg, wvAggSlot,
                wvDecodeLit, wvCompareVals, wvResolveConst, wvMakeGlobal, wvValBody,
@@ -212,7 +212,11 @@ pub void wvSwitchCore(Wv* w, NodeId scrutId, SwitchCase* cases, u32 n,
     w->b.br(entry);
 
     IrBlock* savedBreak = w->breakT;
+    u32 savedBreakMark = w->breakDropMark;
+    u32 savedBreakDefers = w->breakDeferMark;
     w->breakT = joinBb;
+    w->breakDropMark = w->dropLen;
+    w->breakDeferMark = w->deferLen;
     w->loopDepth++;
 
     i = 0;
@@ -262,6 +266,8 @@ pub void wvSwitchCore(Wv* w, NodeId scrutId, SwitchCase* cases, u32 n,
     }
 
     w->breakT = savedBreak;
+    w->breakDropMark = savedBreakMark;
+    w->breakDeferMark = savedBreakDefers;
     w->loopDepth--;
     wvSetBlock(w, joinBb);
 }
@@ -274,6 +280,131 @@ pub void wvSwitch(Wv* w, Stmt* s, NodeId id)
 }
 
 
+
+/* ── defer stack ────────────────────────────────────────────── */
+
+void wvDeferPush(Wv* w, NodeId stmt)
+{
+    if (w->deferLen >= w->deferCap)
+    {
+        u32 nc = w->deferCap == 0 ? 8 : w->deferCap * 2;
+        NodeId* nd = alloc<NodeId>((usize)nc);
+        if (nd == null) { wvErr(w, stmt, "out of memory in defer table"); return; }
+        u32 i = 0;
+        while (i < w->deferLen) { nd[i] = w->defers[i]; i++; }
+        if (w->defers != null) dealloc<NodeId>(w->defers);
+        w->defers = nd;
+        w->deferCap = nc;
+    }
+    w->defers[w->deferLen] = stmt;
+    w->deferLen++;
+}
+
+/* run deferred statements above `mark` LIFO; scope end also pops */
+void wvDefersFrom(Wv* w, u32 mark, bool pop)
+{
+    u32 i = w->deferLen;
+    while (i > mark)
+    {
+        i--;
+        wvStmt(w, w->defers[i]);
+    }
+    if (pop && w->deferLen > mark) w->deferLen = mark;
+}
+
+pub void wvDefersBranch(Wv* w, u32 mark)
+{
+    wvDefersFrom(w, mark, false);
+}
+
+/* ── RAII drop stack ────────────────────────────────────────── */
+
+void wvDropPush(Wv* w, Str name, IrValue* slot, Ty ty, NodeId mdef)
+{
+    if (w->dropLen >= w->dropCap)
+    {
+        u32 nc = w->dropCap == 0 ? 8 : w->dropCap * 2;
+        WvDrop* nd = alloc<WvDrop>((usize)nc);
+        if (nd == null) { wvErr(w, NodeId{}, "out of memory in drop table"); return; }
+        u32 i = 0;
+        while (i < w->dropLen) { nd[i] = w->drops[i]; i++; }
+        if (w->drops != null) dealloc<WvDrop>(w->drops);
+        w->drops = nd;
+        w->dropCap = nc;
+    }
+    w->drops[w->dropLen] = WvDrop { .name = name, .slot = slot, .ty = ty, .mdef = mdef };
+    w->dropLen++;
+}
+
+i32 wvDropFind(Wv* w, Str name)
+{
+    if (name == 0) return -1;
+    i32 i = (i32)w->dropLen - 1;
+    while (i >= 0)
+    {
+        if (w->drops[i].name == name) return i;
+        i--;
+    }
+    return -1;
+}
+
+void wvDropRemoveAt(Wv* w, u32 idx)
+{
+    if (idx >= w->dropLen) return;
+    u32 i = idx;
+    while (i + 1 < w->dropLen)
+    {
+        w->drops[i] = w->drops[i + 1];
+        i++;
+    }
+    w->dropLen--;
+}
+
+/* emit `owner_drop(&slot);` for one entry */
+void wvEmitDropEntry(Wv* w, WvDrop* d)
+{
+    if (d == null || d->slot == null) return;
+    bool nf = false;
+    NodeId mdef = NodeId{ .index = 0 };
+    IrFunc* f = wvMethodFnFor(w, d->ty, w->ctx->intern("drop"), NodeId{}, &nf, &mdef);
+    if (f == null) return;
+    u8 sk = wvMethodSelfKind(w, mdef);
+    u32 n = sk != 0 ? 1 : 0;
+    IrValue*[1] args;
+    if (n != 0)
+    {
+        Ty u = wvUnwrapTy(w, d->ty);
+        bool recvPtr = u != 0 && (w->ctx->types + u)->kind.tag == TypeKind::Pointer;
+        if (recvPtr)
+        {
+            IrType* st = wvSlotTy(d->slot->type);
+            IrValue* pv = wvV(w->b.load(st, d->slot));
+            if (pv == null) return;
+            args[0] = pv;
+        }
+        else args[0] = d->slot;
+    }
+    w->b.call(&f->base, args, n);
+}
+
+/* walk the live set above `mark` innermost-first; `skip` leaves one
+ * entry un-dropped (a moved-out local). `pop` truncates the stack after
+ * the walk (scope end), otherwise the live set survives (branch exit). */
+void wvDropsFrom(Wv* w, u32 mark, i32 skip, bool pop)
+{
+    i32 i = (i32)w->dropLen - 1;
+    while (i >= (i32)mark)
+    {
+        if (i != skip) wvEmitDropEntry(w, &w->drops[i]);
+        i--;
+    }
+    if (pop && w->dropLen > mark) w->dropLen = mark;
+}
+
+pub void wvDropsBranch(Wv* w, u32 mark, i32 skip)
+{
+    wvDropsFrom(w, mark, skip, false);
+}
 
 /* lower a VarDecl: alloca, optionally initialise (aggregates copy
  * element-wise from the source's address), register the local */
@@ -326,6 +457,23 @@ pub void wvVarDecl(Wv* w, Stmt* s, NodeId id)
             if (init != null) w->b.store(init, slot);
         }
     }
+    /* RAII move: `T x = y;` transfers y's ownership, so y must not
+     * drop at scope exit (the C backend's cgPushDrop does the same) */
+    if (s->kind.payload.VarDecl.dropMethod.index != 0)
+    {
+        NodeId initId = s->kind.payload.VarDecl.init;
+        if (initId.index != 0)
+        {
+            Node* in = wvNode(w, initId);
+            if (in->kind.tag == NodeKind::Expr &&
+                in->kind.payload.Expr.value.kind.tag == ExprKind::Ident)
+            {
+                i32 si = wvDropFind(w, in->kind.payload.Expr.value.kind.payload.Ident.name);
+                if (si >= 0) wvDropRemoveAt(w, (u32)si);
+            }
+        }
+        wvDropPush(w, name, slot, vt, s->kind.payload.VarDecl.dropMethod);
+    }
     wvPushLocal(w, name, slot, vt);
 }
 
@@ -340,6 +488,8 @@ pub void wvVarDecl(Wv* w, Stmt* s, NodeId id)
 void wvForIn(Wv* w, Stmt* s, NodeId id)
 {
     u32 scopeMark = w->locLen;
+    u32 entryMark = w->dropLen;
+    u32 entryDefers = w->deferLen;
     NodeId iterId = s->kind.payload.ForIn.iterExpr;
     NodeId rangeStart = s->kind.payload.ForIn.rangeStart;
     NodeId rangeEnd = s->kind.payload.ForIn.rangeEnd;
@@ -602,6 +752,7 @@ void wvForIn(Wv* w, Stmt* s, NodeId id)
 
     IrBlock* headBb = wvBlock(w, "forin.head");
     IrBlock* bodyBb = wvBlock(w, "forin.body");
+    IrBlock* closeBb = wvBlock(w, "forin.close");
     IrBlock* postBb = wvBlock(w, "forin.post");
     IrBlock* exitBb = wvBlock(w, "forin.end");
     w->b.br(headBb);
@@ -620,14 +771,22 @@ void wvForIn(Wv* w, Stmt* s, NodeId id)
         if (endV == null || iv == null) { w->locLen = scopeMark; return; }
         IrValue* c = wvV(w->b.icmp(IrICmpPred::Ult, iv, endV));
         if (c == null) { w->locLen = scopeMark; return; }
-        w->b.condBr(c, bodyBb, exitBb);
+        w->b.condBr(c, bodyBb, closeBb);
     }
 
     wvSetBlock(w, bodyBb);
     IrBlock* savedBreak = w->breakT;
     IrBlock* savedCont = w->contT;
+    u32 savedBreakMark = w->breakDropMark;
+    u32 savedContMark = w->contDropMark;
+    u32 savedBreakDefers = w->breakDeferMark;
+    u32 savedContDefers = w->contDeferMark;
     w->breakT = exitBb;
     w->contT = postBb;
+    w->breakDropMark = entryMark;
+    w->contDropMark = entryMark;
+    w->breakDeferMark = entryDefers;
+    w->contDeferMark = entryDefers;
     w->loopDepth++;
     {
         /* this iteration's element: an indexed address, or at(recv, i) */
@@ -730,6 +889,10 @@ void wvForIn(Wv* w, Stmt* s, NodeId id)
     w->loopDepth--;
     w->breakT = savedBreak;
     w->contT = savedCont;
+    w->breakDropMark = savedBreakMark;
+    w->contDropMark = savedContMark;
+    w->breakDeferMark = savedBreakDefers;
+    w->contDeferMark = savedContDefers;
     if (!w->term) w->b.br(postBb);
 
     wvSetBlock(w, postBb);
@@ -742,7 +905,13 @@ void wvForIn(Wv* w, Stmt* s, NodeId id)
         w->b.br(headBb);
     }
 
+    wvSetBlock(w, closeBb);
+    wvDefersFrom(w, entryDefers, true);
+    wvDropsFrom(w, entryMark, -1, true);
+    w->b.br(exitBb);
     wvSetBlock(w, exitBb);
+    w->dropLen = entryMark;
+    w->deferLen = entryDefers;
     w->locLen = scopeMark;
 }
 
@@ -764,23 +933,51 @@ pub void wvStmt(Wv* w, NodeId id)
         StmtKind::VarDecl => { wvVarDecl(w, s, id); },
         StmtKind::Return => {
             NodeId vId = s->kind.payload.Return.value;
+            IrValue* v = null;
+            i32 skip = -1;
             if (vId.index != 0)
             {
-                IrValue* v = wvExpr(w, vId);
-                if (v != null) w->b.ret(v);
+                Node* rn = wvNode(w, vId);
+                if (rn->kind.tag == NodeKind::Expr &&
+                    rn->kind.payload.Expr.value.kind.tag == ExprKind::Ident)
+                    skip = wvDropFind(w, rn->kind.payload.Expr.value.kind.payload.Ident.name);
+                v = wvExpr(w, vId);
+                if (v != null) {
+                    wvDefersBranch(w, w->fnDeferMark);
+                    wvDropsBranch(w, w->fnDropMark, skip);
+                    w->b.ret(v);
+                }
             }
-            else w->b.retVoid();
+            else
+            {
+                wvDefersBranch(w, w->fnDeferMark);
+                wvDropsBranch(w, w->fnDropMark, -1);
+                w->b.retVoid();
+            }
             wvTerm(w);
         },
         StmtKind::Block => {
             /* block scope: locals declared inside vanish at the closing
              * brace (sema enforces the same rule — see T0001 on escape) */
             u32 scopeMark = w->locLen;
+            u32 dropMark = w->dropLen;
+            u32 deferMark = w->deferLen;
             u32 i = 0;
             while (i < s->kind.payload.Block.stmtsLen && !w->term)
             {
                 wvStmt(w, s->kind.payload.Block.stmts[i]);
                 i++;
+            }
+            /* a terminated block already unwound through return/break */
+            if (!w->term)
+            {
+                wvDefersFrom(w, deferMark, true);
+                wvDropsFrom(w, dropMark, -1, true);
+            }
+            else
+            {
+                if (w->deferLen > deferMark) w->deferLen = deferMark;
+                if (w->dropLen > dropMark) w->dropLen = dropMark;
             }
             w->locLen = scopeMark;
         },
@@ -815,24 +1012,43 @@ pub void wvStmt(Wv* w, NodeId id)
         StmtKind::While => {
             IrBlock* headBb = wvBlock(w, "while.head");
             IrBlock* bodyBb = wvBlock(w, "while.body");
+            IrBlock* closeBb = wvBlock(w, "while.close");
             IrBlock* exitBb = wvBlock(w, "while.end");
+            u32 entryMark = w->dropLen;
+            u32 entryDefers = w->deferLen;
             w->b.br(headBb);
             wvSetBlock(w, headBb);
             IrValue* c = wvCond(w, wvExpr(w, s->kind.payload.While.cond));
             if (c == null) return;
-            w->b.condBr(c, bodyBb, exitBb);
+            w->b.condBr(c, bodyBb, closeBb);
 
             wvSetBlock(w, bodyBb);
             IrBlock* savedBreak = w->breakT;
             IrBlock* savedCont = w->contT;
+            u32 savedBreakMark = w->breakDropMark;
+            u32 savedContMark = w->contDropMark;
+            u32 savedBreakDefers = w->breakDeferMark;
+            u32 savedContDefers = w->contDeferMark;
             w->breakT = exitBb;
             w->contT = headBb;
+            w->breakDropMark = entryMark;
+            w->contDropMark = entryMark;
+            w->breakDeferMark = entryDefers;
+            w->contDeferMark = entryDefers;
             w->loopDepth++;
             wvStmt(w, s->kind.payload.While.body);
             w->loopDepth--;
             w->breakT = savedBreak;
             w->contT = savedCont;
+            w->breakDropMark = savedBreakMark;
+            w->contDropMark = savedContMark;
+            w->breakDeferMark = savedBreakDefers;
+            w->contDeferMark = savedContDefers;
             if (!w->term) w->b.br(headBb);
+            wvSetBlock(w, closeBb);
+            wvDefersFrom(w, entryDefers, true);
+            wvDropsFrom(w, entryMark, -1, true);
+            w->b.br(exitBb);
             wvSetBlock(w, exitBb);
         },
         StmtKind::Loop => {
@@ -842,6 +1058,8 @@ pub void wvStmt(Wv* w, NodeId id)
             IrBlock* headBb = wvBlock(w, "loop.head");
             IrBlock* bodyBb = wvBlock(w, "loop.body");
             IrBlock* exitBb = wvBlock(w, "loop.end");
+            u32 entryMark = w->dropLen;
+            u32 entryDefers = w->deferLen;
             w->b.br(headBb);
             wvSetBlock(w, headBb);
             w->b.br(bodyBb);
@@ -849,13 +1067,25 @@ pub void wvStmt(Wv* w, NodeId id)
             wvSetBlock(w, bodyBb);
             IrBlock* savedBreak = w->breakT;
             IrBlock* savedCont = w->contT;
+            u32 savedBreakMark = w->breakDropMark;
+            u32 savedContMark = w->contDropMark;
+            u32 savedBreakDefers = w->breakDeferMark;
+            u32 savedContDefers = w->contDeferMark;
             w->breakT = exitBb;
             w->contT = headBb;
+            w->breakDropMark = entryMark;
+            w->contDropMark = entryMark;
+            w->breakDeferMark = entryDefers;
+            w->contDeferMark = entryDefers;
             w->loopDepth++;
             wvStmt(w, s->kind.payload.Loop.body);
             w->loopDepth--;
             w->breakT = savedBreak;
             w->contT = savedCont;
+            w->breakDropMark = savedBreakMark;
+            w->contDropMark = savedContMark;
+            w->breakDeferMark = savedBreakDefers;
+            w->contDeferMark = savedContDefers;
             if (!w->term) w->b.br(headBb);
             wvSetBlock(w, exitBb);
         },
@@ -868,11 +1098,14 @@ pub void wvStmt(Wv* w, NodeId id)
             NodeId postId = s->kind.payload.For.post;
             bool hasPost = (s->kind.payload.For.flags & 4) != 0;
             u32 scopeMark = w->locLen;
+            u32 entryMark = w->dropLen;
+            u32 entryDefers = w->deferLen;
 
             if (initId.index != 0) wvStmt(w, initId);
 
             IrBlock* headBb = wvBlock(w, "for.head");
             IrBlock* bodyBb = wvBlock(w, "for.body");
+            IrBlock* closeBb = wvBlock(w, "for.close");
             IrBlock* postBb = hasPost || postId.index != 0 ? wvBlock(w, "for.post") : null;
             IrBlock* exitBb = wvBlock(w, "for.end");
             w->b.br(headBb);
@@ -882,20 +1115,32 @@ pub void wvStmt(Wv* w, NodeId id)
             {
                 IrValue* c = wvCond(w, wvExpr(w, condId));
                 if (c == null) { w->locLen = scopeMark; return; }
-                w->b.condBr(c, bodyBb, exitBb);
+                w->b.condBr(c, bodyBb, closeBb);
             }
             else w->b.br(bodyBb); // no condition: run forever (break exits)
 
             wvSetBlock(w, bodyBb);
             IrBlock* savedBreak = w->breakT;
             IrBlock* savedCont = w->contT;
+            u32 savedBreakMark = w->breakDropMark;
+            u32 savedContMark = w->contDropMark;
+            u32 savedBreakDefers = w->breakDeferMark;
+            u32 savedContDefers = w->contDeferMark;
             w->breakT = exitBb;
             w->contT = postBb != null ? postBb : headBb;
+            w->breakDropMark = entryMark;
+            w->contDropMark = w->dropLen;
+            w->breakDeferMark = entryDefers;
+            w->contDeferMark = w->deferLen;
             w->loopDepth++;
             wvStmt(w, s->kind.payload.For.body);
             w->loopDepth--;
             w->breakT = savedBreak;
             w->contT = savedCont;
+            w->breakDropMark = savedBreakMark;
+            w->contDropMark = savedContMark;
+            w->breakDeferMark = savedBreakDefers;
+            w->contDeferMark = savedContDefers;
             if (!w->term) w->b.br(postBb != null ? postBb : headBb);
 
             if (postBb != null)
@@ -904,7 +1149,13 @@ pub void wvStmt(Wv* w, NodeId id)
                 if (postId.index != 0) wvExpr(w, postId);
                 if (!w->term) w->b.br(headBb);
             }
+            wvSetBlock(w, closeBb);
+            wvDefersFrom(w, entryDefers, true);
+            wvDropsFrom(w, entryMark, -1, true);
+            w->b.br(exitBb);
             wvSetBlock(w, exitBb);
+            w->dropLen = entryMark;
+            w->deferLen = entryDefers;
             w->locLen = scopeMark;
         },
         StmtKind::Asm => {
@@ -1135,7 +1386,7 @@ pub void wvStmt(Wv* w, NodeId id)
         StmtKind::Switch => { wvSwitch(w, s, id); },
         StmtKind::ForIn => { wvForIn(w, s, id); },
         StmtKind::Defer => {
-            wvErr(w, id, "defer is not supported");
+            wvDeferPush(w, s->kind.payload.Defer.stmt);
         },
         StmtKind::Comptime => {
             /* comptime blocks are evaluated by mono's CtEval, which
@@ -1148,11 +1399,15 @@ pub void wvStmt(Wv* w, NodeId id)
         },
         StmtKind::Break => {
             if (w->breakT == null) { wvErr(w, id, "break outside a loop"); return; }
+            wvDefersBranch(w, w->breakDeferMark);
+            wvDropsBranch(w, w->breakDropMark, -1);
             w->b.br(w->breakT);
             wvTerm(w);
         },
         StmtKind::Continue => {
             if (w->contT == null) { wvErr(w, id, "continue outside a loop"); return; }
+            wvDefersBranch(w, w->contDeferMark);
+            wvDropsBranch(w, w->contDropMark, -1);
             w->b.br(w->contT);
             wvTerm(w);
         },

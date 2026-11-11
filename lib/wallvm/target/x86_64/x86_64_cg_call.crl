@@ -20,14 +20,21 @@ pub extend X86_64CodeGen
     // (value itself), 2 = xmm register, 3 = integer register (struct
     // words loaded through their address), 4 = stack slot (struct
     // words loaded through their address).
-    u32 classifyCallArg(IrValue* arg, u32* intIdx, u32* fpIdx, u32* stackOff,
-                        u32* outReg, u32* outOff, u32* outWords)
+    IrType* callParamTy(IrType* ft, u32 i)
+    {
+        if (ft == null || ft->kind != IrTypeKind::Func) return null;
+        return i < ft->nparams ? ft->params[i] : null;
+    }
+
+    u32 classifyCallArg(IrValue* arg, IrType* pty, u32* intIdx, u32* fpIdx,
+                        u32* stackOff, u32* outReg, u32* outOff, u32* outWords)
     {
         u32 maxInt = self.isWindows ? 4 : 6;
         u32 maxFp = self.isWindows ? 4 : 8;
         *outReg = 0;
         *outOff = 0;
         *outWords = 1;
+        IrType* at = pty != null ? pty : (arg != null ? arg->type : null);
         if (arg == null)
         {
             if (*intIdx < maxInt)
@@ -40,15 +47,15 @@ pub extend X86_64CodeGen
             *stackOff += 8;
             return 0;
         }
-        bool isFp = arg->type != null &&
-                    (arg->type->kind == IrTypeKind::Float ||
-                     arg->type->kind == IrTypeKind::Vector);
-        bool isStruct = arg->type != null && arg->type->kind == IrTypeKind::Struct;
+        bool isFp = at != null &&
+                    (at->kind == IrTypeKind::Float ||
+                     at->kind == IrTypeKind::Vector);
+        bool isStruct = at != null && at->kind == IrTypeKind::Struct;
         if (isStruct && !isFp)
         {
             // a struct is passed all-in-registers or all-on-stack,
             // never split across the boundary
-            u32 sz = arg->type->width;
+            u32 sz = at->width;
             u32 words = (sz > 8 && sz <= 16) ? 2 : 1;
             bool byValue = sz <= 16;
             u32 need = byValue ? words : 1;
@@ -65,7 +72,7 @@ pub extend X86_64CodeGen
         }
         if (isFp)
         {
-            u32 words = arg->type->width > 64 ? 2 : 1;
+            u32 words = at->width > 64 ? 2 : 1;
             *outWords = words;
             if (*fpIdx < maxFp)
             {
@@ -109,6 +116,19 @@ pub extend X86_64CodeGen
         str* fpRegs = sysvFpRegs;
         if (self.isWindows) fpRegs = win64FpRegs;
 
+        // an indirect callee is a value (function-pointer local/param,
+        // field load, global): park it in %r11 before the argument moves
+        // overwrite the registers it may currently live in. %r11 is not
+        // an argument register and the move planner only uses %r10.
+        bool indirect = callee->kind != IrValueKind::Func;
+        if (indirect)
+        {
+            str csrc = self.opForReg(callee, "r11");
+            self.emitter.emit("\tmovq ");
+            self.emitter.emit(csrc);
+            self.emitter.emitLine(", %r11");
+        }
+
         u32 nargs = inst->nops - 1;
 
         // pass A: classify every argument, collect the register moves.
@@ -129,7 +149,8 @@ pub extend X86_64CodeGen
             u32 outReg = 0;
             u32 outOff = 0;
             u32 outWords = 1;
-            u32 kind = self.classifyCallArg(arg, &intIdx, &fpIdx, &stackOff,
+            u32 kind = self.classifyCallArg(arg, self.callParamTy(callee->type, i),
+                                             &intIdx, &fpIdx, &stackOff,
                                              &outReg, &outOff, &outWords);
             if (arg != null && arg->kind == IrValueKind::ConstInt && kind == 1)
             {
@@ -247,7 +268,8 @@ pub extend X86_64CodeGen
             u32 outReg = 0;
             u32 outOff = 0;
             u32 outWords = 1;
-            u32 kind = self.classifyCallArg(arg, &sInt, &sFp, &sOff,
+            u32 kind = self.classifyCallArg(arg, self.callParamTy(callee->type, i),
+                                             &sInt, &sFp, &sOff,
                                              &outReg, &outOff, &outWords);
             if (kind == 4)
             {
@@ -320,6 +342,17 @@ pub extend X86_64CodeGen
                         self.emitter.emitU32(outOff);
                         self.emitter.emitLine("(%rsp)");
                     }
+                }
+                else if (arg != null && arg->kind == IrValueKind::Func)
+                {
+                    // a function address is a symbol, not a home: load it
+                    // first, then spill the register to the stack slot
+                    str fr = self.opForReg(arg, "r11");
+                    self.emitter.emit("\tmovq ");
+                    self.emitter.emit(fr);
+                    self.emitter.emit(", ");
+                    self.emitter.emitU32(outOff);
+                    self.emitter.emitLine("(%rsp)");
                 }
                 else if (arg != null)
                 {
@@ -461,10 +494,12 @@ pub extend X86_64CodeGen
 
         // SysV varargs: the callee reads %al to decide whether to
         // save the xmm registers into its register save area
-        if (!self.isWindows && callee->kind == IrValueKind::Func)
+        if (!self.isWindows)
         {
-            IrFunc* fn = (IrFunc*)callee;
-            if (fn->base.type != null && fn->base.type->isVararg)
+            IrType* ct = callee->type;
+            if (callee->kind == IrValueKind::Func)
+                ct = ((IrFunc*)callee)->base.type;
+            if (ct != null && ct->isVararg)
             {
                 self.emitter.emit("\tmovb $");
                 self.emitter.emitU32(fpIdx);
@@ -472,15 +507,22 @@ pub extend X86_64CodeGen
             }
         }
 
-        self.emitter.emit(tail ? "\tjmp " : "\tcall ");
-        self.emitter.emit(calleeName);
-        if (!self.isWindows && callee->kind == IrValueKind::Func)
+        if (indirect)
         {
-            IrFunc* fn = (IrFunc*)callee;
-            if (fn->isExtern)
-                self.emitter.emit("@PLT");
+            self.emitter.emit(tail ? "\tjmp *%r11\n" : "\tcall *%r11\n");
         }
-        self.emitter.emit("\n");
+        else
+        {
+            self.emitter.emit(tail ? "\tjmp " : "\tcall ");
+            self.emitter.emit(calleeName);
+            if (!self.isWindows)
+            {
+                IrFunc* fn = (IrFunc*)callee;
+                if (fn->isExtern)
+                    self.emitter.emit("@PLT");
+            }
+            self.emitter.emit("\n");
+        }
 
         if (!tail && total > 0)
         {
@@ -492,6 +534,57 @@ pub extend X86_64CodeGen
         // a tail jump hands the result straight to the Ret after us,
         // which emits nothing, so there is no home to sink it into
         if (tail) return;
+
+        // an aggregate result is a value address in this IR, while the
+        // ABI hands back <=16-byte structs in rax/rdx and >16-byte ones
+        // as a pointer into the callee's frame: copy/land it in a
+        // per-call slot in our own frame so the address stays valid
+        if (inst->base.type != null && inst->base.type->kind == IrTypeKind::Struct)
+        {
+            u32 off = 0;
+            if (self.allocaSlotOf(self.currentFunc, &inst->base, &off))
+            {
+                u32 sz = self.ctx->irTypeSizeOf(inst->base.type);
+                if (sz == 0) sz = inst->base.type->width;
+                if (sz <= 8)
+                {
+                    self.emitter.emit("\tmovq %rax, -");
+                    self.emitter.emitU32(off);
+                    self.emitter.emitLine("(%rbp)");
+                }
+                else if (sz <= 16)
+                {
+                    self.emitter.emit("\tmovq %rax, -");
+                    self.emitter.emitU32(off);
+                    self.emitter.emitLine("(%rbp)");
+                    self.emitter.emit("\tmovq %rdx, -");
+                    self.emitter.emitU32(off - 8);
+                    self.emitter.emitLine("(%rbp)");
+                }
+                else
+                {
+                    // rep movsb: rsi/rdi/rcx are call-clobbered, so the
+                    // copy cannot disturb a value live across the call
+                    self.emitter.emit("\tmovq %rax, %rsi\n");
+                    self.emitter.emit("\tleaq -");
+                    self.emitter.emitU32(off);
+                    self.emitter.emitLine("(%rbp), %rdi");
+                    self.emitter.emit("\tmovq $");
+                    self.emitter.emitU32(sz);
+                    self.emitter.emitLine(", %rcx");
+                    self.emitter.emitLine("\trep movsb");
+                }
+                str dst2 = self.getRegForValue(&inst->base);
+                bool spill2 = self.valueIsSpill(&inst->base);
+                str work2 = spill2 ? "r10" : dst2;
+                self.emitter.emit("\tleaq -");
+                self.emitter.emitU32(off);
+                self.emitter.emit("(%rbp), ");
+                self.emitter.emitLine(work2);
+                if (spill2) self.sinkInt(&inst->base, "r10");
+                return;
+            }
+        }
 
         // the result arrives in rax / xmm0 — sink it into the home
         // lsra picked for the call's value
@@ -545,6 +638,11 @@ pub extend X86_64CodeGen
         if (inst->nops < 1 || inst->ops[0] == null) return false;
         if (inst->ops[0]->kind != IrValueKind::Func) return false;
         if (inst->ops[0]->name.isEmpty()) return false;
+        // an aggregate result is materialised in the caller's own frame
+        // slot, so the jump-first shape cannot produce the required
+        // address (and a >16-byte callee temp would dangle)
+        if (inst->base.type != null && inst->base.type->kind == IrTypeKind::Struct)
+            return false;
         // a stack argument would have to be shuffled under the return
         // address we are about to inherit, register args need nothing
         u32 tInt = 0;
@@ -555,7 +653,9 @@ pub extend X86_64CodeGen
             u32 outReg = 0;
             u32 outOff = 0;
             u32 outWords = 1;
-            u32 kind = self.classifyCallArg(inst->ops[i], &tInt, &tFp, &tStack,
+            u32 kind = self.classifyCallArg(inst->ops[i],
+                                            self.callParamTy(inst->ops[0]->type, i - 1),
+                                            &tInt, &tFp, &tStack,
                                             &outReg, &outOff, &outWords);
             if (kind == 0 || kind == 4) return false;
         }
