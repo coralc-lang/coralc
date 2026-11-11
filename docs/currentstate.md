@@ -450,6 +450,10 @@ re-check current behavior) / `RULE` (standing rule to honor).
 
 ### G-cg — parsed + checked, failed codegen
 
+- **[VERIFIED] Inventory:** `docs/codegen-gaps.md` holds the current, tested
+  list (construct → sema → C backend → wallvm result), including indirect
+  function-pointer calls, wallvm drop RAII, aggregate switch expressions,
+  static-storage initializers, user `@iter` loops, and the C backend caps.
 - **[OPEN] C-backend missing-construct inventory** — per G-par #2:
   catalog every construct the parser+sema accept that `codegen.crl`
   errors on ("construct not supported" / G0002 class), as the working
