@@ -743,6 +743,14 @@ pub struct IrContext
     // time a pass reports `changed`; cached analyses stamp themselves with
     // the current value when (re)built and treat a mismatch as stale.
     u32 analysisGeneration;
+    // type interning index: bucket -> typeIdx+1 (0 = empty), linear probe.
+    // tyGetOrCreate probes this instead of scanning every interned type.
+    // sub-elements are canonical (created before their parents), so the key
+    // mixes pointer values and the stored field checks confirm each match.
+    // kept at the end: irCtxCreate's positional literal maps onto the
+    // leading slots and must not shift.
+    u32* tyHashBuckets;
+    u32 tyHashCap;              // power of two; 0 until the first insert
 
     u32 nextValueId() { return self.nextId++; }
 
@@ -970,33 +978,94 @@ pub struct IrContext
         return st;
     }
 
+    // structural match on the parts the scalar field checks skipped.
+    bool _tyMatchComponents(IrType* t, IrTypeKind kind, IrType* elem, IrType* ret, IrType** params)
+    {
+        if (kind == IrTypeKind::Ptr || kind == IrTypeKind::Array || kind == IrTypeKind::Vector)
+            return irTypeEqual(t->elem, elem);
+        if (kind == IrTypeKind::Func)
+        {
+            if (!irTypeEqual(t->ret, ret)) return false;
+            for (u32 j = 0; j < t->nparams; j++)
+                if (!irTypeEqual(t->params[j], params[j])) return false;
+            return true;
+        }
+        if (kind == IrTypeKind::Struct)
+        {
+            for (u32 j = 0; j < t->nparams; j++)
+                if (!irTypeEqual(t->params[j], params[j])) return false;
+            return true;
+        }
+        return true;
+    }
+
+    // FNV-1a over the intern key; elem/ret/params are canonical pointers,
+    // so structurally equal keys hash identically across allocations
+    u32 _tyHashKey(IrTypeKind kind, u32 width, u32 count, u32 nparams,
+                   bool isVararg, u32 tflags, IrType* elem, IrType* ret, IrType** params)
+    {
+        u64 h = 1469598103934665603;
+        h = (h ^ (u64)kind) * 1099511628211;
+        h = (h ^ (u64)width) * 1099511628211;
+        h = (h ^ (u64)count) * 1099511628211;
+        h = (h ^ (u64)nparams) * 1099511628211;
+        h = (h ^ (u64)(isVararg ? 1 : 0)) * 1099511628211;
+        h = (h ^ (u64)tflags) * 1099511628211;
+        h = (h ^ (u64)elem) * 1099511628211;
+        h = (h ^ (u64)ret) * 1099511628211;
+        for (u32 j = 0; j < nparams; j++)
+            h = (h ^ (u64)params[j]) * 1099511628211;
+        return (u32)(h ^ (h >> 32));
+    }
+
+    void _tyHashPlace(u32 idx)
+    {
+        IrType* t = self.types[idx];
+        u32 mask = self.tyHashCap - 1;
+        u32 h = self._tyHashKey(t->kind, t->width, t->count, t->nparams,
+                                t->isVararg, t->tflags, t->elem, t->ret, t->params) & mask;
+        while (self.tyHashBuckets[h] != 0) h = (h + 1) & mask;
+        self.tyHashBuckets[h] = idx + 1;
+    }
+
+    // place idx; grow (and rehash) first when the load would exceed 50%.
+    // called before ntypes is bumped, so the rehash covers only [0, ntypes)
+    void _tyHashInsert(u32 idx)
+    {
+        if (self.tyHashCap == 0 || ((self.ntypes + 1) * 2) > self.tyHashCap)
+        {
+            u32 newCap = self.tyHashCap == 0 ? 16 : self.tyHashCap * 2;
+            while (((self.ntypes + 1) * 2) > newCap) newCap *= 2;
+            u32* nb = alloc<u32>((usize)newCap);
+            for (u32 i = 0; i < newCap; i++) nb[i] = 0;
+            if (self.tyHashBuckets != null) dealloc<u32>(self.tyHashBuckets);
+            self.tyHashBuckets = nb;
+            self.tyHashCap = newCap;
+            for (u32 i = 0; i < self.ntypes; i++) self._tyHashPlace(i);
+        }
+        self._tyHashPlace(idx);
+    }
+
     IrType* tyGetOrCreate(IrTypeKind kind, u32 width,
                           IrType* elem, u32 count,
                           IrType* ret, IrType** params,
                           u32 nparams, bool isVararg, u32 tflags)
     {
-        for (u32 i = 0; i < self.ntypes; i++)
+        if (self.tyHashCap > 0)
         {
-            IrType* t = self.types[i];
-            if (t->kind != kind || t->width != width) continue;
-            if (t->count != count || t->nparams != nparams || t->isVararg != isVararg) continue;
-            if (t->tflags != tflags) continue;
-            if (kind == IrTypeKind::Ptr || kind == IrTypeKind::Array || kind == IrTypeKind::Vector)
-                { if (t->count == count && irTypeEqual(t->elem, elem)) return t; }
-            else if (kind == IrTypeKind::Func) {
-                if (!irTypeEqual(t->ret, ret)) continue;
-                bool match = true;
-                for (u32 j = 0; j < nparams; j++)
-                    if (!irTypeEqual(t->params[j], params[j])) { match = false; break; }
-                if (match) return t;
+            u32 mask = self.tyHashCap - 1;
+            u32 h = self._tyHashKey(kind, width, count, nparams, isVararg, tflags, elem, ret, params) & mask;
+            while (true)
+            {
+                u32 slot = self.tyHashBuckets[h];
+                if (slot == 0) break;
+                IrType* t = self.types[slot - 1];
+                if (t->kind == kind && t->width == width && t->count == count &&
+                    t->nparams == nparams && t->isVararg == isVararg && t->tflags == tflags &&
+                    self._tyMatchComponents(t, kind, elem, ret, params))
+                    return t;
+                h = (h + 1) & mask;
             }
-            else if (kind == IrTypeKind::Struct) {
-                bool match = true;
-                for (u32 j = 0; j < nparams; j++)
-                    if (!irTypeEqual(t->params[j], params[j])) { match = false; break; }
-                if (match) return t;
-            }
-            else return t;
         }
 
         IrType* t = alloc<IrType>((usize)1);
@@ -1012,6 +1081,7 @@ pub struct IrContext
             self.types = newTypes; self.capTypes = newCap;
         }
         self.types[idx] = t;
+        self._tyHashInsert(idx);
         self.ntypes = idx + 1;
         return t;
     }
@@ -1190,6 +1260,7 @@ pub void irCtxDestroy(IrContext* ctx)
     if (ctx->arrayConsts) dealloc<IrArrayConst*>(ctx->arrayConsts);
     if (ctx->structConsts) dealloc<IrStructConst*>(ctx->structConsts);
     if (ctx->types) dealloc<IrType*>(ctx->types);
+    if (ctx->tyHashBuckets) dealloc<u32>(ctx->tyHashBuckets);
     dealloc<IrContext>(ctx);
 }
 
@@ -1224,6 +1295,9 @@ pub void irStructTypeDestroy(IrStructType* st)
 pub bool irTypeEqual(IrType* a, IrType* b)
 {
     if (!a || !b) return false;
+    // tyGetOrCreate interns every type, so identical types share one
+    // allocation: pointer equality settles the common case outright.
+    if (a == b) return true;
     if (a->kind != b->kind) return false;
     switch (a->kind)
     {
