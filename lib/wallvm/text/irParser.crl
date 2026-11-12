@@ -1,7 +1,7 @@
 #[[no_drop_all]]
-import wallvm::irtypes { IrContext, IrModule, IrFunc, IrBlock, IrInst, IrType, IrTypeKind, IrValue, IrValueKind, IrGlobal, IrStringConst, IrStructType, IrArrayConst };
+import wallvm::irtypes { IrContext, IrModule, IrFunc, IrBlock, IrInst, IrType, IrTypeKind, IrValue, IrValueKind, IrGlobal, IrStringConst, IrStructType, IrArrayConst, IrStructConst };
 import wallvm::irOps { IrOpcode, IrICmpPred, IrFCmpPred, IrAtomicOrdering, IrAtomicRmwOp, IR_AUX_UNSIGNED };
-import wallvm::irMetadata { MetadataSet, attachInstMetadata, attachFuncMetadata, attachGlobalMetadata, attachStringMetadata, addInt, addString, addIRValue, addFloat, addBool, addType };
+import wallvm::irMetadata { MetadataSet, attachInstMetadata, attachFuncMetadata, attachGlobalMetadata, attachStringMetadata, addInt, addString, addIRValue, addFloat, addBool, addType, irModuleAddAttrGroup, irModuleAttrGroup };
 import std::mman { alloc, dealloc, copy };
 import core::cchar { cchar };
 import platform::libc { strtod };
@@ -12,7 +12,8 @@ enum FixupTarget
     InstOp,
     MetaEntry,
     GlobalInit,
-    ArrayElem
+    ArrayElem,
+    StructElem
 }
 
 // %refs used before their def (phi bodies, metadata) and @refs used before
@@ -30,6 +31,8 @@ struct Fixup
     IrGlobal* global;
     IrArrayConst* arr;
     u32 arrIdx;
+    IrStructConst* sc;
+    u32 scIdx;
 }
 
 pub struct IrParser
@@ -270,13 +273,20 @@ bool expectChar(IrParser* p, u8 c, str what)
 
 bool isIdentStart(u8 c)
 {
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+    // '.' admits the printer's generated `.Lcs<id>` string labels and
+    // `.str` globals; parseAtom checks for a numeric literal first, so
+    // `.5` still reaches parseNumber.
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           c == '_' || c == '.';
 }
 
 bool isIdentChar(u8 c)
 {
+    // '$' separates a front-end disambiguator suffix from the mangled
+    // name (`…EG$9474`); the rest matches the mangling alphabet.
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-           (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-';
+           (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-' ||
+           c == '$';
 }
 
 bool isHexDigit(u8 c)
@@ -379,6 +389,16 @@ str parseStringLiteral(IrParser* p)
         n += 1;
     }
     return str::fromParts((const u8*)buf, n);
+}
+
+// The text layer's extern slots name a symbol/library. A quote is not part
+// of such a name — seeing one means someone emitted a string literal into
+// the slot (`extern "\"C\""`), which the frontend has no way to mean.
+bool externNameHasQuote(str s)
+{
+    for (usize i = 0; i < s.len; i++)
+        if (s.ptr[i] == '"') return true;
+    return false;
 }
 
 NumToken parseNumber(IrParser* p)
@@ -761,6 +781,8 @@ void addFixup(IrParser* p, IrInst* inst, u32 opIdx, str name, u8 kind)
     f->global = null;
     f->arr = null;
     f->arrIdx = 0;
+    f->sc = null;
+    f->scIdx = 0;
 }
 
 // a metadata value slot survives entry-array growth because the fixup
@@ -778,6 +800,8 @@ void addMetaFixup(IrParser* p, MetadataSet* md, u32 mdIdx, str name, u8 kind)
     f->global = null;
     f->arr = null;
     f->arrIdx = 0;
+    f->sc = null;
+    f->scIdx = 0;
 }
 
 void addGlobalFixup(IrParser* p, IrGlobal* g, str name)
@@ -793,6 +817,8 @@ void addGlobalFixup(IrParser* p, IrGlobal* g, str name)
     f->global = g;
     f->arr = null;
     f->arrIdx = 0;
+    f->sc = null;
+    f->scIdx = 0;
 }
 
 // aggregate init elements fill slots in a freshly built constArray — fresh
@@ -810,6 +836,27 @@ void addArrayFixup(IrParser* p, IrArrayConst* ac, u32 idx, str name)
     f->global = null;
     f->arr = ac;
     f->arrIdx = idx;
+    f->sc = null;
+    f->scIdx = 0;
+}
+
+// struct constant slots work like array slots: the const was just built,
+// so patching its element array after the module closes is safe
+void addStructFixup(IrParser* p, IrStructConst* sc, u32 idx, str name)
+{
+    Fixup* f = fixupGrow(p);
+    f->name = dupStr(name);
+    f->kind = 2;
+    f->target = FixupTarget::StructElem;
+    f->inst = null;
+    f->opIdx = 0;
+    f->mdSet = null;
+    f->mdIdx = 0;
+    f->global = null;
+    f->arr = null;
+    f->arrIdx = 0;
+    f->sc = sc;
+    f->scIdx = idx;
 }
 
 // phi operands may name a value the text defines later, everything else
@@ -1359,7 +1406,13 @@ void parseMetaInstr(IrParser* p, IrInst* inst)
         bool hadEq = false;
         u32 n = parseMetaValues(p, vals, 8, &hadEq);
         if (p->hadError) return;
-        if (key.equals("var") && n >= 4 &&
+        if (key.equals("loc") && n >= 3 &&
+            vals[0].kind == 2 && vals[1].kind == 0 && vals[2].kind == 0)
+        {
+            inst->setDebugLoc(vals[0].s, (u32)vals[1].i, (u32)vals[2].i);
+            if (vals[0].s.ptr != null) dealloc<u8>((u8*)vals[0].s.ptr);
+        }
+        else if (key.equals("var") && n >= 4 &&
             vals[0].kind == 2 && vals[1].kind == 4 &&
             vals[2].kind == 0 && vals[3].kind == 0)
         {
@@ -1643,9 +1696,10 @@ void parseInstruction(IrParser* p)
             }
             else
             {
-                parseError(p, "gep index into non-aggregate type");
-                opsFree(&l);
-                return;
+                // scalar pointee: C-style element indexing over the scalar
+                // itself — `gep ptr i64 %p, 1` strides one i64 and keeps
+                // ptr i64. The aggregate branches above descend a level;
+                // this one does not.
             }
         }
         inst = emitFinish(p, IrOpcode::Gep, p->ctx->tyPtr(rt), &l, 0, 0);
@@ -2069,6 +2123,11 @@ void prescanBody(IrParser* p, IrFunc* f)
             if (k < p->len && (u8)p->input.ptr[k] == ':')
             {
                 str name = str::fromParts(p->input.ptr + i, j - i);
+                if (findBlock(p, name) != null)
+                {
+                    parseError(p, "duplicate block label in function");
+                    return;
+                }
                 IrBlock* bb = p->ctx->createBlock(name);
                 f->addBlock(bb);
                 addBlockName(p, name, bb);
@@ -2312,16 +2371,42 @@ void parseFuncDecl(IrParser* p)
         str kw = takeIdent(p);
         (void)kw;
         skipWs(p);
-        str lib = parseStringLiteral(p);
-        if (p->hadError) return;
-        skipWs(p);
-        str sym;
+        // `extern`                      default lib, symbol = function name
+        // `extern "sym"`               custom symbol, default lib
+        // `extern "lib" "sym"`         both: library/CC and link symbol
+        // Prints without the empty-string placeholder the old form forced.
+        str first = str::empty();
+        str second = str::empty();
         if (p->cur == '"')
         {
-            sym = parseStringLiteral(p);
+            first = parseStringLiteral(p);
             if (p->hadError) return;
+            skipWs(p);
+            if (p->cur == '"')
+            {
+                second = parseStringLiteral(p);
+                if (p->hadError) return;
+            }
         }
-        else sym = dupStr(name);
+        // A literal quote after unescaping can only come from a printer
+        // that wrapped the name in another layer of quotes; reject instead
+        // of silently adopting the wrapper as part of the symbol.
+        if (externNameHasQuote(first) || externNameHasQuote(second))
+        {
+            parseError(p, "quote in extern library/symbol name");
+            return;
+        }
+        str lib = str::empty();
+        str sym;
+        if (!second.isEmpty() || first.isEmpty())
+        {
+            if (!first.isEmpty()) lib = first;
+            sym = dupStr(name);
+        }
+        else
+        {
+            sym = first;
+        }
         f->isExtern = true;
         f->externLib = lib;
         f->externSym = sym;
@@ -2434,6 +2519,8 @@ IrValue* parseAggregateInit(IrParser* p, IrType* ty)
         parseError(p, "aggregate initializer requires array or vector type");
         return null;
     }
+    skipWs(p);
+    if (!expectChar(p, '[', "expected '[' in aggregate initializer")) return null;
     IrType* elemTy = ty->elem;
     u32 cap = ty->count > 0 ? ty->count : 1;
     IrValue** elems = alloc<IrValue*>((usize)cap);
@@ -2468,7 +2555,7 @@ IrValue* parseAggregateInit(IrParser* p, IrType* ty)
                 parseError(p, "expected nested list for aggregate element");
                 break;
             }
-            if (elemTy->kind == IrTypeKind::Struct || elemTy->kind == IrTypeKind::Func)
+            if (elemTy->kind == IrTypeKind::Func)
             {
                 parseError(p, "unsupported aggregate element type");
                 break;
@@ -2479,7 +2566,17 @@ IrValue* parseAggregateInit(IrParser* p, IrType* ty)
                 break;
             }
             AtomRef r;
-            parseAtom(p, elemTy, false, true, &r);
+            if (p->cur == '{' && elemTy->kind == IrTypeKind::Struct)
+            {
+                r.val = parseStructInit(p, elemTy);
+                r.pending = false;
+                r.name = str::empty();
+                r.isSym = false;
+            }
+            else
+            {
+                parseAtom(p, elemTy, false, true, &r);
+            }
             if (p->hadError) break;
             if (r.pending)
             {
@@ -2522,14 +2619,120 @@ IrValue* parseAggregateInit(IrParser* p, IrType* ty)
     return &ac->base;
 }
 
+// `= { … }` struct initializer: fields in declaration order, each atom
+// parsed against its field type. Nested aggregates recurse, and a @symbol
+// field defers to the module fixup pass like an array element does.
+IrValue* parseStructInit(IrParser* p, IrType* ty)
+{
+    if (ty == null || ty->kind != IrTypeKind::Struct)
+    {
+        parseError(p, "struct initializer requires struct type");
+        return null;
+    }
+    u32 n = ty->nparams;
+    u32 cap = n > 0 ? n : 1;
+    IrValue** elems = alloc<IrValue*>((usize)cap);
+    str* pend = alloc<str>((usize)cap);
+    for (u32 i = 0; i < cap; i++) { elems[i] = null; pend[i] = str::empty(); }
+    skipWs(p);
+    if (!expectChar(p, '{', "expected '{' in struct initializer")) return null;
+    u32 i = 0;
+    while (!p->hadError)
+    {
+        skipWs(p);
+        if (p->cur == '}') break;
+        if (i >= n)
+        {
+            parseError(p, "too many struct initializer elements");
+            break;
+        }
+        IrType* ft = ty->params[i];
+        AtomRef r;
+        if (p->cur == '{' && ft != null && ft->kind == IrTypeKind::Struct)
+        {
+            r.val = parseStructInit(p, ft);
+            r.pending = false;
+            r.name = str::empty();
+            r.isSym = false;
+        }
+        else if (p->cur == '[' && ft != null &&
+                 (ft->kind == IrTypeKind::Array || ft->kind == IrTypeKind::Vector))
+        {
+            r.val = parseAggregateInit(p, ft);
+            r.pending = false;
+            r.name = str::empty();
+            r.isSym = false;
+        }
+        else
+        {
+            parseAtom(p, ft, false, true, &r);
+        }
+        if (p->hadError) break;
+        if (r.pending)
+        {
+            elems[i] = null;
+            pend[i] = r.name;
+        }
+        else
+        {
+            elems[i] = r.val;
+        }
+        i += 1;
+        skipWs(p);
+        if (p->cur == ',') { advance(p); continue; }
+        break;
+    }
+    if (p->hadError)
+    {
+        dealloc<IrValue*>(elems);
+        dealloc<str>(pend);
+        return null;
+    }
+    if (!expectChar(p, '}', "expected '}' in struct initializer"))
+    {
+        dealloc<IrValue*>(elems);
+        dealloc<str>(pend);
+        return null;
+    }
+    if (i != n)
+    {
+        parseError(p, "struct initializer length does not match type");
+        dealloc<IrValue*>(elems);
+        dealloc<str>(pend);
+        return null;
+    }
+    IrValue* scv = p->ctx->createStructConst(ty, elems, n);
+    IrStructConst* sc = (IrStructConst*)scv;
+    for (u32 k = 0; k < n; k++)
+        if (pend[k].len > 0) addStructFixup(p, sc, k, pend[k]);
+    dealloc<IrValue*>(elems);
+    dealloc<str>(pend);
+    return scv;
+}
+
 void parseGlobalDecl(IrParser* p)
 {
     skipSpaces(p);
     bool isConst = false;
-    if (peekIdent(p).equals("const"))
+    bool isExtern = false;
+    // `global extern const @g` — extern and const are independent flags,
+    // print in that order, accept either order on the way back in.
+    while (!p->hadError)
     {
-        #[[maybe_unused]] str kw = takeIdent(p);
-        isConst = true;
+        str kw = peekIdent(p);
+        if (kw.equals("const"))
+        {
+            takeIdent(p);
+            isConst = true;
+            skipWs(p);
+        }
+        else if (kw.equals("extern"))
+        {
+            takeIdent(p);
+            isExtern = true;
+            skipWs(p);
+        }
+        else break;
     }
     skipWs(p);
     if (p->cur != '@') { parseError(p, "expected '@' in global declaration"); return; }
@@ -2542,13 +2745,27 @@ void parseGlobalDecl(IrParser* p)
     IrValue* init = null;
     str initRef = str::empty();
     skipSpaces(p);
+    // printer output carries the front-end's pointer type on globals
+    // (`global @x: ptr array i32 4 = [ … ]`); aggregate initializers
+    // describe the pointee, so look through one pointer for them. Scalar
+    // initializers stay on the declared type (a pointer-typed 0 or a
+    // symbol reference).
+    IrType* initTy = ty;
     if (p->cur == '=')
     {
         advance(p);
         skipWs(p);
+        if (ty != null && ty->kind == IrTypeKind::Ptr && ty->elem != null &&
+            (p->cur == '[' || p->cur == '{'))
+            initTy = ty->elem;
         if (p->cur == '[')
         {
-            init = parseAggregateInit(p, ty);
+            init = parseAggregateInit(p, initTy);
+            if (p->hadError) return;
+        }
+        else if (p->cur == '{')
+        {
+            init = parseStructInit(p, initTy);
             if (p->hadError) return;
         }
         else
@@ -2560,7 +2777,7 @@ void parseGlobalDecl(IrParser* p)
             if (r.pending) initRef = r.name;
         }
     }
-    IrGlobal* g = p->ctx->createGlobal(name, ty, isConst, false, init, p->ctx->irTypeAlignOf(ty));
+    IrGlobal* g = p->ctx->createGlobal(name, ty, isConst, isExtern, init, p->ctx->irTypeAlignOf(initTy));
     p->currentModule->addGlobal(g);
     if (initRef.len > 0) addGlobalFixup(p, g, initRef);
     while (!p->hadError)
@@ -2643,10 +2860,71 @@ void resolveModuleFixups(IrParser* p)
             f->mdSet->entries[f->mdIdx].value.irVal = v;
         }
         else if (f->target == FixupTarget::GlobalInit) f->global->initVal = v;
+        else if (f->target == FixupTarget::StructElem) f->sc->elems[f->scIdx] = v;
         else f->arr->elems[f->arrIdx] = v;
         dealloc<u8>((u8*)f->name.ptr);
     }
     p->numFixs = 0;
+}
+
+// `attributes #1 = { !nounwind !readonly !alignstack = 16 };`
+// Contents use the same !key[=values] entry grammar as metadata clauses;
+// the module owns the sets and IrFunc.attrGroup points at them 1-based.
+void parseAttributeGroup(IrParser* p)
+{
+    skipWs(p);
+    if (!expectChar(p, '#', "expected '#' in attributes declaration")) return;
+    skipSpaces(p);
+    if (!(p->cur >= '0' && p->cur <= '9'))
+    {
+        parseError(p, "expected attribute-group index");
+        return;
+    }
+    u32 idx = 0;
+    while (p->cur >= '0' && p->cur <= '9')
+    {
+        idx = idx * 10 + (u32)(p->cur - '0');
+        advance(p);
+    }
+    if (idx == 0)
+    {
+        parseError(p, "attribute-group indices are 1-based");
+        return;
+    }
+    if (!expectChar(p, '=', "expected '=' after attribute-group index")) return;
+    if (!expectChar(p, '{', "expected '{' in attribute group")) return;
+    while (p->currentModule->nAttrGroups < idx)
+        irModuleAddAttrGroup(p->currentModule);
+    MetadataSet* md = irModuleAttrGroup(p->currentModule, idx);
+    if (md == null)
+    {
+        parseError(p, "cannot allocate attribute group");
+        return;
+    }
+    while (!p->hadError)
+    {
+        skipWs(p);
+        if (p->cur == '}') break;
+        if (p->cur != '!')
+        {
+            parseError(p, "expected '!' attribute or '}'");
+            return;
+        }
+        advance(p);
+        str key = takeIdent(p);
+        if (p->hadError) return;
+        MetaAtom[8] vals;
+        bool hadEq = false;
+        u32 n = parseMetaValues(p, vals, 8, &hadEq);
+        if (p->hadError) return;
+        commitMetaClause(p, md, key, vals, n, hadEq, false);
+        if (p->hadError) return;
+        skipWs(p);
+        if (p->cur == ',') advance(p);
+    }
+    if (!expectChar(p, '}', "expected '}' after attribute group")) return;
+    skipWs(p);
+    if (p->cur == ';') advance(p);
 }
 
 pub IrModule* parseModule(IrParser* p, str text)
@@ -2704,6 +2982,11 @@ pub IrModule* parseModule(IrParser* p, str text)
         {
             takeIdent(p);
             parseFuncDecl(p);
+        }
+        else if (w.equals("attributes"))
+        {
+            takeIdent(p);
+            parseAttributeGroup(p);
         }
         else { parseError(p, "expected declaration"); break; }
     }
