@@ -17,10 +17,14 @@ Every message, in both directions, is preceded by a header block and then
 exactly *N* bytes of UTF-8 JSON:
 
 ```
-Content-Length: 143\r\n
+Content-Length: 148\r\n
 Content-Type: application/vscode-jsonrpc; charset=utf-8\r\n
 \r\n
-{"jsonrpc":"2.0","id":1,"result":{…}}
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": { … }
+}
 ```
 
 Rules:
@@ -29,8 +33,16 @@ Rules:
   counts as its encoded length.
 - The header block ends with a **blank line** (`\r\n\r\n`). The server may omit
   `Content-Type`; clients must accept its absence.
-- Messages are not newline-delimited. A `\n` inside a JSON string is escaped as
-  `\n` and does not terminate a message.
+- **Serialization is whitespace-insensitive on the way in, formatted on the
+  way out.** `coralc --serve` pretty-prints every message it sends (2-space
+  indentation; bodies span multiple lines). Clients may send compact or
+  indented JSON — the server frames strictly by `Content-Length`. The VS Code
+  client sends indented JSON to match. Framing is only ever `Content-Length`:
+  a literal `\n` between JSON tokens is insignificant whitespace and must
+  never be used to resynchronize the stream.
+- A `\n` inside a JSON **string** is still escaped as `\n`; only the
+  whitespace between tokens is literal.
+- Messages are not newline-delimited.
 - **No JSON-RPC batching.** LSP does not support it; clients and servers must
   not send arrays.
 - **Stdout carries the protocol and nothing else.** No banners, no progress, no
