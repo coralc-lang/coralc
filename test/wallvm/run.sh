@@ -8,7 +8,8 @@ cd "$(dirname "$0")"
 CORALC="${CORALC:-coralc}"
 LEVELS="${LEVELS:-O0 O1 O2 O3}"
 OUT=output
-TMP=/home/cerie/Documents/coral/test/wallvm/output 
+TMP=/home/cerie/Documents/coral/test/wallvm/output
+TMP2=/tmp/
 TIMEOUT="${TIMEOUT:-15}"
 mkdir -p "$TMP" "$OUT"
 
@@ -34,7 +35,7 @@ for case in cases/*.ir; do
                 echo "FAIL compile $name $lv: timeout after ${TIMEOUT}s"
             else
                 echo "FAIL compile $name $lv (exit $rc)"
-                cat "$TMP/${name}_${lv}.err"
+                cat "$TMP2/${name}_${lv}.err"
             fi
             fail=$((fail+1))
             continue
