@@ -1,0 +1,58 @@
+#!/bin/bash
+# muvm driver test runner: .ir -> muvm_tool (parse + driver pipeline +
+# print) -> reparse fixture check.
+#
+# The backend has no codegen yet, so the checks here are:
+#   1. the tool exits 0 (driver ran the module without error)
+#   2. its output parses again through the same path (fixpoint stable)
+# LEVELS defaults to O0..O3 — the opt level is currently a no-op but the
+# pipeline runs regardless, so regressions in the driver path are caught.
+set -u
+cd "$(dirname "$0")"
+CORALC="${CORALC:-coralc}"
+LEVELS="${LEVELS:-O0 O1 O2 O3}"
+CASES="${CASES:-../wallvm/cases}"
+OUT=output
+TMP=/home/cerie/Documents/coral/test/muvm/output
+TIMEOUT="${TIMEOUT:-15}"
+mkdir -p "$TMP" "$OUT"
+
+if [ ! -x ./muvm_tool ] || [ "${REBUILD:-0}" = "1" ]; then
+    echo "building muvm_tool..."
+    "$CORALC" muvm_tool.crl -o muvm_tool || exit 1
+fi
+
+t() { timeout --kill-after=5 "$TIMEOUT" "$@"; }
+
+pass=0
+fail=0
+for case in "$CASES"/*.ir; do
+    name=$(basename "$case" .ir)
+    for lv in $LEVELS; do
+        echo "TEST $name $lv"
+        t ./muvm_tool "$case" "$OUT/${name}_${lv}.mir" "$lv" 2>"$TMP/${name}_${lv}.err"
+        rc=$?
+        if [ "$rc" -ne 0 ]; then
+            echo "FAIL driver $name $lv (exit $rc)"
+            cat "$TMP/${name}_${lv}.err"
+            fail=$((fail+1))
+            continue
+        fi
+        t ./muvm_tool "$OUT/${name}_${lv}.mir" "$OUT/${name}_${lv}.mir2" "$lv" 2>"$TMP/${name}_${lv}.err2"
+        rc=$?
+        if [ "$rc" -ne 0 ]; then
+            echo "FAIL reparse $name $lv (exit $rc)"
+            fail=$((fail+1))
+            continue
+        fi
+        cmp -s "$OUT/${name}_${lv}.mir" "$OUT/${name}_${lv}.mir2"
+        if [ "$?" -ne 0 ]; then
+            echo "FAIL fixpoint $name $lv (output changed on reparse)"
+            fail=$((fail+1))
+            continue
+        fi
+        pass=$((pass+1))
+    done
+done
+echo "pass=$pass fail=$fail"
+[ "$fail" -eq 0 ]
