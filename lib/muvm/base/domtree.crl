@@ -1,131 +1,138 @@
 #[[no_drop_all]]
+// Dominator tree for the muvm IR — fresh implementation.
+//
+// The original was the wallvm domtree with everything derived twice:
+// pointer-scan O(n²) lookups for ids, idom chains walked per query,
+// no children lists. This version builds a pointer→index hash table in
+// irDomtreeNew, resolves everything in O(1) after that, and packs the
+// DFS-children arrays so callers that need the tree shape (mem2reg and
+// friends) get it directly instead of rebuilding it themselves.
+//
+// Unreachable blocks get no idom entry — irDomtreeIdom returns null for
+// them, dominates() returns false against them, and they are simply not
+// in the DFS preorder, so a preorder walk visits exactly the reachable
+// subgraph.
+
 import muvm::irtypes { IrFunc, IrBlock };
-import std::mman { alloc, dealloc };
+import std::mman { alloc, dealloc, copy };
 
 pub struct IrDomTree
 {
     IrBlock** blocks;
     u32 nblocks;
-    IrBlock** idoms;
+    // idom[i] = index of i's immediate dominator; entry (0) = itself;
+    // unreachable blocks stay 0xFFFFFFFF.
+    u32* idom;
+    // DFS discovery order of blocks (entry = 0).
+    u32* dfn;
+    // packed children: kids[kidsStart[i] .. kidsStart[i+1]) holds block
+    // indices of the DFS children of blocks[i]
+    u32* kidsStart;
+    IrBlock** kids;
+    u32 nkids;
+    // pointer→index hash table, open addressing, filled at construction
+    IrBlock** hashKeys;
+    u32* hashVals;
+    u32 hashMask;
 }
 
-// Helper, EVAL operation from Lengauer-Tarjan with path compression.
-// Returns the ancestor of v (or v itself) with the minimal semi-dominator.
-// The chain is walked up first, then compressed top-down so each label
-// comparison uses ancestors whose labels are already final.
-u32 _domEval(u32 v, u32 n, u32* ancestor, u32* label, u32* semi, u32* dfn, u32* work)
+// ---- pointer hash -----------------------------------------------------
+static u32 hashPtr(usize p)
 {
-    if (ancestor[v] >= n) return v;
-    u32 top = 0;
-    u32 x = v;
-    while (ancestor[x] < n)
-    {
-        work[top++] = x;
-        x = ancestor[x];
-    }
-    while (top > 0)
-    {
-        u32 w = work[--top];
-        if (dfn[semi[label[ancestor[w]]]] < dfn[semi[label[w]]])
-            label[w] = label[ancestor[w]];
-    }
-    return label[v];
+    u64 h = (u64)p * 0x9E3779B1UL;
+    h ^= h >> 16;
+    h *= 0x85EBCA6BUL;
+    h ^= h >> 13;
+    return (u32)h;
 }
 
-// Lengauer-Tarjan algorithm for computing immediate dominators.
-// O(N * alpha(N)) two-pass algorithm.
-//
-// Phase 1, DFS numbering, build parent/child relationship in DFS tree.
-// Phase 2, process vertices in reverse DFS order.
-//   - Compute semi-dominator (semi) from predecessors.
-//   - Use union-find (ancestor/label) to answer EVAL queries.
-//   - Link vertex into forest, process bucket of its parent.
-// Phase 3, final pass to set immediate dominators.
+void hashInsert(IrDomTree* dt, IrBlock* bb, u32 idx)
+{
+    if (dt->hashKeys == null) return;
+    u32 h = hashPtr((usize)bb) & dt->hashMask;
+    while (dt->hashKeys[h] != null)
+    {
+        if (dt->hashKeys[h] == bb) { dt->hashVals[h] = idx; return; }
+        h = (h + 1) & dt->hashMask;
+    }
+    dt->hashKeys[h] = bb;
+    dt->hashVals[h] = idx;
+}
 
+bool hashLookup(IrDomTree* dt, IrBlock* bb, u32* out)
+{
+    if (dt->hashKeys == null) return false;
+    u32 h = hashPtr((usize)bb) & dt->hashMask;
+    u32 probes = 0;
+    while (probes <= dt->hashMask + 1)
+    {
+        if (dt->hashKeys[h] == null) return false;
+        if (dt->hashKeys[h] == bb) { *out = dt->hashVals[h]; return true; }
+        h = (h + 1) & dt->hashMask;
+        probes++;
+    }
+    return false;
+}
+
+// ---- construction -----------------------------------------------------
 pub IrDomTree* irDomtreeNew(IrFunc* func)
 {
     if (func == null || func->nblocks == 0) return null;
-
     u32 n = func->nblocks;
 
     IrDomTree* dt = alloc<IrDomTree>((usize)1);
     dt->blocks = alloc<IrBlock*>((usize)n);
-    dt->idoms = alloc<IrBlock*>((usize)n);
-    dt->nblocks = n;
+    dt->idom = alloc<u32>((usize)n);
+    dt->dfn = alloc<u32>((usize)n);
+    dt->kidsStart = alloc<u32>((usize)(n + 1));
+    // one pass to count children per block — children arrays get exact size
+    dt->nkids = 0;
+    for (u32 i = 0; i < n; i++) dt->blocks[i] = func->blocks[i];
 
-    for (u32 i = 0; i < n; i++)
-        dt->blocks[i] = func->blocks[i];
+    // hash table, power of two, load factor <= 0.5
+    u32 cap = 2;
+    while (cap < n * 2) cap *= 2;
+    dt->hashKeys = alloc<IrBlock*>((usize)cap);
+    dt->hashVals = alloc<u32>((usize)cap);
+    dt->hashMask = cap - 1;
+    for (u32 i = 0; i < cap; i++) { dt->hashKeys[i] = null; dt->hashVals[i] = 0; }
+    for (u32 i = 0; i < n; i++) hashInsert(dt, dt->blocks[i], i);
 
-    // arrays indexed by block index
-    u32* parent = alloc<u32>((usize)n); // DFS parent
-    u32* dfn = alloc<u32>((usize)n); // DFS number (block->index)
-    u32* vertex = alloc<u32>((usize)n); // index->block (reverse mapping)
-    u32* semi = alloc<u32>((usize)n); // semi-dominator (store block index)
-    u32* idom = alloc<u32>((usize)n); // immediate dominator (block index)
-    u32* ancestor = alloc<u32>((usize)n); // union-find parent
-    u32* label = alloc<u32>((usize)n); // label for EVAL
-    u32* bucket = alloc<u32>((usize)n); // bucket head (singly linked list)
-    u32* next = alloc<u32>((usize)n); // bucket next pointer
+    // hmm, we don't have idom yet — children are counted after LT computes.
+    // hold the entry pointers arrays for the LT phase.
+    for (u32 i = 0; i < n; i++) { dt->idom[i] = 0xFFFFFFFF; dt->dfn[i] = 0; }
 
-    for (u32 i = 0; i < n; i++)
-    {
-        parent[i] = n;
-        dfn[i] = n;
-        vertex[i] = n;
-        semi[i] = i;
-        idom[i] = n;
-        ancestor[i] = n;
-        label[i] = i;
-        bucket[i] = n;
-        next[i] = n;
-    }
-
-    // dt->blocks[i] == func->blocks[i] by construction, so indices are
-    // their own reverse mapping
-    u32* blockIdx = alloc<u32>((usize)n);
-    for (u32 i = 0; i < n; i++)
-        blockIdx[i] = i;
-
-    u32* revIdx = alloc<u32>((usize)n);
-    for (u32 i = 0; i < n; i++) revIdx[i] = n;
-
-    // Iterative DFS from entry (assumes entry is func->blocks[0])
-    u32* stack = alloc<u32>((usize)n);
-    u32* state = alloc<u32>((usize)n); // 0=unvisited, 1=in-stack, 2=processed
+    // --- iterative DFS from entry for discovery order ---
+    u32* state = alloc<u32>((usize)n);
     for (u32 i = 0; i < n; i++) state[i] = 0;
-
-    u32 time = 0;
+    u32* stack = alloc<u32>((usize)n);
     u32 sp = 0;
     stack[sp++] = 0;
     state[0] = 1;
+    u32 time = 0;
+    u32* vertex = alloc<u32>((usize)n);
+    u32* parent = alloc<u32>((usize)n);
+    for (u32 i = 0; i < n; i++) { parent[i] = n; vertex[i] = n; }
 
     while (sp > 0)
     {
-        u32 cur = stack[sp - 1];
-
-        if (state[cur] == 1)
+        u32 v = stack[sp - 1];
+        if (state[v] == 1)
         {
-            // First visit, assign DFS number
-            state[cur] = 2;
-            dfn[cur] = time;
-            vertex[time] = cur;
-            revIdx[cur] = cur;
+            state[v] = 2;
+            dt->dfn[v] = time;
+            vertex[time] = v;
             time++;
-
-            IrBlock* curBlock = func->blocks[cur];
-            for (u32 j = 0; j < curBlock->nsuccs; j++)
+            IrBlock* vb = dt->blocks[v];
+            for (u32 j = 0; j < vb->nsuccs; j++)
             {
-                IrBlock* succBlock = curBlock->succs[j];
-                u32 succ = n;
-                // Find succ index in func->blocks
-                for (u32 k = 0; k < n; k++)
-                    if (func->blocks[k] == succBlock) { succ = k; break; }
-
-                if (succ < n && state[succ] == 0)
+                u32 si = 0xFFFFFFFF;
+                if (!hashLookup(dt, vb->succs[j], &si)) continue;
+                if (state[si] == 0)
                 {
-                    parent[succ] = cur;
-                    state[succ] = 1;
-                    stack[sp++] = succ;
+                    parent[si] = v;
+                    state[si] = 1;
+                    stack[sp++] = si;
                 }
             }
         }
@@ -135,98 +142,126 @@ pub IrDomTree* irDomtreeNew(IrFunc* func)
         }
     }
 
-    // Iterate vertices in reverse DFS order
-    for (u32 wIdx = time - 1; wIdx > 0; wIdx--)
+    u32* semi = alloc<u32>((usize)n);
+    u32* idomArr = alloc<u32>((usize)n);
+    u32* ancestor = alloc<u32>((usize)n);
+    u32* label = alloc<u32>((usize)n);
+    u32* bucket = alloc<u32>((usize)n);
+    u32* next = alloc<u32>((usize)n);
+    for (u32 i = 0; i < n; i++)
     {
-        u32 w = vertex[wIdx]; // block index
+        semi[i] = i;
+        idomArr[i] = n;
+        ancestor[i] = n;
+        label[i] = i;
+        bucket[i] = n;
+        next[i] = n;
+    }
 
-        // Step 1, compute semi-dominator of w
-        IrBlock* wBlock = func->blocks[blockIdx[w]];
-        semi[w] = parent[w]; // default semi = parent in DFS tree
-
-        for (u32 j = 0; j < wBlock->npreds; j++)
+    // semi-dominator computation (Lengauer-Tarjan), reverse DFS order
+    u32* evalWork = alloc<u32>((usize)n);
+    for (u32 wIdx = time; wIdx-- > 0; )
+    {
+        if (wIdx == 0) break;
+        u32 w = vertex[wIdx];
+        semi[w] = parent[w];
+        IrBlock* wb = dt->blocks[w];
+        for (u32 j = 0; j < wb->npreds; j++)
         {
-            IrBlock* vBlock = wBlock->preds[j];
-            u32 v = n;
-            for (u32 k = 0; k < n; k++)
-                if (func->blocks[k] == vBlock) { v = k; break; }
-            if (v >= n) continue;
-
+            u32 v = 0xFFFFFFFF;
+            if (!hashLookup(dt, wb->preds[j], &v)) continue;
             u32 u;
-            if (dfn[v] <= dfn[w])
+            if (dt->dfn[v] <= dt->dfn[w])
             {
-                u = v; // v is an ancestor of w
+                u = v;
             }
             else
             {
-                // EVAL(v), find ancestor of v with minimal semi
-                u = _domEval(v, n, ancestor, label, semi, dfn, stack);
+                // eval(v)
+                u32 top = 0;
+                u32 x = v;
+                while (ancestor[x] < n)
+                {
+                    evalWork[top++] = x;
+                    x = ancestor[x];
+                }
+                while (top > 0)
+                {
+                    u32 e = evalWork[--top];
+                    if (dt->dfn[semi[label[ancestor[e]]]] < dt->dfn[semi[label[e]]])
+                        label[e] = label[ancestor[e]];
+                }
+                u = label[v];
             }
-
-            if (dfn[semi[u]] < dfn[semi[w]])
+            if (dt->dfn[semi[u]] < dt->dfn[semi[w]])
                 semi[w] = semi[u];
         }
-
-        // Step 2, add w to bucket of semi(w)
         next[w] = bucket[semi[w]];
         bucket[semi[w]] = w;
-
-        // Step 3, LINK(parent[w], w), w becomes child of parent[w]
         ancestor[w] = parent[w];
         label[w] = w;
 
-        // Step 4, process bucket of parent[w]
-        u32 v = bucket[parent[w]];
+        // process parent bucket
+        u32 pIdx = parent[w];
+        if (pIdx >= n) continue;
+        u32 v = bucket[pIdx];
         while (v < n)
         {
-            // EVAL(v) with COMPRESS
-            u32 uEval = _domEval(v, n, ancestor, label, semi, dfn, stack);
-
-            if (dfn[semi[uEval]] < dfn[semi[v]])
-                idom[v] = uEval;
+            u32 u = label[v];
+            if (dt->dfn[semi[u]] < dt->dfn[semi[v]])
+                idomArr[v] = u;
             else
-                idom[v] = parent[w];
-
-            u32 tmp = next[v];
-            v = tmp;
+                idomArr[v] = pIdx;
+            v = next[v];
         }
-        bucket[parent[w]] = n;
+        bucket[pIdx] = n;
     }
-
-    // Phase 3, final pass, set idom
+    idomArr[0] = 0;
     for (u32 wIdx = 1; wIdx < time; wIdx++)
     {
         u32 w = vertex[wIdx];
-        if (idom[w] != semi[w])
-            idom[w] = idom[idom[w]];
+        if (idomArr[w] != semi[w])
+            idomArr[w] = idomArr[idomArr[w]];
     }
-    idom[0] = 0; // entry dominates itself
+    for (u32 i = 0; i < n; i++)
+        if (state[i] != 0) dt->idom[i] = idomArr[i];
 
-    // Convert block indices to IrBlock pointers
+    // --- packed children ---
+    // kidsStart walks cumulative counts in index order
+    u32* kidCount = alloc<u32>((usize)n);
+    for (u32 i = 0; i < n; i++) kidCount[i] = 0;
     for (u32 i = 0; i < n; i++)
     {
-        if (i == 0)
-            dt->idoms[i] = func->blocks[blockIdx[0]];
-        else if (idom[i] < n)
-            dt->idoms[i] = func->blocks[blockIdx[idom[i]]];
-        else
-            dt->idoms[i] = null;
+        if (dt->idom[i] != 0xFFFFFFFF && dt->idom[i] != i)
+            kidCount[dt->idom[i]]++;
+    }
+    dt->kidsStart[0] = 0;
+    for (u32 i = 0; i < n; i++)
+        dt->kidsStart[i + 1] = dt->kidsStart[i] + kidCount[i];
+    dt->nkids = dt->kidsStart[n];
+    dt->kids = alloc<IrBlock*>((usize)(dt->nkids ? dt->nkids : 1));
+    u32* fill = alloc<u32>((usize)n);
+    for (u32 i = 0; i < n; i++) fill[i] = dt->kidsStart[i];
+    for (u32 i = 0; i < n; i++)
+    {
+        if (dt->idom[i] == 0xFFFFFFFF || dt->idom[i] == i) continue;
+        u32 dst = fill[dt->idom[i]]++;
+        dt->kids[dst] = dt->blocks[i];
     }
 
-    // Cleanup
-    dealloc<u32>(stack);
-    dealloc<u32>(state);
-    dealloc<u32>(blockIdx);
-    dealloc<u32>(parent);
-    dealloc<u32>(dfn);
-    dealloc<u32>(vertex);
+    dealloc<u32>(kidCount);
+    dealloc<u32>(fill);
     dealloc<u32>(semi);
-    dealloc<u32>(idom);
+    dealloc<u32>(idomArr);
     dealloc<u32>(ancestor);
     dealloc<u32>(label);
     dealloc<u32>(bucket);
     dealloc<u32>(next);
-    dealloc<u32>(revIdx);
+    dealloc<u32>(evalWork);
+    dealloc<u32>(vertex);
+    dealloc<u32>(parent);
+    dealloc<u32>(stack);
+    dealloc<u32>(state);
 
     return dt;
 }
@@ -235,50 +270,70 @@ pub void irDomtreeFree(IrDomTree* dt)
 {
     if (dt == null) return;
     if (dt->blocks != null) dealloc<IrBlock*>(dt->blocks);
-    if (dt->idoms != null) dealloc<IrBlock*>(dt->idoms);
+    if (dt->idom != null) dealloc<u32>(dt->idom);
+    if (dt->dfn != null) dealloc<u32>(dt->dfn);
+    if (dt->kidsStart != null) dealloc<u32>(dt->kidsStart);
+    if (dt->kids != null) dealloc<IrBlock*>(dt->kids);
+    if (dt->hashKeys != null) dealloc<IrBlock*>(dt->hashKeys);
+    if (dt->hashVals != null) dealloc<u32>(dt->hashVals);
     dealloc<IrDomTree>(dt);
 }
 
+// Block index of bb, or 0xFFFFFFFF if not in the tree (unreachable).
+pub u32 irDomtreeBlockIndex(IrDomTree* dt, IrBlock* bb)
+{
+    if (dt == null || bb == null) return 0xFFFFFFFF;
+    u32 out;
+    if (!hashLookup(dt, bb, &out)) return 0xFFFFFFFF;
+    return out;
+}
+
+// Immediate dominator of bb, or null (unreachable block). Entry returns itself.
 pub IrBlock* irDomtreeIdom(IrDomTree* dt, IrBlock* bb)
 {
     if (dt == null || bb == null) return null;
-    for (u32 i = 0; i < dt->nblocks; i++)
-    {
-        if (dt->blocks[i] == bb)
-            return dt->idoms[i];
-    }
-    return null;
+    u32 i = irDomtreeBlockIndex(dt, bb);
+    if (i == 0xFFFFFFFF) return null;
+    u32 id = dt->idom[i];
+    if (id == 0xFFFFFFFF || id >= dt->nblocks) return null;
+    return dt->blocks[id];
+}
+
+// DFS children of bb: out* filled, returns the count.
+pub u32 irDomtreeChildCount(IrDomTree* dt, IrBlock* bb)
+{
+    if (dt == null || bb == null) return 0;
+    u32 i = irDomtreeBlockIndex(dt, bb);
+    if (i == 0xFFFFFFFF) return 0;
+    return dt->kidsStart[i + 1] - dt->kidsStart[i];
+}
+
+// The kth DFS child of bb, or null.
+pub IrBlock* irDomtreeChild(IrDomTree* dt, IrBlock* bb, u32 k)
+{
+    if (dt == null || bb == null) return null;
+    u32 i = irDomtreeBlockIndex(dt, bb);
+    if (i == 0xFFFFFFFF) return null;
+    u32 start = dt->kidsStart[i];
+    u32 count = dt->kidsStart[i + 1] - start;
+    if (k >= count) return null;
+    return dt->kids[start + k];
 }
 
 pub bool irDomtreeDominates(IrDomTree* dt, IrBlock* a, IrBlock* b)
 {
     if (dt == null || a == null || b == null) return false;
-    if (a == b) return true;
-    // The idom chain of the root is the root itself, so walks from a
-    // self-dominated block must be bounded or they would never terminate.
+    u32 ib = irDomtreeBlockIndex(dt, b);
+    u32 ia = irDomtreeBlockIndex(dt, a);
+    if (ib == 0xFFFFFFFF || ia == 0xFFFFFFFF) return false;
+    if (ia == ib) return true;
+    // idom chain from b to a; entry's idom is itself, stop there
+    u32 cur = dt->idom[ib];
     u32 guard = 0;
-    IrBlock* current = irDomtreeIdom(dt, b);
-    while (current != null && guard <= dt->nblocks)
+    while (cur != 0xFFFFFFFF && cur != ia && guard <= dt->nblocks)
     {
-        if (current == a) return true;
-        current = irDomtreeIdom(dt, current);
+        cur = dt->idom[cur];
         guard++;
     }
-    return false;
-}
-
-pub u32 irDomtreeLevel(IrDomTree* dt, IrBlock* bb)
-{
-    u32 level = 0;
-    u32 guard = 0;
-    IrBlock* current = irDomtreeIdom(dt, bb);
-    while (current != null && guard <= dt->nblocks)
-    {
-        level++;
-        guard++;
-        IrBlock* nxt = irDomtreeIdom(dt, current);
-        if (nxt == current) break;
-        current = nxt;
-    }
-    return level;
+    return cur == ia;
 }
