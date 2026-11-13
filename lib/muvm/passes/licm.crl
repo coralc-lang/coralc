@@ -1,0 +1,278 @@
+#[[no_drop_all]]
+// LICM — loop-invariant code motion for muvm.
+//
+// Natural loops are detected over the dominator tree (loop_detect).
+// For each loop a preheader is created: all outside predecessors of the
+// header are redirected through a new single-successor block, and phi
+// inputs in the header naming those outside preds are renamed. Then a
+// fixpoint walks loop blocks hoisting instructions whose operands are
+// all loop-invariant into the preheader — safe speculatable opcodes
+// only (pure arithmetic/compare/bitmanip/vector/gep; no div, no memory).
+//
+// This version does not hoist loads (needs alias info to prove no
+// intervening store in the loop writes the slot).
+
+import muvm::passes::common { gVerbose };
+import muvm::passes::loop_detect { IrLoop, irLoopDetectNatural, irLoopDestroy, gVerboseLoop };
+import muvm::irOps { IrOpcode, irOpcodeIsTerminator, irOpcodeStr };
+import muvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind };
+import std::mman { alloc, dealloc };
+
+pub struct LicmPass
+{
+    IrContext* ctx;
+    u64 hoisted;
+
+    static LicmPass new(IrContext* ctx)
+    {
+        return LicmPass {
+            .ctx = ctx,
+            .hoisted = 0
+        };
+    }
+
+    u32 blockIndex(IrFunc* func, IrBlock* bb)
+    {
+        for (u32 i = 0; i < func->nblocks; i++)
+            if (func->blocks[i] == bb)
+                return i;
+        return func->nblocks;
+    }
+
+    // phi inputs naming oldPred in `block` are renamed to newPred
+    void renamePhiPred(IrBlock* block, IrBlock* oldPred, IrBlock* newPred)
+    {
+        if (block == null) return;
+        for (u32 i = 0; i < block->ninsts; i++)
+        {
+            IrInst* phi = block->insts[i];
+            if (phi == null || phi->opcode != IrOpcode::Phi) continue;
+            for (u32 j = 1; j < phi->nops; j += 2)
+            {
+                if (phi->ops[j] == &oldPred->base)
+                {
+                    phi->ops[j]->removeUser(phi);
+                    phi->ops[j] = &newPred->base;
+                    (&newPred->base)->addUser(phi);
+                }
+            }
+        }
+    }
+
+    // White-list of opcodes that are safe to speculate: no side
+    // effects, no trapping behavior. Divisions (SDiv/UDiv/SRem/URem)
+    // excluded — a zero divisor would introduce a spurious trap.
+    bool opcodeSpeculatable(IrOpcode op)
+    {
+        switch (op)
+        {
+            IrOpcode::Neg | IrOpcode::Not |
+            IrOpcode::Add | IrOpcode::Sub | IrOpcode::Mul |
+            IrOpcode::And | IrOpcode::Or | IrOpcode::Xor |
+            IrOpcode::Shl | IrOpcode::Ashr | IrOpcode::Lshr |
+            IrOpcode::Trunc | IrOpcode::Zext | IrOpcode::Sext |
+            IrOpcode::FpTrunc | IrOpcode::FpExt | IrOpcode::Bitcast |
+            IrOpcode::FpToSi | IrOpcode::SiToFp | IrOpcode::FpToUi | IrOpcode::UiToFp |
+            IrOpcode::ICmp | IrOpcode::FCmp |
+            IrOpcode::CtPop | IrOpcode::CtLz | IrOpcode::CtTz |
+            IrOpcode::Rotl | IrOpcode::Rotr | IrOpcode::Bswap |
+            IrOpcode::SMin | IrOpcode::SMax | IrOpcode::UMin | IrOpcode::UMax |
+            IrOpcode::Abs |
+            IrOpcode::FAdd | IrOpcode::FSub | IrOpcode::FMul | IrOpcode::FDiv |
+            IrOpcode::Fma | IrOpcode::FAbs | IrOpcode::FSqrt |
+            IrOpcode::VecAdd | IrOpcode::VecSub | IrOpcode::VecMul | IrOpcode::VecDiv |
+            IrOpcode::VecFAdd | IrOpcode::VecFSub | IrOpcode::VecFMul | IrOpcode::VecFDiv |
+            IrOpcode::VecMin | IrOpcode::VecMax | IrOpcode::VecBroadcast |
+            IrOpcode::ShuffleVector | IrOpcode::ExtractElement | IrOpcode::InsertElement |
+            IrOpcode::ExtractValue | IrOpcode::InsertValue |
+            IrOpcode::Gep |
+            IrOpcode::Select => { return true; },
+            else => { return false; }
+        }
+    }
+
+    bool run(IrFunc* func)
+    {
+        if (func == null) return false;
+        if (gVerbose) eprintln("licm: begin func={} nblocks={}", func->base.name, func->nblocks);
+        if (gVerbose) gVerboseLoop = true;
+        IrLoop** loops = irLoopDetectNatural(func);
+        if (loops == null) return false;
+        if (gVerbose)
+        {
+            u32 nLoops = 0;
+            while (loops[nLoops] != null) nLoops++;
+            eprintln("licm: detected {} natural loops", nLoops);
+        }
+
+        bool changedAny = false;
+        u32 nfn = func->nblocks;
+
+        for (u32 li = 0; loops[li] != null; li++)
+        {
+            IrLoop* lp = loops[li];
+            // membership over the CURRENT func block array (loop detection
+            // ran before any preheader creation this loop did, but earlier
+            // iterations create preheader blocks — indexes shift, rebuild)
+            bool* inLoop = alloc<bool>((usize)nfn);
+            for (u32 bi = 0; bi < nfn; bi++) inLoop[bi] = false;
+            for (u32 bi = 0; bi < lp->nblocks; bi++)
+            {
+                u32 idx = self.blockIndex(func, lp->blocks[bi]);
+                if (idx < nfn) inLoop[idx] = true;
+            }
+
+            IrBlock* header = lp->header;
+            u32 hIdx = self.blockIndex(func, header);
+            if (hIdx >= nfn) { dealloc<bool>(inLoop); continue; }
+
+            // collect outside predecessors of the header
+            u32 nOut = 0;
+            for (u32 i = 0; i < header->npreds; i++)
+            {
+                IrBlock* p = header->preds[i];
+                u32 pi = self.blockIndex(func, p);
+                if (pi == nfn || !inLoop[pi]) nOut++;
+            }
+            if (nOut == 0)
+            {
+                // no entry from outside — infinite loop or unreachable; skip
+                dealloc<bool>(inLoop);
+                continue;
+            }
+
+            // First pass: figure out whether there is anything to hoist.
+            // Create the preheader only when there is at least one safe,
+            // loop-invariant instruction — otherwise the pass is a no-op
+            // and we must not add empty blocks (breaks idempotence).
+            bool anyHoist = false;
+            for (u32 bi = 0; bi < lp->nblocks; bi++)
+            {
+                IrBlock* blk = lp->blocks[bi];
+                for (u32 ii = 0; ii < blk->ninsts; ii++)
+                {
+                    IrInst* inst = blk->insts[ii];
+                    if (inst == null) continue;
+                    if (!self.opcodeSpeculatable(inst->opcode)) continue;
+                    bool ok = true;
+                    for (u32 oj = 0; oj < inst->nops; oj++)
+                    {
+                        IrValue* opc = inst->ops[oj];
+                        if (opc == null || opc->kind != IrValueKind::Inst) continue;
+                        IrInst* def = (IrInst*)opc;
+                        IrBlock* parent = def->parent;
+                        if (parent == null) continue;
+                        u32 piIdx = self.blockIndex(func, parent);
+                        if (piIdx < nfn && inLoop[piIdx]) { ok = false; break; }
+                    }
+                    if (ok) { anyHoist = true; break; }
+                }
+                if (anyHoist) break;
+            }
+            if (!anyHoist)
+            {
+                dealloc<bool>(inLoop);
+                continue;
+            }
+
+            // create the preheader
+            IrBlock* pre = self.ctx->createBlock("licm.preheader");
+            func->addBlock(pre);
+            IrValue** brOps = alloc<IrValue*>((usize)1);
+            brOps[0] = &header->base;
+            IrInst* brTerm = self.ctx->createInst(IrOpcode::Br, self.ctx->tyVoid(), brOps, 1, 0, 0);
+            dealloc<IrValue*>(brOps);
+            pre->addInst(brTerm);
+            pre->addSucc(header);
+            header->addPred(pre);
+
+            // redirect outside preds to the preheader
+            for (u32 i = 0; i < header->npreds; i++)
+            {
+                IrBlock* p = header->preds[i];
+                if (p == pre) continue;
+                u32 pi = self.blockIndex(func, p);
+                if (pi != nfn && inLoop[pi]) continue;    // loop-internal pred — keep
+                // terminator: point this pred's Br/CondBr/Switch slots at pre
+                for (u32 ii = 0; ii < p->ninsts; ii++)
+                {
+                    IrInst* t = p->insts[ii];
+                    if (t == null || !irOpcodeIsTerminator(t->opcode)) continue;
+                    for (u32 oj = 0; oj < t->nops; oj++)
+                    {
+                        if (t->ops[oj] == &header->base)
+                        {
+                            t->ops[oj]->removeUser(t);
+                            t->ops[oj] = &pre->base;
+                            (&pre->base)->addUser(t);
+                        }
+                    }
+                }
+                // splice the succ IN PLACE — remove+add would swap in the
+                // moved succ for the last element and destroy the arm
+                // order that downstream phases (sccp phase-2c) depend on
+                for (u32 sj = 0; sj < p->nsuccs; sj++)
+                    if (p->succs[sj] == header) { p->succs[sj] = pre; break; }
+                header->removePred(p);
+                pre->addPred(p);
+                // phi inputs naming p in the header now name pre
+                self.renamePhiPred(header, p, pre);
+            }
+
+            // hoisting fixpoint: keep moving safe loop-invariant insts
+            bool moved = true;
+            while (moved)
+            {
+                moved = false;
+                for (u32 bi = 0; bi < lp->nblocks; bi++)
+                {
+                    IrBlock* blk = lp->blocks[bi];
+                    if (blk->ninsts == 0) continue;
+                    for (u32 ii = 0; ii < blk->ninsts; ii++)
+                    {
+                        IrInst* inst = blk->insts[ii];
+                        if (inst == null) continue;
+                        if (!self.opcodeSpeculatable(inst->opcode)) continue;
+                        // operand defined in the loop (directly by another inst in
+                        // the loop) blocks hoisting this round — the fixpoint will
+                        // get it next round once that inst moves out
+                        bool ok = true;
+                        for (u32 oj = 0; oj < inst->nops; oj++)
+                        {
+                            IrValue* opc = inst->ops[oj];
+                            if (opc == null || opc->kind != IrValueKind::Inst) continue;
+                            IrInst* def = (IrInst*)opc;
+                            IrBlock* parent = def->parent;
+                            if (parent == null) continue;   // detached (already hoisted) — invariant
+                            u32 piIdx = self.blockIndex(func, parent);
+                            if (piIdx < nfn && inLoop[piIdx]) { ok = false; break; }
+                        }
+                        if (!ok) continue;
+                        if (gVerbose) eprintln("licm: hoist inst id={} op={} out of loop header={}", inst->base.id, irOpcodeStr(inst->opcode), header->base.name);
+                        inst->detach();
+                        pre->insertBefore(inst, brTerm);
+                        self.hoisted++;
+                        moved = true;
+                        changedAny = true;
+                        // insts shifted down by detach — rescan this block
+                        ii = (u32)-1;
+                        break;
+                    }
+                }
+            }
+
+            dealloc<bool>(inLoop);
+        }
+
+        irLoopDestroy(loops);
+        return changedAny;
+    }
+}
+
+pub bool muvmPassLicm(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (func == null || ctx == null) return false;
+    LicmPass pass = LicmPass::new(ctx);
+    return pass.run(func);
+}
