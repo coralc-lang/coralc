@@ -1,0 +1,264 @@
+#[[no_drop_all]]
+// muvm IR verifier — the pass every stage boundary should run.
+//
+// Catches the classes of bug that text-level golden tests cannot see:
+// mis-wired pred/succ lists, phi arity ≠ pred count, terminators not
+// last, uses walking past their definitions, dropped terminators,
+// duplicate instruction ids, and stale edges after edge surgery.
+//
+// Errors print as one “verify: <message>” line each (max 32), plus one
+// summary line. Returns false when the function is malformed — wired into
+// the graph via MuvmOptions.verify (verify-each) or the --verify flag of
+// the test tool.
+
+import muvm::irOps { IrOpcode, irOpcodeIsTerminator, irOpcodeStr };
+import muvm::irtypes { IrFunc, IrBlock, IrInst, IrValue, IrValueKind };
+import muvm::domtree { IrDomTree, irDomtreeNew, irDomtreeBlockIndex, irDomtreeDominates, irDomtreeFree };
+import std::mman { alloc, dealloc };
+import std::ios { eprintln };
+
+pub struct VerifyPass
+{
+    u64 nErrs;
+
+    static VerifyPass new()
+    {
+        return VerifyPass { .nErrs = 0 };
+    }
+
+    void err(str msg)
+    {
+        if (self.nErrs < 32) eprintln("verify: {}", msg);
+        self.nErrs++;
+    }
+
+    bool check(IrFunc* func)
+    {
+        if (func == null) return false;
+        self.nErrs = 0;
+        IrDomTree* dt = irDomtreeNew(func);
+
+        // --- unique instruction ids -----------------------------------
+        u32 maxId = 0;
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            if (bb == null) continue;
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+                if (bb->insts[ii] != null && bb->insts[ii]->base.id > maxId)
+                    maxId = bb->insts[ii]->base.id;
+        }
+        bool* seen = alloc<bool>((usize)maxId + 1);
+        for (u32 i = 0; i <= maxId; i++) seen[i] = false;
+
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            if (bb == null) continue;
+            // --- every block ends in a terminator, and only that ------
+            if (bb->ninsts == 0)
+            {
+                self.err("empty block without terminator");
+            }
+            else
+            {
+                IrInst* t = bb->insts[bb->ninsts - 1];
+                if (t != null && !irOpcodeIsTerminator(t->opcode))
+                    self.err("last inst is not a terminator");
+                for (u32 ii = 0; ii + 1 < bb->ninsts; ii++)
+                {
+                    IrInst* e = bb->insts[ii];
+                    if (e != null && irOpcodeIsTerminator(e->opcode))
+                        self.err("terminator in non-final position");
+                }
+            }
+
+            // --- succ list matches terminator arity, order preserved --
+            if (bb->ninsts == 0) continue;
+            IrInst* term = bb->insts[bb->ninsts - 1];
+            if (term == null) continue;
+            switch (term->opcode)
+            {
+                IrOpcode::Br => {
+                    if (bb->nsuccs != 1) self.err("br: nsuccs != 1");
+                    else if (term->ops[0] != null && bb->succs[0] != (IrBlock*)term->ops[0])
+                        self.err("br: succ list disagrees with operand");
+                    break;
+                },
+                IrOpcode::CondBr => {
+                    if (bb->nsuccs != 2) self.err("cond_br: nsuccs != 2");
+                    else
+                    {
+                        if (term->ops[1] != null && bb->succs[0] != (IrBlock*)term->ops[1])
+                            self.err("cond_br: succ[0] != then-arm");
+                        if (term->ops[2] != null && bb->succs[1] != (IrBlock*)term->ops[2])
+                            self.err("cond_br: succ[1] != else-arm");
+                    }
+                    break;
+                },
+                IrOpcode::Switch => {
+                    u32 cases = (term->nops - 2) / 2;
+                    if (bb->nsuccs != 1 + cases) self.err("switch: nsuccs != 1 + #cases");
+                    else
+                    {
+                        if (term->ops[1] != null && bb->succs[0] != (IrBlock*)term->ops[1])
+                            self.err("switch: succ[0] != default");
+                        u32 sj = 1;
+                        for (u32 j = 2; j + 1 < term->nops && sj < bb->nsuccs; j += 2)
+                        {
+                            if (term->ops[j + 1] != null && bb->succs[sj] != (IrBlock*)term->ops[j + 1])
+                                self.err("switch: case block mismatch");
+                            sj++;
+                        }
+                    }
+                    break;
+                },
+                IrOpcode::Ret | IrOpcode::Noret | IrOpcode::Unreachable => {
+                    if (bb->nsuccs != 0) self.err("ret/unreachable/noret: block has succs");
+                    break;
+                },
+                else => { }
+            }
+
+            // --- succ↔pred consistency, count parallel edges exactly ---
+            for (u32 sj = 0; sj < bb->nsuccs; sj++)
+            {
+                IrBlock* s = bb->succs[sj];
+                if (s == null) continue;
+                u32 found = 0;
+                for (u32 pj = 0; pj < s->npreds; pj++)
+                    if (s->preds[pj] == bb) found++;
+                u32 want = 1;
+                if (term->opcode == IrOpcode::CondBr && term->ops[1] == term->ops[2] && s == (IrBlock*)term->ops[1]) want = 2;
+                if (bb->succs[sj] == s && sj + 1 < bb->nsuccs && bb->succs[sj + 1] == s) want = 2;
+                if (found < want) self.err("pred list missing this inbound edge");
+            }
+            for (u32 pj = 0; pj < bb->npreds; pj++)
+            {
+                IrBlock* p = bb->preds[pj];
+                if (p == null) continue;
+                u32 found = 0;
+                for (u32 sj = 0; sj < p->nsuccs; sj++)
+                    if (p->succs[sj] == bb) found++;
+                if (found == 0) self.err("pred lists bb but bb is not a succ of pred");
+            }
+
+            // --- entry block has no preds -----------------------------
+            if (bi == 0 && bb->npreds != 0) self.err("entry block has predecessors");
+
+            // --- defs recorded for domination -------------------------
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst == null) continue;
+                u32 id = inst->base.id;
+                if (id <= maxId)
+                {
+                    if (seen[id]) self.err("duplicate instruction id");
+                    seen[id] = true;
+                }
+            }
+        }
+
+        // --- phi shape & edge correspondence ---------------------------
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            if (bb == null) continue;
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* phi = bb->insts[ii];
+                if (phi == null || phi->opcode != IrOpcode::Phi) continue;
+                if (phi->nops < 2 || (phi->nops % 2) != 0)
+                    self.err("phi: operands not value/block pairs");
+                else
+                {
+                    u32 pairs = phi->nops / 2;
+                    // count pairs naming pred p vs edges p→bb
+                    for (u32 pj = 0; pj < phi->nops; pj += 2)
+                    {
+                        IrBlock* pb = null;
+                        if (phi->ops[pj + 1] != null) pb = (IrBlock*)phi->ops[pj + 1];
+                        if (pb == null) { self.err("phi: null predecessor block"); continue; }
+                        bool isPred = false;
+                        for (u32 k = 0; k < bb->npreds; k++)
+                            if (bb->preds[k] == pb) isPred = true;
+                        if (!isPred) self.err("phi: incoming block is not a predecessor");
+                    }
+                    // every distinct pred must appear in the phi at least once
+                    for (u32 k = 0; k < bb->npreds; k++)
+                    {
+                        IrBlock* p = bb->preds[k];
+                        bool present = false;
+                        for (u32 pj = 1; pj < phi->nops; pj += 2)
+                            if (phi->ops[pj] == &p->base) { present = true; break; }
+                        if (!present) self.err("phi: missing incoming pair for predecessor");
+                    }
+                    if (pairs == 0) self.err("phi: no incoming values");
+                }
+            }
+        }
+
+        // --- domination: defs must precede (or dominate) uses ---------
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            if (bb == null) continue;
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* u = bb->insts[ii];
+                if (u == null) continue;
+                for (u32 oj = 0; oj < u->nops; oj++)
+                {
+                    IrValue* op = u->ops[oj];
+                    if (op == null || op->kind != IrValueKind::Inst) continue;
+                    IrInst* def = (IrInst*)op;
+                    IrBlock* defBlock = def->parent;
+                    if (defBlock == null) continue;             // detached orphan — caught elsewhere
+                    if (u->opcode == IrOpcode::Phi)
+                    {
+                        // phi uses are edge uses on the paired incoming
+                        // block — domination is over the edge source, not
+                        // the phi's position in the block
+                        if ((oj & 1) == 1) continue;                   // block slot — not an Inst use
+                        IrBlock* pairBlock = null;
+                        if (oj + 1 < u->nops && u->ops[oj + 1] != null)
+                            pairBlock = (IrBlock*)u->ops[oj + 1];
+                        if (pairBlock == null) continue;
+                        if (!irDomtreeDominates(dt, defBlock, pairBlock))
+                            self.err("phi operand def does not dominate the incoming edge");
+                        continue;
+                    }
+                    if (defBlock == bb)
+                    {
+                        u32 defIdx = self.instIndex(bb, def);
+                        if (defIdx >= ii) self.err("use of a value defined after it (same block)");
+                        continue;
+                    }
+                    if (!irDomtreeDominates(dt, defBlock, bb))
+                        self.err("def does not dominate use");
+                }
+            }
+        }
+
+        dealloc<bool>(seen);
+        if (dt != null) irDomtreeFree(dt);
+        if (self.nErrs > 0)
+            eprintln("verify: {} error(s) in func {}", (u64)self.nErrs, func->base.name);
+        return self.nErrs == 0;
+    }
+
+    u32 instIndex(IrBlock* bb, IrInst* inst)
+    {
+        for (u32 i = 0; i < bb->ninsts; i++)
+            if (bb->insts[i] == inst) return i;
+        return bb->ninsts;
+    }
+}
+
+pub bool muvmPassVerify(IrFunc* func, rawptr userdata)
+{
+    VerifyPass pass = VerifyPass::new();
+    (void)userdata;
+    return pass.check(func);
+}
