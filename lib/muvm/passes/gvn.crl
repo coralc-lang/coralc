@@ -1,0 +1,422 @@
+#[[no_drop_all]]
+// GVN — global value numbering for muvm.
+//
+// Dominator-scoped expression table: each block clones the visibility of
+// its parent's table upon entry (tracked by an index marker, not an
+// allocation) and discards it on exit. Pure expressions are looked up by
+// operand pointers (normalized for commutative ops); loads are also
+// numberable, with clobber flushing on any store/call/fence/atomic.
+// This subsumes block-local CSE — every local CSE match is a dominator
+// match where the dominating expr is in the same block.
+//
+// Not supported: PRE (partial redundancy elimination), floats with
+// metadata-encoded fast-math (flags must match exactly — IEEE semantics
+// make f+0.0 ≠ f without fast-math), loads with clobbers between them in
+// sibling branches.
+
+import muvm::irOps { IrOpcode, irOpcodeIsCommutative };
+import muvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind, IrType, IrTypeKind };
+import muvm::domtree { IrDomTree, irDomtreeNew, irDomtreeFree, irDomtreeBlockIndex, irDomtreeChildCount, irDomtreeChild, irDomtreeIdom };
+import std::mman { alloc, dealloc };
+
+// ---------------------------------------------------------------------------
+// expression table — global entries array + open-addressed hash buckets
+// ---------------------------------------------------------------------------
+
+pub struct GvnEntry
+{
+    u64 key;
+    IrInst* inst;
+}
+
+pub struct GvnPass
+{
+    IrContext* ctx;
+    u64 hits;
+    u64 inserts;
+
+    GvnEntry* entries;
+    u32 nEnt;
+    u32 capEnt;
+
+    u64* bucketKeys;
+    u32* bucketSlot;
+    u32 capBuckets;
+
+    u32[128] markStack;
+    u32 markTop;
+    u32 currentMark;
+
+    // same-block load cache: flushed on every memory write/op
+    IrValue** loadPtrs;
+    IrInst** loadInsts;
+    u32 nLoads;
+    u32 capLoads;
+
+    static GvnPass new(IrContext* ctx)
+    {
+        return GvnPass {
+            .ctx = ctx,
+            .hits = 0,
+            .inserts = 0,
+            .entries = null,
+            .nEnt = 0,
+            .capEnt = 0,
+            .bucketKeys = null,
+            .bucketSlot = null,
+            .capBuckets = 0,
+            .markTop = 0,
+            .currentMark = 0,
+            .loadPtrs = null,
+            .loadInsts = null,
+            .nLoads = 0,
+            .capLoads = 0
+        };
+    }
+
+    void deinit()
+    {
+        if (self.entries != null) dealloc<GvnEntry>(self.entries);
+        if (self.bucketKeys != null) dealloc<u64>(self.bucketKeys);
+        if (self.bucketSlot != null) dealloc<u32>(self.bucketSlot);
+        if (self.loadPtrs != null) dealloc<IrValue*>(self.loadPtrs);
+        if (self.loadInsts != null) dealloc<IrInst*>(self.loadInsts);
+    }
+
+    // -------- scope markers ---------------------------------------------
+    void enterScope()
+    {
+        self.markStack[self.markTop++] = self.currentMark;
+    }
+
+    void exitScope()
+    {
+        self.markTop--;
+        self.currentMark = self.markStack[self.markTop];
+    }
+
+    // -------- hash utilities --------------------------------------------
+    static u64 mix64(u64 x)
+    {
+        x ^= x >> 33;
+        x *= 0xFF51AFD7ED558CCDUL;
+        x ^= x >> 33;
+        x *= 0xC4CEB9FE1A85EC53UL;
+        x ^= x >> 33;
+        return x;
+    }
+
+    u32 hashSlot(u64 key)
+    {
+        return (u32)(GvnPass::mix64(key) & (u64)(self.capBuckets - 1));
+    }
+
+    void ensureBuckets()
+    {
+        u32 want = 16;
+        while (want < self.nEnt * 2) want *= 2;
+        if (self.capBuckets >= want) return;
+        if (self.bucketKeys != null)
+        {
+            dealloc<u64>(self.bucketKeys);
+            dealloc<u32>(self.bucketSlot);
+        }
+        self.bucketKeys = alloc<u64>((usize)want);
+        self.bucketSlot = alloc<u32>((usize)want);
+        for (u32 i = 0; i < want; i++)
+        {
+            self.bucketKeys[i] = 0;
+            self.bucketSlot[i] = 0xFFFFFFFF;
+        }
+        self.capBuckets = want;
+    }
+
+    void ensureEntries()
+    {
+        u32 nc = self.capEnt ? self.capEnt * 2 : 16;
+        while (nc < self.nEnt + 1) nc *= 2;
+        GvnEntry* ne = alloc<GvnEntry>((usize)nc);
+        if (self.entries != null)
+        {
+            for (u32 i = 0; i < self.nEnt; i++) ne[i] = self.entries[i];
+            dealloc<GvnEntry>(self.entries);
+        }
+        self.entries = ne;
+        self.capEnt = nc;
+    }
+
+    void rebuildBuckets()
+    {
+        // called when buckets grown: re-audit all live entries
+        for (u32 i = 0; i < self.capBuckets; i++)
+        {
+            self.bucketKeys[i] = 0;
+            self.bucketSlot[i] = 0xFFFFFFFF;
+        }
+        for (u32 i = 0; i < self.currentMark; i++)
+        {
+            u64 key = self.entries[i].key;
+            u32 slot = self.hashSlot(key);
+            while (self.bucketSlot[slot] != 0xFFFFFFFF)
+                slot = (slot + 1) & (self.capBuckets - 1);
+            self.bucketKeys[slot] = key;
+            self.bucketSlot[slot] = i;
+        }
+    }
+
+    // -------- table -----------------------------------------------------
+    u32 findOrAdd(u64 key, IrInst* inst)
+    {
+        self.ensureBuckets();
+        u32 slot = self.hashSlot(key);
+        while (self.bucketSlot[slot] != 0xFFFFFFFF)
+        {
+            u32 idx = self.bucketSlot[slot];
+            // live probe — skip dead entries (index >= currentMark)
+            if (idx < self.currentMark && self.entries[idx].key == key)
+                return idx;
+            slot = (slot + 1) & (self.capBuckets - 1);
+        }
+        return 0xFFFFFFFF;
+    }
+
+    bool insert(u64 key, IrInst* inst, u32* outIdx)
+    {
+        if (self.nEnt >= self.capEnt)
+        {
+            self.ensureEntries();
+            self.rebuildBuckets();
+        }
+        u32 slot = self.hashSlot(key);
+        while (self.bucketSlot[slot] != 0xFFFFFFFF)
+        {
+            u32 idx = self.bucketSlot[slot];
+            if (idx < self.currentMark && self.entries[idx].key == key)
+                return false; // already there
+            slot = (slot + 1) & (self.capBuckets - 1);
+        }
+        if (self.nEnt >= self.currentMark)
+        {
+            // entries overwritten before being pushed by a child — grow
+            // and ensure the slot exists
+        }
+        self.entries[self.nEnt].key = key;
+        self.entries[self.nEnt].inst = inst;
+        self.bucketKeys[slot] = key;
+        self.bucketSlot[slot] = self.nEnt;
+        *outIdx = self.nEnt;
+        self.nEnt++;
+        self.currentMark = self.nEnt;
+        self.inserts++;
+        return true;
+    }
+
+    // -------- pure-expression check ---------------------------------------
+    static bool isCseOp(IrOpcode op)
+    {
+        switch (op)
+        {
+            IrOpcode::Add | IrOpcode::Sub | IrOpcode::Mul |
+            IrOpcode::And | IrOpcode::Or  | IrOpcode::Xor |
+            IrOpcode::Shl | IrOpcode::Ashr | IrOpcode::Lshr |
+            IrOpcode::Rotl | IrOpcode::Rotr |
+            IrOpcode::SMin | IrOpcode::SMax | IrOpcode::UMin | IrOpcode::UMax |
+            IrOpcode::SDiv | IrOpcode::UDiv | IrOpcode::SRem | IrOpcode::URem |
+            IrOpcode::Neg | IrOpcode::Not |
+            IrOpcode::Bswap | IrOpcode::CtPop | IrOpcode::CtLz | IrOpcode::CtTz |
+            IrOpcode::Abs | IrOpcode::FAbs | IrOpcode::FSqrt | IrOpcode::Fma |
+            IrOpcode::FAdd | IrOpcode::FSub | IrOpcode::FMul | IrOpcode::FDiv |
+            IrOpcode::ICmp | IrOpcode::FCmp |
+            IrOpcode::Trunc | IrOpcode::Zext | IrOpcode::Sext |
+            IrOpcode::FpTrunc | IrOpcode::FpExt |
+            IrOpcode::FpToSi | IrOpcode::SiToFp | IrOpcode::FpToUi | IrOpcode::UiToFp |
+            IrOpcode::Bitcast | IrOpcode::Gep | IrOpcode::Select => {
+                return true;
+            },
+            else => { return false; }
+        }
+    }
+
+    static u32 typeWidth(IrType* t)
+    {
+        if (t == null) return 64;
+        return t->width > 0 ? t->width : 64;
+    }
+
+    static u64 hashInst(IrInst* inst)
+    {
+        u64 h = 0xCBF29CE484222325UL;
+        h ^= (u64)(u32)inst->opcode;
+        h *= 0x100000001B3UL;
+        h ^= (u64)(GvnPass::typeWidth(inst->base.type));
+        h *= 0x100000001B3UL;
+        h ^= (u64)inst->flags;
+        h *= 0x100000001B3UL;
+        h ^= (u64)inst->icmpPred;
+        h *= 0x100000001B3UL;
+        h ^= (u64)inst->fcmpPred;
+        h *= 0x100000001B3UL;
+        u32 k = 0;
+        while (k < inst->nops)
+        {
+            h ^= GvnPass::mix64((u64)inst->ops[k]);
+            h *= 0x100000001B3UL;
+            k++;
+        }
+        return h;
+    }
+
+    static bool exprEq(IrInst* a, IrInst* b)
+    {
+        if (a->opcode != b->opcode) return false;
+        if (a->base.type != b->base.type) return false;
+        if (a->flags != b->flags) return false;
+        if (a->icmpPred != b->icmpPred) return false;
+        if (a->fcmpPred != b->fcmpPred) return false;
+        if (a->nops != b->nops) return false;
+        for (u32 k = 0; k < a->nops; k++)
+            if (a->ops[k] != b->ops[k]) return false;
+        return true;
+    }
+
+    void flushLoadCache()
+    {
+        self.nLoads = 0;
+    }
+
+    bool loadMatch(IrInst* inst, IrInst** hit)
+    {
+        for (u32 i = 0; i < self.nLoads; i++)
+        {
+            if (self.loadPtrs[i] != inst->ops[0]) continue;
+            if (self.loadInsts[i]->base.type != inst->base.type) continue;
+            // same pointer, same type, and no clobber between producers —
+            // flush on every memory write guarantees this
+            *hit = self.loadInsts[i];
+            return true;
+        }
+        return false;
+    }
+
+    void recordLoad(IrInst* inst)
+    {
+        if (self.nLoads >= self.capLoads)
+        {
+            u32 nc = self.capLoads ? self.capLoads * 2 : 4;
+            IrValue** np = alloc<IrValue*>((usize)nc);
+            IrInst** ni = alloc<IrInst*>((usize)nc);
+            for (u32 i = 0; i < self.nLoads; i++)
+            {
+                np[i] = self.loadPtrs[i];
+                ni[i] = self.loadInsts[i];
+            }
+            if (self.loadPtrs != null) dealloc<IrValue*>(self.loadPtrs);
+            if (self.loadInsts != null) dealloc<IrInst*>(self.loadInsts);
+            self.loadPtrs = np;
+            self.loadInsts = ni;
+            self.capLoads = nc;
+        }
+        self.loadPtrs[self.nLoads] = inst->ops[0];
+        self.loadInsts[self.nLoads] = inst;
+        self.nLoads++;
+    }
+
+    u64 processBlock(IrBlock* bb)
+    {
+        if (bb == null) return 0;
+        u64 hits = 0;
+        for (u32 ii = 0; ii < bb->ninsts; ii++)
+        {
+            IrInst* inst = bb->insts[ii];
+            if (inst == null) continue;
+            IrOpcode op = inst->opcode;
+
+            // loads: same-block CSE
+            if (op == IrOpcode::Load)
+            {
+                IrInst* hit = null;
+                if (self.loadMatch(inst, &hit))
+                {
+                    inst->base.replaceAllUses(&hit->base);
+                    inst->detach();
+                    ii = ii - 1;
+                    hits++;
+                    self.hits++;
+                    continue;
+                }
+                self.recordLoad(inst);
+                continue;
+            }
+
+            // stores/calls/atomics/fences/in-line asm: clobber load cache
+            if (op == IrOpcode::Store || op == IrOpcode::Call ||
+                op == IrOpcode::AtomicStore || op == IrOpcode::AtomicRmw ||
+                op == IrOpcode::AtomicCmpXchg || op == IrOpcode::Fence ||
+                op == IrOpcode::InlineAsm)
+            {
+                self.flushLoadCache();
+                continue;
+            }
+
+            // pure expression numbering for non-terminator ops
+            if (!GvnPass::isCseOp(op)) continue;
+            if (inst->base.type == null) continue;
+
+            u64 key = GvnPass::hashInst(inst);
+            u32 found = self.findOrAdd(key, inst);
+            if (found != 0xFFFFFFFF)
+            {
+                // verify congruence before fusing
+                IrInst* canonical = self.entries[found].inst;
+                if (canonical != null && GvnPass::exprEq(canonical, inst))
+                {
+                    inst->base.replaceAllUses(&canonical->base);
+                    inst->detach();
+                    ii = ii - 1;
+                    hits++;
+                    self.hits++;
+                    continue;
+                }
+            }
+            // insert in scope
+            u32 slotIdx = 0;
+            self.insert(key, inst, &slotIdx);
+        }
+        return hits;
+    }
+
+    void walkBlock(IrFunc* func, IrDomTree* dt, IrBlock* bb)
+    {
+        if (bb == null) return;
+        self.enterScope();
+        self.processBlock(bb);
+        u32 nchildren = irDomtreeChildCount(dt, bb);
+        for (u32 i = 0; i < nchildren; i++)
+        {
+            IrBlock* child = irDomtreeChild(dt, bb, i);
+            self.walkBlock(func, dt, child);
+        }
+        self.exitScope();
+    }
+
+    bool run(IrFunc* func)
+    {
+        if (func == null || func->nblocks == 0) return false;
+        IrDomTree* dt = irDomtreeNew(func);
+        if (dt == null) return false;
+        IrBlock* entry = func->blocks[0];
+        self.walkBlock(func, dt, entry);
+        irDomtreeFree(dt);
+        return self.hits > 0;
+    }
+}
+
+pub bool muvmPassGvn(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (func == null || ctx == null) return false;
+    GvnPass pass = GvnPass::new(ctx);
+    bool r = pass.run(func);
+    pass.deinit();
+    return r;
+}
