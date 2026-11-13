@@ -301,3 +301,5 @@ Where to check:
 The same code should also cover the other misuse cases: a brace initializer on a `bool`, a pointer, an enum, or a `str`. Assigning the wrong number of elements to a struct is a different problem and deserves its own code (arity of initializer).
 
 Please disregard my earlier note about checking the subject type before exhaustiveness. It was based on the wrong construct. The "uninitialized read" gap I mentioned also doesn't apply to this file, though it's still a missing code in general.
+
+missing flag is a keyword and ca't be useda s an identifier. it just says expected an expression
