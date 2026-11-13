@@ -34,11 +34,6 @@ fib:
 .type main, @function
 main:
 	pushq %rbx
-	jmp .L29
-.L26:
-	movq %rsi, %rax
-	popq %rbx
-	ret
 .L29:
 	movq $0x0000000000000009, %rdi
 	call fib
@@ -48,5 +43,11 @@ main:
 	movq %rax, %rsi
 	addq %rsi, %rbx
 	movq %rbx, %rsi
+	jmp .L40
+.L26:
+	movl %esi, %edi
+	movq %rdi, %rax
+	popq %rbx
+	ret
 .L40:
 	jmp .L26

@@ -18,14 +18,14 @@ sumto:
 	movq %r12, %r8
 	addq %rbx, %r8
 	cmpq $0x0000000000000000, %rbx
-	jg .L56
+	jg .L54
 .L27:
 	movq %r12, %rax
 	addq $8, %rsp
 	popq %r12
 	popq %rbx
 	ret
-.L56:
+.L54:
 	movq %r8, %r12
 	movq %r9, %rbx
 	jmp .L23
@@ -35,12 +35,6 @@ main:
 	pushq %rbx
 	movq $0x0000000000000000, %rbx
 	movq $0x0000000000000005, %r9
-	jmp .L40
-.L38:
-	movl %ebx, %esi
-	movq %rsi, %rax
-	popq %rbx
-	ret
 .L40:
 .L41:
 	movq %r9, %r8
@@ -48,8 +42,13 @@ main:
 	movq %rbx, %rdi
 	addq %r9, %rdi
 	cmpq $0x0000000000000000, %r9
-	jle .L38
-.L62:
+	jg .L60
+.L38:
+	movl %ebx, %esi
+	movq %rsi, %rax
+	popq %rbx
+	ret
+.L60:
 	movq %rdi, %rbx
 	movq %r8, %r9
 	jmp .L40

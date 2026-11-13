@@ -1,0 +1,1429 @@
+#[[no_drop_all]]
+import wallvm::irtypes { IrModule, IrFunc, IrBlock, IrInst, IrType, IrTypeKind, IrValue, IrValueKind, IrContext, IrGlobal, IrStringConst, IrStructType, IrArrayConst, IrVarDebugInfo, IrStructConst };
+import wallvm::irOps { IrOpcode, IrICmpPred, IrFCmpPred, IrAtomicOrdering, IrAtomicRmwOp, irOpcodeStr, irICmpStr, irFCmpStr, irAtomicOrderingStr, irAtomicRmwOpStr };
+import wallvm::irMetadata { MetadataSet, MetadataEntry, MetadataValue, MetadataValueKind, irModuleAttrGroup };
+import std::string { String };
+import platform::libc { snprintf, strtod };
+import std::mman { copy, alloc, dealloc };
+import core::cchar { cchar };
+
+// the raw bit pattern, because sign, infinity and nan live in the exponent
+// field where a numeric comparison sees nothing useful
+u64 f64Bits(f64 d)
+{
+    u64 b;
+    copy<u8>((u8*)&b, (u8*)&d, 8);
+    return b;
+}
+
+f64 bitsToF64(u64 b)
+{
+    f64 d;
+    copy<u8>((u8*)&d, (u8*)&b, 8);
+    return d;
+}
+
+
+
+// IR.md 10 round-trip: whatever this emits has to reparse to the same
+// graph, so every shape mirrors the parser's dispatch exactly — names
+// print as the parser would bind them, and unnamed results print their
+// id, which takeIdent happily accepts as a name
+pub struct IrPrinter
+{
+    String out;
+
+    // Anonymous struct types get synthesized names (`@anon.N`) so a dump
+    // references one compact `type` declaration instead of expanding the
+    // whole nested shape at every use. Populated per printModule call by
+    // anonCollect; indices are stable within one module dump.
+    IrType** anonTypes;
+    u32 nAnonTypes;
+    u32 capAnonTypes;
+
+    // Per-function block labels after uniquification. Front-end block
+    // names are source-scope names and can repeat (`sc.join` in several
+    // selects); emitting them verbatim made branch targets ambiguous and
+    // the re-parsed CFG invalid.
+    IrBlock** blockMapBlocks;
+    str* blockMapNames;
+    u32 nBlockMap;
+    u32 capBlockMap;
+
+    static IrPrinter new()
+    {
+        return IrPrinter { String::new(), null, 0, 0, null, null, 0, 0 };
+    }
+
+    u32 anonIndexOf(IrType* t)
+    {
+        for (u32 i = 0; i < self.nAnonTypes; i++)
+            if (self.anonTypes[i] == t) return i + 1;
+        return 0;
+    }
+
+    void anonAdd(IrType* t)
+    {
+        if (self.nAnonTypes >= self.capAnonTypes)
+        {
+            u32 newCap = self.capAnonTypes != 0 ? self.capAnonTypes * 2 : 8;
+            IrType** nt = alloc<IrType*>((usize)newCap);
+            for (u32 i = 0; i < self.nAnonTypes; i++) nt[i] = self.anonTypes[i];
+            if (self.anonTypes != null) dealloc<IrType*>(self.anonTypes);
+            self.anonTypes = nt;
+            self.capAnonTypes = newCap;
+        }
+        self.anonTypes[self.nAnonTypes++] = t;
+    }
+
+    bool structHasName(IrModule* m, IrType* t)
+    {
+        if (m == null) return false;
+        for (u32 i = 0; i < m->nstructs; i++)
+        {
+            IrStructType* st = m->structs[i];
+            if (st != null && st->irType == t && st->name.len > 0) return true;
+        }
+        return false;
+    }
+
+    // Interner order is creation order and a struct's field types must exist
+    // before the struct itself is interned, so iterating ctx->types yields
+    // nested anonymous structs before their parents (a legal decl order).
+    void anonCollect(IrModule* m)
+    {
+        self.nAnonTypes = 0;
+        if (m == null || m->ctx == null) return;
+        IrContext* ctx = m->ctx;
+        for (u32 i = 0; i < ctx->ntypes; i++)
+        {
+            IrType* t = ctx->types[i];
+            if (t == null || t->kind != IrTypeKind::Struct) continue;
+            if (self.structHasName(m, t)) continue;
+            if (self.anonIndexOf(t) != 0) continue;
+            self.anonAdd(t);
+        }
+    }
+
+    void anonReset()
+    {
+        if (self.anonTypes != null) dealloc<IrType*>(self.anonTypes);
+        self.anonTypes = null;
+        self.nAnonTypes = 0;
+        self.capAnonTypes = 0;
+    }
+
+    void blockMapReset()
+    {
+        if (self.blockMapNames != null)
+        {
+            for (u32 i = 0; i < self.nBlockMap; i++)
+                if (self.blockMapNames[i].ptr != null)
+                    dealloc<u8>((u8*)self.blockMapNames[i].ptr);
+            dealloc<str>(self.blockMapNames);
+        }
+        if (self.blockMapBlocks != null) dealloc<IrBlock*>(self.blockMapBlocks);
+        self.blockMapBlocks = null;
+        self.blockMapNames = null;
+        self.nBlockMap = 0;
+        self.capBlockMap = 0;
+    }
+
+    bool blockNameInUse(str name)
+    {
+        for (u32 i = 0; i < self.nBlockMap; i++)
+            if (self.blockMapNames[i].equals(name)) return true;
+        return false;
+    }
+
+    str blockNameWithSuffix(str base, u32 suffix)
+    {
+        u8[24] tail;
+        u32 tn = 0;
+        if (suffix != 0)
+        {
+            tail[tn] = '.';
+            tn += 1;
+            u32 v = suffix;
+            u8[12] digits;
+            u32 dn = 0;
+            loop
+            {
+                digits[dn] = (u8)('0' + (v % 10));
+                dn += 1;
+                v /= 10;
+                if (v == 0 || dn >= 12) break;
+            }
+            while (dn > 0)
+            {
+                dn -= 1;
+                tail[tn] = digits[dn];
+                tn += 1;
+            }
+        }
+        usize bl = base.len;
+        usize total = bl + (usize)tn;
+        u8* buf = alloc<u8>(total + 1);
+        for (usize i = 0; i < bl; i++) buf[i] = base.ptr[i];
+        for (usize j = 0; j < (usize)tn; j++) buf[bl + j] = tail[j];
+        buf[total] = 0;
+        return str::fromParts((const u8*)buf, total);
+    }
+
+    void blockMapBuild(IrFunc* f)
+    {
+        self.blockMapReset();
+        if (f == null) return;
+        self.capBlockMap = f->nblocks > 0 ? f->nblocks : 1;
+        self.blockMapBlocks = alloc<IrBlock*>((usize)self.capBlockMap);
+        self.blockMapNames = alloc<str>((usize)self.capBlockMap);
+        for (u32 bi = 0; bi < f->nblocks; bi++)
+        {
+            IrBlock* bb = f->blocks[bi];
+            if (bb == null) continue;
+            str base = bb->base.name;
+            cchar[32] tmp;
+            if (base.isEmpty())
+            {
+                i32 n = snprintf(tmp, 32, C"b%u", (u32)bb->base.id);
+                if (n < 0) n = 0;
+                base = str::fromParts((const u8*)tmp, (usize)n);
+            }
+            str name = self.blockNameWithSuffix(base, 0);
+            u32 suffix = 0;
+            while (self.blockNameInUse(name))
+            {
+                if (name.ptr != null) dealloc<u8>((u8*)name.ptr);
+                suffix += 1;
+                name = self.blockNameWithSuffix(base, suffix);
+            }
+            self.blockMapBlocks[self.nBlockMap] = bb;
+            self.blockMapNames[self.nBlockMap] = name;
+            self.nBlockMap += 1;
+        }
+    }
+
+    void printAnonStructDecl(IrModule* m, IrType* t, u32 idx)
+    {
+        self.emitStr("type @anon.");
+        self.emitU64((u64)idx);
+        self.emitStr(" = struct");
+        if ((t->tflags & 1) != 0) self.emitStr(" packed");
+        if ((t->tflags & 8) != 0) self.emitStr(" nominal");
+        if ((t->tflags & 4) != 0)
+        {
+            self.emitStr(" opaque;\n");
+            return;
+        }
+        self.emitStr(" { ");
+        for (u32 i = 0; i < t->nparams; i++)
+        {
+            if (i > 0) self.emitStr(", ");
+            self.emitChar('f');
+            self.emitU64((u64)i);
+            self.emitStr(": ");
+            self.emitType(m, t->params[i]);
+        }
+        self.emitStr(" };\n");
+    }
+
+    void destroy()
+    {
+        self.anonReset();
+        self.blockMapReset();
+        self.out.free();
+    }
+
+    str output()
+    {
+        return self.out.asView();
+    }
+
+    void emitStr(str s)
+    {
+        self.out.appendView(s);
+    }
+
+    void emitChar(u8 c)
+    {
+        self.out.pushChar(c);
+    }
+
+    void emitCstr(const u8* s)
+    {
+        if (s == null) return;
+        usize i = 0;
+        while (s[i] != 0)
+        {
+            self.out.pushChar(s[i]);
+            i += 1;
+        }
+    }
+
+    void emitU64(u64 v)
+    {
+        if (v == 0)
+        {
+            self.out.pushChar('0');
+            return;
+        }
+        u8[32] buf;
+        u32 n = 0;
+        while (v != 0)
+        {
+            u64 digit = v % 10;
+            buf[n] = (u8)('0' + digit);
+            v /= 10;
+            n += 1;
+        }
+        while (n > 0)
+        {
+            n -= 1;
+            self.out.pushChar((u8)buf[n]);
+        }
+    }
+
+    void emitI64(i64 v)
+    {
+        if (v < 0)
+        {
+            self.out.pushChar('-');
+            u64 mag = (u64)(-(v + 1)) + 1u;
+            self.emitU64(mag);
+        }
+        else self.emitU64((u64)v);
+    }
+
+    void emitHexU64(u64 v)
+    {
+        self.emitStr("0x");
+        bool started = false;
+        for (i32 shift = 60; shift >= 0; shift -= 4)
+        {
+            u64 digit = (v >> (u64)shift) & 0xF;
+            if (!started && digit == 0 && shift != 0) continue;
+            started = true;
+            self.out.pushChar(digit < 10 ? (u8)('0' + digit) : (u8)('a' + digit - 10));
+        }
+    }
+
+    // shortest text that strtod gives back as the same double — the parser
+    // lexes floats through strtod too, so the round trip is bit-exact; a
+    // bare integral value gets a forced ".0" or it would reparse as an int
+    void emitFloat(f64 v)
+    {
+        u64 bits = f64Bits(v);
+        u64 sign = bits >> 63;
+        u64 exp = (bits >> 52) & 0x7FF;
+        u64 man = bits & 0xFFFFFFFFFFFFF;
+        if (exp == 0x7FF)
+        {
+            if (sign != 0) self.out.pushChar('-');
+            if (man == 0) self.emitStr("inf");
+            else self.emitStr("nan");
+            return;
+        }
+        u8[64] buf;
+        for (i32 prec = 1; prec <= 17; prec += 1)
+        {
+            i32 n = snprintf((cchar*)buf, 64, C"%.*g", (i32)prec, v);
+            if (n <= 0 || n > 55) continue;
+            bool plain = true;
+            for (i32 i = 0; i < n; i++)
+            {
+                if (buf[i] == '.' || buf[i] == 'e' || buf[i] == 'E') { plain = false; break; }
+            }
+            if (plain)
+            {
+                buf[n] = '.';
+                buf[n + 1] = '0';
+                buf[n + 2] = 0;
+                n += 2;
+            }
+            if (strtod((cchar*)buf, null) == v)
+            {
+                for (i32 i = 0; i < n; i++) self.out.pushChar(buf[i]);
+                return;
+            }
+        }
+        // 17 digits always round-trips a finite double, but if we ever get
+        // here the raw bits are the exact fallback the parser accepts
+        self.emitHexU64(bits);
+    }
+
+    void emitEscaped(str s)
+    {
+        self.out.pushChar('"');
+        for (usize i = 0; i < s.len; i++)
+        {
+            u8 b = s.ptr[i];
+            if (b == (u8)'\\') self.emitStr("\\\\");
+            else if (b == (u8)'"') self.emitStr("\\\"");
+            else if (b == (u8)'\n') self.emitStr("\\n");
+            else if (b == (u8)'\t') self.emitStr("\\t");
+            else if (b >= 32 && b <= 126) self.out.pushChar((u8)b);
+            else
+            {
+                self.emitStr("\\x");
+                u64 hi = (u64)b >> 4;
+                u64 lo = (u64)b & 0xF;
+                self.out.pushChar(hi < 10 ? (u8)('0' + hi) : (u8)('a' + hi - 10));
+                self.out.pushChar(lo < 10 ? (u8)('0' + lo) : (u8)('a' + lo - 10));
+            }
+        }
+        self.out.pushChar('"');
+    }
+
+    void emitType(IrModule* m, IrType* t)
+    {
+        if (t == null)
+        {
+            self.emitStr("void");
+            return;
+        }
+        switch (t->kind)
+        {
+            IrTypeKind::Void => { self.emitStr("void"); },
+            IrTypeKind::Int =>
+            {
+                self.emitChar('i');
+                self.emitU64((u64)t->width);
+            },
+            IrTypeKind::Float =>
+            {
+                if ((t->tflags & 2) != 0) self.emitStr("bf16");
+                else if (t->width == 32) self.emitStr("f32");
+                else if (t->width == 64) self.emitStr("f64");
+                else { self.emitChar('f'); self.emitU64((u64)t->width); }
+            },
+            IrTypeKind::Ptr =>
+            {
+                self.emitStr("ptr");
+                if (t->count != 0)
+                {
+                    self.emitStr(" addrspace(");
+                    self.emitU64((u64)t->count);
+                    self.emitChar(')');
+                }
+                if (t->elem != null)
+                {
+                    self.emitChar(' ');
+                    self.emitType(m, t->elem);
+                }
+            },
+            IrTypeKind::Array =>
+            {
+                self.emitStr("array ");
+                self.emitType(m, t->elem);
+                self.emitChar(' ');
+                self.emitU64((u64)t->count);
+            },
+            IrTypeKind::Vector =>
+            {
+                self.emitStr("vector ");
+                self.emitType(m, t->elem);
+                self.emitChar(' ');
+                self.emitU64((u64)t->count);
+            },
+            IrTypeKind::Func =>
+            {
+                self.emitStr("func ");
+                self.emitType(m, t->ret);
+                self.emitStr(" (");
+                for (u32 i = 0; i < t->nparams; i++)
+                {
+                    if (i > 0) self.emitStr(", ");
+                    self.emitType(m, t->params[i]);
+                }
+                if (t->isVararg)
+                {
+                    if (t->nparams > 0) self.emitStr(", ");
+                    self.emitStr("...");
+                }
+                self.emitChar(')');
+            },
+            IrTypeKind::Struct =>
+            {
+                // named structs print the reference the parser looks up in
+                // the module side table; printer-synthesized `anon.N`
+                // declarations (anonCollect) name the rest; only structs
+                // printed outside printModule still expand inline
+                if (m != null)
+                {
+                    for (u32 i = 0; i < m->nstructs; i++)
+                    {
+                        IrStructType* st = m->structs[i];
+                        if (st->irType == t && st->name.len > 0)
+                        {
+                            self.emitStr("struct @");
+                            self.emitStr(st->name);
+                            return;
+                        }
+                    }
+                }
+                u32 anon = self.anonIndexOf(t);
+                if (anon != 0)
+                {
+                    self.emitStr("struct @anon.");
+                    self.emitU64((u64)anon);
+                    return;
+                }
+                self.emitStr("struct { ");
+                for (u32 i = 0; i < t->nparams; i++)
+                {
+                    if (i > 0) self.emitStr(", ");
+                    self.emitType(m, t->params[i]);
+                }
+                self.emitStr(" }");
+            },
+            else => { self.emitStr("void"); }
+        }
+    }
+
+    // %name when the parser bound one, %<id> otherwise — the id form is
+    // what an unnamed result prints on its defining line, so references
+    // and definitions always agree
+    void emitValueRef(IrValue* v)
+    {
+        self.emitChar('%');
+        if (!v->name.isEmpty()) self.emitStr(v->name);
+        else self.emitU64((u64)v->id);
+    }
+
+    u64 refWidth(IrValue* v)
+    {
+        if (!v->name.isEmpty()) return 1 + (u64)v->name.len;
+        u64 id = (u64)v->id;
+        u64 w = 2;
+        while (id >= 10)
+        {
+            id = id / 10;
+            w++;
+        }
+        return w;
+    }
+
+    void emitSymbol(IrValue* v)
+    {
+        self.emitChar('@');
+        if (!v->name.isEmpty()) self.emitStr(v->name);
+        else self.emitU64((u64)v->id);
+    }
+
+    void emitBlockLabel(IrValue* v)
+    {
+        for (u32 i = 0; i < self.nBlockMap; i++)
+        {
+            if (self.blockMapBlocks[i] == (IrBlock*)v)
+            {
+                self.emitStr(self.blockMapNames[i]);
+                return;
+            }
+        }
+        if (!v->name.isEmpty()) self.emitStr(v->name);
+        else
+        {
+            self.emitChar('b');
+            self.emitU64((u64)v->id);
+        }
+    }
+
+    void emitArrayConst(IrModule* m, IrArrayConst* ac)
+    {
+        self.emitStr("[ ");
+        for (u32 i = 0; i < ac->nelems; i++)
+        {
+            if (i > 0) self.emitStr(", ");
+            self.emitAtom(m, ac->elems[i]);
+        }
+        self.emitStr(" ]");
+    }
+
+    void emitStructConst(IrModule* m, IrStructConst* sc)
+    {
+        self.emitStr("{ ");
+        for (u32 i = 0; i < sc->nelems; i++)
+        {
+            if (i > 0) self.emitStr(", ");
+            self.emitAtom(m, sc->elems[i]);
+        }
+        self.emitStr(" }");
+    }
+
+    void emitAtom(IrModule* m, IrValue* v)
+    {
+        if (v == null)
+        {
+            self.emitStr("@missing");
+            return;
+        }
+        switch (v->kind)
+        {
+            IrValueKind::ConstInt =>
+            {
+                if (v->type != null && v->type->kind == IrTypeKind::Int && v->type->width == 1)
+                {
+                    if ((v->valData & 1) != 0) self.emitStr("true");
+                    else self.emitStr("false");
+                }
+                else
+                {
+                    // P3/P4: valData holds only the low ty->width bits
+                    // (constInt masks on creation); print the signed
+                    // interpretation of those bits so i32 -1 dumps as -1
+                    // instead of 4294967295 and round-trips through the
+                    // parser. u64 0xFFFF…FF still prints -1 — no
+                    // signedness in the type, the bits are identical.
+                    u64 raw = v->valData;
+                    if (v->type != null && v->type->kind == IrTypeKind::Int &&
+                        v->type->width > 0 && v->type->width < 64 &&
+                        (raw & (((u64)1 << (u64)(v->type->width - 1)))) != (u64)0)
+                    {
+                        raw |= ~(((u64)1 << (u64)v->type->width) - (u64)1);
+                    }
+                    self.emitI64((i64)raw);
+                }
+            },
+            IrValueKind::ConstFloat => { self.emitFloat(bitsToF64(v->valData)); },
+            IrValueKind::ConstArray => { self.emitArrayConst(m, (IrArrayConst*)v); },
+            IrValueKind::StructConst => { self.emitStructConst(m, (IrStructConst*)v); },
+            IrValueKind::Func => { self.emitSymbol(v); },
+            IrValueKind::Global => { self.emitSymbol(v); },
+            IrValueKind::StringConst => { self.emitSymbol(v); },
+            IrValueKind::Arg => { self.emitValueRef(v); },
+            IrValueKind::Inst => { self.emitValueRef(v); },
+            IrValueKind::Block => { self.emitBlockLabel(v); },
+            else => { self.emitStr("%missing"); }
+        }
+    }
+
+    void emitMetaValue(IrModule* m, MetadataValue* mv)
+    {
+        switch (mv->vkind)
+        {
+            MetadataValueKind::Int => { self.emitI64((i64)mv->intVal); },
+            MetadataValueKind::Float => { self.emitFloat(mv->floatVal); },
+            MetadataValueKind::Bool =>
+            {
+                if (mv->intVal != 0) self.emitStr("true");
+                else self.emitStr("false");
+            },
+            MetadataValueKind::String => { self.emitEscaped(mv->strVal); },
+            MetadataValueKind::IRValue => { self.emitAtom(m, mv->irVal); },
+            MetadataValueKind::Type => { self.emitType(m, mv->typeVal); },
+            else => { self.emitI64((i64)mv->intVal); }
+        }
+    }
+
+    // one entry, one clause; bare !key is the canonical spelling of the
+    // conventional = 1, except alignment which the parser mirrors into the
+    // field only when it sees an explicit =
+    void emitMetaEntry(IrModule* m, str key, MetadataValue* mv)
+    {
+        self.emitChar(' ');
+        self.emitChar('!');
+        self.emitStr(key);
+        bool bare = mv->vkind == MetadataValueKind::Int && mv->intVal == 1 &&
+                    !key.equals("alignment");
+        if (!bare)
+        {
+            self.emitStr(" = ");
+            self.emitMetaValue(m, mv);
+        }
+    }
+
+    void emitMetaSet(IrModule* m, rawptr md)
+    {
+        self.emitMetaSkip(m, md, false);
+    }
+
+    void emitMetaSkip(IrModule* m, rawptr md, bool skipAlignment)
+    {
+        if (md == null) return;
+        MetadataSet* set = (MetadataSet*)md;
+        for (u32 i = 0; i < set->numEntries; i++)
+        {
+            MetadataEntry* e = &set->entries[i];
+            if (skipAlignment && e->key.equals("alignment")) continue;
+            self.emitMetaEntry(m, e->key, &e->value);
+        }
+    }
+
+    // source location: optimizer-made instructions (inlining, safety
+    // instrumentation, unrolling) inherit the original site, so a dump has
+    // to carry it or the passes cannot resume with the same diagnostics
+    void emitDebugLoc(IrInst* inst)
+    {
+        if (inst->debugLoc.file.isEmpty()) return;
+        self.emitStr(" !loc = ");
+        self.emitEscaped(inst->debugLoc.file);
+        self.emitStr(", ");
+        self.emitU64((u64)inst->debugLoc.line);
+        self.emitStr(", ");
+        self.emitU64((u64)inst->debugLoc.col);
+    }
+
+    // var debug rides its own clause — the parser routes !var into the
+    // instruction's side array, never into the metadata set
+    void emitVarDebug(IrModule* m, IrInst* inst)
+    {
+        for (u32 i = 0; i < inst->nvarDbg; i++)
+        {
+            IrVarDebugInfo* d = &inst->varDbg[i];
+            self.emitStr(" !var = ");
+            self.emitEscaped(d->varName);
+            self.emitStr(", ");
+            self.emitType(m, d->varType);
+            self.emitStr(", ");
+            self.emitU64((u64)d->line);
+            self.emitStr(", ");
+            self.emitU64((u64)d->col);
+            if (d->argIndex != 0xFFFFFFFF)
+            {
+                self.emitStr(", ");
+                self.emitU64((u64)d->argIndex);
+            }
+        }
+    }
+
+    void emitTypedArgs(IrModule* m, IrInst* inst, u32 from)
+    {
+        for (u32 i = from; i < inst->nops; i++)
+        {
+            if (i > from) self.emitStr(", ");
+            IrValue* op = inst->ops[i];
+            if (op == null)
+            {
+                /* value-mode asm output: the slot carries the inst's own
+                 * result (the register output writes it directly), so it
+                 * prints as a self reference; the asm operand list parses
+                 * with allowFwd, so it reparses through the fixup table.
+                 * A null slot on any other opcode is a real hole. */
+                if (inst->opcode == IrOpcode::InlineAsm && inst->base.type != null)
+                {
+                    self.emitType(m, inst->base.type);
+                    self.emitChar(' ');
+                    self.emitValueRef(&inst->base);
+                }
+                else
+                {
+                    self.emitStr("void @missing");
+                }
+                continue;
+            }
+            self.emitType(m, op->type);
+            self.emitChar(' ');
+            self.emitAtom(m, op);
+        }
+    }
+
+    void emitBinary(IrModule* m, IrInst* inst)
+    {
+        self.emitType(m, inst->base.type);
+        self.emitChar(' ');
+        self.emitAtom(m, inst->ops[0]);
+        self.emitStr(", ");
+        self.emitAtom(m, inst->ops[1]);
+    }
+
+    void emitUnary(IrModule* m, IrInst* inst)
+    {
+        self.emitType(m, inst->base.type);
+        self.emitChar(' ');
+        self.emitAtom(m, inst->ops[0]);
+    }
+
+    // the whole instruction, minus its result prefix and metadata tail
+    void emitBody(IrModule* m, IrInst* inst)
+    {
+        IrOpcode op = inst->opcode;
+        switch (op)
+        {
+            IrOpcode::Br =>
+            {
+                self.emitStr("br ");
+                self.emitAtom(m, inst->ops[0]);
+            },
+            IrOpcode::CondBr =>
+            {
+                self.emitStr("cond_br ");
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(", ");
+                self.emitAtom(m, inst->ops[1]);
+                self.emitStr(", ");
+                self.emitAtom(m, inst->ops[2]);
+            },
+            IrOpcode::Ret =>
+            {
+                if (inst->base.type->kind == IrTypeKind::Void) self.emitStr("ret");
+                else
+                {
+                    self.emitStr("ret ");
+                    self.emitType(m, inst->base.type);
+                    self.emitChar(' ');
+                    self.emitAtom(m, inst->ops[0]);
+                }
+            },
+            IrOpcode::Fma =>
+            {
+                self.emitType(m, inst->base.type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(", ");
+                self.emitAtom(m, inst->ops[1]);
+                self.emitStr(", ");
+                self.emitAtom(m, inst->ops[2]);
+            },
+            IrOpcode::ICmp =>
+            {
+                self.emitStr("icmp ");
+                self.emitStr(irICmpStr(inst->icmpPred));
+                self.emitChar(' ');
+                self.emitType(m, inst->ops[0]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(", ");
+                self.emitAtom(m, inst->ops[1]);
+            },
+            IrOpcode::FCmp =>
+            {
+                self.emitStr("fcmp ");
+                self.emitStr(irFCmpStr(inst->fcmpPred));
+                self.emitChar(' ');
+                self.emitType(m, inst->ops[0]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(", ");
+                self.emitAtom(m, inst->ops[1]);
+            },
+            IrOpcode::Alloca =>
+            {
+                self.emitStr("alloca ");
+                /* aggregate slots carry the aggregate type on the value
+                 * itself (the ABI classifier reads Struct-typed values and
+                 * gep walks fields off it), so `elem` is null there — print
+                 * the value type as-is instead of the null elem, which
+                 * rendered every struct/array local as `alloca void`.
+                 * Scalar slots stay ptr-typed: print their pointee. */
+                IrType* at = inst->base.type;
+                if (at != null && at->kind == IrTypeKind::Ptr)
+                    self.emitType(m, at->elem);
+                else
+                    self.emitType(m, at);
+            },
+            IrOpcode::Load => {
+                self.emitStr("load ");
+                self.emitType(m, inst->base.type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+            },
+            IrOpcode::Store =>
+            {
+                self.emitStr("store ");
+                self.emitType(m, inst->ops[0]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(", ");
+                self.emitAtom(m, inst->ops[1]);
+            },
+            IrOpcode::Gep =>
+            {
+                self.emitStr("gep ");
+                for (u32 i = 0; i < inst->nops; i++)
+                {
+                    if (i > 0) self.emitStr(", ");
+                    self.emitAtom(m, inst->ops[i]);
+                }
+            },
+            IrOpcode::Call =>
+            {
+                self.emitStr("call ");
+                self.emitType(m, inst->base.type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitChar('(');
+                self.emitTypedArgs(m, inst, 1);
+                self.emitChar(')');
+            },
+            IrOpcode::Phi =>
+            {
+                self.emitStr("phi ");
+                self.emitType(m, inst->base.type);
+                for (u32 i = 0; i + 1 < inst->nops; i += 2)
+                {
+                    self.emitStr(" [ ");
+                    self.emitAtom(m, inst->ops[i]);
+                    self.emitStr(", ");
+                    self.emitAtom(m, inst->ops[i + 1]);
+                    self.emitStr(" ]");
+                    if (i + 2 < inst->nops) self.emitChar(',');
+                }
+            },
+            IrOpcode::Select =>
+            {
+                self.emitStr("select ");
+                self.emitType(m, inst->ops[0]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(", ");
+                self.emitType(m, inst->ops[1]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[1]);
+                self.emitStr(", ");
+                self.emitType(m, inst->ops[2]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[2]);
+            },
+            IrOpcode::ExtractValue =>
+            {
+                self.emitStr("extractvalue ");
+                self.emitType(m, inst->ops[0]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(", ");
+                self.emitAtom(m, inst->ops[1]);
+            },
+            IrOpcode::InsertValue =>
+            {
+                self.emitStr("insertvalue ");
+                self.emitType(m, inst->ops[0]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(", ");
+                self.emitType(m, inst->ops[1]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[1]);
+                self.emitStr(", ");
+                self.emitAtom(m, inst->ops[2]);
+            },
+            IrOpcode::ShuffleVector =>
+            {
+                self.emitStr("shufflevector ");
+                self.emitType(m, inst->ops[0]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(", ");
+                self.emitAtom(m, inst->ops[1]);
+                for (u32 i = 2; i < inst->nops; i++)
+                {
+                    self.emitStr(", ");
+                    self.emitAtom(m, inst->ops[i]);
+                }
+            },
+            IrOpcode::ExtractElement =>
+            {
+                self.emitStr("extractelement ");
+                self.emitType(m, inst->ops[0]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(", ");
+                self.emitAtom(m, inst->ops[1]);
+            },
+            IrOpcode::InsertElement =>
+            {
+                self.emitStr("insertelement ");
+                self.emitType(m, inst->ops[0]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(", ");
+                self.emitType(m, inst->ops[1]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[1]);
+                self.emitStr(", ");
+                self.emitAtom(m, inst->ops[2]);
+            },
+            IrOpcode::AtomicLoad =>
+            {
+                self.emitStr("atomic_load ");
+                self.emitType(m, inst->base.type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(", ");
+                self.emitStr(irAtomicOrderingStr((IrAtomicOrdering)inst->icmpPred));
+            },
+            IrOpcode::AtomicStore =>
+            {
+                self.emitStr("atomic_store ");
+                self.emitType(m, inst->ops[0]->type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(", ");
+                self.emitAtom(m, inst->ops[1]);
+                self.emitStr(", ");
+                self.emitStr(irAtomicOrderingStr((IrAtomicOrdering)inst->icmpPred));
+            },
+            IrOpcode::AtomicRmw =>
+            {
+                self.emitStr("atomic_rmw ");
+                self.emitStr(irAtomicRmwOpStr((IrAtomicRmwOp)inst->icmpPred));
+                self.emitChar(' ');
+                self.emitType(m, inst->base.type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(", ");
+                self.emitAtom(m, inst->ops[1]);
+                self.emitStr(", ");
+                self.emitStr(irAtomicOrderingStr((IrAtomicOrdering)inst->fcmpPred));
+            },
+            IrOpcode::AtomicCmpXchg =>
+            {
+                self.emitStr("atomic_cmpxchg ");
+                self.emitType(m, inst->base.type);
+                self.emitChar(' ');
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(", ");
+                self.emitAtom(m, inst->ops[1]);
+                self.emitStr(", ");
+                self.emitAtom(m, inst->ops[2]);
+                self.emitStr(", ");
+                self.emitStr(irAtomicOrderingStr((IrAtomicOrdering)inst->icmpPred));
+                self.emitStr(", ");
+                self.emitStr(irAtomicOrderingStr((IrAtomicOrdering)inst->fcmpPred));
+            },
+            IrOpcode::Fence =>
+            {
+                self.emitStr("fence ");
+                self.emitStr(irAtomicOrderingStr((IrAtomicOrdering)inst->icmpPred));
+            },
+            IrOpcode::GcRoot =>
+            {
+                self.emitStr("gc_root ");
+                self.emitAtom(m, inst->ops[0]);
+            },
+            IrOpcode::GcWriteBarrier =>
+            {
+                self.emitStr("gc_writebarrier ");
+                self.emitAtom(m, inst->ops[0]);
+                self.emitStr(", ");
+                self.emitAtom(m, inst->ops[1]);
+            },
+            IrOpcode::InlineAsm =>
+            {
+                self.emitStr("inlineasm ");
+                if (inst->asmNumSideEffects != 0) self.emitStr("volatile ");
+                self.emitType(m, inst->base.type);
+                self.emitChar(' ');
+                self.emitEscaped(inst->asmString);
+                self.emitStr(" : ");
+                self.emitEscaped(inst->asmConstraints);
+                self.emitStr(" : ");
+                self.emitEscaped(inst->asmClobbers);
+                self.emitStr(" (");
+                self.emitTypedArgs(m, inst, 0);
+                self.emitChar(')');
+            },
+            IrOpcode::Neg => { self.emitStr("neg "); self.emitUnary(m, inst); },
+            IrOpcode::Not => { self.emitStr("not "); self.emitUnary(m, inst); },
+            IrOpcode::Abs => { self.emitStr("abs "); self.emitUnary(m, inst); },
+            IrOpcode::CtPop => { self.emitStr("ctpop "); self.emitUnary(m, inst); },
+            IrOpcode::CtLz => { self.emitStr("ctlz "); self.emitUnary(m, inst); },
+            IrOpcode::CtTz => { self.emitStr("cttz "); self.emitUnary(m, inst); },
+            IrOpcode::Bswap => { self.emitStr("bswap "); self.emitUnary(m, inst); },
+            IrOpcode::FAbs => { self.emitStr("fabs "); self.emitUnary(m, inst); },
+            IrOpcode::FSqrt => { self.emitStr("fsqrt "); self.emitUnary(m, inst); },
+            IrOpcode::VecBroadcast => { self.emitStr("vbroadcast "); self.emitUnary(m, inst); },
+            IrOpcode::Add => {
+                str n = inst->isUnsignedArith() ? "add.u " : "add ";
+                self.emitStr(n); self.emitBinary(m, inst);
+            },
+            IrOpcode::Sub => {
+                str n = inst->isUnsignedArith() ? "sub.u " : "sub ";
+                self.emitStr(n); self.emitBinary(m, inst);
+            },
+            IrOpcode::Mul => {
+                str n = inst->isUnsignedArith() ? "mul.u " : "mul ";
+                self.emitStr(n); self.emitBinary(m, inst);
+            },
+            IrOpcode::SDiv => { self.emitStr("sdiv "); self.emitBinary(m, inst); },
+            IrOpcode::UDiv => { self.emitStr("udiv "); self.emitBinary(m, inst); },
+            IrOpcode::SRem => { self.emitStr("srem "); self.emitBinary(m, inst); },
+            IrOpcode::URem => { self.emitStr("urem "); self.emitBinary(m, inst); },
+            IrOpcode::And => { self.emitStr("and "); self.emitBinary(m, inst); },
+            IrOpcode::Or => { self.emitStr("or "); self.emitBinary(m, inst); },
+            IrOpcode::Xor => { self.emitStr("xor "); self.emitBinary(m, inst); },
+            IrOpcode::Shl => { self.emitStr("shl "); self.emitBinary(m, inst); },
+            IrOpcode::Ashr => { self.emitStr("ashr "); self.emitBinary(m, inst); },
+            IrOpcode::Lshr => { self.emitStr("lshr "); self.emitBinary(m, inst); },
+            IrOpcode::Rotl => { self.emitStr("rotl "); self.emitBinary(m, inst); },
+            IrOpcode::Rotr => { self.emitStr("rotr "); self.emitBinary(m, inst); },
+            IrOpcode::SMin => { self.emitStr("smin "); self.emitBinary(m, inst); },
+            IrOpcode::SMax => { self.emitStr("smax "); self.emitBinary(m, inst); },
+            IrOpcode::UMin => { self.emitStr("umin "); self.emitBinary(m, inst); },
+            IrOpcode::UMax => { self.emitStr("umax "); self.emitBinary(m, inst); },
+            IrOpcode::FAdd => { self.emitStr("fadd "); self.emitBinary(m, inst); },
+            IrOpcode::FSub => { self.emitStr("fsub "); self.emitBinary(m, inst); },
+            IrOpcode::FMul => { self.emitStr("fmul "); self.emitBinary(m, inst); },
+            IrOpcode::FDiv => { self.emitStr("fdiv "); self.emitBinary(m, inst); },
+            IrOpcode::VecAdd => { self.emitStr("vadd "); self.emitBinary(m, inst); },
+            IrOpcode::VecSub => { self.emitStr("vsub "); self.emitBinary(m, inst); },
+            IrOpcode::VecMul => { self.emitStr("vmul "); self.emitBinary(m, inst); },
+            IrOpcode::VecDiv => { self.emitStr("vdiv "); self.emitBinary(m, inst); },
+            IrOpcode::VecFAdd => { self.emitStr("vfadd "); self.emitBinary(m, inst); },
+            IrOpcode::VecFSub => { self.emitStr("vfsub "); self.emitBinary(m, inst); },
+            IrOpcode::VecFMul => { self.emitStr("vfmul "); self.emitBinary(m, inst); },
+            IrOpcode::VecFDiv => { self.emitStr("vfdiv "); self.emitBinary(m, inst); },
+            IrOpcode::VecMin => { self.emitStr("vmin "); self.emitBinary(m, inst); },
+            IrOpcode::VecMax => { self.emitStr("vmax "); self.emitBinary(m, inst); },
+            // casts print like the parser reads them: opcode word first,
+            // then `type atom to type` — omitting it produced
+            // `i64 %x to i32`, which reparses as an unknown opcode
+            IrOpcode::Trunc | IrOpcode::Zext | IrOpcode::Sext |
+            IrOpcode::FpTrunc | IrOpcode::FpExt | IrOpcode::FpToSi |
+            IrOpcode::SiToFp | IrOpcode::FpToUi | IrOpcode::UiToFp |
+            IrOpcode::Bitcast => {
+                self.emitStr(irOpcodeStr(op));
+                self.emitChar(' ');
+                if (inst->nops > 0 && inst->ops[0] != null)
+                {
+                    self.emitType(m, inst->ops[0]->type);
+                    self.emitChar(' ');
+                    self.emitAtom(m, inst->ops[0]);
+                    self.emitStr(" to ");
+                }
+                self.emitType(m, inst->base.type);
+            },
+            else => {
+                // terminators without operands, safepoint and friends fall
+                // through to the shared name table; landingpad lands here
+                // too and reparses as the reserved word it is
+                self.emitStr(irOpcodeStr(op));
+            }
+        }
+    }
+
+    void printInst(IrModule* m, IrInst* inst, u32 eqWidth)
+    {
+        self.emitStr("    ");
+        // `ret <ty> %v` carries the returned value's type on the
+        // instruction, but it defines no SSA result: never prefix it with
+        // `%name = ` (that printed `%62 = ret i32 %61`).
+        bool definesValue = inst->base.type->kind != IrTypeKind::Void &&
+                            inst->opcode != IrOpcode::Ret;
+        if (definesValue)
+        {
+            self.emitValueRef(&inst->base);
+            u64 w = self.refWidth(&inst->base);
+            while (w < (u64)eqWidth)
+            {
+                self.emitChar(' ');
+                w++;
+            }
+            self.emitStr(" = ");
+        }
+        self.emitBody(m, inst);
+        self.emitDebugLoc(inst);
+        self.emitVarDebug(m, inst);
+        self.emitMetaSet(m, inst->metadata);
+    }
+    // Blocks must print so every value's def block precedes its uses: the
+    // parser resolves %refs while reading, and optimizer passes (the
+    // inliner especially) leave the block array in creation order, not
+    // dominance order. Kahn over def-block -> use-block edges; entry
+    // dominates everything so it always has indegree 0 and stays first.
+    // Cycles are impossible in valid SSA; if one appears anyway the
+    // remaining blocks keep array order so output stays deterministic.
+    void printBlocksWithDefsFirst(IrModule* m, IrFunc* f)
+    {
+        u32 nb = f->nblocks;
+        self.blockMapBuild(f);
+        if (nb == 0) return;
+        u32 eqWidth = 0;
+        for (u32 bi = 0; bi < nb; bi++)
+        {
+            IrBlock* bb = f->blocks[bi];
+            if (bb == null) continue;
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst == null || inst->base.type->kind == IrTypeKind::Void) continue;
+                if (inst->opcode == IrOpcode::Ret) continue;
+                u64 w = self.refWidth(&inst->base);
+                if (w > (u64)eqWidth) eqWidth = (u32)w;
+            }
+        }
+        usize n = (usize)nb;
+        u32* indeg = alloc<u32>(n);
+        bool* adj = alloc<bool>(n * n);
+        bool* done = alloc<bool>(n);
+        for (usize i = 0; i < n; i++)
+        {
+            indeg[i] = 0;
+            done[i] = f->blocks[i] == null;
+            for (usize j = 0; j < n; j++) adj[i * n + j] = false;
+        }
+        for (u32 bi = 0; bi < nb; bi++)
+        {
+            IrBlock* bb = f->blocks[bi];
+            if (bb == null) continue;
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst == null) continue;
+                for (u32 oi = 0; oi < inst->nops; oi++)
+                {
+                    IrValue* op = inst->ops[oi];
+                    if (op == null || op->kind != IrValueKind::Inst) continue;
+                    IrBlock* db = ((IrInst*)op)->parent;
+                    if (db == null || db == bb) continue;
+                    u32 di = nb;
+                    for (u32 k = 0; k < nb; k++)
+                        if (f->blocks[k] == db) { di = k; break; }
+                    if (di == nb || di == bi) continue;
+                    if (!adj[(usize)di * n + (usize)bi])
+                    {
+                        adj[(usize)di * n + (usize)bi] = true;
+                        indeg[bi]++;
+                    }
+                }
+            }
+        }
+        for (u32 step = 0; step < nb; step++)
+        {
+            u32 pick = nb;
+            if (!done[0] && indeg[0] == 0) pick = 0;
+            else
+            {
+                for (u32 k = 0; k < nb; k++)
+                    if (!done[k] && indeg[k] == 0) { pick = k; break; }
+                if (pick == nb)
+                    for (u32 k = 0; k < nb; k++)
+                        if (!done[k]) { pick = k; break; }
+            }
+            if (pick == nb) break;
+            done[pick] = true;
+            for (u32 k = 0; k < nb; k++)
+                if (adj[(usize)pick * n + (usize)k] && indeg[k] > 0) indeg[k]--;
+            if (f->blocks[pick] != null) self.printBlock(m, f->blocks[pick], eqWidth);
+        }
+        dealloc<u32>(indeg);
+        dealloc<bool>(adj);
+        dealloc<bool>(done);
+    }
+
+    void printBlock(IrModule* m, IrBlock* bb, u32 eqWidth)
+    {
+        // The entry label is redundant unless something references it —
+        // a branch target (npreds) or a phi incoming pair. Same spirit as
+        // the asm emitter (emitBlockDefinition), so no entry/label
+        // metadata leaks into the printed IR either.
+        IrFunc* f = bb->parent;
+        bool isEntry = f != null && f->nblocks > 0 && f->blocks[0] == bb;
+        bool referenced = bb->npreds > 0;
+        if (isEntry && !referenced)
+        {
+            for (u32 bi = 0; bi < f->nblocks && !referenced; bi++)
+            {
+                IrBlock* pb = f->blocks[bi];
+                if (pb == null) continue;
+                for (u32 ii = 0; ii < pb->ninsts && !referenced; ii++)
+                {
+                    IrInst* inst = pb->insts[ii];
+                    if (inst == null || inst->opcode != IrOpcode::Phi) continue;
+                    for (u32 oi = 0; oi < inst->nops; oi++)
+                        if (inst->ops[oi] == &bb->base) { referenced = true; break; }
+                }
+            }
+        }
+        if (!(isEntry && !referenced))
+        {
+            self.emitBlockLabel(&bb->base);
+            self.emitStr(":\n");
+        }
+        for (u32 i = 0; i < bb->ninsts; i++)
+        {
+            IrInst* inst = bb->insts[i];
+            if (inst == null) continue;
+            self.printInst(m, inst, eqWidth);
+            self.emitChar('\n');
+        }
+    }
+
+    void printStructDecl(IrModule* m, IrStructType* st)
+    {
+        self.emitStr("type @");
+        self.emitStr(st->name);
+        self.emitStr(" = struct");
+        u32 tf = st->irType != null ? st->irType->tflags : 0;
+        if ((tf & 1) != 0) self.emitStr(" packed");
+        if ((tf & 8) != 0) self.emitStr(" nominal");
+        if ((tf & 4) != 0)
+        {
+            self.emitStr(" opaque;\n");
+            return;
+        }
+        self.emitStr(" { ");
+        for (u32 i = 0; i < st->nfields; i++)
+        {
+            if (i > 0) self.emitStr(", ");
+            // field names are cosmetic; the type system interned by field
+            // types, so a builder-made struct with no names still has a
+            // valid grammar position to fill
+            bool named = st->fieldNames != null && st->fieldNames[i].len > 0;
+            if (named) { self.emitStr(st->fieldNames[i]); self.emitStr(": "); }
+            else
+            {
+                self.emitChar('f');
+                self.emitU64((u64)i);
+                self.emitStr(": ");
+            }
+            self.emitType(m, st->fieldTypes[i]);
+        }
+        self.emitStr(" };\n");
+    }
+
+    void printGlobal(IrModule* m, IrGlobal* g)
+    {
+        self.emitStr("global");
+        if (g->isExtern) self.emitStr(" extern");
+        if (g->isConst) self.emitStr(" const");
+        self.emitStr(" @");
+        if (!g->base.name.isEmpty()) self.emitStr(g->base.name);
+        self.emitStr(": ");
+        self.emitType(m, g->base.type);
+        if (g->initVal != null)
+        {
+            self.emitStr(" = ");
+            self.emitAtom(m, g->initVal);
+        }
+        if (g->alignment != 0)
+        {
+            self.emitStr(" !alignment = ");
+            self.emitU64((u64)g->alignment);
+        }
+        self.emitMetaSkip(m, g->metadata, g->alignment != 0);
+        self.emitStr(";\n");
+    }
+
+    void printAttributeGroups(IrModule* m)
+    {
+        for (u32 i = 0; i < m->nAttrGroups; i++)
+        {
+            MetadataSet* md = irModuleAttrGroup(m, i + 1);
+            if (md == null) continue;
+            self.emitStr("\nattributes #");
+            self.emitU64((u64)(i + 1));
+            self.emitStr(" = {");
+            for (u32 e = 0; e < md->numEntries; e++)
+                self.emitMetaEntry(m, md->entries[e].key, &md->entries[e].value);
+            self.emitStr(" }\n");
+        }
+    }
+
+    void printStringDecl(IrModule* m, IrStringConst* sc)
+    {
+        self.emitStr("string @");
+        if (!sc->base.name.isEmpty()) self.emitStr(sc->base.name);
+        self.emitStr(": ");
+        self.emitEscaped(str::fromParts(sc->data, (usize)sc->length));
+        self.emitMetaSet(m, sc->metadata);
+        self.emitStr(";\n");
+    }
+
+    void emitFuncHead(IrModule* m, IrFunc* f)
+    {
+        if (f->cc != 0)
+        {
+            self.emitStr(" !cc = ");
+            self.emitU64((u64)f->cc);
+        }
+        if (f->attrGroup != 0)
+        {
+            self.emitStr(" !attrgroup = ");
+            self.emitU64((u64)f->attrGroup);
+        }
+        self.emitMetaSet(m, f->metadata);
+    }
+
+    void printFunc(IrModule* m, IrFunc* f)
+    {
+        self.emitStr("func @");
+        if (!f->base.name.isEmpty()) self.emitStr(f->base.name);
+        self.emitChar('(');
+        for (u32 i = 0; i < f->nargs; i++)
+        {
+            if (i > 0) self.emitStr(", ");
+            self.emitValueRef(f->args[i]);
+            self.emitStr(": ");
+            self.emitType(m, f->args[i]->type);
+        }
+        if (f->base.type != null && f->base.type->isVararg)
+        {
+            if (f->nargs > 0) self.emitStr(", ");
+            self.emitStr("...");
+        }
+        self.emitChar(')');
+        if (f->retType != null && f->retType->kind != IrTypeKind::Void)
+        {
+            self.emitChar(' ');
+            self.emitType(m, f->retType);
+        }
+        if (f->isExtern)
+        {
+            str lib = f->externLib;
+            str sym = f->externSym;
+            if (sym.isEmpty()) sym = f->base.name;
+            self.emitStr(" extern");
+            // omit empty slots; a library only prints when it exists, and
+            // the symbol follows a library so the single-string form
+            // always means "custom symbol, default library"
+            if (!lib.isEmpty())
+            {
+                self.emitChar(' ');
+                self.emitEscaped(lib);
+                self.emitChar(' ');
+                self.emitEscaped(sym);
+            }
+            else if (!sym.isEmpty() && !sym.equals(f->base.name))
+            {
+                self.emitChar(' ');
+                self.emitEscaped(sym);
+            }
+            self.emitFuncHead(m, f);
+            self.emitStr(";\n");
+            return;
+        }
+        self.emitFuncHead(m, f);
+        self.emitStr(" {\n");
+        self.printBlocksWithDefsFirst(m, f);
+        self.emitStr("}\n");
+    }
+
+    pub void printModule(IrModule* m)
+    {
+        self.anonReset();
+        self.anonCollect(m);
+        self.emitStr("module ");
+        self.emitEscaped(m->name);
+        self.emitStr("\n");
+        for (u32 i = 0; i < self.nAnonTypes; i++)
+        {
+            self.emitChar('\n');
+            self.printAnonStructDecl(m, self.anonTypes[i], i + 1);
+        }
+        for (u32 i = 0; i < m->nstructs; i++)
+        {
+            IrStructType* st = m->structs[i];
+            // anonymous twins are type-system citizens with no decl of
+            // their own; the named twin prints the whole shape
+            if (st->name.len == 0) continue;
+            self.emitChar('\n');
+            self.printStructDecl(m, st);
+        }
+        self.printAttributeGroups(m);
+        for (u32 i = 0; i < m->nglobals; i++)
+        {
+            self.emitChar('\n');
+            self.printGlobal(m, m->globals[i]);
+        }
+        for (u32 i = 0; i < m->nconstStrings; i++)
+        {
+            self.emitChar('\n');
+            self.printStringDecl(m, m->constStrings[i]);
+        }
+        for (u32 i = 0; i < m->nfuncs; i++)
+        {
+            self.emitChar('\n');
+            self.printFunc(m, m->funcs[i]);
+        }
+    }
+}
