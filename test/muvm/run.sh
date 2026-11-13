@@ -55,7 +55,16 @@ for case in "$caseset"/*.ir; do
             fail=$((fail+1))
             continue
         fi
-        if [ -f "$caseset/$name.gold" ]; then
+        # Per-level goldens: ${name}_${lv}.gold preferred; fall back to the
+        # case-level ${name}.gold so old fixtures still run.
+        if [ -f "$caseset/${name}_${lv}.gold" ]; then
+            cmp -s "$OUT/${name}_${lv}.mir" "$caseset/${name}_${lv}.gold"
+            if [ "$?" -ne 0 ]; then
+                echo "FAIL golden $name $lv"
+                fail=$((fail+1))
+                continue
+            fi
+        elif [ -f "$caseset/$name.gold" ]; then
             cmp -s "$OUT/${name}_${lv}.mir" "$caseset/$name.gold"
             if [ "$?" -ne 0 ]; then
                 echo "FAIL golden $name $lv"
