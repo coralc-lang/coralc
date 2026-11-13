@@ -1,0 +1,194 @@
+#[[no_drop_all]]
+// ADCE + unreachable-block elimination for muvm. Fresh pass, one module,
+// two phases:
+//
+//   1. reachability: blocks unreachable from the entry block (via CFG
+//      successors) are detached wholesale — their insts are detached
+//      without freeing (the IR frees at a coarser grain; no dangling
+//      users are ever observable because every user of a dead value is
+//      itself dead).
+//   2. ADCE: mark-sweep. Roots are instructions with side effects —
+//      terminators, stores, calls, atomics, fences, landing pads, inline
+//      asm, GC ops. Liveness walks backwards through operands; anything
+//      unmarked is detached from its block.
+//
+// Detached instructions leak by design at this layer — the sweep is
+// about *code shape* (fewer instructions, dead blocks gone), and the IR
+// performs reclamation at a coarser grain. User lists of detached insts
+// are left intact on purpose: they still point at detached peers, and
+// no surviving instruction can see them.
+
+import muvm::irOps { IrOpcode, irOpcodeIsTerminator };
+import muvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind };
+import std::mman { alloc, dealloc };
+
+pub struct AdcePass
+{
+    IrContext* ctx;
+    u64 removed;
+
+    static AdcePass new(IrContext* ctx)
+    {
+        return AdcePass {
+            .ctx = ctx,
+            .removed = 0
+        };
+    }
+
+    static bool isRoot(IrInst* inst)
+    {
+        switch (inst->opcode)
+        {
+            IrOpcode::Store | IrOpcode::Call |
+            IrOpcode::Ret | IrOpcode::Br | IrOpcode::CondBr |
+            IrOpcode::Switch | IrOpcode::Unreachable | IrOpcode::Noret |
+            IrOpcode::AtomicStore | IrOpcode::AtomicRmw | IrOpcode::AtomicCmpXchg |
+            IrOpcode::Fence | IrOpcode::LandingPad | IrOpcode::InlineAsm |
+            IrOpcode::GcRoot | IrOpcode::GcSafepoint | IrOpcode::GcWriteBarrier => { return true; },
+            else => { return false; }
+        }
+    }
+
+    // Phase 1 — drop unreachable blocks. Returns true if any were removed.
+    bool removeUnreachable(IrFunc* func)
+    {
+        u32 nb = func->nblocks;
+        if (nb == 0) return false;
+        bool* reachable = alloc<bool>((usize)nb);
+        for (u32 i = 0; i < nb; i++) reachable[i] = false;
+        u32* queue = alloc<u32>((usize)nb);
+        u32 qHead = 0;
+        u32 qTail = 0;
+        reachable[0] = true;
+        queue[qTail++] = 0;
+        while (qHead < qTail)
+        {
+            u32 bi = queue[qHead++];
+            IrBlock* bb = func->blocks[bi];
+            for (u32 si = 0; si < bb->nsuccs; si++)
+            {
+                IrBlock* succ = bb->succs[si];
+                for (u32 k = 0; k < func->nblocks; k++)
+                {
+                    if (func->blocks[k] == succ)
+                    {
+                        if (!reachable[k])
+                        {
+                            reachable[k] = true;
+                            queue[qTail++] = k;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        u32 dropped = 0;
+        // iterate backwards: removeBlock shifts elements down
+        for (u32 bi = nb; bi-- > 0; )
+        {
+            if (reachable[bi]) continue;
+            IrBlock* bb = func->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+                bb->insts[ii]->detach();
+            bb->ninsts = 0;
+            func->removeBlock(bb);
+            dropped++;
+        }
+        dealloc<bool>(reachable);
+        dealloc<u32>(queue);
+        if (dropped > 0) self.removed += (u64)dropped;
+        return dropped > 0;
+    }
+
+    // Phase 2 — ADCE sweep. Returns true if any instructions were detached.
+    bool sweepDead(IrFunc* func)
+    {
+        // liveness over value ids: live[id] == true means the value is
+        // demanded by some root-connected path
+        u32 cap = self.ctx->nextValueId() + 1;
+        bool* live = alloc<bool>((usize)cap);
+        for (u32 i = 0; i < cap; i++) live[i] = false;
+
+        // seed from roots; grow along operands
+        // small fixed-point loop over the block list (nblocks is small)
+        u32 nblocks0 = func->nblocks;
+        for (u32 bi = 0; bi < nblocks0; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst == null) continue;
+                if (self.isRoot(inst)) live[inst->base.id] = true;
+            }
+        }
+        bool changed = true;
+        while (changed)
+        {
+            changed = false;
+            for (u32 bi = 0; bi < func->nblocks; bi++)
+            {
+                IrBlock* bb = func->blocks[bi];
+                for (u32 ii = 0; ii < bb->ninsts; ii++)
+                {
+                    IrInst* inst = bb->insts[ii];
+                    if (inst == null || !live[inst->base.id]) continue;
+                    for (u32 oi = 0; oi < inst->nops; oi++)
+                    {
+                        IrValue* op = inst->ops[oi];
+                        if (op == null) continue;
+                        if (op->kind != IrValueKind::Inst) continue;
+                        IrInst* opInst = (IrInst*)op;
+                        if (!live[opInst->base.id])
+                        {
+                            live[opInst->base.id] = true;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        u32 dropped = 0;
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            u32 ii = 0;
+            while (ii < bb->ninsts)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst != null && !live[inst->base.id])
+                {
+                    inst->detach();
+                    dropped++;
+                }
+                else
+                {
+                    ii++;
+                }
+            }
+        }
+        dealloc<bool>(live);
+        if (dropped > 0) self.removed += (u64)dropped;
+        return dropped > 0;
+    }
+
+    bool run(IrFunc* func)
+    {
+        if (func == null) return false;
+        bool changed = false;
+        if (self.removeUnreachable(func)) changed = true;
+        if (self.sweepDead(func)) changed = true;
+        return changed;
+    }
+}
+
+pub bool muvmPassAdce(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (func == null || ctx == null) return false;
+    AdcePass pass = AdcePass::new(ctx);
+    bool r = pass.run(func);
+    (void)pass;
+    return r;
+}
