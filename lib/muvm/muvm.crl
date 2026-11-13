@@ -1,0 +1,473 @@
+#[[no_drop_all]]
+
+// muvm driver — the embedding API for the muvm backend.
+//
+// The driver is an API, not a script. Callers see:
+//
+//   muvmOptions(optLevel)      — a fully-defaulted options value; mutate
+//                                its fields, no process-global switches
+//   muvmOptimize               — run one function through the function-
+//                                stage pass graph (O0-O3)
+//   muvmStructureLane          — fixed post-opt phase (unroll opt-in,
+//                                phi lowering when the backend needs it)
+//   muvmCompileModule          — module orchestration (opt -> lane ->
+//                                regalloc -> codegen), error-annotated
+//   muvmCompileAsm             — test-support export, rejects non-CPU CCs
+//                                and returns empty on failure
+//   muvmCompileIRToString?     — not an export: tests use muvmOptimize
+//                                directly, see test/muvm/muvm_tool.crl
+//
+// Pass authoring contract: a pass is a node function
+//
+//     bool myNode(IrFunc* func, rawptr userdata)
+//
+// registered with PassGraph::addNode, which records a dependency edge to
+// the previously-registered node. edge targets must dominate the node's
+// registration order — a pass that must run *before* an earlier node
+// belongs in a different pipeline tier, not in this one. Passes that
+// only publish analyses (AA/MSSA) pass isAnalysis = true and must never
+// report change. The graph is finalized by Kahn's algorithm (insertion
+// order breaks ties) at pipeline construction; the linear cascade of
+// legacy pass lists is the degenerate case, not the design.
+//
+// There are no global flags in muvm — every behaviour knob lives on
+// MuvmOptions and reaches passes via the graph's nodes, never through
+// the filesystem or mutable globals.
+
+import muvm::irtypes { IrContext, IrFunc, IrModule };
+import muvm::irMetadata { funcIsOptNone };
+import muvm::irPrinter { IrPrinter };
+import muvm::passes::safety { muvmPassSafety };
+import std::mman { alloc, dealloc };
+import std::ios { eprintln };
+
+// ---------------------------------------------------------------------------
+// Calling conventions
+// ---------------------------------------------------------------------------
+// mivm-local for now — the rules/ABI tables land with the backends, at
+// which point this enum stays the public handle callers pass around.
+pub enum CallingConvention
+{
+    SystemV,
+    Win64,
+    SyscallWin64,
+    SyscallX86_64,
+    SyscallMacOS,
+    Cdecl,
+    Stdcall,
+    Fastcall,
+    SyscallX86,
+    WinX86_32,
+    Wasm32,
+    Wasm64,
+}
+
+bool ccIsWasm(CallingConvention cc)
+{
+    return cc == CallingConvention::Wasm32 || cc == CallingConvention::Wasm64;
+}
+
+// ---------------------------------------------------------------------------
+// Options — a value, not a global
+// ---------------------------------------------------------------------------
+pub enum SafetyMode
+{
+    Off,    // no instrumentation anywhere (default)
+    Debug,  // instrumentation only at O0
+    All,    // instrumentation at every opt level
+}
+
+pub struct MuvmOptions
+{
+    u32 optLevel;   // 0..3
+    SafetyMode safety;
+    str trapName;   // symbol the _trap-based safety checks call ("_trap")
+    bool unroll;    // opt-in full unrolling (structure lane)
+    bool keepPhis;  // regalloc may materialize phi copies directly
+    bool verbose;   // print each graph node on every run
+    bool dumps;     // print the module after every node that reports a change
+    u32 maxIters;   // 0 = default budget by level (1/2/5/8)
+}
+
+pub MuvmOptions muvmOptions(u32 optLevel)
+{
+    MuvmOptions o;
+    o.optLevel = optLevel > 3 ? 3 : optLevel;
+    o.safety = SafetyMode::Off;  // opt-in: users enable per call
+    o.trapName = "_trap";
+    o.unroll = false;
+    o.keepPhis = true;
+    o.verbose = false;
+    o.dumps = false;
+    o.maxIters = 0;
+    return o;
+}
+
+u32 maxItersFor(MuvmOptions o)
+{
+    if (o.maxIters != 0) return o.maxIters;
+    return (o.optLevel >= 3) ? 8 : (o.optLevel >= 2) ? 5 : (o.optLevel >= 1) ? 2 : 1;
+}
+
+// ---------------------------------------------------------------------------
+// Results
+// ---------------------------------------------------------------------------
+pub struct CompileResult
+{
+    bool success;
+    str errorMsg;
+    u32 errorLine;
+}
+
+pub CompileResult muvmSuccess()
+{
+    CompileResult r;
+    r.success = true;
+    r.errorMsg = str::empty();
+    r.errorLine = 0;
+    return r;
+}
+
+pub CompileResult muvmError(str msg, u32 line)
+{
+    CompileResult r;
+    r.success = false;
+    r.errorMsg = msg;
+    r.errorLine = line;
+    return r;
+}
+
+pub void muvmDumpModule(IrModule* modd, str label)
+{
+    if (modd == null) return;
+    IrPrinter pr = IrPrinter::new();
+    pr.printModule(modd);
+    eprintln("; ---- {} ----", label);
+    eprintln("{}", pr.output());
+    pr.destroy();
+}
+
+// ---------------------------------------------------------------------------
+// PassGraph — nodes + dependency edges, scheduled by Kahn's algorithm
+// ---------------------------------------------------------------------------
+typedef GraphNodeFn = bool(IrFunc*, rawptr);
+
+pub struct PassGraph
+{
+    GraphNodeFn* nodes;
+    str* names;
+    bool* isAnalysis;
+    u32* edgeFrom;
+    u32* edgeTo;
+    u32* order;
+    u32 count;
+    u32 capacity;
+    u32 edgeCount;
+    u32 edgeCap;
+    u32 orderLen;
+    bool finalized;
+    MuvmOptions opt;
+
+    static PassGraph new()
+    {
+        return PassGraph {
+            .nodes = null,
+            .names = null,
+            .isAnalysis = null,
+            .edgeFrom = null,
+            .edgeTo = null,
+            .order = null,
+            .count = 0,
+            .capacity = 0,
+            .edgeCount = 0,
+            .edgeCap = 0,
+            .orderLen = 0,
+            .finalized = false,
+            .opt = muvmOptions(0)
+        };
+    }
+
+    // Sets the options the executor consults for verbose/dump behaviour.
+    // Call before run*; muvmPipeline does this for its callers.
+    void setOptions(MuvmOptions o)
+    {
+        self.opt = o;
+    }
+
+    u32 grow()
+    {
+        u32 nc = self.capacity ? self.capacity * 2 : 8;
+        GraphNodeFn* nn = alloc<GraphNodeFn>((usize)nc);
+        str* nm = alloc<str>((usize)nc);
+        bool* na = alloc<bool>((usize)nc);
+        for (u32 i = 0; i < self.count; i++)
+        {
+            nn[i] = self.nodes[i];
+            nm[i] = self.names[i];
+            na[i] = self.isAnalysis[i];
+        }
+        if (self.nodes != null) dealloc<GraphNodeFn>(self.nodes);
+        if (self.names != null) dealloc<str>(self.names);
+        if (self.isAnalysis != null) dealloc<bool>(self.isAnalysis);
+        self.nodes = nn;
+        self.names = nm;
+        self.isAnalysis = na;
+        return nc;
+    }
+
+    u32 addNode(GraphNodeFn fn, str name, bool analysis)
+    {
+        if (self.count >= self.capacity)
+            self.capacity = self.grow();
+        self.nodes[self.count] = fn;
+        self.names[self.count] = name;
+        self.isAnalysis[self.count] = analysis;
+        self.count++;
+        self.finalized = false;
+        return self.count - 1;
+    }
+
+    void addEdge(u32 from, u32 to)
+    {
+        if (self.edgeCount >= self.edgeCap)
+        {
+            u32 ec = self.edgeCap ? self.edgeCap * 2 : 16;
+            u32* ef = alloc<u32>((usize)ec);
+            u32* et = alloc<u32>((usize)ec);
+            for (u32 i = 0; i < self.edgeCount; i++)
+            {
+                ef[i] = self.edgeFrom[i];
+                et[i] = self.edgeTo[i];
+            }
+            if (self.edgeFrom != null) dealloc<u32>(self.edgeFrom);
+            if (self.edgeTo != null) dealloc<u32>(self.edgeTo);
+            self.edgeFrom = ef;
+            self.edgeTo = et;
+            self.edgeCap = ec;
+        }
+        self.edgeFrom[self.edgeCount] = from;
+        self.edgeTo[self.edgeCount] = to;
+        self.edgeCount++;
+        self.finalized = false;
+    }
+
+    // Kahn's algorithm; insertion order of zero-indegree nodes breaks
+    // ties. Cycles are a bug in the node set — reported on stderr and
+    // execution continues in insertion order.
+    void finalize()
+    {
+        if (self.finalized) return;
+        if (self.order != null)
+        {
+            dealloc<u32>(self.order);
+            self.order = null;
+            self.orderLen = 0;
+        }
+        u32* indeg = alloc<u32>((usize)(self.count ? self.count : 1));
+        for (u32 i = 0; i < self.count; i++) indeg[i] = 0;
+        for (u32 e = 0; e < self.edgeCount; e++) indeg[self.edgeTo[e]]++;
+        u32* order = alloc<u32>((usize)(self.count ? self.count : 1));
+        bool* emitted = alloc<bool>((usize)(self.count ? self.count : 1));
+        for (u32 i = 0; i < self.count; i++) emitted[i] = false;
+        for (u32 n = 0; n < self.count; n++)
+        {
+            u32 pick = 0xFFFFFFFF;
+            for (u32 i = 0; i < self.count; i++)
+                if (!emitted[i] && indeg[i] == 0) { pick = i; break; }
+            if (pick == 0xFFFFFFFF)
+            {
+                eprintln("pass graph: dependency cycle, falling back to insertion order");
+                for (u32 i = 0; i < self.count; i++) order[i] = i;
+                self.order = order;
+                self.orderLen = self.count;
+                dealloc<u32>(indeg);
+                dealloc<bool>(emitted);
+                self.finalized = true;
+                return;
+            }
+            order[n] = pick;
+            emitted[pick] = true;
+            for (u32 e = 0; e < self.edgeCount; e++)
+                if (self.edgeFrom[e] == pick) indeg[self.edgeTo[e]] = indeg[self.edgeTo[e]] - 1;
+        }
+        self.order = order;
+        self.orderLen = self.count;
+        dealloc<u32>(indeg);
+        dealloc<bool>(emitted);
+        self.finalized = true;
+    }
+
+    void clear()
+    {
+        if (self.nodes != null) dealloc<GraphNodeFn>(self.nodes);
+        if (self.names != null) dealloc<str>(self.names);
+        if (self.isAnalysis != null) dealloc<bool>(self.isAnalysis);
+        if (self.edgeFrom != null) dealloc<u32>(self.edgeFrom);
+        if (self.edgeTo != null) dealloc<u32>(self.edgeTo);
+        if (self.order != null) dealloc<u32>(self.order);
+        self.nodes = null;
+        self.names = null;
+        self.isAnalysis = null;
+        self.edgeFrom = null;
+        self.edgeTo = null;
+        self.order = null;
+        self.count = 0;
+        self.capacity = 0;
+        self.edgeCount = 0;
+        self.edgeCap = 0;
+        self.orderLen = 0;
+        self.finalized = false;
+    }
+
+    bool runOnFunc(IrFunc* func, rawptr ctx)
+    {
+        return self.runOnFuncIterate(func, ctx, 1);
+    }
+
+    // Iterates the graph until no node reports a change, or maxIters
+    // iterations elapse. Any node that reports change bumps the context
+    // analysis generation so cached analyses rebuild themselves.
+    bool runOnFuncIterate(IrFunc* func, rawptr ctx, u32 maxIters)
+    {
+        bool anyChanged = false;
+        for (u32 iter = 0; iter < maxIters; iter++)
+        {
+            bool changed = false;
+            for (u32 i = 0; i < self.orderLen; i++)
+            {
+                u32 ni = self.order[i];
+                if (self.opt.verbose)
+                    eprintln("> node {} (iter {})", self.names[ni], iter);
+                bool nodeChanged = self.nodes[ni](func, ctx);
+                if (nodeChanged)
+                {
+                    changed = true;
+                    ((IrContext*)ctx)->analysisGeneration++;
+                    if (self.opt.dumps)
+                        muvmDumpModule(func->parent, self.names[ni]);
+                }
+            }
+            if (!changed) break;
+            anyChanged = true;
+        }
+        return anyChanged;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pipelines — built from data, not from a control-flow tangle
+// ---------------------------------------------------------------------------
+// The default function-stage graph. Passes register here as they are
+// written — the list is the pipeline, one node per pass, each wired to
+// run after its predecessor. Nodes appear in registration order inside
+// the graph's dependency chain; finalize() re-derives the real order.
+void registerDefaultNodes(PassGraph* g, MuvmOptions o)
+{
+    // Passes land here one at a time (fold first, then SCCP, GVN, ...).
+    // Example of the shape:
+    //   u32 prev = 0xFFFFFFFF;
+    //   prev = addChained(g, prev, (GraphNodeFn)muvmPassFold, "fold", false);
+    (void)g;
+    (void)o;
+}
+
+pub u32 addChained(PassGraph* g, u32 prev, GraphNodeFn fn, str name, bool isAnalysis)
+{
+    u32 id = g->addNode(fn, name, isAnalysis);
+    if (prev != 0xFFFFFFFF) g->addEdge(prev, id);
+    return id;
+}
+
+pub PassGraph muvmPipeline(MuvmOptions o)
+{
+    PassGraph g = PassGraph::new();
+    g.setOptions(o);
+    registerDefaultNodes(&g, o);
+    g.finalize();
+    return g;
+}
+
+// ---------------------------------------------------------------------------
+// Public entry points
+// ---------------------------------------------------------------------------
+pub bool muvmOptimize(IrFunc* func, IrContext* ctx, CallingConvention cc, MuvmOptions o)
+{
+    if (func == null || ctx == null) return false;
+    if (funcIsOptNone(func) && o.optLevel > 0) o.optLevel = 0;
+
+    if (o.verbose)
+        eprintln("; func={} O{}", func->base.name, o.optLevel);
+
+    // Safety instrumentation is an opt-in pre-phase: it rewrites the IR
+    // with trap calls the optimizer then processes like any other code.
+    bool wantSafety = (o.safety == SafetyMode::All) ||
+                      (o.safety == SafetyMode::Debug && o.optLevel == 0);
+    if (wantSafety)
+    {
+        if (o.verbose)
+            eprintln("> safety {}", func->base.name);
+        muvmPassSafety(func, ctx, o.trapName);
+    }
+
+    PassGraph g = muvmPipeline(o);
+    bool r = g.runOnFuncIterate(func, (rawptr)ctx, maxItersFor(o));
+    g.clear();
+    ctx->clearAnalysisCaches();
+    return r;
+}
+
+pub bool muvmStructureLane(IrFunc* func, IrContext* ctx, MuvmOptions o)
+{
+    if (func == null || ctx == null) return false;
+
+    // Full unrolling: opt-in, and the unroll pass has not landed.
+    if (o.unroll && o.verbose)
+        eprintln("> unroll requested but not implemented yet ({})", func->base.name);
+
+    // Phi lowering: keep-phis is the contract (the allocator materializes
+    // phi copies); there is no phi-demotion pass in muvm yet either. The
+    // structure lane is where they will land, after the last IR-stage
+    // node and before regalloc.
+    return true;
+}
+
+// Phase 1 (optimize + structure lane) runs for every non-extern function
+// before any regalloc/codegen touches the module — inlining clones
+// pre-regalloc IR, so callees must still be in that form here.
+// Phases 2 and 3 are stubbed with an honest error: muvm has no allocator
+// and no backends yet.
+pub CompileResult muvmCompileModule(IrModule* modd, IrContext* ctx, CallingConvention cc, MuvmOptions o)
+{
+    if (modd == null) return muvmError("null module", 0);
+    if (ctx == null) return muvmError("null context", 0);
+
+    for (u32 fi = 0; fi < modd->nfuncs; fi++)
+    {
+        IrFunc* func = modd->funcs[fi];
+        if (func == null) continue;
+        if (func->isExtern) continue;
+        muvmOptimize(func, ctx, cc, o);
+        if (!muvmStructureLane(func, ctx, o))
+            return muvmError("structure lane failed", 0);
+    }
+    if (ccIsWasm(cc))
+        return muvmError("wasm backend not implemented yet", 0);
+    return muvmError("codegen backend not implemented yet", 0);
+}
+
+// Test-support export. Returns the generated assembly text, or an empty
+// str on failure (len == 0). Currently always empty — see muvmCompileModule.
+pub str muvmCompileAsm(IrModule* modd, IrContext* ctx, CallingConvention cc, MuvmOptions o)
+{
+    if (modd == null || ctx == null) return str::empty();
+
+    for (u32 fi = 0; fi < modd->nfuncs; fi++)
+    {
+        IrFunc* func = modd->funcs[fi];
+        if (func == null) continue;
+        if (func->isExtern) continue;
+        muvmOptimize(func, ctx, cc, o);
+        if (!muvmStructureLane(func, ctx, o)) return str::empty();
+    }
+    return str::empty();
+}
