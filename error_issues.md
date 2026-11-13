@@ -1,4 +1,4 @@
- 
+run the compiler under perf. to find performance draining hotspots, then, optimize the algorithms there. or the expensive operations. we'll keep doing it over and over until we are comfortable. 
 
 I went through the grammar for constructs that parse (or are silently accepted) but have no diagnostic, so they fall through to codegen. This is a lot of codes, but most are one-liners. I'd tackle them in this order:
 

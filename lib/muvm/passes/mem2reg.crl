@@ -1,0 +1,373 @@
+#[[no_drop_all]]
+// mem2reg — promote entry-block allocas to SSA values. Fresh Cytron-style
+// implementation: legality check, dominance frontiers, iterated phi
+// placement, dominator-tree renaming with a per-alloca stack.
+//
+// Legality: the alloca's uses must all be Load (pointer operand) or Store
+// (pointer operand) — no GEP, cast, phi, call, select, atomic, GEP-lite
+// through third parties. Pointee element types must agree and must be
+// plain Int (no struct/vector promotion in v1; those allocas stay in
+// memory). A load reachable without any store on the path materializes
+// as const zero — an uninitialized read is UB, so dropping it is sound.
+// An alloca with zero uses is detached directly.
+//
+// After renaming, the alloca and every store to it are detached. No
+// user ever observes a half-rewritten state — all uses are RAU'd before
+// any detach.
+
+import muvm::irOps { IrOpcode };
+import muvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind, IrType, IrTypeKind };
+import muvm::domtree { IrDomTree, irDomtreeNew, irDomtreeFree, irDomtreeIdom };
+import std::mman { alloc, dealloc, copy };
+
+struct Frame
+{
+    u32 idx;
+    u32 topBefore;
+    bool afterChildren;
+}
+
+pub struct Mem2RegPass
+{
+    IrContext* ctx;
+
+    static Mem2RegPass new(IrContext* ctx)
+    {
+        return Mem2RegPass {
+            .ctx = ctx
+        };
+    }
+
+    
+    // shared helper: domtree children of each block (null-counted,
+    // caller frees). blockIndex returns a block's index or 0xFFFFFFFF.
+    
+    static u32 blockIndexOf(IrFunc* func, IrBlock* bb)
+    {
+        for (u32 k = 0; k < func->nblocks; k++)
+            if (func->blocks[k] == bb) return k;
+        return 0xFFFFFFFF;
+    }
+
+    static u32 idomIndex(IrFunc* func, IrDomTree* dt, u32 i)
+    {
+        IrBlock* idom = irDomtreeIdom(dt, func->blocks[i]);
+        if (idom == null) return 0;
+        u32 idx = Mem2RegPass::blockIndexOf(func, idom);
+        return idx;
+    }
+
+    
+    // dominance frontiers: df[x * n + y] == true iff y is in DF(x)
+    
+    void computeDF(IrFunc* func, IrDomTree* dt, bool* df)
+    {
+        u32 n = func->nblocks;
+        for (u32 bi = 0; bi < n; bi++)
+        {
+            IrBlock* b = func->blocks[bi];
+            if (b->npreds < 2) continue;
+            u32 idomIdx = self.idomIndex(func, dt, bi);
+            for (u32 pi = 0; pi < b->npreds; pi++)
+            {
+                u32 runner = Mem2RegPass::blockIndexOf(func, b->preds[pi]);
+                if (runner == 0xFFFFFFFF) continue;
+                while (runner != idomIdx && runner != 0)
+                {
+                    df[runner * n + bi] = true;
+                    u32 rIdx = self.idomIndex(func, dt, runner);
+                    if (rIdx == runner) break;
+                    runner = rIdx;
+                }
+            }
+        }
+    }
+
+    
+    bool allocaPromotionOk(IrInst* alloca, IrType** elemOut)
+    {
+        IrType* elem = null;
+        for (u32 i = 0; i < alloca->base.nusers; i++)
+        {
+            IrInst* u = alloca->base.users[i];
+            bool ok = false;
+            IrType* t = null;
+            if (u->opcode == IrOpcode::Load && u->ops[0] == &alloca->base)
+            {
+                ok = true;
+                t = u->base.type;
+            }
+            else if (u->opcode == IrOpcode::Store && u->ops[1] == &alloca->base)
+            {
+                ok = true;
+                t = u->ops[0] != null ? u->ops[0]->type : null;
+            }
+            if (!ok) return false;
+            if (elem == null) elem = t;
+            else if (elem != t) return false;
+        }
+        // v1: plain ints only — struct/vector allocas stay in memory
+        if (elem != null && elem->kind != IrTypeKind::Int) return false;
+        *elemOut = elem;
+        return true;
+    }
+
+    
+    bool promoteAlloca(IrFunc* func, IrInst* alloca)
+    {
+        IrType* elemTy = null;
+        if (!self.allocaPromotionOk(alloca, &elemTy)) return false;
+        if (alloca->base.nusers == 0)
+        {
+            alloca->detach();
+            return true;
+        }
+        if (elemTy == null) return false;
+
+        IrDomTree* dt = irDomtreeNew(func);
+        if (dt == null) return false;
+        u32 n = func->nblocks;
+        bool* df = alloc<bool>((usize)(n * n ? n * n : 1));
+        for (u32 i = 0; i < n * n; i++) df[i] = false;
+        self.computeDF(func, dt, df);
+
+        // store-block flags + phi placement
+        bool* hasPhi = alloc<bool>((usize)n);
+        bool* isStoreBlock = alloc<bool>((usize)n);
+        for (u32 i = 0; i < n; i++) { hasPhi[i] = false; isStoreBlock[i] = false; }
+        for (u32 i = 0; i < n; i++)
+        {
+            IrBlock* bb = func->blocks[i];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst != null && inst->opcode == IrOpcode::Store &&
+                    inst->ops[1] == &alloca->base)
+                    isStoreBlock[i] = true;
+            }
+        }
+        u32* work = alloc<u32>((usize)n);
+        u32 nw = 0;
+        IrInst** phiOf = alloc<IrInst*>((usize)n);
+        for (u32 i = 0; i < n; i++) phiOf[i] = null;
+
+        for (u32 i = 0; i < n; i++)
+            if (isStoreBlock[i]) work[nw++] = i;
+
+        while (nw > 0)
+        {
+            u32 b = work[--nw];
+            for (u32 y = 0; y < n; y++)
+            {
+                if (!df[b * n + y]) continue;
+                if (hasPhi[y]) continue;
+                hasPhi[y] = true;
+                IrBlock* yb = func->blocks[y];
+                IrValue** ops = alloc<IrValue*>((usize)(yb->npreds * 2));
+                for (u32 j = 0; j < yb->npreds * 2; j++) ops[j] = null;
+                IrInst* phi = self.ctx->createInst(IrOpcode::Phi, elemTy, ops, yb->npreds * 2, 0, 0);
+                dealloc<IrValue*>(ops);
+                // move phi to the front of the block: createInst appended
+                for (u32 j = 0; j < yb->ninsts; j++)
+                {
+                    if (yb->insts[j] == phi)
+                    {
+                        for (u32 k = j; k > 0; k--) yb->insts[k] = yb->insts[k - 1];
+                        yb->insts[0] = phi;
+                        break;
+                    }
+                }
+                for (u32 j = 0; j < yb->npreds * 2; j++)
+                {
+                    if (phi->ops[j] != null) phi->ops[j]->removeUser(phi);
+                    phi->ops[j] = null;
+                }
+                // register users once with real values? createInst handles
+                // opsCopy with nulls — reuse: do explicit user wiring below
+                // as operands are filled. We fill in renaming; addUser then.
+                phiOf[y] = phi;
+                if (!isStoreBlock[y]) work[nw++] = y;
+            }
+        }
+
+        // renaming: dominator-tree pre-order with an explicit frame stack
+
+        Frame* frames = alloc<Frame>((usize)(n * 2 + 4));
+        u32 frameCount = 0;
+        u32 stackCap = 2 * n + 4;
+        IrValue** stack = alloc<IrValue*>((usize)stackCap);
+        u32 stackTop = 0;
+        IrValue* zeroV = self.ctx->constInt(elemTy, 0);
+
+        // children lists per block
+        IrBlock** childOf = alloc<IrBlock*>((usize)n);
+        u32* childFill = alloc<u32>((usize)n);
+        for (u32 i = 0; i < n; i++) { childOf[i] = null; childFill[i] = 0; }
+        {
+            u32* kidCount = alloc<u32>((usize)n);
+            for (u32 i = 0; i < n; i++) kidCount[i] = 0;
+            for (u32 i = 1; i < n; i++)
+            {
+                u32 id = self.idomIndex(func, dt, i);
+                if (id < n) kidCount[id]++;
+            }
+            for (u32 i = 0; i < n; i++)
+                if (kidCount[i] > 0) childOf[i] = alloc<IrBlock>((usize)kidCount[i]);
+            for (u32 i = 1; i < n; i++)
+            {
+                u32 id = self.idomIndex(func, dt, i);
+                if (id < n) childOf[id][childFill[id]++] = func->blocks[i];
+            }
+            dealloc<u32>(kidCount);
+        }
+
+        frames[frameCount] = Frame { .idx = 0, .topBefore = 0, .afterChildren = false };
+        frameCount++;
+        while (frameCount > 0)
+        {
+            Frame f = frames[--frameCount];
+            IrBlock* bb = func->blocks[f.idx];
+            if (!f.afterChildren)
+            {
+                f.topBefore = stackTop;
+                frames[frameCount] = f;
+                f.afterChildren = true;
+                frameCount++;
+                for (u32 ii = 0; ii < bb->ninsts; ii++)
+                {
+                    IrInst* inst = bb->insts[ii];
+                    if (inst == null) continue;
+                    if (inst->opcode == IrOpcode::Phi)
+                    {
+                        if (phiOf[f.idx] == inst)
+                        {
+                            stack[stackTop] = &inst->base;
+                            stackTop++;
+                        }
+                        continue;
+                    }
+                    if (inst->opcode == IrOpcode::Store && inst->ops[1] == &alloca->base)
+                    {
+                        stack[stackTop] = inst->ops[0];
+                        stackTop++;
+                        continue;
+                    }
+                    if (inst->opcode == IrOpcode::Load && inst->ops[0] == &alloca->base)
+                    {
+                        IrValue* top = stackTop > 0 ? stack[stackTop - 1] : zeroV;
+                        inst->base.replaceAllUses(top);
+                        inst->detach();
+                        ii--;
+                        continue;
+                    }
+                }
+                // fill successor phis with (top, bb)
+                for (u32 si = 0; si < bb->nsuccs; si++)
+                {
+                    u32 succIdx = Mem2RegPass::blockIndexOf(func, bb->succs[si]);
+                    if (succIdx == 0xFFFFFFFF) continue;
+                    IrInst* phi = phiOf[succIdx];
+                    if (phi == null) continue;
+                    for (u32 j = 0; j < phi->nops; j += 2)
+                    {
+                        if (phi->ops[j + 1] != null) continue;
+                        if (phi->ops[j] != null) phi->ops[j]->removeUser(phi);
+                        IrValue* top = stackTop > 0 ? stack[stackTop - 1] : zeroV;
+                        phi->ops[j] = top;
+                        top->addUser(phi);
+                        if (phi->ops[j + 1] != null) phi->ops[j + 1]->removeUser(phi);
+                        phi->ops[j + 1] = &bb->base;
+                        (&bb->base)->addUser(phi);
+                        break;
+                    }
+                }
+                // children, reverse so they pop in order
+                for (u32 ci = childFill[f.idx]; ci-- > 0; )
+                {
+                    u32 childIdx = Mem2RegPass::blockIndexOf(func, childOf[f.idx][ci]);
+                    if (childIdx == 0xFFFFFFFF) continue;
+                    frames[frameCount] = Frame { .idx = childIdx, .topBefore = 0, .afterChildren = false };
+                    frameCount++;
+                }
+            }
+            else
+            {
+                // restore stack top to entry state
+                stackTop = f.topBefore;
+            }
+        }
+
+        // cleanup: detach stores and alloca itself (loads detached already)
+        for (u32 i = 0; i < n; i++)
+        {
+            IrBlock* bb = func->blocks[i];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst != null && inst->opcode == IrOpcode::Store &&
+                    inst->ops[1] == &alloca->base)
+                {
+                    inst->detach();
+                    ii--;
+                }
+            }
+        }
+        alloca->detach();
+
+        for (u32 i = 0; i < n; i++) if (childOf[i] != null) dealloc<IrBlock>(childOf[i]);
+        dealloc<IrBlock*>(childOf);
+        dealloc<u32>(childFill);
+        dealloc<Frame>(frames);
+        dealloc<IrValue*>(stack);
+        dealloc<IrInst*>(phiOf);
+        dealloc<u32>(work);
+        dealloc<bool>(isStoreBlock);
+        dealloc<bool>(hasPhi);
+        dealloc<bool>(df);
+        irDomtreeFree(dt);
+        return true;
+    }
+
+    bool run(IrFunc* func)
+    {
+        if (func == null) return false;
+        bool changed = false;
+        // collect first — promotion detaches insts, do not iterate and mutate
+        IrInst** allocas = alloc<IrInst*>((usize)16);
+        u32 nallocas = 0;
+        u32 capAllocas = 16;
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst != null && inst->opcode == IrOpcode::Alloca)
+                {
+                    if (nallocas >= capAllocas)
+                    {
+                        u32 nc = capAllocas * 2;
+                        IrInst** np = alloc<IrInst*>((usize)nc);
+                        for (u32 k = 0; k < nallocas; k++) np[k] = allocas[k];
+                        dealloc<IrInst*>(allocas);
+                        allocas = np;
+                        capAllocas = nc;
+                    }
+                    allocas[nallocas++] = inst;
+                }
+            }
+        }
+        for (u32 i = 0; i < nallocas; i++)
+            if (self.promoteAlloca(func, allocas[i])) changed = true;
+        dealloc<IrInst*>(allocas);
+        return changed;
+    }
+}
+
+pub bool muvmPassMem2Reg(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (func == null || ctx == null) return false;
+    Mem2RegPass pass = Mem2RegPass::new(ctx);
+    return pass.run(func);
+}
