@@ -1,0 +1,480 @@
+#[[no_drop_all]]
+// fold — instcombine-style expression folding for muvm. Fresh pass, one
+// worklist, no full-function rescans: every rewrite re-enqueues the
+// rewritten value's users. One `changed` bit, one pass.
+//
+// Scope for v1: integer binary ops (all int widths), unary Neg/Not,
+// Trunc/Zext/Sext/Bitcast, ICmp, Select. No floats (rounding is not a
+// thing you guess), no reassociation (needs a flags discipline — later),
+// no divide-by-z rewrites (div-by-zero is UB here but we don't fold it
+// away), no strength reduction (mul-by-pow2 → shl, later). The
+// commutative-op canonicalizer rides along inside the node: a lone
+// constant operand moves to the right, which is the shape every fold
+// below matches on.
+
+import muvm::irOps { IrOpcode, IrICmpPred };
+import muvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind, IrType, IrTypeKind };
+import std::mman { alloc, dealloc };
+
+pub struct FoldPass
+{
+    IrContext* ctx;
+    IrInst** work;
+    u32 nwork;
+    u32 capWork;
+    IrInst** dead;
+    u32 ndead;
+    u32 capDead;
+    u64 nFolds;
+
+    static FoldPass new(IrContext* ctx)
+    {
+        return FoldPass {
+            .ctx = ctx,
+            .work = null,
+            .nwork = 0,
+            .capWork = 0,
+            .dead = null,
+            .ndead = 0,
+            .capDead = 0,
+            .nFolds = 0
+        };
+    }
+
+    void deinit()
+    {
+        if (self.work != null) dealloc<IrInst*>(self.work);
+        self.work = null;
+        self.nwork = 0;
+        self.capWork = 0;
+        if (self.dead != null) dealloc<IrInst*>(self.dead);
+        self.dead = null;
+        self.ndead = 0;
+        self.capDead = 0;
+    }
+
+    void push(IrInst* inst)
+    {
+        if (inst == null) return;
+        if (self.nwork >= self.capWork)
+        {
+            u32 nc = self.capWork ? self.capWork * 2 : 32;
+            IrInst** nw = alloc<IrInst*>((usize)nc);
+            for (u32 i = 0; i < self.nwork; i++) nw[i] = self.work[i];
+            if (self.work != null) dealloc<IrInst*>(self.work);
+            self.work = nw;
+            self.capWork = nc;
+        }
+        self.work[self.nwork++] = inst;
+    }
+
+    void markDead(IrInst* inst)
+    {
+        if (self.ndead >= self.capDead)
+        {
+            u32 nc = self.capDead ? self.capDead * 2 : 16;
+            IrInst** nd = alloc<IrInst*>((usize)nc);
+            for (u32 i = 0; i < self.ndead; i++) nd[i] = self.dead[i];
+            if (self.dead != null) dealloc<IrInst*>(self.dead);
+            self.dead = nd;
+            self.capDead = nc;
+        }
+        self.dead[self.ndead++] = inst;
+    }
+
+    bool run(IrFunc* func)
+    {
+        if (func == null) return false;
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        
+        {
+            IrBlock* bb = func->blocks[bi];
+            if (bb == null) continue;
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+                self.push(bb->insts[ii]);
+        }
+        while (self.nwork > 0)
+        {
+            IrInst* inst = self.work[--self.nwork];
+            if (inst->parent == null) continue;
+            IrValue* replacement = self.tryFold(inst);
+            if (replacement == null) continue;
+            self.nFolds++;
+            // Capture the users before RAU (RAU drains the list),
+            // re-enqueue them after rewiring so they refold.
+            u32 nu = inst->base.nusers;
+            IrInst** users = alloc<IrInst*>((usize)(nu ? nu : 1));
+            for (u32 i = 0; i < nu; i++) users[i] = inst->base.users[i];
+            inst->base.replaceAllUses(replacement);
+            for (u32 i = 0; i < nu; i++) self.push(users[i]);
+            dealloc<IrInst*>(users);
+            inst->detach();
+            self.markDead(inst);
+        }
+        // Deferred teardown: the worklist held inst pointers above.
+        for (u32 i = 0; i < self.ndead; i++)
+            self.dead[i]->erase();
+        return self.nFolds > 0;
+    }
+
+    // ------------------------------------------------------------------
+    // helpers
+    // ------------------------------------------------------------------
+    bool isConstInt(IrValue* v)
+    {
+        return v != null && v->kind == IrValueKind::ConstInt;
+    }
+
+    u32 typeWidth(IrType* t)
+    {
+        if (t == null) return 64;
+        return t->width > 0 ? t->width : 64;
+    }
+
+    u64 maskFor(u32 w)
+    {
+        if (w >= 64) return ~(u64)0;
+        return ((u64)1 << (u64)w) - 1;
+    }
+
+    i64 sextFrom(u64 v, u32 w)
+    {
+        if (w >= 64) return (i64)v;
+        u64 m = self.maskFor(w);
+        v &= m;
+        if ((v & ((u64)1 << (u64)(w - 1))) != 0) return (i64)(v | ~m);
+        return (i64)v;
+    }
+
+    IrValue* iconst(IrType* ty, u64 v)
+    {
+        return self.ctx->constInt(ty, v);
+    }
+
+    u32 widthOf(IrInst* inst)
+    {
+        return self.typeWidth(inst->base.type);
+    }
+
+    bool isCommutative(IrOpcode op)
+    {
+        return op == IrOpcode::Add || op == IrOpcode::Mul ||
+               op == IrOpcode::And || op == IrOpcode::Or ||
+               op == IrOpcode::Xor;
+    }
+
+    // --- binary integer ops -------------------------------------------
+    IrValue* tryBinary(IrInst* inst)
+    {
+        IrValue* l = inst->ops[0];
+        IrValue* r = inst->ops[1];
+        if (l == null || r == null) return null;
+        u32 w = self.widthOf(inst);
+        u64 mask = self.maskFor(w);
+
+        // comm_canon: lone constant moves to the right — the shape the
+        // folds below match. Not itself a rewrite (no RAU), but it does
+        // count as a change for the pipeline's generation bump.
+        if (self.isCommutative(inst->opcode) && self.isConstInt(l) && !self.isConstInt(r))
+        {
+            IrValue* t = inst->ops[0];
+            inst->ops[0] = inst->ops[1];
+            inst->ops[1] = t;
+            l = inst->ops[0];
+            r = inst->ops[1];
+            self.nFolds++;
+        }
+
+        if (self.isConstInt(l) && self.isConstInt(r))
+            return self.foldConstIntBinop(inst->opcode, l, r, inst->base.type, w, mask);
+
+        // identities — the operands' instructions stay in the block; any
+        // now-dead producers are DCE's job to remove, not this pass's.
+        if (inst->opcode == IrOpcode::Add && self.isConstInt(r) && (r->valData & mask) == 0) return l;
+        if (inst->opcode == IrOpcode::Add && self.isConstInt(l) && (l->valData & mask) == 0) return r;
+        if (inst->opcode == IrOpcode::Sub && self.isConstInt(r) && (r->valData & mask) == 0) return l;
+        if (inst->opcode == IrOpcode::Sub && l == r) return self.iconst(inst->base.type, 0);
+        if (inst->opcode == IrOpcode::Mul)
+        {
+            if (self.isConstInt(r))
+            {
+                u64 rv = r->valData & mask;
+                if (rv == 1) return l;
+                if (rv == 0) return self.iconst(inst->base.type, 0);
+            }
+            if (self.isConstInt(l) && (l->valData & mask) == 1) return r;
+            if (self.isConstInt(l) && (l->valData & mask) == 0) return self.iconst(inst->base.type, 0);
+        }
+        if (inst->opcode == IrOpcode::And)
+        {
+            if (self.isConstInt(r))
+            {
+                u64 rv = r->valData & mask;
+                if (rv == 0) return self.iconst(inst->base.type, 0);
+                if (rv == mask) return l;
+            }
+            if (l == r) return l;
+        }
+        if (inst->opcode == IrOpcode::Or)
+        {
+            if (self.isConstInt(r))
+            {
+                u64 rv = r->valData & mask;
+                if (rv == 0) return l;
+                if (rv == mask) return self.iconst(inst->base.type, mask);
+            }
+            if (l == r) return l;
+        }
+        if (inst->opcode == IrOpcode::Xor)
+        {
+            if (self.isConstInt(r) && (r->valData & mask) == 0) return l;
+            if (l == r) return self.iconst(inst->base.type, 0);
+            // (x ^ C) ^ C == x
+            if (l->kind == IrValueKind::Inst)
+            {
+                IrInst* inner = (IrInst*)l;
+                if (inner->opcode == IrOpcode::Xor && inner->nops == 2 &&
+                    self.isConstInt(inner->ops[1]) && self.isConstInt(r) &&
+                    (inner->ops[1]->valData & mask) == (r->valData & mask))
+                    return inner->ops[0];
+            }
+        }
+        if ((inst->opcode == IrOpcode::Shl ||
+             inst->opcode == IrOpcode::Lshr ||
+             inst->opcode == IrOpcode::Ashr) &&
+            self.isConstInt(r) && (r->valData & (u64)63) == 0)
+            return l;
+        return null;
+    }
+
+    // --- unary ----------------------------------------------------------
+    IrValue* tryUnary(IrInst* inst)
+    {
+        IrValue* x = inst->ops[0];
+        if (x == null) return null;
+        u32 w = self.widthOf(inst);
+        u64 mask = self.maskFor(w);
+        if (inst->opcode == IrOpcode::Neg)
+        {
+            if (self.isConstInt(x)) return self.iconst(inst->base.type, (0 - x->valData) & mask);
+            if (x->kind == IrValueKind::Inst && ((IrInst*)x)->opcode == IrOpcode::Neg)
+                return ((IrInst*)x)->ops[0];
+            return null;
+        }
+        if (inst->opcode == IrOpcode::Not)
+        {
+            if (self.isConstInt(x)) return self.iconst(inst->base.type, (~x->valData) & mask);
+            if (x->kind == IrValueKind::Inst && ((IrInst*)x)->opcode == IrOpcode::Not)
+                return ((IrInst*)x)->ops[0];
+            return null;
+        }
+        return null;
+    }
+
+    // --- casts ----------------------------------------------------------
+    IrValue* tryCast(IrInst* inst)
+    {
+        IrValue* x = inst->ops[0];
+        if (x == null) return null;
+        u32 w = self.widthOf(inst);
+        u64 mask = self.maskFor(w);
+
+        if (inst->opcode == IrOpcode::Bitcast)
+        {
+            if (inst->base.type != null && x->type != null &&
+                inst->base.type->kind == IrTypeKind::Int && x->type->kind == IrTypeKind::Int &&
+                inst->base.type->width == x->type->width)
+                return x;
+            if (x->kind == IrValueKind::Inst && ((IrInst*)x)->opcode == IrOpcode::Bitcast)
+            {
+                IrInst* inner = (IrInst*)x;
+                if (inner->ops[0] != null && inner->base.type == inst->base.type)
+                    return inner->ops[0];
+            }
+            return null;
+        }
+        if (inst->opcode == IrOpcode::Trunc)
+        {
+            if (self.isConstInt(x)) return self.iconst(inst->base.type, x->valData & mask);
+            if (x->kind == IrValueKind::Inst)
+            {
+                IrInst* xi = (IrInst*)x;
+                if (xi->opcode == IrOpcode::Trunc && xi->ops[0] != null &&
+                    xi->ops[0]->type != null && xi->ops[0]->type->width == w)
+                    return xi->ops[0];
+                // trunc(sext x) to x's source width — the round trip
+                if (xi->opcode == IrOpcode::Sext && xi->ops[0] != null &&
+                    xi->ops[0]->type != null && xi->ops[0]->type->width == w)
+                    return xi->ops[0];
+            }
+            return null;
+        }
+        if (inst->opcode == IrOpcode::Zext || inst->opcode == IrOpcode::Sext)
+        {
+            u32 iw = self.typeWidth(x->type);
+            if (self.isConstInt(x))
+            {
+                if (inst->opcode == IrOpcode::Zext)
+                    return self.iconst(inst->base.type, x->valData & self.maskFor(iw));
+                return self.iconst(inst->base.type, (u64)self.sextFrom(x->valData, iw) & mask);
+            }
+            if (inst->opcode == IrOpcode::Zext && x->kind == IrValueKind::Inst)
+            {
+                IrInst* xi = (IrInst*)x;
+                // zext(trunc x) — x is already exactly w wide
+                if (xi->opcode == IrOpcode::Trunc && xi->ops[0] != null &&
+                    xi->ops[0]->type != null && xi->ops[0]->type->width == w)
+                    return xi->ops[0];
+            }
+            return null;
+        }
+        return null;
+    }
+
+    // --- comparisons ----------------------------------------------------
+    IrValue* tryICmp(IrInst* inst)
+    {
+        IrValue* l = inst->ops[0];
+        IrValue* r = inst->ops[1];
+        if (l == null || r == null) return null;
+        IrICmpPred p = inst->icmpPred;
+        u32 w = self.typeWidth(l->type);
+        u64 mask = self.maskFor(w);
+
+        if (self.isConstInt(l) && self.isConstInt(r))
+        {
+            u64 au = l->valData & mask;
+            u64 bu = r->valData & mask;
+            i64 sa = self.sextFrom(l->valData, w);
+            i64 sb = self.sextFrom(r->valData, w);
+            bool res = false;
+            switch (p)
+            {
+                IrICmpPred::Eq => { res = au == bu; },
+                IrICmpPred::Ne => { res = au != bu; },
+                IrICmpPred::Slt => { res = sa < sb; },
+                IrICmpPred::Sle => { res = sa <= sb; },
+                IrICmpPred::Sgt => { res = sa > sb; },
+                IrICmpPred::Sge => { res = sa >= sb; },
+                IrICmpPred::Ult => { res = au < bu; },
+                IrICmpPred::Ule => { res = au <= bu; },
+                IrICmpPred::Ugt => { res = au > bu; },
+                IrICmpPred::Uge => { res = au >= bu; },
+                else => { return null; }
+            }
+            return self.iconst(self.ctx->tyInt(1), res ? 1 : 0);
+        }
+        // comparisons against the value itself fold to a constant
+        if (l == r)
+        {
+            switch (p)
+            {
+                IrICmpPred::Eq => { return self.iconst(self.ctx->tyInt(1), 1); },
+                IrICmpPred::Ne => { return self.iconst(self.ctx->tyInt(1), 0); },
+                IrICmpPred::Sle => { return self.iconst(self.ctx->tyInt(1), 1); },
+                IrICmpPred::Sge => { return self.iconst(self.ctx->tyInt(1), 1); },
+                IrICmpPred::Ule => { return self.iconst(self.ctx->tyInt(1), 1); },
+                IrICmpPred::Uge => { return self.iconst(self.ctx->tyInt(1), 1); },
+                IrICmpPred::Slt => { return self.iconst(self.ctx->tyInt(1), 0); },
+                IrICmpPred::Sgt => { return self.iconst(self.ctx->tyInt(1), 0); },
+                IrICmpPred::Ult => { return self.iconst(self.ctx->tyInt(1), 0); },
+                IrICmpPred::Ugt => { return self.iconst(self.ctx->tyInt(1), 0); },
+                else => { return null; }
+            }
+        }
+        return null;
+    }
+
+    // --- select ---------------------------------------------------------
+    IrValue* trySelect(IrInst* inst)
+    {
+        IrValue* c = inst->ops[0];
+        if (c == null || c->kind != IrValueKind::ConstInt) return null;
+        if (inst->ops[1] == inst->ops[2]) return inst->ops[1];
+        return (c->valData & 1) != 0 ? inst->ops[1] : inst->ops[2];
+    }
+
+    // --- entry ----------------------------------------------------------
+    IrValue* tryFold(IrInst* inst)
+    {
+        switch (inst->opcode)
+        {
+            IrOpcode::Neg | IrOpcode::Not => { return self.tryUnary(inst); },
+            IrOpcode::Add | IrOpcode::Sub |
+            IrOpcode::Mul | IrOpcode::And |
+            IrOpcode::Or | IrOpcode::Xor |
+            IrOpcode::Shl | IrOpcode::Lshr |
+            IrOpcode::Ashr | IrOpcode::SDiv |
+            IrOpcode::UDiv | IrOpcode::SRem |
+            IrOpcode::URem | IrOpcode::Rotl |
+            IrOpcode::Rotr => { return self.tryBinary(inst); },
+            IrOpcode::Trunc | IrOpcode::Zext |
+            IrOpcode::Sext | IrOpcode::Bitcast => { return self.tryCast(inst); },
+            IrOpcode::ICmp => { return self.tryICmp(inst); },
+            IrOpcode::Select => { return self.trySelect(inst); },
+            else => { return null; }
+        }
+    }
+
+    IrValue* foldConstIntBinop(IrOpcode op, IrValue* l, IrValue* r, IrType* resultTy, u32 w, u64 mask)
+    {
+        u64 a = l->valData & mask;
+        u64 b = r->valData & mask;
+        i64 sa = self.sextFrom(a, w);
+        i64 sb = self.sextFrom(b, w);
+        u64 res = 0;
+        switch (op)
+        {
+            IrOpcode::Add => { res = (a + b) & mask; break; },
+            IrOpcode::Sub => { res = (a - b) & mask; break; },
+            IrOpcode::Mul => { res = (a * b) & mask; break; },
+            IrOpcode::And => { res = a & b; break; },
+            IrOpcode::Or  => { res = a | b; break; },
+            IrOpcode::Xor => { res = a ^ b; break; },
+            IrOpcode::Shl => { res = b < (u64)w ? ((a << b) & mask) : (u64)0; break; },
+            IrOpcode::Lshr => { res = b < (u64)w ? ((a >> b) & mask) : (u64)0; break; },
+            IrOpcode::Ashr => { res = b < (u64)w ? (((u64)((u64)sa >> b)) & mask) : (sa < (i64)0 ? mask : (u64)0); break; },
+            IrOpcode::Rotl => { res = b < (u64)w && w > 0 ? (((a << b) | (a >> ((u64)w - b))) & mask) : a; break; },
+            IrOpcode::Rotr => { res = b < (u64)w && w > 0 ? (((a >> b) | (a << ((u64)w - b))) & mask) : a; break; },
+            
+            IrOpcode::SDiv => {
+                if (sb == 0) return null;                 // div by zero — keep
+                if ((u64)sa == (u64)0x8000000000000000 && sb == -1) return null;
+                res = (u64)(sa / sb) & mask;
+                break;
+            },
+            
+            IrOpcode::UDiv => {
+                if (b == 0) return null;
+                res = a / b;
+                break;
+            },
+            
+            IrOpcode::SRem => {
+                if (sb == 0) return null;
+                if ((u64)sa == (u64)0x8000000000000000 && sb == -1) return self.iconst(resultTy, 0);
+                res = (u64)(sa % sb) & mask;
+                break;
+            },
+            
+            IrOpcode::URem => {
+                if (b == 0) return null;
+                res = a % b;
+                break;
+            },
+            
+            else => { return null; }
+        }
+        return self.iconst(resultTy, res);
+    }
+}
+
+pub bool muvmPassFold(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (func == null || ctx == null) return false;
+    FoldPass pass = FoldPass::new(ctx);
+    bool r = pass.run(func);
+    pass.deinit();
+    return r;
+}
