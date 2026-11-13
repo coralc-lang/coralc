@@ -2,18 +2,20 @@
 # muvm driver test runner: .ir -> muvm_tool (parse + driver pipeline +
 # print) -> reparse fixture check.
 #
-# The backend has no codegen yet, so the checks here are:
+# Checks:
 #   1. the tool exits 0 (driver ran the module without error)
 #   2. its output parses again through the same path (fixpoint stable)
-# LEVELS defaults to O0..O3 — the opt level is currently a no-op but the
-# pipeline runs regardless, so regressions in the driver path are caught.
+#   3. if <case>.gold exists, output must match it byte-for-byte at every
+#      level
+# LEVELS defaults to O0..O3. Error output (.err) goes to TMP, not OUT —
+# OUT only holds the .mir fixtures.
 set -u
 cd "$(dirname "$0")"
 CORALC="${CORALC:-coralc}"
 LEVELS="${LEVELS:-O0 O1 O2 O3}"
 CASES="${CASES:-../wallvm/cases}"
 OUT=output
-TMP=/home/cerie/Documents/coral/test/muvm/output
+TMP=/tmp/opencode/muvm
 TIMEOUT="${TIMEOUT:-15}"
 mkdir -p "$TMP" "$OUT"
 
@@ -26,7 +28,9 @@ t() { timeout --kill-after=5 "$TIMEOUT" "$@"; }
 
 pass=0
 fail=0
-for case in "$CASES"/*.ir; do
+for caseset in "$CASES" cases; do
+    [ -d "$caseset" ] || continue
+for case in "$caseset"/*.ir; do
     name=$(basename "$case" .ir)
     for lv in $LEVELS; do
         echo "TEST $name $lv"
@@ -51,8 +55,17 @@ for case in "$CASES"/*.ir; do
             fail=$((fail+1))
             continue
         fi
+        if [ -f "$caseset/$name.gold" ]; then
+            cmp -s "$OUT/${name}_${lv}.mir" "$caseset/$name.gold"
+            if [ "$?" -ne 0 ]; then
+                echo "FAIL golden $name $lv"
+                fail=$((fail+1))
+                continue
+            fi
+        fi
         pass=$((pass+1))
     done
+done
 done
 echo "pass=$pass fail=$fail"
 [ "$fail" -eq 0 ]
