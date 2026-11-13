@@ -1,0 +1,338 @@
+#[[no_drop_all]]
+// SCCP — sparse conditional constant propagation for muvm.
+// Uses the engine in sccp_lattice.crl: no mutation of IR there, no lattice
+// work here.
+//
+// Phase 1: iterate to a fixpoint over the reachable subgraph — blocks
+// start unreachable and become reachable when a predecessor claims an
+// edge (cond_br with a constant condition claims only the taken arm).
+// Cells only move Bottom→Const→Top, so this terminates.
+//
+// Phase 2: every value whose cell stabilized as Const is replaced
+// everywhere with a real constant; every cond_br/switch whose condition
+// is Const is rewritten to an unconditional Br.
+
+import muvm::irOps { IrOpcode, irOpcodeStr };
+import muvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind, IrType, IrTypeKind };
+import muvm::passes::sccp_lattice { Lattice, Cell, LatticeKind, latticeGet, latticeSet, latticeNew, latticeDestroy, evaluate, constCell, top, bottom };
+import std::mman { alloc, dealloc, copy };
+import std::ios { eprintln };
+
+pub struct SccpPass
+{
+    IrContext* ctx;
+    u64 propagated;
+
+    static SccpPass new(IrContext* ctx)
+    {
+        return SccpPass {
+            .ctx = ctx,
+            .propagated = 0
+        };
+    }
+
+    u32 blockIndexOf(IrFunc* func, IrBlock* bb)
+    {
+        for (u32 i = 0; i < func->nblocks; i++)
+            if (func->blocks[i] == bb) return i;
+        return 0xFFFFFFFF;
+    }
+
+    // Remove predecessor-list reference from `dead` that names `bb`, and
+    // drop the phi inputs in `dead` naming `bb` — the dead branch's CFG
+    // edge is cut on both ends.
+    void pruneEdge(IrBlock* bb, IrBlock* dead)
+    {
+        if (dead == null || bb == null) return;
+        bb->removeSucc(dead);
+        dead->removePred(bb);
+        for (u32 i = 0; i < dead->ninsts; i++)
+        {
+            IrInst* phi = dead->insts[i];
+            if (phi == null || phi->opcode != IrOpcode::Phi) continue;
+            u32 j = 1;
+            while (j < phi->nops)
+            {
+                // value at j-1, pred block at j
+                if (phi->ops[j] == &bb->base)
+                {
+                    phi->ops[j]->removeUser(phi);
+                    if (phi->ops[j - 1] != null) phi->ops[j - 1]->removeUser(phi);
+                    // shift the remaining pairs left by two slots
+                    u32 k = j + 1;
+                    while (k + 1 < phi->nops)
+                    {
+                        phi->ops[k - 2] = phi->ops[k];
+                        phi->ops[k - 1] = phi->ops[k + 1];
+                        k += 2;
+                    }
+                    phi->ops[phi->nops - 2] = null;
+                    phi->ops[phi->nops - 1] = null;
+                    phi->nops -= 2;
+                    // re-scan this phi from the start (safety over
+                    // cleverness; phis are small)
+                    j = 1;
+                    continue;
+                }
+                j += 2;
+            }
+        }
+    }
+
+    // debug dump toggle: off reads null;-> no such flag yet
+    bool dumpCells;
+
+    bool run(IrFunc* func)
+    {
+        if (func == null) return false;
+        self.dumpCells = true;
+        u32 nblocks = func->nblocks;
+        if (nblocks == 0) return false;
+
+        Lattice L = latticeNew();
+        bool* reachable = alloc<bool>((usize)nblocks);
+        for (u32 i = 0; i < nblocks; i++) reachable[i] = false;
+        reachable[0] = true;
+
+        // worklist of blocks to evaluate; re-queued whenever an input changes.
+        // Grows on demand — a block can change at most a few times, but we
+        // top up the cap rather than silently drop an enqueue.
+        u32* wl = alloc<u32>((usize)nblocks);
+        u32 capWl = nblocks;
+        u32 nwl = 0;
+        wl[nwl++] = 0;
+
+        u64 iters = 0;
+        while (nwl > 0)
+        {
+            u32 bi = wl[--nwl];
+            iters++;
+            if (iters > 100000) break;     // safety net — lattice height is small
+            IrBlock* bb = func->blocks[bi];
+            if (bb == null) continue;
+            eprintln("sccp dbg3: eval block {} ({})", bi, bb->base.name);
+
+            // evaluate insts in order
+            bool blockChanged = false;
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst == null) continue;
+                u32 id = inst->base.id;
+                Cell after = evaluate(&L, inst);
+                if (latticeSet(&L, id, after)) blockChanged = true;
+            }
+
+            // then decide which successor edges are real
+            IrInst* term = null;
+            if (bb->ninsts > 0) term = bb->insts[bb->ninsts - 1];
+            if (term != null)
+            {
+                for (u32 sj = 0; sj < bb->nsuccs; sj++)
+                {
+                    u32 sIdx = self.blockIndexOf(func, bb->succs[sj]);
+                    if (sIdx == 0xFFFFFFFF) continue;
+                    bool admit = false;
+                    switch (term->opcode)
+                    {
+                        IrOpcode::Br =>
+                        {
+                            admit = true;
+                            break;
+                        },
+                        IrOpcode::CondBr =>
+                        {
+                            Cell d = latticeGet(&L, term->ops[0]);
+                            if (d.kind == LatticeKind::Bottom) admit = false;
+                            else if (d.kind == LatticeKind::Top) admit = true;
+                            else admit = (((d.val & 1) != 0) == (sj == 0));
+                            break;
+                        },
+                        IrOpcode::Switch =>
+                        {
+                            Cell d = latticeGet(&L, term->ops[0]);
+                            if (d.kind == LatticeKind::Bottom) admit = false;
+                            else if (d.kind == LatticeKind::Top) admit = true;
+                            else
+                            {
+                                if (sj == 0)
+                                {
+                                    bool anyCase = false;
+                                    for (u32 j = 2; j + 1 < term->nops; j += 2)
+                                    {
+                                        IrValue* cv = term->ops[j];
+                                        if (cv->kind == IrValueKind::ConstInt &&
+                                            cv->valData == d.val)
+                                        {
+                                            anyCase = true;
+                                            break;
+                                        }
+                                    }
+                                    admit = !anyCase;
+                                }
+                                else
+                                {
+                                    u32 vi = 2 + (sj - 1) * 2;
+                                    IrValue* cv = term->ops[vi];
+                                    if (cv != null && cv->kind == IrValueKind::ConstInt &&
+                                        cv->valData == d.val)
+                                        admit = true;
+                                }
+                            }
+                            break;
+                        },
+                        else =>
+                        {
+                            admit = false;
+                        }
+                    }
+                    if (admit && !reachable[sIdx])
+                    {
+                        reachable[sIdx] = true;
+                        blockChanged = true;
+                        if (nwl >= capWl)
+                        {
+                            u32 nc = capWl * 2;
+                            u32* nw = alloc<u32>((usize)nc);
+                            for (u32 k = 0; k < nwl; k++) nw[k] = wl[k];
+                            dealloc<u32>(wl);
+                            wl = nw;
+                            capWl = nc;
+                        }
+                        wl[nwl++] = sIdx;
+                    }
+                }
+            }
+
+            // any cell move inside the block may ripple into successors;
+            // re-queue the block so the next pass sees them
+            if (blockChanged && nwl == capWl)
+            {
+                u32 nc = capWl * 2;
+                u32* nw = alloc<u32>((usize)nc);
+                for (u32 k = 0; k < nwl; k++) nw[k] = wl[k];
+                dealloc<u32>(wl);
+                wl = nw;
+                capWl = nc;
+            }
+            if (blockChanged) wl[nwl++] = bi;
+        }
+
+        // debug dump: dump lattice state (guarded by verbose global)
+        if (self.dumpCells)
+        {
+            for (u32 bi = 0; bi < nblocks; bi++)
+            {
+                IrBlock* bb = func->blocks[bi];
+                eprintln("sccp dump block[{}] = {}", bi, bb->base.name);
+                for (u32 ii = 0; ii < bb->ninsts; ii++)
+                {
+                    IrInst* inst = bb->insts[ii];
+                    if (inst == null) continue;
+                    Cell c = latticeGet(&L, &inst->base);
+                    eprintln("  id={} op={} kind={} val={}", inst->base.id, irOpcodeStr(inst->opcode), (u32)c.kind, c.val);
+                }
+            }
+        }
+
+        // phase 2 — fold constants, fold terminators
+        bool all = false;
+        for (u32 bi = 0; bi < nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst == null) continue;
+                if (inst->opcode == IrOpcode::Br || inst->opcode == IrOpcode::Ret ||
+                    inst->opcode == IrOpcode::Unreachable || inst->opcode == IrOpcode::Noret ||
+                    inst->opcode == IrOpcode::Phi)
+                    continue;
+                Cell c = latticeGet(&L, &inst->base);
+                if (c.kind != LatticeKind::Const) continue;
+                IrValue* con = null;
+                IrType* ty = inst->base.type;
+                if (ty != null && ty->kind == IrTypeKind::Float)
+                {
+                    f64 fv;
+                    copy<u8>((u8*)&fv, (u8*)&c.val, 8);
+                    con = self.ctx->constFloat(ty, fv);
+                }
+                else
+                {
+                    con = self.ctx->constInt(ty, c.val);
+                }
+                if (con == null) continue;
+                inst->base.replaceAllUses(con);
+                inst->detach();
+                ii = ii - 1;
+                self.propagated++;
+                all = true;
+            }
+        }
+
+        // phase 2c — fold terminators with const conditions to unconditional br
+        for (u32 bi = 0; bi < nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            if (bb->ninsts == 0) continue;
+            IrInst* term = bb->insts[bb->ninsts - 1];
+            IrBlock* taken = null;
+            if (term->opcode == IrOpcode::CondBr)
+            {
+                IrValue* condV = term->ops[0];
+                Cell d = latticeGet(&L, condV);
+                eprintln("phase2c: branch cond id={} cell={} val={}", condV->id, (u32)d.kind, d.val);
+                if (d.kind == LatticeKind::Const)
+                    taken = ((d.val & 1) != 0) ? bb->succs[0] : bb->succs[1];
+            }
+            else if (term->opcode == IrOpcode::Switch)
+            {
+                Cell d = latticeGet(&L, term->ops[0]);
+                if (d.kind == LatticeKind::Const)
+                {
+                    taken = bb->succs[0];             // default
+                    for (u32 sj = 1; sj < bb->nsuccs; sj++)
+                    {
+                        u32 vi = 2 + (sj - 1) * 2;
+                        IrValue* cv = term->ops[vi];
+                        if (cv != null && cv->kind == IrValueKind::ConstInt && cv->valData == d.val)
+                        {
+                            taken = bb->succs[sj];
+                            break;
+                        }
+                    }
+                }
+            }
+            if (taken == null) continue;
+
+            // sever every other edge
+            for (u32 sj = 0; sj < bb->nsuccs; )
+            {
+                IrBlock* s = bb->succs[sj];
+                if (s == taken) { sj++; continue; }
+                self.pruneEdge(bb, s);
+            }
+            // rewrite terminator
+            IrValue** ops = alloc<IrValue*>((usize)1);
+            ops[0] = &taken->base;
+            IrInst* br = self.ctx->createInst(IrOpcode::Br, self.ctx->tyVoid(), ops, 1, 0, 0);
+            dealloc<IrValue*>(ops);
+            term->detach();
+            bb->addInst(br);
+            all = true;
+        }
+
+        dealloc<bool>(reachable);
+        latticeDestroy(&L);
+        return all;
+    }
+}
+
+pub bool muvmPassSccp(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (func == null || ctx == null) return false;
+    SccpPass pass = SccpPass::new(ctx);
+    return pass.run(func);
+}

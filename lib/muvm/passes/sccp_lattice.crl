@@ -1,0 +1,409 @@
+#[[no_drop_all]]
+// SCCP lattice and constant-evaluation engine. Pure data flow over the
+// IR's value graph — no IR mutation here. The pass driver owns the
+// context and does the rewrites.
+//
+// Lattice per SSA value: Bottom (undefined/unreached) → Const(value)
+// → Top (overdefined). Merges through phis and through the
+// control-flow edges that matter are pointwise and monotone — cells
+// only move Bottom→Const→Top, so the driver's outer loop terminates.
+
+import muvm::irOps { IrOpcode, IrICmpPred };
+import muvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind, IrType, IrTypeKind };
+import std::mman { alloc, dealloc, copy };
+
+pub enum LatticeKind
+{
+    Bottom,
+    Const,
+    Top
+}
+
+pub struct Cell
+{
+    LatticeKind kind;
+    u64 val;
+}
+
+pub static Cell bottom()
+{
+    Cell c;
+    c.kind = LatticeKind::Bottom;
+    c.val = 0;
+    return c;
+}
+
+pub static Cell top()
+{
+    Cell c;
+    c.kind = LatticeKind::Top;
+    c.val = 0;
+    return c;
+}
+
+pub static Cell constCell(u64 v)
+{
+    Cell c;
+    c.kind = LatticeKind::Const;
+    c.val = v;
+    return c;
+}
+
+pub static Cell meet(Cell a, Cell b)
+{
+    if (a.kind == LatticeKind::Bottom) return b;
+    if (b.kind == LatticeKind::Bottom) return a;
+    if (a.kind == LatticeKind::Const && b.kind == LatticeKind::Const && a.val == b.val) return a;
+    return top();
+}
+
+pub struct Lattice
+{
+    Cell* cells;
+    u32 cap;
+}
+
+pub static Lattice latticeNew()
+{
+    Lattice l;
+    l.cells = null;
+    l.cap = 0;
+    return l;
+}
+
+pub static void latticeDestroy(Lattice* l)
+{
+    if (l->cells != null) dealloc<Cell>(l->cells);
+    l->cells = null;
+    l->cap = 0;
+}
+
+static void latticeEnsure(Lattice* l, u32 id)
+{
+    if (id < l->cap) return;
+    u32 nc = l->cap ? l->cap * 2 : 32;
+    while (nc <= id) nc *= 2;
+    Cell* ncCells = alloc<Cell>((usize)nc);
+    for (u32 i = 0; i < nc; i++)
+    {
+        ncCells[i].kind = LatticeKind::Bottom;
+        ncCells[i].val = 0;
+    }
+    if (l->cells != null)
+    {
+        for (u32 i = 0; i < l->cap; i++) ncCells[i] = l->cells[i];
+        dealloc<Cell>(l->cells);
+    }
+    l->cells = ncCells;
+    l->cap = nc;
+}
+
+// id-parameter helper that also accepts raw SSA values — when the cell
+// says Bottom, fall back to the IR's own constant inventory.
+pub static Cell latticeGet(Lattice* l, IrValue* v)
+{
+    if (v == null) return bottom();
+    u32 id = v->id;
+    if (l->cells == null || id >= l->cap)
+    {
+        if (v->kind == IrValueKind::ConstInt || v->kind == IrValueKind::ConstFloat)
+            return constCell(v->valData);
+        return bottom();
+    }
+    Cell c = l->cells[id];
+    if (c.kind == LatticeKind::Const) return c;
+    if (c.kind == LatticeKind::Bottom &&
+        (v->kind == IrValueKind::ConstInt || v->kind == IrValueKind::ConstFloat))
+        return constCell(v->valData);
+    return c;
+}
+
+// monotone move: only Bottom→Const→Top is allowed; a request that would
+// narrow a Top back down to Const is rejected (that would be unsound).
+// returns true if the cell moved
+pub static bool latticeSet(Lattice* l, u32 id, Cell c)
+{
+    latticeEnsure(l, id);
+    Cell* dst = &l->cells[id];
+    #[[maybe_unused]] u32 prevKind = (u32)dst->kind;
+    bool changed = false;
+    if (dst->kind != c.kind || (c.kind == LatticeKind::Const && dst->val != c.val)) changed = true;
+    if (changed) eprintln("latticeSet dbg id={} {} -> {}", id, prevKind, (u32)c.kind);
+    if (dst->kind == c.kind && (c.kind != LatticeKind::Const || dst->val == c.val)) return false;
+    u32 cur = (u32)dst->kind;
+    u32 want = (u32)c.kind;
+    if (want < cur) return false;  // would narrow — reject
+    dst->kind = c.kind;
+    dst->val = c.val;
+    return true;
+}
+
+
+// constant evaluation helpers (widths, sign extension, masks)
+
+
+pub static u64 maskLow(u32 bits)
+{
+    if (bits >= 64) return ~(u64)0;
+    return ((u64)1 << (u64)bits) - 1;
+}
+
+pub static i64 sext64(u64 v, u32 bits)
+{
+    if (bits >= 64) return (i64)v;
+    u64 m = maskLow(bits);
+    v &= m;
+    u64 sbit = 1 << (u64)(bits - 1);
+    if ((v & sbit) != 0) v |= ~m;
+    return (i64)v;
+}
+
+static i64 sa64(Cell c, u32 w)
+{
+    return sext64(c.val, w);
+}
+
+static u32 widthOf(IrValue* v)
+{
+    return v->type != null ? (v->type->width > 0 ? v->type->width : 64) : 64;
+}
+
+static i64 si(IrValue* v)
+{
+    return (i64)widthOf(v);
+}
+
+static Cell evalBinary(IrOpcode op, Cell a, Cell b, u32 w)
+{
+    if (a.kind == LatticeKind::Top || b.kind == LatticeKind::Top) return top();
+    if (a.kind == LatticeKind::Bottom || b.kind == LatticeKind::Bottom) return bottom();
+    u64 m = maskLow(w);
+    u64 x = a.val & m;
+    u64 y = b.val & m;
+    u64 r = 0;
+    switch (op)
+    {
+        IrOpcode::Add => { r = (x + y) & m; break; },
+        IrOpcode::Sub => { r = (x - y) & m; break; },
+        IrOpcode::Mul => { r = (x * y) & m; break; },
+        IrOpcode::And => { r = x & y; break; },
+        IrOpcode::Or  => { r = x | y; break; },
+        IrOpcode::Xor => { r = x ^ y; break; },
+        IrOpcode::Shl => { r = y < (u64)w ? ((x << y) & m) : 0; break; },
+        IrOpcode::Lshr => { r = y < (u64)w ? ((x >> y) & m) : 0; break; },
+        
+        IrOpcode::Ashr => {
+            i64 sa = sext64(x, w);
+            r = y < (u64)w ? ((u64)(sa >> (i64)y) & m) : ((sa < 0) ? m : (u64)0);
+            break;
+        },
+        IrOpcode::SDiv => {
+            i64 sa = sext64(x, w);
+            i64 sb = sext64(y, w);
+            if (sb == 0) return top();
+            if (sa == (i64)0x8000000000000000 && sb == (i64)-1) return top();
+            r = (u64)(sa / sb) & m;
+            break;
+        },
+        IrOpcode::UDiv => {
+            if (y == 0) return top();
+            r = x / y;
+            break;
+        },
+        IrOpcode::SRem => {
+            i64 sa = sext64(x, w);
+            i64 sb = sext64(y, w);
+            if (sb == 0) return top();
+            if (sa == (i64)0x8000000000000000 && sb == (i64)-1) return constCell(0);
+            r = (u64)(sa % sb) & m;
+            break;
+        },
+        IrOpcode::URem => {
+            if (y == 0) return top();
+            r = x % y;
+            break;
+        },
+        IrOpcode::Rotl => {
+            u64 sh = y % (u64)(w > 0 ? w : 1);
+            if (sh >= (u64)w) r = x;
+            else r = ((x << sh) | (x >> ((u64)w - sh))) & m;
+            break;
+        },
+        IrOpcode::Rotr => {
+            u64 sh = y % (u64)(w > 0 ? w : 1);
+            if (sh >= (u64)w) r = x;
+            else r = ((x >> sh) | (x << ((u64)w - sh))) & m;
+            break;
+        },
+        IrOpcode::SMin => { r = (sext64(x, w) < sext64(y, w)) ? x : y; break; },
+        IrOpcode::SMax => { r = (sext64(x, w) > sext64(y, w)) ? x : y; break; },
+        IrOpcode::UMin => { r = x < y ? x : y; break; },
+        IrOpcode::UMax => { r = x > y ? x : y; break; },
+        else => { return top(); }
+    }
+    return constCell(r);
+}
+
+static bool evalICmpPred(IrICmpPred p, u64 a, u64 b, u32 w)
+{
+    u64 x = a & maskLow(w);
+    u64 y = b & maskLow(w);
+    i64 sa = sext64(x, w);
+    i64 sb = sext64(y, w);
+    switch (p)
+    {
+        IrICmpPred::Eq => { return x == y; },
+        IrICmpPred::Ne => { return x != y; },
+        IrICmpPred::Slt => { return sa < sb; },
+        IrICmpPred::Sle => { return sa <= sb; },
+        IrICmpPred::Sgt => { return sa > sb; },
+        IrICmpPred::Sge => { return sa >= sb; },
+        IrICmpPred::Ult => { return x < y; },
+        IrICmpPred::Ule => { return x <= y; },
+        IrICmpPred::Ugt => { return x > y; },
+        IrICmpPred::Uge => { return x >= y; },
+        else => { return false; }
+    }
+}
+
+static Cell evalCast(IrOpcode op, Cell a, u32 srcw, u32 dstw)
+{
+    if (a.kind == LatticeKind::Bottom) return bottom();
+    if (a.kind == LatticeKind::Top) return top();
+    u64 x = a.val & maskLow(srcw);
+    u64 m = maskLow(dstw);
+    switch (op)
+    {
+        IrOpcode::Trunc => { return constCell(x & m); },
+        IrOpcode::Zext  => { return constCell(x & m); },
+        IrOpcode::Sext  => { return constCell((u64)sext64(x, srcw) & m); },
+        IrOpcode::Bitcast => { return a; },     // int-to-int — bit pattern preserved
+        else => { return top(); }
+    }
+}
+
+static Cell evalUnary(IrOpcode op, Cell a, u32 w)
+{
+    if (a.kind == LatticeKind::Bottom) return bottom();
+    if (a.kind == LatticeKind::Top) return top();
+    u64 m = maskLow(w);
+    u64 x = a.val & m;
+    u64 r = 0;
+    switch (op)
+    {
+        IrOpcode::Neg => { r = (0 - x) & m; break; },
+        IrOpcode::Not => { r = (~x) & m; break; },
+        
+        IrOpcode::Abs => {
+            i64 sa = sext64(x, w);
+            r = (u64)(sa < 0 ? -sa : sa) & m;
+            break;
+        },
+        IrOpcode::CtPop => {
+            u64 v = x;
+            while (v) { v &= v - 1; r++; }
+            r &= m;
+            break;
+        },
+        IrOpcode::CtLz => {
+            u32 c = 0;
+            u64 bit = (u64)1 << (u64)((w - 1) % 64);
+            while (c < w && (x & bit) == 0) { bit >>= 1; c++; }
+            r = (u64)c;
+            break;
+        },
+        IrOpcode::CtTz => {
+            if (x == 0) { r = (u64)w; break; }
+            u64 tmp = x;
+            u32 c = 0;
+            while ((tmp & 1) == 0) { tmp >>= 1; c++; }
+            r = (u64)c;
+            break;
+        },
+        else => { return top(); }
+    }
+    return constCell(r);
+}
+
+
+// evaluate one instruction on a lattice; returns its new cell
+
+pub static Cell evaluate(Lattice* l, IrInst* inst)
+{
+    u32 w = inst->base.type != null ? (inst->base.type->width > 0 ? inst->base.type->width : 64) : 64;
+
+    // phis: meet of incoming value cells (even indices are value ops)
+    if (inst->opcode == IrOpcode::Phi)
+    {
+        Cell merged = bottom();
+        for (u32 j = 0; j < inst->nops; j += 2)
+        {
+            if (inst->ops[j] == null) continue;
+            Cell inc = latticeGet(l, inst->ops[j]);
+            eprintln("phi eval dbg: phi_id={} inc_j={} inc_val_kind={} val={}", inst->base.id, j, (u32)inc.kind, inc.val);
+            merged = meet(merged, inc);
+        }
+        return merged;
+    }
+
+    // side-effecting or opaque ops: never a constant
+    switch (inst->opcode)
+    {
+        IrOpcode::Call | IrOpcode::Load | IrOpcode::Gep | IrOpcode::Alloca |
+        IrOpcode::Store | IrOpcode::AtomicLoad | IrOpcode::AtomicStore |
+        IrOpcode::AtomicRmw | IrOpcode::AtomicCmpXchg | IrOpcode::Fence |
+        IrOpcode::GcRoot | IrOpcode::GcWriteBarrier | IrOpcode::GcSafepoint |
+        IrOpcode::LandingPad | IrOpcode::ExtractValue | IrOpcode::ExtractElement |
+        IrOpcode::InsertValue | IrOpcode::InsertElement |
+        IrOpcode::InlineAsm => { return top(); },
+        else => { }
+    }
+
+    Cell a = inst->nops > 0 ? latticeGet(l, inst->ops[0]) : bottom();
+    Cell b = inst->nops > 1 ? latticeGet(l, inst->ops[1]) : bottom();
+
+    switch (inst->opcode)
+    {
+        IrOpcode::Add | IrOpcode::Sub | IrOpcode::Mul | IrOpcode::And |
+        IrOpcode::Or  | IrOpcode::Xor | IrOpcode::Shl | IrOpcode::Lshr |
+        IrOpcode::Ashr | IrOpcode::SDiv | IrOpcode::UDiv | IrOpcode::SRem |
+        IrOpcode::URem | IrOpcode::Rotl | IrOpcode::Rotr | IrOpcode::SMin |
+        IrOpcode::SMax | IrOpcode::UMin | IrOpcode::UMax => {
+            return evalBinary(inst->opcode, a, b, w);
+        },
+        
+        IrOpcode::Neg | IrOpcode::Not | IrOpcode::Abs |
+        IrOpcode::CtPop | IrOpcode::CtLz | IrOpcode::CtTz => {
+            return evalUnary(inst->opcode, a, w);
+        },
+        
+        IrOpcode::ICmp => {
+            if (a.kind == LatticeKind::Top || b.kind == LatticeKind::Top) return top();
+            if (a.kind == LatticeKind::Bottom || b.kind == LatticeKind::Bottom) return bottom();
+            return constCell(evalICmpPred(inst->icmpPred, a.val, b.val, w) ? 1 : 0);
+        },
+        
+        IrOpcode::Trunc | IrOpcode::Zext | IrOpcode::Sext | IrOpcode::Bitcast => {
+            u32 srcw = inst->ops[0] != null ? (u32)si(inst->ops[0]) : 64;
+            return evalCast(inst->opcode, a, srcw, w);
+        },
+
+        IrOpcode::Select => {
+            if (a.kind == LatticeKind::Top || a.kind == LatticeKind::Bottom)
+            {
+                // cond is overdefined or unreached — arms don't collapse
+                if (a.kind == LatticeKind::Bottom) return bottom();
+                Cell t = latticeGet(l, inst->ops[1]);
+                Cell f = latticeGet(l, inst->ops[2]);
+                if (t.kind == f.kind && (t.kind != LatticeKind::Const || t.val == f.val)) return t;
+                return top();
+            }
+            Cell taken = latticeGet(l, inst->ops[(a.val & 1) ? 1 : 2]);
+            return taken;
+        },
+        
+        else => {
+            return top();
+        }
+    }
+}
