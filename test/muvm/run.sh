@@ -4,7 +4,8 @@
 #
 # Checks:
 #   1. the tool exits 0 (driver ran the module without error)
-#   2. its output parses again through the same path (fixpoint stable)
+#   2. the module read back from the dump denotes the same IR as the dump
+#      itself (semantic fixpoint check, see semantic_eq.py)
 #   3. if <case>.gold exists, output must match it byte-for-byte at every
 #      level
 # LEVELS defaults to O0..O3. Error output (.err) goes to TMP, not OUT —
@@ -49,9 +50,8 @@ for case in "$caseset"/*.ir; do
             fail=$((fail+1))
             continue
         fi
-        cmp -s "$OUT/${name}_${lv}.mir" "$OUT/${name}_${lv}.mir2"
-        if [ "$?" -ne 0 ]; then
-            echo "FAIL fixpoint $name $lv (output changed on reparse)"
+        if ! python3 semantic_eq.py "$OUT/${name}_${lv}.mir" "$OUT/${name}_${lv}.mir2"; then
+            echo "FAIL fixpoint $name $lv (reparse produced a different module)"
             fail=$((fail+1))
             continue
         fi

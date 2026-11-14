@@ -1,0 +1,299 @@
+#[[no_drop_all]]
+// Loop constant-load motion for muvm — fresh narrow implementation.
+//
+// Hoist loads whose base/index operands are loop-invariant out of loops
+// that contain no memory-affecting operations anywhere in the loop
+// (no stores, atomics, calls, inline asm, GC ops, landing pads). Without
+// alias analysis this is the strongest safe check: any writer could
+// alias the pointer loaded from.
+//
+// Requires the load's block to dominate the latch — a conditional load
+// is never speculated.
+//
+// Preexisting preheaders are reused; otherwise one is created on demand
+// in the same shape loop_canon emits (Br to header).
+
+import muvm::passes::common { gVerbose };
+import muvm::irOps { IrOpcode, irOpcodeIsTerminator };
+import muvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind };
+import muvm::passes::loop_detect { IrLoop, irLoopDetectNatural, irLoopDestroy };
+import muvm::domtree { IrDomTree, irDomtreeNew, irDomtreeFree, irDomtreeDominates };
+import std::mman { alloc, dealloc };
+import std::ios { eprintln };
+
+pub struct LoopCsePass
+{
+    IrContext* ctx;
+    u64 hoisted;
+
+    static LoopCsePass new(IrContext* ctx)
+    {
+        return LoopCsePass { .ctx = ctx, .hoisted = 0 };
+    }
+
+    u32 blockIndex(IrFunc* func, IrBlock* bb)
+    {
+        for (u32 i = 0; i < func->nblocks; i++)
+            if (func->blocks[i] == bb) return i;
+        return func->nblocks;
+    }
+
+    bool isWriter(IrOpcode op)
+    {
+        switch (op)
+        {
+            IrOpcode::Store |
+            IrOpcode::AtomicLoad | IrOpcode::AtomicStore |
+            IrOpcode::AtomicRmw | IrOpcode::AtomicCmpXchg | IrOpcode::Fence |
+            IrOpcode::Call |
+            IrOpcode::InlineAsm |
+            IrOpcode::LandingPad |
+            IrOpcode::GcRoot | IrOpcode::GcWriteBarrier | IrOpcode::GcSafepoint |
+            IrOpcode::Resume | IrOpcode::CatchSwitch | IrOpcode::CatchPad | IrOpcode::CleanupPad => { return true; },
+            else => { return false; }
+        }
+    }
+
+    bool loopHasWriter(IrLoop* lp)
+    {
+        for (u32 bi = 0; bi < lp->nblocks; bi++)
+        {
+            IrBlock* bb = lp->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+                if (self.isWriter(bb->insts[ii]->opcode)) return true;
+        }
+        return false;
+    }
+
+    // base/index operand chain must be strictly loop-invariant: every
+    // operand is a constant, an arg, or an instruction defined outside the loop
+    bool isInvariantChain(IrFunc* func, bool* inLoop, u32 nfn, IrInst* inst)
+    {
+        for (u32 oj = 0; oj < inst->nops; oj++)
+        {
+            IrValue* o = inst->ops[oj];
+            if (o == null) return false;
+            if (o->kind == IrValueKind::ConstInt || o->kind == IrValueKind::ConstFloat)
+                continue;
+            if (o->kind == IrValueKind::Arg) continue;
+            if (o->kind != IrValueKind::Inst) return false;
+            IrInst* def = (IrInst*)o;
+            IrBlock* parent = def->parent;
+            if (parent == null) continue; // detached — invariant
+            u32 pi = self.blockIndex(func, parent);
+            if (pi >= nfn) return false;
+            if (inLoop[pi]) return false;
+        }
+        return true;
+    }
+
+    bool isHoistableLoad(IrFunc* func, bool* inLoop, u32 nfn, IrInst* inst)
+    {
+        if (inst->opcode != IrOpcode::Load) return false;
+        return self.isInvariantChain(func, inLoop, nfn, inst);
+    }
+
+    IrBlock* ensurePreheader(IrFunc* func, IrLoop* lp)
+    {
+        u32 nfn = func->nblocks;
+        bool* inLoop = alloc<bool>((usize)nfn);
+        for (u32 bi = 0; bi < nfn; bi++) inLoop[bi] = false;
+        for (u32 bi = 0; bi < lp->nblocks; bi++)
+        {
+            u32 idx = self.blockIndex(func, lp->blocks[bi]);
+            if (idx < nfn) inLoop[idx] = true;
+        }
+
+        IrBlock* header = lp->header;
+        // count outside preds
+        u32 nOut = 0;
+        IrBlock* soleOutside = null;
+        bool soleIsPreheader = false;
+        for (u32 pj = 0; pj < header->npreds; pj++)
+        {
+            IrBlock* p = header->preds[pj];
+            u32 pi = self.blockIndex(func, p);
+            if (pi == nfn || !inLoop[pi])
+            {
+                nOut++;
+                if (nOut == 1) soleOutside = p;
+                soleIsPreheader = (p->nsuccs == 1 && p->succs[0] == header);
+            }
+        }
+        if (nOut == 1 && soleOutside != null && soleIsPreheader)
+        {
+            dealloc<bool>(inLoop);
+            return soleOutside;
+        }
+        if (nOut == 0) { dealloc<bool>(inLoop); return null; }
+
+        IrBlock* preheader = self.ctx->createBlock("loop_cse.preheader");
+        func->addBlock(preheader);
+        IrValue** brOps = alloc<IrValue*>((usize)1);
+        brOps[0] = &header->base;
+        IrInst* brTerm = self.ctx->createInst(IrOpcode::Br, self.ctx->tyVoid(), brOps, 1, 0, 0);
+        dealloc<IrValue*>(brOps);
+        preheader->addInst(brTerm);
+        preheader->addSucc(header);
+        // IrBlock::addSucc self-registers the pred — don't double-add
+
+        IrBlock** outPreds = alloc<IrBlock*>((usize)header->npreds);
+        u32 nOutPreds = 0;
+        for (u32 pj = 0; pj < header->npreds; pj++)
+        {
+            IrBlock* p = header->preds[pj];
+            if (p == preheader) continue;
+            u32 pi = self.blockIndex(func, p);
+            if (pi == nfn || !inLoop[pi]) outPreds[nOutPreds++] = p;
+        }
+        for (u32 pi = 0; pi < nOutPreds; pi++)
+        {
+            IrBlock* p = outPreds[pi];
+            for (u32 ii = 0; ii < p->ninsts; ii++)
+            {
+                IrInst* t = p->insts[ii];
+                if (t == null || !irOpcodeIsTerminator(t->opcode)) continue;
+                for (u32 oj = 0; oj < t->nops; oj++)
+                {
+                    if (t->ops[oj] == &header->base)
+                    {
+                        t->ops[oj]->removeUser(t);
+                        t->ops[oj] = &preheader->base;
+                        (&preheader->base)->addUser(t);
+                    }
+                }
+            }
+            for (u32 sj = 0; sj < p->nsuccs; sj++)
+                if (p->succs[sj] == header) { p->succs[sj] = preheader; break; }
+            header->removePred(p);
+            preheader->addPred(p);
+            // phi inputs naming p in header now name preheader
+            for (u32 i2 = 0; i2 < header->ninsts; i2++)
+            {
+                IrInst* phi = header->insts[i2];
+                if (phi == null || phi->opcode != IrOpcode::Phi) continue;
+                for (u32 j2 = 1; j2 < phi->nops; j2 += 2)
+                {
+                    if (phi->ops[j2] == &p->base)
+                    {
+                        phi->ops[j2]->removeUser(phi);
+                        phi->ops[j2] = &preheader->base;
+                        (&preheader->base)->addUser(phi);
+                    }
+                }
+            }
+        }
+        dealloc<IrBlock*>(outPreds);
+        dealloc<bool>(inLoop);
+        return preheader;
+    }
+
+    bool run(IrFunc* func)
+    {
+        if (func == null) return false;
+        if (gVerbose) eprintln("loop_cse: begin func={}", func->base.name);
+
+        IrLoop** loops = irLoopDetectNatural(func);
+        if (loops == null) return false;
+
+        u32 nLoops = 0;
+        while (loops[nLoops] != null) nLoops++;
+        if (gVerbose) eprintln("loop_cse: {} natural loop(s)", nLoops);
+
+        bool changedAny = false;
+
+        for (u32 li = 0; loops[li] != null; li++)
+        {
+            IrLoop* lp = loops[li];
+            if (self.loopHasWriter(lp))
+            {
+                if (gVerbose) eprintln("loop_cse: loop header={} has writers — skip", lp->header->base.name);
+                continue;
+            }
+
+            u32 nfn = func->nblocks;
+            bool* inLoop = alloc<bool>((usize)nfn);
+            for (u32 bi = 0; bi < nfn; bi++) inLoop[bi] = false;
+            for (u32 bi = 0; bi < lp->nblocks; bi++)
+            {
+                u32 idx = self.blockIndex(func, lp->blocks[bi]);
+                if (idx < nfn) inLoop[idx] = true;
+            }
+
+            // any hoistable load at all?
+            bool hasCandidate = false;
+            for (u32 bi = 0; bi < lp->nblocks && !hasCandidate; bi++)
+            {
+                IrBlock* bb = lp->blocks[bi];
+                for (u32 ii = 0; ii < bb->ninsts; ii++)
+                {
+                    IrInst* inst = bb->insts[ii];
+                    if (inst == null) continue;
+                    if (self.isHoistableLoad(func, inLoop, nfn, inst)) { hasCandidate = true; break; }
+                }
+            }
+            if (!hasCandidate)
+            {
+                dealloc<bool>(inLoop);
+                continue;
+            }
+
+            IrBlock* pre = self.ensurePreheader(func, lp);
+            if (pre == null)
+            {
+                dealloc<bool>(inLoop);
+                continue;
+            }
+            if (gVerbose) eprintln("loop_cse: hoisting loads into {}", pre->base.name);
+
+            IrDomTree* dt = irDomtreeNew(func);
+            for (u32 bi = 0; bi < lp->nblocks; bi++)
+            {
+                IrBlock* bb = lp->blocks[bi];
+                // only loads in blocks that dominate the latch run every iteration
+                if (!irDomtreeDominates(dt, bb, lp->latch)) continue;
+                // each block: walk backwards-stable indices, collecting and hoisting
+                u32 ii = 0;
+                while (ii < bb->ninsts)
+                {
+                    IrInst* inst = bb->insts[ii];
+                    if (inst == null) { ii++; continue; }
+                    if (!self.isHoistableLoad(func, inLoop, nfn, inst)) { ii++; continue; }
+                    if (gVerbose) eprintln("loop_cse: hoist load id={} out of loop header={}", inst->base.id, lp->header->base.name);
+                    inst->detach();
+                    // insert before the preheader's terminator
+                    for (u32 pi = 0; pi < pre->ninsts; pi++)
+                    {
+                        IrInst* t = pre->insts[pi];
+                        if (t != null && irOpcodeIsTerminator(t->opcode))
+                        {
+                            pre->insertBefore(inst, t);
+                            goto inserted;
+                        }
+                    }
+                    pre->addInst(inst);
+                    inserted: ;
+                    self.hoisted++;
+                    changedAny = true;
+                    // insts shifted down by detach — rescan
+                    ii = (u32)-1;
+                    break;
+                }
+            }
+            irDomtreeFree(dt);
+            dealloc<bool>(inLoop);
+        }
+
+        irLoopDestroy(loops);
+        if (gVerbose) eprintln("loop_cse: {} load(s) hoisted", self.hoisted);
+        return changedAny;
+    }
+}
+
+pub bool muvmPassLoopCse(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (func == null || ctx == null) return false;
+    LoopCsePass pass = LoopCsePass::new(ctx);
+    return pass.run(func);
+}

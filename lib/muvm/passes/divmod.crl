@@ -1,0 +1,117 @@
+#[[no_drop_all]]
+// DivMod fusion for muvm — a fresh narrow implementation.
+//
+// When a Rem(x, y) and a Div(x, y) share both operands AND the Div already
+// dominates the Rem AND the Div has at least two users, the remainder
+// can be computed as `x - div(x, y) * y`, which is the identity:
+//   rem(x, y) == x - trunc(x/y)*y
+// The transform is exact by definition. We never fire it when the Div is
+// single-use (that would just rebrand a div — same cost) or when it does
+// not dominate the Rem (wrong CFG placement).
+//
+// muvm limitation: the SDiv/UDiv remainder here assumes 2's-complement and
+// trunc-toward-zero semantics (Coral SDiv matches x86 idiv). We do not
+// differentiate a "power of two" special case here — that lives in the
+// algebraic strength-reduction node.
+
+import muvm::passes::common { gVerbose };
+import muvm::irOps { IrOpcode, irOpcodeStr };
+import muvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind };
+import muvm::domtree { IrDomTree, irDomtreeNew, irDomtreeFree, irDomtreeDominates, irDomtreeBlockIndex };
+import std::mman { alloc, dealloc };
+import std::ios { eprintln };
+
+pub struct DivModPass
+{
+    IrContext* ctx;
+    u64 fused;
+
+    static DivModPass new(IrContext* ctx)
+    {
+        return DivModPass { .ctx = ctx, .fused = 0 };
+    }
+
+    bool run(IrFunc* func)
+    {
+        if (func == null) return false;
+        IrDomTree* dt = irDomtreeNew(func);
+        if (dt == null) return false;
+
+        bool changed = false;
+
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            u32 ii = 0;
+            while (ii < bb->ninsts)
+            {
+                IrInst* inst = bb->insts[ii];
+                IrOpcode divOp;
+                if (inst->opcode == IrOpcode::SRem) divOp = IrOpcode::SDiv;
+                else if (inst->opcode == IrOpcode::URem) divOp = IrOpcode::UDiv;
+                else { ii++; continue; }
+                if (inst->nops != 2) { ii++; continue; }
+                IrValue* x = inst->ops[0];
+                IrValue* y = inst->ops[1];
+                if (x == null || y == null) { ii++; continue; }
+
+                // find a matching div(x, y) that dominates this rem and has
+                // at least two uses
+                IrInst* match = null;
+                for (u32 bj = 0; bj < func->nblocks && match == null; bj++)
+                {
+                    IrBlock* b2 = func->blocks[bj];
+                    for (u32 k = 0; k < b2->ninsts; k++)
+                    {
+                        IrInst* d = b2->insts[k];
+                        if (d->opcode != divOp || d->nops != 2) continue;
+                        if (d->ops[0] != x || d->ops[1] != y) continue;
+                        if (d->base.nusers < 2) continue;
+                        bool ok = false;
+                        if (bj == bi) ok = k < ii;
+                        else ok = irDomtreeDominates(dt, b2, bb);
+                        if (ok) { match = d; break; }
+                    }
+                }
+                if (match == null) { ii++; continue; }
+
+                // rem -> x - mul(div, y)
+                IrValue** mulOps = alloc<IrValue*>((usize)2);
+                mulOps[0] = &match->base;
+                mulOps[1] = y;
+                IrInst* mulInst = self.ctx->createInst(IrOpcode::Mul, inst->base.type, mulOps, 2, 0, 0);
+                dealloc<IrValue*>(mulOps);
+                match->base.addUser(mulInst);
+                y->addUser(mulInst);
+                inst->parent->insertBefore(mulInst, inst);
+
+                IrValue** subOps = alloc<IrValue*>((usize)2);
+                subOps[0] = x;
+                subOps[1] = &mulInst->base;
+                IrInst* subInst = self.ctx->createInst(IrOpcode::Sub, inst->base.type, subOps, 2, 0, 0);
+                dealloc<IrValue*>(subOps);
+                x->addUser(subInst);
+                mulInst->base.addUser(subInst);
+                inst->parent->insertBefore(subInst, inst);
+
+                inst->base.replaceAllUses(&subInst->base);
+                inst->detach();
+
+                self.fused++;
+                changed = true;
+            }
+        }
+
+        irDomtreeFree(dt);
+        if (gVerbose) eprintln("divmod: {} fused", self.fused);
+        return changed;
+    }
+}
+
+pub bool muvmPassDivMod(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (func == null || ctx == null) return false;
+    DivModPass pass = DivModPass::new(ctx);
+    return pass.run(func);
+}
