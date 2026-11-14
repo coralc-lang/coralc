@@ -1,0 +1,223 @@
+#[[no_drop_all]]
+// Jump threading for muvm — a fresh, narrow implementation.
+//
+// Single-pred passthrough block elision: a block carrying only Phis and a
+// terminator Br, with exactly one predecessor, collapses into that
+// predecessor. Each phi reduces to its single incoming pair (used sole-
+// pred to deduce value), its uses are RAU'd to that value, its incoming
+// pred's terminator is rewired to the target of the Br, and the block is
+// deleted. Iteration repeat as long as any rewrite fires.
+//
+// Deliberately narrow — no condition threading, no multi-pred select
+// expansion, no loop-aware case. Equivalent in spirit to the GCC/
+// LLVM "Jump Threading" pass's simplest contract.
+//
+// NOTE: const-conditioned terminators are SCCP's responsibility — we do
+// not touch them (mirrors simplifycfg's pass-A rule) because threading
+// through a const arm splits the merge phi ambiguously.
+
+import muvm::passes::common { gVerbose };
+import muvm::irOps { IrOpcode, irOpcodeIsTerminator };
+import muvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind };
+import std::mman { alloc, dealloc };
+import std::ios { eprintln };
+
+pub struct JumpThreadPass
+{
+    IrContext* ctx;
+    u64 threaded;
+
+    static JumpThreadPass new(IrContext* ctx)
+    {
+        return JumpThreadPass { .ctx = ctx, .threaded = 0 };
+    }
+
+    u32 blockIndex(IrFunc* func, IrBlock* bb)
+    {
+        for (u32 i = 0; i < func->nblocks; i++)
+            if (func->blocks[i] == bb) return i;
+        return func->nblocks;
+    }
+
+    void replaceAllUses(IrValue* val, IrValue* peer)
+    {
+        if (val == peer) return;
+        u32 nu = val->nusers;
+        if (nu == 0) return;
+        for (u32 u = nu; u-- > 0; )
+        {
+            IrInst* user = val->users[u];
+            if (user == null) continue;
+            for (u32 oj = 0; oj < user->nops; oj++)
+            {
+                if (user->ops[oj] == val)
+                {
+                    user->ops[oj] = peer;
+                    peer->addUser(user);
+                }
+            }
+            val->users[u] = val->users[--val->nusers];
+        }
+        for (u32 u = 0; u < val->nusers; u++) if (val->users != null) val->users[u] = null;
+    }
+
+    void renamePhiPred(IrBlock* block, IrBlock* oldPred, IrBlock* newPred)
+    {
+        if (block == null) return;
+        for (u32 i = 0; i < block->ninsts; i++)
+        {
+            IrInst* phi = block->insts[i];
+            if (phi == null || phi->opcode != IrOpcode::Phi) continue;
+            for (u32 j = 1; j < phi->nops; j += 2)
+            {
+                if (phi->ops[j] == &oldPred->base)
+                {
+                    phi->ops[j]->removeUser(phi);
+                    phi->ops[j] = &newPred->base;
+                    (&newPred->base)->addUser(phi);
+                }
+            }
+        }
+    }
+
+    // true if pred's terminator is const-conditional — such terminators
+    // are SCCP's responsibility, not ours
+    bool predTermConstCond(IrBlock* pred)
+    {
+        if (pred == null || pred->ninsts == 0) return false;
+        IrInst* pterm = pred->insts[pred->ninsts - 1];
+        if (pterm == null) return false;
+        switch (pterm->opcode)
+        {
+            IrOpcode::CondBr => {
+                return (pterm->ops[0] != null && pterm->ops[0]->kind == IrValueKind::ConstInt);
+            },
+            IrOpcode::Switch => {
+                return (pterm->ops[0] != null && pterm->ops[0]->kind == IrValueKind::ConstInt);
+            },
+            else => { return false; }
+        }
+    }
+
+    bool run(IrFunc* func)
+    {
+        if (func == null) return false;
+        if (gVerbose) eprintln("jump_thread: begin func={}", func->base.name);
+
+        bool changed = false;
+        u32 iters = 0;
+
+        loop {
+            iters++;
+            if (iters > 1000) break;
+            bool moved = false;
+            u32 nb = func->nblocks;
+            for (u32 bi = 0; bi < nb; bi++)
+            {
+                IrBlock* bb = func->blocks[bi];
+                if (bb == null) continue;
+                if (bb->npreds != 1) continue;
+                IrBlock* pred = bb->preds[0];
+                if (pred == null || pred == bb) continue;
+
+                // predecessor's terminator is const-conditioned? let SCCP handle it
+                if (self.predTermConstCond(pred)) continue;
+
+                // must consist only of phis and one Br terminator
+                IrInst* term = null;
+                bool onlyPhisOrBr = true;
+                for (u32 i = 0; i < bb->ninsts; i++)
+                {
+                    IrInst* t = bb->insts[i];
+                    if (t == null) continue;
+                    if (irOpcodeIsTerminator(t->opcode))
+                    {
+                        if (t->opcode != IrOpcode::Br) { onlyPhisOrBr = false; break; }
+                        term = t;
+                        continue;
+                    }
+                    if (t->opcode != IrOpcode::Phi) { onlyPhisOrBr = false; break; }
+                }
+                if (!onlyPhisOrBr || term == null) continue;
+
+                IrBlock* target = (IrBlock*)term->ops[0];
+                if (target == null || target == bb || target == pred) continue;
+
+                // phi audit: only single-pair phis allowed (else need more work)
+                bool phisFoldable = true;
+                for (u32 i = 0; i < bb->ninsts; i++)
+                {
+                    IrInst* phi = bb->insts[i];
+                    if (phi == null || phi->opcode != IrOpcode::Phi) continue;
+                    if (phi->nops != 2) { phisFoldable = false; break; }
+                    if (phi->ops[1] == null || phi->ops[1] != &pred->base) { phisFoldable = false; break; }
+                    if (phi->ops[0] == null) { phisFoldable = false; break; }
+                }
+                if (!phisFoldable) continue;
+
+                // RAU: each phi is foo(singleIncomingValue). Replace uses.
+                for (u32 i = 0; i < bb->ninsts; i++)
+                {
+                    IrInst* phi = bb->insts[i];
+                    if (phi == null || phi->opcode != IrOpcode::Phi) continue;
+                    IrValue* peer = phi->ops[0];
+                    self.replaceAllUses(&phi->base, peer);
+                    // clear phi's incoming slots so detach doesn't double-free
+                    phi->ops[0]->removeUser(phi);
+                    phi->ops[1]->removeUser(phi);
+                    phi->ops[0] = null;
+                    phi->ops[1] = null;
+                    phi->nops = 0;
+                }
+
+                // rewrite pred's terminator to jump directly at target
+                for (u32 i = 0; i < pred->ninsts; i++)
+                {
+                    IrInst* pterm = pred->insts[i];
+                    if (pterm == null) continue;
+                    if (!irOpcodeIsTerminator(pterm->opcode)) continue;
+                    for (u32 oj = 0; oj < pterm->nops; oj++)
+                    {
+                        if (pterm->ops[oj] == &bb->base)
+                        {
+                            pterm->ops[oj]->removeUser(pterm);
+                            pterm->ops[oj] = &target->base;
+                            (&target->base)->addUser(pterm);
+                        }
+                    }
+                }
+                // splice succ list in place: replace bb with target in-order
+                for (u32 sj = 0; sj < pred->nsuccs; sj++)
+                    if (pred->succs[sj] == bb) pred->succs[sj] = target;
+                // fix target's pred list AND rename phi preds in target
+                target->removePred(bb);
+                target->addPred(pred);
+                self.renamePhiPred(target, bb, pred);
+                // remove bb's pred link (bb has one pred: pred)
+                bb->removePred(pred);
+
+                // detach and discard bb
+                for (u32 i = 0; i < bb->ninsts; i++)
+                    if (bb->insts[i] != null) bb->insts[i]->detach();
+                bb->ninsts = 0;
+                func->removeBlock(bb);
+
+                self.threaded++;
+                changed = true;
+                moved = true;
+                break;
+            }
+            if (!moved) break;
+        }
+        if (gVerbose) eprintln("jump_thread: threaded={}", self.threaded);
+        return changed;
+    }
+}
+
+pub bool muvmPassJumpThread(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (func == null || ctx == null) return false;
+    JumpThreadPass pass = JumpThreadPass::new(ctx);
+    return pass.run(func);
+}
