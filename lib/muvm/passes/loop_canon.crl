@@ -1,0 +1,557 @@
+#[[no_drop_all]]
+// Loop canonicalization for muvm — loop-simplify form.
+//
+// For each natural loop (loop_detect), three phases run, in order:
+//   1. dedicated exits — an exit block with predecessors both inside and
+//      outside the loop is split: all in-loop preds are redirected to a
+//      fresh "loop.exit" block (single successor = the original exit),
+//      and the exit's phis are re-parented to it. A block whose preds
+//      are all in-loop is already dedicated and is left alone.
+//   2. preheader — the header must have exactly one outside predecessor
+//      with a single successor back to the header (a preheader). If it
+//      does not, a fresh "loop.preheader" block is created and the
+//      outside preds are redirected through it.
+//   3. LCSSA (loop-closed SSA) — every value defined inside the loop
+//      that is used outside gets one phi per dedicated exit block;
+//      uses dominated by an exit are re-pointed at that exit's phi.
+//      Uses no single exit can dominate are left in place (still legal
+//      SSA — the def still dominates them — just not re-closed).
+// Rotation (guard + fall-through latch) is deliberately not done yet.
+//
+// The verifier's succ/pred multiset rule is the law here: every
+// redirection below splices succ lists IN PLACE (the arm order must
+// stay matched to the terminator's ops[] order) and re-points phis
+// naming the moved predecessor.
+
+import muvm::passes::common { gVerbose };
+import muvm::passes::loop_detect { IrLoop, irLoopDetectNatural, irLoopDestroy, gVerboseLoop };
+import muvm::irOps { IrOpcode, irOpcodeIsTerminator, irOpcodeStr };
+import muvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind };
+import muvm::domtree { IrDomTree, irDomtreeNew, irDomtreeFree, irDomtreeDominates };
+import std::mman { alloc, dealloc };
+import std::ios { eprintln };
+
+pub struct LoopCanonPass
+{
+    IrContext* ctx;
+    u64 dedicatedExits;
+    u64 preheaders;
+    u64 lcssaPhis;
+    u64 lcssaUses;
+    u64 unhandled;
+
+    static LoopCanonPass new(IrContext* ctx)
+    {
+        return LoopCanonPass {
+            .ctx = ctx,
+            .dedicatedExits = 0,
+            .preheaders = 0,
+            .lcssaPhis = 0,
+            .lcssaUses = 0,
+            .unhandled = 0
+        };
+    }
+
+    u32 blockIndex(IrFunc* func, IrBlock* bb)
+    {
+        for (u32 i = 0; i < func->nblocks; i++)
+            if (func->blocks[i] == bb)
+                return i;
+        return func->nblocks;
+    }
+
+    bool* buildInLoop(IrFunc* func, IrLoop* lp)
+    {
+        u32 nfn = func->nblocks;
+        bool* inLoop = alloc<bool>((usize)nfn);
+        for (u32 bi = 0; bi < nfn; bi++) inLoop[bi] = false;
+        for (u32 bi = 0; bi < lp->nblocks; bi++)
+        {
+            u32 idx = self.blockIndex(func, lp->blocks[bi]);
+            if (idx < nfn) inLoop[idx] = true;
+        }
+        return inLoop;
+    }
+
+    void renamePhiPred(IrBlock* block, IrBlock* oldPred, IrBlock* newPred)
+    {
+        if (block == null) return;
+        for (u32 i = 0; i < block->ninsts; i++)
+        {
+            IrInst* phi = block->insts[i];
+            if (phi == null || phi->opcode != IrOpcode::Phi) continue;
+            for (u32 j = 1; j < phi->nops; j += 2)
+            {
+                if (phi->ops[j] == &oldPred->base)
+                {
+                    phi->ops[j]->removeUser(phi);
+                    phi->ops[j] = &newPred->base;
+                    (&newPred->base)->addUser(phi);
+                }
+            }
+        }
+    }
+
+    // phi ins must lead the block's instruction list — shift it to the front
+    void phiFrontInsert(IrBlock* bb, IrInst* phi)
+    {
+        bb->addInst(phi);
+        for (u32 j = 0; j < bb->ninsts; j++)
+        {
+            if (bb->insts[j] == phi)
+            {
+                for (u32 k = j; k > 0; k = k - 1) bb->insts[k] = bb->insts[k - 1];
+                bb->insts[0] = phi;
+                return;
+            }
+        }
+    }
+
+    // redirect one predecessor block p's terminator slots from target to replacement,
+    // splice succ lists in place, and fix phi pred naming in target
+    void redirectBlockTo(IrBlock* p, IrBlock* target, IrBlock* replacement)
+    {
+        for (u32 ii = 0; ii < p->ninsts; ii++)
+        {
+            IrInst* t = p->insts[ii];
+            if (t == null || !irOpcodeIsTerminator(t->opcode)) continue;
+            for (u32 oj = 0; oj < t->nops; oj++)
+            {
+                if (t->ops[oj] == &target->base)
+                {
+                    t->ops[oj]->removeUser(t);
+                    t->ops[oj] = &replacement->base;
+                    (&replacement->base)->addUser(t);
+                }
+            }
+        }
+        for (u32 sj = 0; sj < p->nsuccs; sj++)
+            if (p->succs[sj] == target) { p->succs[sj] = replacement; break; }
+        target->removePred(p);
+        replacement->addPred(p);
+        self.renamePhiPred(target, p, replacement);
+    }
+
+    // create a Br-terminated single-succ block jumping to target
+    IrBlock* branchBlock(IrFunc* func, str name, IrBlock* target)
+    {
+        IrBlock* blk = self.ctx->createBlock(name);
+        func->addBlock(blk);
+        IrValue** brOps = alloc<IrValue*>((usize)1);
+        brOps[0] = &target->base;
+        IrInst* brTerm = self.ctx->createInst(IrOpcode::Br, self.ctx->tyVoid(), brOps, 1, 0, 0);
+        dealloc<IrValue*>(brOps);
+        blk->addInst(brTerm);
+        blk->addSucc(target);
+        return blk;
+    }
+
+    bool defUsedOutside(IrFunc* func, bool* inLoop, u32 nfn, IrInst* def)
+    {
+        u32 nu = def->base.nusers;
+        for (u32 uj = 0; uj < nu; uj++)
+        {
+            IrInst* user = def->base.users[uj];
+            if (user == null) continue;
+            if (user->opcode == IrOpcode::Phi)
+            {
+                for (u32 j = 0; j < user->nops; j += 2)
+                {
+                    if (user->ops[j] != &def->base) continue;
+                    IrBlock* ib = (IrBlock*)user->ops[j + 1];
+                    u32 ibi = self.blockIndex(func, ib);
+                    if (ibi < nfn && !inLoop[ibi]) return true;
+                }
+            }
+            else
+            {
+                IrBlock* parent = user->parent;
+                u32 pi = self.blockIndex(func, parent);
+                if (pi < nfn && !inLoop[pi]) return true;
+            }
+        }
+        return false;
+    }
+
+    bool run(IrFunc* func)
+    {
+        if (func == null) return false;
+        if (gVerbose)
+        {
+            eprintln("loop_canon: begin func={} nblocks={}", func->base.name, func->nblocks);
+            gVerboseLoop = true;
+        }
+
+        IrLoop** loops = irLoopDetectNatural(func);
+        if (loops == null) return false;
+
+        u32 nLoops = 0;
+        while (loops[nLoops] != null) nLoops++;
+        if (gVerbose) eprintln("loop_canon: {} natural loop(s)", nLoops);
+
+        bool changedAny = false;
+
+        for (u32 li = 0; loops[li] != null; li++)
+        {
+            IrLoop* lp = loops[li];
+            u32 nfn = func->nblocks;
+            bool* inLoop = self.buildInLoop(func, lp);
+
+            IrBlock* header = lp->header;
+            u32 kHeader = self.blockIndex(func, header);
+            if (kHeader >= nfn)
+            {
+                dealloc<bool>(inLoop);
+                continue;
+            }
+
+            // ---- phase 1: dedicated exits -------------------------------
+            u32* exitIdx = alloc<u32>((usize)nfn);
+            u32 nExits = 0;
+            for (u32 bi = 0; bi < nfn; bi++)
+            {
+                if (!inLoop[bi]) continue;
+                IrBlock* bb = func->blocks[bi];
+                for (u32 sj = 0; sj < bb->nsuccs; sj++)
+                {
+                    IrBlock* s = bb->succs[sj];
+                    u32 si = self.blockIndex(func, s);
+                    if (si >= nfn || inLoop[si]) continue;
+                    bool seen = false;
+                    for (u32 ei = 0; ei < nExits; ei++)
+                        if (func->blocks[exitIdx[ei]] == s) { seen = true; break; }
+                    if (!seen) exitIdx[nExits++] = si;
+                }
+            }
+            if (gVerbose) eprintln("loop_canon: phase 1 — {} candidate exit(s)", nExits);
+
+            for (u32 ei = 0; ei < nExits; ei++)
+            {
+                IrBlock* exit = func->blocks[exitIdx[ei]];
+                u32 nIn = 0;
+                for (u32 pj = 0; pj < exit->npreds; pj++)
+                {
+                    u32 pi = self.blockIndex(func, exit->preds[pj]);
+                    if (pi < nfn && inLoop[pi]) nIn++;
+                }
+                bool alreadyDedicated = (nIn == exit->npreds);
+                if (gVerbose)
+                    eprintln("loop_canon: exit {} npreds={} nIn={} {}", exit->base.name, exit->npreds, nIn,
+                        alreadyDedicated ? "dedicated, keep" : "shared, split");
+                if (alreadyDedicated) continue;
+
+                IrBlock* ded = self.branchBlock(func, "loop.exit", exit);
+                if (gVerbose) eprintln("loop_canon:   created {} -> {}", ded->base.name, exit->base.name);
+                // snapshot the in-loop preds — the pred list mutates as we redirect
+                IrBlock** loopPreds = alloc<IrBlock*>((usize)exit->npreds);
+                u32 nLoopPreds = 0;
+                for (u32 pj = 0; pj < exit->npreds; pj++)
+                {
+                    IrBlock* p = exit->preds[pj];
+                    if (p == ded) continue;
+                    u32 pi = self.blockIndex(func, p);
+                    if (pi < nfn && inLoop[pi]) loopPreds[nLoopPreds++] = p;
+                }
+                for (u32 pi = 0; pi < nLoopPreds; pi++)
+                    self.redirectBlockTo(loopPreds[pi], exit, ded);
+                dealloc<IrBlock*>(loopPreds);
+                self.dedicatedExits++;
+                changedAny = true;
+            }
+            dealloc<u32>(exitIdx);
+
+            // ---- phase 2: preheader -------------------------------------
+            dealloc<bool>(inLoop);
+            nfn = func->nblocks;
+            inLoop = self.buildInLoop(func, lp);
+
+            u32 nOut = 0;
+            IrBlock* soleOutside = null;
+            bool soleIsPreheader = false;
+            for (u32 pj = 0; pj < header->npreds; pj++)
+            {
+                IrBlock* p = header->preds[pj];
+                u32 pi = self.blockIndex(func, p);
+                if (pi == nfn || !inLoop[pi])
+                {
+                    nOut++;
+                    if (nOut == 1) soleOutside = p;
+                    // only useful when this is the only outside pred — do the check now
+                    soleIsPreheader = (p->nsuccs == 1 && p->succs[0] == header);
+                }
+            }
+            if (gVerbose)
+            {
+                eprintln("loop_canon: phase 2 — preds of {} :", header->base.name);
+                for (u32 pj = 0; pj < header->npreds; pj++)
+                {
+                    IrBlock* p = header->preds[pj];
+                    u32 pi = self.blockIndex(func, p);
+                    eprintln("loop_canon:   pred[{}] {} pi={} {} succ0={}", pj, p->base.name, pi,
+                        (pi < nfn && inLoop[pi]) ? "in" : "out",
+                        p->nsuccs > 0 ? p->succs[0]->base.name : str { (const u8*)"", 0 });
+                }
+                eprintln("loop_canon: phase 2 — outside preds of {} = {}", header->base.name, nOut);
+            }
+            if (nOut == 1 && soleOutside != null && soleIsPreheader)
+            {
+                if (gVerbose) eprintln("loop_canon:   existing preheader {} works, keep", soleOutside->base.name);
+            }
+            else if (nOut > 0)
+            {
+                IrBlock* preheader = self.branchBlock(func, "loop.preheader", header);
+                if (gVerbose) eprintln("loop_canon:   created preheader {}", preheader->base.name);
+                IrBlock** outPreds = alloc<IrBlock*>((usize)header->npreds);
+                u32 nOutPreds = 0;
+                for (u32 pj = 0; pj < header->npreds; pj++)
+                {
+                    IrBlock* p = header->preds[pj];
+                    if (p == preheader) continue;
+                    u32 pi = self.blockIndex(func, p);
+                    if (pi == nfn || !inLoop[pi]) outPreds[nOutPreds++] = p;
+                }
+                for (u32 pi = 0; pi < nOutPreds; pi++)
+                    self.redirectBlockTo(outPreds[pi], header, preheader);
+                dealloc<IrBlock*>(outPreds);
+                self.preheaders++;
+                changedAny = true;
+            }
+
+            // ---- phase 3: LCSSA ------------------------------------------
+            dealloc<bool>(inLoop);
+            nfn = func->nblocks;
+            inLoop = self.buildInLoop(func, lp);
+            u32* exitIdx2 = alloc<u32>((usize)nfn);
+            u32 nExits2 = 0;
+            for (u32 bi = 0; bi < nfn; bi++)
+            {
+                if (inLoop[bi]) continue;
+                IrBlock* e = func->blocks[bi];
+                bool hasInLoopPred = false;
+                for (u32 pj = 0; pj < e->npreds; pj++)
+                {
+                    u32 pi = self.blockIndex(func, e->preds[pj]);
+                    if (pi < nfn && inLoop[pi]) { hasInLoopPred = true; break; }
+                }
+                if (hasInLoopPred) exitIdx2[nExits2++] = bi;
+            }
+            if (gVerbose)
+            {
+                eprintln("loop_canon: phase 3 — {} LCSSA exit(s)", nExits2);
+                for (u32 ei = 0; ei < nExits2; ei++)
+                {
+                    IrBlock* exit = func->blocks[exitIdx2[ei]];
+                    eprintln("loop_canon:   exit[{}] {} ninsts={} npreds={}", ei, exit->base.name, exit->ninsts, exit->npreds);
+                    for (u32 k = 0; k < exit->ninsts; k++)
+                        eprintln("loop_canon:     inst {} id={}", irOpcodeStr(exit->insts[k]->opcode), exit->insts[k]->base.id);
+                }
+            }
+
+            if (nExits2 > 0)
+            {
+                IrDomTree* dt = irDomtreeNew(func);
+                for (u32 bi = 0; bi < lp->nblocks; bi++)
+                {
+                    IrBlock* blk = lp->blocks[bi];
+                    for (u32 ii = 0; ii < blk->ninsts; ii++)
+                    {
+                        IrInst* def = blk->insts[ii];
+                        if (def == null) continue;
+                        if (!self.defUsedOutside(func, inLoop, nfn, def)) continue;
+
+                        // snapshot users BEFORE creating phis — the phis themselves
+                        // become users and must not be considered for rewrite
+                        u32 nu = def->base.nusers;
+                        IrInst** snap = alloc<IrInst*>((usize)(nu > 0 ? nu : 1));
+                        for (u32 uj = 0; uj < nu; uj++) snap[uj] = def->base.users[uj];
+
+                        // one phi per exit — reuse an existing closing phi, if
+                        // one already names def from exactly these in-loop preds
+                        IrInst** phiFor = alloc<IrInst*>((usize)nExits2);
+                        bool* exitSkipped = alloc<bool>((usize)nExits2);
+                        for (u32 ei = 0; ei < nExits2; ei++) { phiFor[ei] = null; exitSkipped[ei] = false; }
+
+                        for (u32 ei = 0; ei < nExits2; ei++)
+                        {
+                            IrBlock* exit = func->blocks[exitIdx2[ei]];
+                            u32 wi = 0;
+                            for (u32 pj = 0; pj < exit->npreds; pj++)
+                            {
+                                u32 pi = self.blockIndex(func, exit->preds[pj]);
+                                if (pi < nfn && inLoop[pi]) wi++;
+                            }
+                            if (wi == 0) { exitSkipped[ei] = true; continue; }
+                            // a single-edge LCSSA phi is trivially a copy-phi
+                            // (nops=2) and fold erases it, so we would recreate it
+                            // every pipeline iteration and never reach fixpoint —
+                            // skip. multi-pred exits keep their closing phis.
+                            if (wi == 1) { exitSkipped[ei] = true; if (gVerbose) eprintln("loop_canon:   LCSSA skipped — single in-loop pred"); continue; }
+                            // look for an existing phi in exit carrying def from
+                            // exactly the current in-loop preds (loop-simplify is
+                            // a pre-relation; LCSSA phis exist pre-parsed output)
+                            bool reused = false;
+                            for (u32 ii = 0; ii < exit->ninsts && !reused; ii++)
+                            {
+                                IrInst* phi = exit->insts[ii];
+                                if (phi == null || phi->opcode != IrOpcode::Phi) continue;
+                                if (gVerbose)
+                                    eprintln("loop_canon:   reuse candidate id={} nops={} want={} def={}",
+                                        phi->base.id, phi->nops, wi * 2, def->base.id);
+                                if (phi->nops != wi * 2) continue;
+                                u32 w = 0;
+                                bool ok = true;
+                                for (u32 k = 0; k + 1 < phi->nops; k += 2)
+                                {
+                                    if (phi->ops[k] != &def->base) { ok = false; break; }
+                                    IrBlock* ib = (IrBlock*)phi->ops[k + 1];
+                                    u32 pi = self.blockIndex(func, ib);
+                                    if (pi >= nfn || !inLoop[pi]) { ok = false; break; }
+                                    w++;
+                                }
+                                if (gVerbose)
+                                    eprintln("loop_canon:   reuse candidate ok={} w={} want={}", ok, w, wi);
+                                if (ok && w == wi)
+                                {
+                                    phiFor[ei] = phi;
+                                    reused = true;
+                                    if (gVerbose)
+                                        eprintln("loop_canon:   reuse LCSSA phi id={} in {} for def id={}",
+                                            phi->base.id, exit->base.name, def->base.id);
+                                }
+                            }
+                            if (reused) continue;
+
+                            IrValue** ops = alloc<IrValue*>((usize)(wi * 2));
+                            u32 wi2 = 0;
+                            for (u32 pj = 0; pj < exit->npreds; pj++)
+                            {
+                                IrBlock* p = exit->preds[pj];
+                                u32 pi = self.blockIndex(func, p);
+                                if (pi >= nfn || !inLoop[pi]) continue;
+                                ops[wi2 * 2] = &def->base;
+                                ops[wi2 * 2 + 1] = &p->base;
+                                wi2++;
+                            }
+                            IrInst* phi = self.ctx->createInst(IrOpcode::Phi, def->base.type, ops, wi2 * 2, 0, 0);
+                            dealloc<IrValue*>(ops);
+                            self.phiFrontInsert(exit, phi);
+                            def->base.addUser(phi);
+                            for (u32 pj = 0; pj < exit->npreds; pj++)
+                            {
+                                IrBlock* p = exit->preds[pj];
+                                u32 pi = self.blockIndex(func, p);
+                                if (pi >= nfn || !inLoop[pi]) continue;
+                                p->base.addUser(phi);
+                            }
+                            phiFor[ei] = phi;
+                            self.lcssaPhis++;
+                            if (gVerbose)
+                                eprintln("loop_canon:   LCSSA phi id={} in {} for def id={} op={}",
+                                    phi->base.id, exit->base.name, def->base.id, irOpcodeStr(def->opcode));
+                        }
+
+                        // does at least one exit host a phi for this def?
+                        bool anyPhi = false;
+                        for (u32 ei = 0; ei < nExits2; ei++)
+                            if (phiFor[ei] != null) { anyPhi = true; break; }
+
+                        for (u32 uj = 0; uj < nu; uj++)
+                        {
+                            IrInst* user = snap[uj];
+                            if (user == null) continue;
+                            // skip our own LCSSA phis — never rewrite their operands to themselves
+                            bool isOneOfOurs = false;
+                            for (u32 ei = 0; ei < nExits2; ei++)
+                                if (phiFor[ei] == user) { isOneOfOurs = true; break; }
+                            if (isOneOfOurs) continue;
+
+                            if (user->opcode == IrOpcode::Phi)
+                            {
+                                for (u32 j = 0; j < user->nops; j += 2)
+                                {
+                                    if (user->ops[j] != &def->base) continue;
+                                    IrBlock* anchor = (IrBlock*)user->ops[j + 1];
+                                    u32 ai = self.blockIndex(func, anchor);
+                                    if (ai < nfn && inLoop[ai]) continue;
+                                    IrInst* bestPhi = null;
+                                    for (u32 ei = 0; ei < nExits2; ei++)
+                                    {
+                                        if (exitSkipped[ei] || phiFor[ei] == null) continue;
+                                        IrBlock* exit = func->blocks[exitIdx2[ei]];
+                                        if (irDomtreeDominates(dt, exit, anchor)) { bestPhi = phiFor[ei]; break; }
+                                    }
+                                    if (bestPhi != null)
+                                    {
+                                        if (gVerbose) eprintln("loop_canon:     rewrite user id={} slot {} via exit phi id={}", user->base.id, j / 2, bestPhi->base.id);
+                                        user->ops[j]->removeUser(user);
+                                        user->ops[j] = &bestPhi->base;
+                                        bestPhi->base.addUser(user);
+                                        self.lcssaUses++;
+                                        changedAny = true;
+                                    }
+                                    else if (anyPhi)
+                                    {
+                                        self.unhandled++;
+                                        if (gVerbose) eprintln("loop_canon:     unhandled phi user id={} slot {} (no exit dominates)", user->base.id, j / 2);
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                IrBlock* anchor = user->parent;
+                                u32 ai = self.blockIndex(func, anchor);
+                                if (ai < nfn && inLoop[ai]) continue;
+                                IrInst* bestPhi = null;
+                                for (u32 ei = 0; ei < nExits2; ei++)
+                                {
+                                    if (exitSkipped[ei] || phiFor[ei] == null) continue;
+                                    IrBlock* exit = func->blocks[exitIdx2[ei]];
+                                    if (irDomtreeDominates(dt, exit, anchor)) { bestPhi = phiFor[ei]; break; }
+                                }
+                                if (bestPhi != null)
+                                {
+                                    if (gVerbose) eprintln("loop_canon:     rewrite user id={} op={} via exit phi id={}", user->base.id, irOpcodeStr(user->opcode), bestPhi->base.id);
+                                    for (u32 j = 0; j < user->nops; j++)
+                                    {
+                                        if (user->ops[j] != &def->base) continue;
+                                        user->ops[j]->removeUser(user);
+                                        user->ops[j] = &bestPhi->base;
+                                        bestPhi->base.addUser(user);
+                                        self.lcssaUses++;
+                                        changedAny = true;
+                                    }
+                                }
+                                else if (anyPhi)
+                                {
+                                    self.unhandled++;
+                                    if (gVerbose) eprintln("loop_canon:     unhandled user id={} op={} (no exit dominates)", user->base.id, irOpcodeStr(user->opcode));
+                                }
+                            }
+                        }
+                        dealloc<IrInst*>(snap);
+                        dealloc<IrInst*>(phiFor);
+                        dealloc<bool>(exitSkipped);
+                    }
+                }
+                irDomtreeFree(dt);
+            }
+            dealloc<u32>(exitIdx2);
+            dealloc<bool>(inLoop);
+        }
+
+        if (gVerbose)
+            eprintln("loop_canon: func={} dedicatedExits={} preheaders={} lcssaPhis={} usesRewritten={} unhandled={}",
+                func->base.name, self.dedicatedExits, self.preheaders, self.lcssaPhis, self.lcssaUses, self.unhandled);
+
+        irLoopDestroy(loops);
+        return changedAny;
+    }
+}
+
+pub bool muvmPassLoopCanon(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (func == null || ctx == null) return false;
+    LoopCanonPass pass = LoopCanonPass::new(ctx);
+    return pass.run(func);
+}
