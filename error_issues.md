@@ -1,3 +1,112 @@
+# Coral (`coralc`): why each tier exists
+
+## Tier 1: full
+
+```
+error[T0006]: cannot use `.` to reach a field through a pointer
+   ╭─▸ src/mu-backend/base.crl:60:27
+   │
+12 │     Diag* diags;
+   │     ┬────
+   │     ╰─ reference: field declared as a pointer here
+   ⋮
+60 │         return self.diags.errors > 0;
+   │                          ┬─
+   │                          ╰─ `.` can't see through `Diag*`
+   │
+   ├─ help: dereference with `->`
+   │
+   │  60 │ -     return self.diags.errors > 0;
+   │  60 │ +     return self.diags->errors > 0;
+   │
+   ╰─ docs: coralc --explain T0006
+```
+
+## Tier 2: full
+
+tier 2 would be more common than tier one
+```
+error[T0006]: cannot use `.` to reach a field through a pointer
+   ╭─▸ src/mu-backend/base.crl:60:27
+12 │     Diag* diags;
+   │     ┬──── declared as a pointer here
+   ⋮
+60 │         return self.diags.errors > 0;
+   │                          ┬─ `.` can't see through `Diag*`
+   ├─ help: dereference with `->`: `self.diags->errors`
+   ╰─ docs: coralc --explain T0006
+```
+
+**Reason:** this tier is for when you have time to read, so it teaches rather than just reports. Each part answers a different question:
+
+- **Header with the full sentence** says what rule was broken, in words a newcomer can follow.
+- **Primary span** (the `.` at 60:27) shows exactly where it went wrong, and the label says why.
+- **Reference span** (line 12) shows *where the pointer came from*. T0006 is confusing because the code at line 60 looks fine. The cause is a declaration made elsewhere, and without line 12 you'd have to go hunting for it.
+- **`⋮` fold** shows the two lines are far apart without printing 47 irrelevant lines.
+- **Diff-style fix** shows the exact edit, so you can apply it by eye or by tool. The `-`/`+` lines make the change unambiguous.
+- **Docs line** is the escape hatch for anyone who still doesn't understand the rule.
+
+It costs about 14 lines per error, which is why it's only used when there are few errors.
+
+## Tier :2 compact
+
+```
+error[T0006]: cannot use `.` through a pointer
+   ╭─▸ src/mu-backend/base.crl:60:27
+60 │         return self.diags.errors > 0;
+   │                          ┬─ use `->`
+   ╰─ ref: `diags` declared as `Diag*` at base.crl:12
+```
+
+**Reason:** once you have a dozen errors, you've stopped learning and started fixing. You already know what T0006 means after seeing it in full, so the tier keeps only what you need to locate and fix each one:
+
+- **Shortened header** drops the long explanation, since the code `T0006` already carries it.
+- **One source line, no context lines**, because the line you need to edit is the only one that matters.
+- **Label doubles as the fix** (`use `->``), replacing the separate help block and diff.
+- **Reference becomes a pointer** (`ref: ... at base.crl:12`). You keep the *where it came from* information, but it costs one line instead of a second code frame, and you can still jump to it if you need to.
+- **Docs line dropped**, because the footer lists `--explain` once per error code.
+
+It costs 4 lines per error, so 12 errors fit on one screen.
+
+## Tier 4: short
+
+```
+src/mu-backend/base.crl:60:27  error[T0006]  cannot use `.` through a pointer  fix: `->`
+```
+
+**Reason:** at this point the errors are a list to work through, not something to read. This tier is built for scanning and for tools:
+
+- **`path:line:col` first** is the format editors, terminals and CI systems already know how to turn into clickable links or jump-to-location.
+- **One line per error** makes it greppable and sortable (`grep T0006`, `sort`, `wc -l`).
+- **Fix hint at the end** keeps the one piece of advice that is actually actionable.
+- **No source line**, because you're about to open the file anyway, and 200 source lines would drown out the 200 locations.
+
+This is also the default for non-TTY output such as pipes and CI logs, where color, box-drawing and multi-line frames are noise.
+
+## How the three relate
+
+| | Full | Compact | Short |
+|---|---|---|---|
+| Lines per error | ~14 | ~4 | 1 |
+| Goal | understand | locate and fix | scan and batch |
+| Reference span | full code frame | `ref:` pointer | dropped |
+| Fix | diff | inline hint | `fix:` suffix |
+| Best for | first-time or rare errors | a normal bad build | floods, CI, tooling |
+
+Each step down removes the most expensive element first (the code frames), then the explanatory text, and keeps the location and the fix to the end. Those are the two things every tier must preserve.
+
+a complete overhault of the error format first.
+
+Diagnostic {
+  severity, code, message,
+  primary: Span,
+  labels:  [ Label { span, text, kind: Primary|Reference|Note } ],
+  notes:   [ string ],
+  fixes:   [ Fix { description, edits: [ {span, replacement} ], applicability } ],
+  docs:    Option<url or explain-id>,
+}
+
+
 run the compiler under perf. to find performance draining hotspots, then, optimize the algorithms there. or the expensive operations. we'll keep doing it over and over until we are comfortable. 
 
 I went through the grammar for constructs that parse (or are silently accepted) but have no diagnostic, so they fall through to codegen. This is a lot of codes, but most are one-liners. I'd tackle them in this order:
@@ -305,3 +414,5 @@ Please disregard my earlier note about checking the subject type before exhausti
 missing flag is a keyword and ca't be useda s an identifier. it just says expected an expression
 
 implicit conversion from srray to pointer or vice versa, should be flagged by a warning. not error, but warning. 
+
+
