@@ -1,0 +1,212 @@
+#[[no_drop_all]]
+/// Linux AArch64 detection.
+///   features : getauxval(AT_HWCAP / AT_HWCAP2)
+///   identity : MIDR from sysfs, else emulated `mrs` when HWCAP_CPUID is set
+///   caches   : sysfs, falling back to CTR_EL0 (a lower bound on the line size)
+///   SVE VL   : prctl(PR_SVE_GET_VL)
+/// MIDR/CTR reads come from the arm64 shim (arm64_shim.s), which must be
+/// assembled and linked separately; the coral toolchain has no mrs intrinsic
+/// yet. In plain C you can include <sys/auxv.h>, <sys/prctl.h>, <fcntl.h>,
+/// <unistd.h>.
+import core::cchar { cchar };
+import core::cpuinfo { CpuInfo, CpuCache, CpuArch, CpuFeature, setFeature, cpuHas };
+
+pub extern("C") u64 getauxval(u64 type);
+pub extern("C") i32 prctl(i32 option, u64 a2, u64 a3, u64 a4, u64 a5);
+pub extern("C") i32 open(const cchar* path, i32 flags);          // O_RDONLY = 0
+pub extern("C") i64 read(i32 fd, u8* buf, u64 n);
+pub extern("C") i32 close(i32 fd);
+pub extern("C") u64 a64_read_midr();                             // arm64_shim.s
+pub extern("C") u64 a64_read_ctr();                              // arm64_shim.s
+
+const u64 AT_HWCAP    = 16;
+const u64 AT_HWCAP2   = 26;
+const u64 HWCAP_CPUID = (u64)1 << 11;
+const i32 PR_SVE_GET_VL = 51;
+
+void arm64_linux_features(CpuInfo* o)
+{
+    u64 h1 = getauxval(AT_HWCAP);
+    u64 h2 = getauxval(AT_HWCAP2);
+
+    if ((h1 & (1 << 1))  != 0) setFeature(o, CpuFeature::ArmNeon);    // HWCAP_ASIMD
+    if ((h1 & (1 << 3))  != 0) setFeature(o, CpuFeature::ArmAes);     // HWCAP_AES
+    if ((h1 & (1 << 7))  != 0) setFeature(o, CpuFeature::ArmCrc32);
+    if ((h1 & (1 << 8))  != 0) setFeature(o, CpuFeature::ArmLse);     // HWCAP_ATOMICS
+    if ((h1 & (1 << 10)) != 0) setFeature(o, CpuFeature::ArmFp16);    // HWCAP_ASIMDHP
+    if ((h1 & (1 << 20)) != 0) setFeature(o, CpuFeature::ArmDotprod); // HWCAP_ASIMDDP
+    if ((h1 & (1 << 22)) != 0) setFeature(o, CpuFeature::ArmSve);
+    if ((h2 & (1 << 1))  != 0) setFeature(o, CpuFeature::ArmSve2);    // HWCAP2_SVE2
+    if ((h2 & (1 << 13)) != 0) setFeature(o, CpuFeature::ArmI8mm);
+    if ((h2 & (1 << 14)) != 0) setFeature(o, CpuFeature::ArmBf16);
+    // The kernel only sets a hwcap bit when the hardware has the feature AND
+    // the kernel can context-switch its state: the arm64 analogue of the x86
+    // xgetbv check.
+}
+
+// copies s into dst as a NUL-terminated byte string, returns the length
+usize _putCstr(u8* dst, str s)
+{
+    usize i = 0;
+    while (i < s.len)
+    {
+        dst[i] = s.ptr[i];
+        i++;
+    }
+    dst[i] = 0;
+    return i;
+}
+
+i64 slurp(str path, u8* buf, u64 cap)
+{
+    u8[96] p;
+    _putCstr(p, path);
+    i32 fd = open((const cchar*)p, 0);
+    if (fd < 0) return -1;
+    i64 n = read(fd, buf, cap - 1);
+    close(fd);
+    if (n >= 0) buf[n] = 0;
+    return n;
+}
+
+u64 parse_hex(const u8* s)                  // accepts optional "0x"
+{
+    u64 v = 0;
+    usize i = 0;
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) i = 2;
+    loop
+    {
+        u8 c = s[i];
+        u64 d;
+        if (c >= '0' && c <= '9') d = (u64)(c - '0');
+        else if (c >= 'a' && c <= 'f') d = (u64)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') d = (u64)(c - 'A' + 10);
+        else break;
+        v = (v << 4) | d;
+        i++;
+    }
+    return v;
+}
+
+u32 parse_size(str s)                 // "32K", "1024K", "4M", "65536"
+{
+    u32 v = 0;
+    usize i = 0;
+    while (i < s.len && s.ptr[i] >= '0' && s.ptr[i] <= '9')
+    {
+        v = v * 10 + (u32)(s.ptr[i] - '0');
+        i++;
+    }
+    if (i < s.len && s.ptr[i] == 'K') v <<= 10;
+    else if (i < s.len && s.ptr[i] == 'M') v <<= 20;
+    return v;
+}
+
+// builds a NUL-terminated sysfs cache path for cpu0/index<i>/<leaf>
+usize cache_path(u8* dst, u32 idx, str leaf)
+{
+    usize n = _putCstr(dst, "/sys/devices/system/cpu/cpu0/cache/index");
+    dst[n++] = (u8)('0' + idx);
+    dst[n++] = '/';
+    n += _putCstr(dst + n, leaf);
+    return n - 1;
+}
+
+u32 read_dec(str path)
+{
+    u8[64] b;
+    if (slurp(path, b, 64) <= 0) return 0;
+    u32 v = 0;
+    usize i = 0;
+    while (b[i] >= '0' && b[i] <= '9')
+    {
+        v = v * 10 + (u32)(b[i] - '0');
+        i++;
+    }
+    return v;
+}
+
+void arm64_linux_identity(CpuInfo* o)
+{
+    u8[64] b;
+    u64 midr = 0;
+    if (slurp("/sys/devices/system/cpu/cpu0/regs/identification/midr_el1", b, 64) > 0)
+    {
+        midr = parse_hex(b);
+    }
+    else if ((getauxval(AT_HWCAP) & HWCAP_CPUID) != 0)   // emulated mrs works
+    {
+        midr = a64_read_midr();                          // else leave 0 = unknown
+    }
+
+    o->midr      = midr;
+    o->vendorId  = (u32)((midr >> 24) & 0xFF);           // implementer: 0x41 = Arm
+    o->family    = (u32)((midr >> 4)  & 0xFFF);          // part number: 0xd0c = Neoverse-N1
+    o->model     = (u32)((midr >> 20) & 0xF);            // variant
+    o->stepping  = (u32)(midr & 0xF);                    // revision
+}
+
+// /sys/devices/system/cpu/cpu0/cache/index<i>/{level,type,size,
+//                                              coherency_line_size,ways_of_associativity}
+void arm64_linux_caches(CpuInfo* o)
+{
+    for (u32 i = 0; i < 8; i++)
+    {
+        u8[96] p;
+        u8[64] b;
+
+        usize n = cache_path(p, i, "level");
+        u32 level = read_dec(str::fromParts((const u8*)p, n));
+        if (level == 0) break;                           // no more index<i> directories
+
+        n = cache_path(p, i, "type");
+        if (slurp(str::fromParts((const u8*)p, n), b, 64) <= 0) continue;
+        u8 t = b[0];                                     // 'D'ata, 'I'nstruction, 'U'nified
+
+        CpuCache k;
+        k.size = 0;
+        k.lineSize = 0;
+        k.assoc = 0;
+        k.sharedBy = 0;
+
+        n = cache_path(p, i, "size");
+        i64 sizeN = slurp(str::fromParts((const u8*)p, n), b, 64);
+        if (sizeN > 0) k.size = parse_size(str::fromParts((const u8*)b, (usize)sizeN));
+        n = cache_path(p, i, "coherency_line_size");
+        k.lineSize = read_dec(str::fromParts((const u8*)p, n));
+        n = cache_path(p, i, "ways_of_associativity");
+        k.assoc = read_dec(str::fromParts((const u8*)p, n));
+
+        if (level == 1 && t == 'D') o->l1d = k;
+        else if (level == 1 && t == 'I') o->l1i = k;
+        else if (level == 2) o->l2 = k;
+        else if (level == 3) o->l3 = k;
+    }
+
+    // sysfs missing (common on Android / boards without cache description):
+    // CTR_EL0 is the SMALLEST line size across cores, so it is a lower bound.
+    if (o->l1d.lineSize == 0 && (getauxval(AT_HWCAP) & HWCAP_CPUID) != 0)
+    {
+        u64 ctr = a64_read_ctr();
+        o->l1d.lineSize = (u32)4 << ((ctr >> 16) & 0xF);    // DminLine
+        o->l1i.lineSize = (u32)4 << (ctr & 0xF);            // IminLine
+    }
+}
+
+pub void detectCpu(CpuInfo* o)
+{
+    o->arch = CpuArch::Aarch64;
+    arm64_linux_features(o);
+    arm64_linux_identity(o);
+    arm64_linux_caches(o);
+
+    if (cpuHas(o, CpuFeature::ArmSve))
+    {
+        // Use the OS-reported value: the sysadmin can cap it below the hardware max.
+        i32 r = prctl(PR_SVE_GET_VL, 0, 0, 0, 0);
+        if (r >= 0) o->sveVlBytes = (u32)r & 0xFFFF;
+    }
+    // TODO big.LITTLE: loop cpu0..cpuN-1 reading midr_el1 and pick a policy
+    // (biggest core / most common / minimum). Hwcaps are already the
+    // intersection across cores, which is the safe answer for features.
+}
