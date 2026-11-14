@@ -12,7 +12,7 @@ import std::vec { Vec };
 import std::string { String };
 import platform::libc { write };
 use code { ErrorCode, codeStr };
-use error { render };
+use error { render, RenderInput, DiagLine };
 use ast::id { SourceLoc, locFile, locLine, locCol };
 
 /* structured copy of one diagnostic, for consumers that are not the
@@ -109,6 +109,10 @@ pub struct DiagnosticEngine
     bool limitNotified;
     // `-w`: suppress all diagnostic rendering (counters still track)
     bool silenced;
+    // 0 auto, 1 full, 2 compact, 3 short
+    u8 format;
+    // 0 auto, 1 always, 2 never
+    u8 colorMode;
     usize lexerErrors;
     usize parserErrors;
     u8* bufStart;
@@ -132,6 +136,8 @@ pub struct DiagnosticEngine
             .errorLimit = 20,
             .limitNotified = false,
             .silenced = false,
+            .format = 0,
+            .colorMode = 0,
             .lexerErrors = 0,
             .parserErrors = 0,
             .bufStart = bufStart,
@@ -265,8 +271,21 @@ pub struct DiagnosticEngine
 
     void emitError(ErrorCode code, SourceLoc loc, str msg, str help)
     {
-        // count first, maybe render second: over-limit errors still bump
-        // the counter, so hasErrors() stays honest
+        self.emitErrorRich(code, loc, msg, help, "", SourceLoc { .data = 0 }, "", "");
+    }
+
+    void emitErrorRich(ErrorCode code, SourceLoc loc, str msg, str label, str help,
+                       SourceLoc refLoc, str refLabel, str fix)
+    {
+        self.emitErrorEdit(code, loc, msg, label, help, refLoc, refLabel, fix, 0, 0, "");
+    }
+
+    /* like emitErrorRich, but also renders a diff for one edit: `editLen`
+     * bytes at 1-based `editCol` on the primary line become `replacement` */
+    void emitErrorEdit(ErrorCode code, SourceLoc loc, str msg, str label, str help,
+                       SourceLoc refLoc, str refLabel, str fix,
+                       u32 editCol, u32 editLen, str replacement)
+    {
         self.errors++;
         if (self.tooManyErrors())
         {
@@ -278,14 +297,21 @@ pub struct DiagnosticEngine
             }
             return;
         }
-        self.renderAt(code, "error", loc, msg, help);
+        self.renderAtEdit(code, "error", loc, msg, label, help, refLoc, refLabel, fix,
+                          editCol, editLen, replacement);
     }
 
     void emitWarning(ErrorCode code, SourceLoc loc, str msg, str help)
     {
+        self.emitWarningRich(code, loc, msg, help, "", SourceLoc { .data = 0 }, "", "");
+    }
+
+    void emitWarningRich(ErrorCode code, SourceLoc loc, str msg, str label, str help,
+                         SourceLoc refLoc, str refLabel, str fix)
+    {
         self.warnings++;
         if (self.tooManyErrors()) return;
-        self.renderAt(code, "warning", loc, msg, help);
+        self.renderAtRich(code, "warning", loc, msg, label, help, refLoc, refLabel, fix);
     }
 
     /* report a diagnostic permitted by an escape-hatch flag (e.g.
@@ -322,81 +348,124 @@ pub struct DiagnosticEngine
         });
     }
 
+    void fillLine(SourceLoc loc, DiagLine* out)
+    {
+        out->path = "";
+        out->line = 0;
+        out->col = 0;
+        out->text = "";
+        out->label = "";
+
+        u32 file = locFile(loc);
+        if (file >= self.fileCount) return;
+        u8* ptr = self.locPtr(loc);
+        if (ptr == null) return;
+
+        out->line = (usize)locLine(loc);
+        out->col = (usize)locCol(loc);
+        u8* fileBuf = self.fileBufs.at((usize)file);
+        u8* fileEnd = self.fileBufEnds.at((usize)file);
+
+        u8* lineStart = ptr;
+        while (lineStart > fileBuf)
+        {
+            u8* prev = lineStart - 1;
+            if (prev[0] == '\n') break;
+            lineStart = prev;
+        }
+
+        u8* lineEnd = ptr;
+        while (lineEnd < fileEnd)
+        {
+            if (lineEnd[0] == '\n') break;
+            if (lineEnd[0] == '\r') break;
+            lineEnd++;
+        }
+
+        out->text = str { .ptr = lineStart, .len = (usize)(lineEnd - lineStart) };
+        out->path = self.filePaths.at((usize)file);
+    }
+
     void renderAt(ErrorCode code, str level, SourceLoc loc, str msg, str help)
+    {
+        self.renderAtRich(code, level, loc, msg, help, "", SourceLoc { .data = 0 }, "", "");
+    }
+
+    void renderAtRich(ErrorCode code, str level, SourceLoc loc, str msg, str label, str help,
+                      SourceLoc refLoc, str refLabel, str fix)
+    {
+        self.renderAtEdit(code, level, loc, msg, label, help, refLoc, refLabel, fix,
+                          0, 0, "");
+    }
+
+    void renderAtEdit(ErrorCode code, str level, SourceLoc loc, str msg, str label, str help,
+                      SourceLoc refLoc, str refLabel, str fix,
+                      u32 editCol, u32 editLen, str replacement)
     {
         // silenced: no textual rendering. with `collect` the position is
         // still resolved so structured records stay accurate in LSP mode.
         if (self.silenced && !self.collect) return;
 
-        str path = "";
-        str lineText = "";
-        str prevText = "";
-        u32 line = 0;
-        u32 col = 0;
-        usize prevLineNo = 0;
+        DiagLine primary;
+        self.fillLine(loc, &primary);
+        primary.label = label;
 
-        u32 file = locFile(loc);
-        if (file < self.fileCount)
+        DiagLine reference;
+        bool hasRef = refLoc.data != 0;
+        self.fillLine(refLoc, &reference);
+        reference.label = refLabel;
+
+        String diffOld = String::new();
+        String diffNew = String::new();
+        bool hasDiff = false;
+        if (!self.silenced && editLen > 0 && replacement.len > 0 &&
+            primary.text.len > 0 && editCol > 0)
         {
-            u8* ptr = self.locPtr(loc);
-            if (ptr != null)
+            usize start = (usize)(editCol - 1);
+            if (start <= primary.text.len)
             {
-                line = locLine(loc);
-                col = locCol(loc);
-                u8* fileBuf = self.fileBufs.at((usize)file);
-                u8* fileEnd = self.fileBufEnds.at((usize)file);
-
-                u8* lineStart = ptr;
-                // widen [ptr] to the full physical line; harmless to split on \r here
-                while (lineStart > fileBuf)
-                {
-                    u8* prev = lineStart - 1;
-                    if (prev[0] == '\n') break;
-                    lineStart = prev;
-                }
-
-                u8* lineEnd = ptr;
-                while (lineEnd < fileEnd)
-                {
-                    if (lineEnd[0] == '\n') break;
-                    if (lineEnd[0] == '\r') break;
-                    lineEnd++;
-                }
-
-                usize lineLen = (usize)(lineEnd - lineStart);
-                lineText = str { .ptr = lineStart, .len = lineLen };
-
-                // the line before the error, for context
-                if (line > 1 && lineStart > fileBuf)
-                {
-                    // lineStart - 1 is the '\n'; walk back one more line for the
-                    // "previous line" context shown above the error line
-                    u8* prevEnd = lineStart - 1;             // the newline before
-                    if (prevEnd > fileBuf)
-                    {
-                        u8* prevStart = prevEnd;
-                        while (prevStart > fileBuf && prevStart[-1] != '\n') prevStart--;
-                        usize plen = (usize)(prevEnd - prevStart);
-                        // trim a trailing \r
-                        if (plen > 0 && prevStart[plen - 1] == 13) plen--;
-                        prevText = str { .ptr = prevStart, .len = plen };
-                        prevLineNo = (usize)(line - 1);
-                    }
-                }
-                path = self.filePaths.at((usize)file);
+                usize end = start + (usize)editLen;
+                if (end > primary.text.len) end = primary.text.len;
+                diffOld = String::from(primary.text);
+                diffNew = String::new();
+                diffNew.pushView(str { .ptr = primary.text.ptr, .len = start });
+                diffNew.pushView(replacement);
+                diffNew.pushView(str { .ptr = primary.text.ptr + end, .len = primary.text.len - end });
+                hasDiff = true;
             }
         }
 
         if (!self.silenced)
         {
-            render(codeStr(code), level, msg,
-                   path, (usize)line, (usize)col,
-                   prevText, prevLineNo,
-                   lineText, help);
+            RenderInput in = RenderInput {
+                .code = codeStr(code),
+                .level = level,
+                .msg = msg,
+                .primary = primary,
+                .reference = reference,
+                .hasRef = hasRef,
+                .help = help,
+                .fix = fix,
+                .hasDiff = hasDiff,
+                .diffOld = diffOld.asView(),
+                .diffNew = diffNew.asView(),
+                .format = self.format,
+                .colorMode = self.colorMode,
+                .ordinal = self.errors,
+            };
+            render(&in);
+            if (hasDiff)
+            {
+                diffOld.free();
+                diffNew.free();
+            }
         }
         if (self.collect)
         {
-            self.addRecord(codeStr(code), level, msg, path, line, col, lineText, help);
+            str recordHelp = help;
+            if (recordHelp.len == 0) recordHelp = label;
+            self.addRecord(codeStr(code), level, msg, primary.path,
+                           (u32)primary.line, (u32)primary.col, primary.text, recordHelp);
         }
     }
 }

@@ -1,21 +1,26 @@
 #[[no_drop_all]]
 /* diagnostics/error.crl: the renderer.
  *
- * Every diagnostic funnels through here. The engine resolves a SourceLoc to
- * (file, line, col) via its file table, extracts the error line and the line
- * before it, and passes the pieces in with a stable code string, a level, a
- * message, and an optional help line. If no help is given, a default one is
- * looked up from the code.
+ * Every diagnostic funnels through here. The engine resolves SourceLocs to
+ * source lines and passes a RenderInput with the primary span, an optional
+ * reference span, labels, help, and a fix hint. The renderer picks one of
+ * three layouts: full, compact, or short. Auto mode uses full for the first
+ * few errors on a terminal, compact while the count is manageable, and short
+ * for pipes, CI logs, and error floods.
  *
- * Output shape (stderr; colours only on a tty):
- *   error[SYN-1002]: expected ';', found '}'
- *     ┌─► g.c:3:1
- *     │
- *     │  2 │     l
- *     │  3 │ }
- *     |      ▲
- *     │      ╰─ a closing delimiter or required token is missing; check the surrounding grammar
- *     │      ╰─ try `coralc --explain SYN-1002` for more information
+ * Output shape (stderr; colours only when enabled):
+ *   error[T0006]: cannot use `.` to reach a field through a pointer
+ *      ╭─▸ src/mu-backend/base.crl:60:27
+ *      │
+ *   12 │     Diag* diags;
+ *      │     ┬────
+ *      │     ╰─ reference: field declared as a pointer here
+ *      ⋮
+ *   60 │         return self.diags.errors > 0;
+ *      │                          ┬─
+ *      │                          ╰─ `.` can't see through `Diag*`
+ *      │
+ *      ╰─ docs: coralc --explain T0006
  */
 
 import platform::libc { write, isatty };
@@ -26,7 +31,7 @@ import std::string { String };
 extend String {
     void outBytes(str s)
     {
-        if (self.len == 0) return;
+        if (s.len == 0) return;
         self.pushView(s);
     }
 
@@ -148,158 +153,379 @@ pub str helpFor(str code)
     return "";
 }
 
-// the one entry point: format and dump to stderr
-
-pub void render(str code, str level, str msg,
-                str file, usize line, usize col,
-                str prevText, usize prevLineNo,
-                str lineText, str help)
+pub struct DiagLine
 {
-    if (msg.len == 0) msg = "diagnostic";
-    if (level.len == 0) level = "error";
-    if (code.len == 0) code = "";
-    bool hasLoc = file.len > 0;
-    if (file.len == 0) file = "unknown";
-    if (help.len == 0) help = helpFor(code);
+    str path;
+    usize line;
+    usize col;
+    str text;
+    str label;
+}
 
-    bool on = isatty(2) == 1;
-    bool hasCode = code.len > 0;
+pub struct RenderInput
+{
+    str code;
+    str level;
+    str msg;
+    DiagLine primary;
+    DiagLine reference;
+    bool hasRef;
+    str help;
+    str fix;
+    bool hasDiff;
+    str diffOld;
+    str diffNew;
+    u8 format;      // 0 auto, 1 full, 2 compact, 3 short
+    u8 colorMode;   // 0 auto, 1 always, 2 never
+    usize ordinal;
+}
+
+bool diagIsWord(u8 c)
+{
+    return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95;
+}
+
+usize diagWordLen(str lineText, usize col)
+{
+    if (col == 0 || col - 1 >= lineText.len) return 1;
+    usize i = col - 1;
+    usize start = i;
+    while (i < lineText.len)
+    {
+        if (!diagIsWord(lineText.ptr[i])) break;
+        i++;
+    }
+    if (i == start) return 1;
+    return i - start;
+}
+
+bool diagSame(str a, str b)
+{
+    if (a.len != b.len) return false;
+    usize i = 0;
+    while (i < a.len)
+    {
+        if (a.ptr[i] != b.ptr[i]) return false;
+        i++;
+    }
+    return true;
+}
+
+str diagBaseName(str path)
+{
+    usize i = path.len;
+    while (i > 0)
+    {
+        u8 c = path.ptr[i - 1];
+        if (c == 47 || c == 92) return str { .ptr = path.ptr + i, .len = path.len - i };
+        i--;
+    }
+    return path;
+}
+
+void diagSpaces(String* o, usize n)
+{
+    if (n > 0) o->pushRepeat(32, n);
+}
+
+void diagDim(String* o, bool on, str s)
+{
+    o->colorOn(on, "[90m");
+    o->outBytes(s);
+    o->colorOff(on);
+}
+
+str diagLevelSeq(str level)
+{
+    if (level.len == 0) return "[1;31m";
+    u8 c = level.ptr[0];
+    if (c == 119) return "[1;33m";  // warning
+    if (c == 101) return "[1;31m";  // error
+    if (c == 102) return "[1;31m";  // fatal error
+    return "[1;36m";                // note
+}
+
+u8 diagResolveFormat(u8 requested, usize ordinal, bool tty)
+{
+    if (requested != 0) return requested;
+    if (!tty) return 3;
+    if (ordinal <= 3) return 1;
+    if (ordinal <= 20) return 2;
+    return 3;
+}
+
+void diagHeader(String* o, bool on, str level, str code, str msg)
+{
+    if (on)
+    {
+        o->colorOn(true, diagLevelSeq(level));
+        o->outBytes(level);
+        o->colorOff(true);
+    }
+    else
+    {
+        o->outBytes(level);
+    }
+    if (code.len > 0)
+    {
+        o->colorOn(on, "[35m");
+        o->pushByte(91);
+        o->outBytes(code);
+        o->pushByte(93);
+        o->colorOff(on);
+    }
+    o->outBytes(": ");
+    o->outBytes(msg);
+    o->pushByte(10);
+}
+
+void diagLocation(String* o, bool on, usize numW, DiagLine* l)
+{
+    diagSpaces(o, numW);
+    o->pushByte(32);
+    o->colorOn(on, "[90m");
+    o->outBytes("╭─▸ ");
+    o->colorOff(on);
+    o->outBytes(l->path);
+    o->pushByte(58);
+    o->outUint(l->line);
+    o->pushByte(58);
+    o->outUint(l->col);
+    o->pushByte(10);
+}
+
+void diagBlank(String* o, bool on, usize numW)
+{
+    diagSpaces(o, numW);
+    diagDim(o, on, " │");
+    o->pushByte(10);
+}
+
+void diagFold(String* o, bool on, usize numW)
+{
+    diagSpaces(o, numW);
+    diagDim(o, on, " ⋮");
+    o->pushByte(10);
+}
+
+void diagSourceLine(String* o, bool on, usize numW, DiagLine* l)
+{
+    o->colorOn(on, "[90m");
+    o->outPad(l->line, numW);
+    o->colorOff(on);
+    diagDim(o, on, " │ ");
+    o->outBytes(l->text);
+    o->pushByte(10);
+}
+
+void diagCaret(String* o, bool on, usize numW, DiagLine* l, bool primary, str prefix, str seq)
+{
+    usize col = l->col > 0 ? l->col - 1 : 0;
+    diagSpaces(o, numW);
+    diagDim(o, on, " │ ");
+    diagSpaces(o, col);
+    o->colorOn(on, primary ? seq : "[1;35m");
+    o->outBytes("┬");
+    usize n = diagWordLen(l->text, l->col);
+    usize d = n > 1 ? n - 1 : 1;
+    usize i = 0;
+    while (i < d) { o->outBytes("─"); i++; }
+    o->colorOff(on);
+    o->pushByte(10);
+
+    if (l->label.len == 0) return;
+    diagSpaces(o, numW);
+    o->pushByte(32);
+    diagDim(o, on, "╰─ ");
+    o->colorOn(on, primary ? "[36m" : "[35m");
+    o->outBytes(prefix);
+    o->outBytes(l->label);
+    o->colorOff(on);
+    o->pushByte(10);
+}
+
+void diagFooter(String* o, bool on, usize numW, str mark, str head, str text, str seq)
+{
+    diagSpaces(o, numW);
+    diagDim(o, on, " ");
+    diagDim(o, on, mark);
+    o->pushByte(32);
+    o->colorOn(on, seq);
+    o->outBytes(head);
+    o->outBytes(text);
+    o->colorOff(on);
+    o->pushByte(10);
+}
+
+void diagDiffLine(String* o, bool on, usize numW, DiagLine* l, bool plus, str text)
+{
+    diagSpaces(o, numW);
+    diagDim(o, on, " │ ");
+    o->colorOn(on, "[90m");
+    o->outPad(l->line, numW);
+    o->colorOff(on);
+    diagDim(o, on, " │ ");
+    o->colorOn(on, plus ? "[32m" : "[31m");
+    o->outBytes(plus ? "+ " : "- ");
+    o->outBytes(text);
+    o->colorOff(on);
+    o->pushByte(10);
+}
+
+void diagShort(String* o, bool on, RenderInput* in, str hint)
+{
+    DiagLine* p = &in->primary;
+    str path = p->path;
+    if (path.len > 0)
+    {
+        o->outBytes(path);
+        o->pushByte(58);
+        o->outUint(p->line);
+        o->pushByte(58);
+        o->outUint(p->col);
+        o->outBytes("  ");
+    }
+    if (on)
+    {
+        o->colorOn(true, diagLevelSeq(in->level));
+        o->outBytes(in->level);
+        o->colorOff(true);
+    }
+    else
+    {
+        o->outBytes(in->level);
+    }
+    if (in->code.len > 0)
+    {
+        o->colorOn(on, "[35m");
+        o->pushByte(91);
+        o->outBytes(in->code);
+        o->pushByte(93);
+        o->colorOff(on);
+    }
+    o->outBytes("  ");
+    o->outBytes(in->msg);
+    if (hint.len > 0)
+    {
+        o->outBytes("  ");
+        o->colorOn(on, "[36m");
+        o->outBytes("fix: ");
+        o->outBytes(hint);
+        o->colorOff(on);
+    }
+    o->pushByte(10);
+}
+
+pub void render(RenderInput* in)
+{
+    if (in->msg.len == 0) in->msg = "diagnostic";
+    if (in->level.len == 0) in->level = "error";
+
+    bool tty = isatty(2) == 1;
+    u8 fmt = diagResolveFormat(in->format, in->ordinal, tty);
+    bool on = in->colorMode == 1 || (in->colorMode == 0 && tty);
+
+    str fallback = helpFor(in->code);
+    str label = in->primary.label;
+    if (label.len == 0) label = in->help;
+    if (label.len == 0) label = fallback;
+    str helpBlock = in->help;
+    if (diagSame(helpBlock, label)) helpBlock = "";
+    in->primary.label = label;
 
     String o = String::new();
 
-    // header: error[CODE]: message
-    // cheap severity sniff off the level string's first byte: 'w'arning
-    // yellow, 'e'rror red, anything else (note) cyan
-    str lvlSeq = "[1;31m";
-    if (level.ptr[0] == 119) lvlSeq = "[33m";       // w... = warning
-    else if (level.ptr[0] != 101) lvlSeq = "[36m";  // note / other
-    o.colorOn(on, lvlSeq);
-    o.outBytes(level);
-    o.colorOff(on);
-    
-    if (hasCode) {
-        o.colorOn(on, "[35m");
-        o.pushByte(91);
-        o.outBytes(code);
-        o.pushByte(93);
-        o.colorOff(on);
+    if (fmt == 3)
+    {
+        str hint = in->fix;
+        if (hint.len == 0) hint = label;
+        diagShort(&o, on, in, hint);
+        write(2, (const cchar*)o.ptr, o.len);
+        return;
     }
-    
-    o.outBytes(": ");
-    o.outBytes(msg);
-    o.pushByte(10);
 
-    usize caretSpaces = 0;
-    usize s = 0;
+    diagHeader(&o, on, in->level, in->code, in->msg);
 
-    // location line
-    if (hasLoc)
+    if (in->primary.path.len == 0)
     {
-    o.colorOn(on, "[90m");
-    o.outBytes("  ┌─► ");
-    o.colorOff(on);
-    o.outBytes(file);
-    o.pushByte(58);
-    o.outUint(line);
-    o.pushByte(58);
-    o.outUint(col);
-    o.pushByte(10);
+        if (label.len > 0)
+        {
+            o.colorOn(on, "[36m");
+            o.outBytes(label);
+            o.colorOff(on);
+            o.pushByte(10);
+        }
+        if (in->code.len > 0)
+        {
+            diagDim(&o, on, "docs: coralc --explain ");
+            diagDim(&o, on, in->code);
+            o.pushByte(10);
+        }
+        write(2, (const cchar*)o.ptr, o.len);
+        return;
+    }
 
-    // blank gutter
-    o.colorOn(on, "[90m");
-    o.outBytes("  │\n");
-    o.colorOff(on);
-
-    // source context: the line before (if any) and the error line
-    usize numW = digits(line);
-    if (prevLineNo != 0)
+    usize numW = digits(in->primary.line);
+    if (in->hasRef && in->reference.line > 0)
     {
-        usize pw = digits(prevLineNo);
-        if (pw > numW) numW = pw;
+        usize rw = digits(in->reference.line);
+        if (rw > numW) numW = rw;
     }
     if (numW < 2) numW = 2;
 
-    if (prevLineNo != 0 && prevText.len > 0)
+    diagLocation(&o, on, numW, &in->primary);
+    diagBlank(&o, on, numW);
+
+    bool refFrame = fmt == 1 && in->hasRef && in->reference.path.len > 0 &&
+                    in->reference.line > 0 && in->reference.line != in->primary.line;
+    if (refFrame)
     {
-        o.colorOn(on, "[90m");
-        o.outBytes("  │ ");
-        o.colorOff(on);
-        o.outPad(prevLineNo, numW);
-        o.colorOn(on, "[90m");
-        o.outBytes(" │ ");
-        o.colorOff(on);
-        o.outBytes(prevText);
-        o.pushByte(10);
+        if (in->primary.line > in->reference.line + 1) diagFold(&o, on, numW);
+        diagSourceLine(&o, on, numW, &in->reference);
+        diagCaret(&o, on, numW, &in->reference, false, "reference: ", "[1;35m");
+        diagBlank(&o, on, numW);
     }
 
-    o.colorOn(on, "[90m");
-    o.outBytes("  │ ");
-    o.colorOff(on);
-    o.outPad(line, numW);
-    o.colorOn(on, "[90m");
-    o.outBytes(" │ ");
-    o.colorOff(on);
-    if (lineText.len > 0) o.outBytes(lineText);
-    o.pushByte(10);
+    diagSourceLine(&o, on, numW, &in->primary);
+    diagCaret(&o, on, numW, &in->primary, true, "", diagLevelSeq(in->level));
 
-    // caret under the error column; source text starts at 4 + numW + 3
-    // ("  │ " gutter + right-aligned number + " │ "). col is 1-based, and
-    // the -4 comps the caret line's "  |" being one column shorter
-    usize prefixLen = 4 + numW + 3;
-    if (prefixLen + col > 4) caretSpaces = prefixLen + col - 4;
-    o.colorOn(on, "[90m");
-    o.outBytes("  |");
-    o.colorOff(on);
-    s = 0;
-    while (s < caretSpaces) { o.pushByte(32); s++; }
-    o.colorOn(on, "[1;31m");
-    o.outBytes("▲");
-    o.colorOff(on);
-    o.pushByte(10);
-    }
-
-    // help line
-    if (help.len > 0)
+    if (fmt == 1)
     {
-        if (hasLoc)
+        bool hasDocs = in->code.len > 0;
+        bool hasHelp = helpBlock.len > 0;
+        bool hasDiff = in->hasDiff;
+        if (hasHelp || hasDiff || hasDocs) diagBlank(&o, on, numW);
+        if (hasHelp)
         {
-            o.colorOn(on, "[90m");
-            o.outBytes("  │");
-            o.colorOff(on);
-            s = 0;
-            while (s < caretSpaces) { o.pushByte(32); s++; }
-            o.colorOn(on, "[90m");
-            o.outBytes("╰─ ");
-            o.colorOff(on);
+            str mark = hasDocs || hasDiff ? "├─" : "╰─";
+            diagFooter(&o, on, numW, mark, "help: ", helpBlock, "[36m");
+            if (hasDocs || hasDiff) diagBlank(&o, on, numW);
         }
-        o.colorOn(on, "[36m");
-        o.outBytes(help);
-        o.colorOff(on);
-        o.pushByte(10);
-    }
-
-    // explain line
-    if (hasCode)
-    {
-        if (hasLoc)
+        if (hasDiff)
         {
-            o.colorOn(on, "[90m");
-            o.outBytes("  │");
-            o.colorOff(on);
-            s = 0;
-            while (s < caretSpaces) { o.pushByte(32); s++; }
-            o.colorOn(on, "[90m");
-            o.outBytes("╰─ ");
-            o.colorOff(on);
+            diagDiffLine(&o, on, numW, &in->primary, false, in->diffOld);
+            diagDiffLine(&o, on, numW, &in->primary, true, in->diffNew);
+            if (hasDocs) diagBlank(&o, on, numW);
         }
-        o.colorOn(on, "[90m");
-        o.outBytes("try `coralc --explain ");
-        o.outBytes(code);
-        o.outBytes("` for more information");
+        if (hasDocs)
+        {
+            diagFooter(&o, on, numW, "╰─", "docs: coralc --explain ", in->code, "[90m");
+        }
+    }
+    else if (in->hasRef && in->reference.path.len > 0)
+    {
+        diagSpaces(&o, numW);
+        diagDim(&o, on, " ╰─ ");
+        o.colorOn(on, "[35m");
+        o.outBytes("ref: ");
         o.colorOff(on);
+        o.outBytes(in->reference.label);
+        o.outBytes(" at ");
+        o.outBytes(diagBaseName(in->reference.path));
+        o.pushByte(58);
+        o.outUint(in->reference.line);
         o.pushByte(10);
     }
 
-    // straight to fd 2: no buffering, no logger dependency
     write(2, (const cchar*)o.ptr, o.len);
 }
