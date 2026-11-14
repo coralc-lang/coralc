@@ -1,0 +1,540 @@
+#[[no_drop_all]]
+// Algebraic simplify for muvm — one node, one walk, instcombine-style local
+// rewrites that `fold` does not subsume (fold handles constants and direct
+// identities; NOT strength reduction, NOT cast chains, NOT reassociation).
+//
+// Contents:
+//   1. commutative canonicalization — lone constant operand moves to the
+//      right; constant-int/const-int pairs and inst/inst pairs are
+//      id-sorted (deterministic GVN hashing shape; instcombine feeds GVN)
+//   2. cast chains — zext(zext), sext(sext), sext(zext), trunc inside ext
+//      collapsible when x moves across, trunc of pure-extent with equal
+//      output widths
+//   3. idempotent collapse — x & x, x | x, smin/max/umin/umax(x, x)
+//   4. shift-ext collapse — lshr(shl(x,n),n)/ashr(shl(x,n),n) → zext/sext
+//      when output width > input width
+//   5. strength reduction — mul by 2^n → shl; sdiv/udiv by 1 → x; srem/urem
+//      by 1 → 0; udiv by 2^n → lshr log2 n
+//   6. lex canonicalization of associative+commutative chains (Add/Mul/
+//      And/Or/Xor) — flatten every same-op node whose operands are
+//      themselves same-op nodes onto one flat operand list, sort the
+//      operand order lexicographically, and rebuild a left-leaning chain
+//      so that GVN (dominator-scoped table + identity rebuild) sees the
+//      same tree for the same mathematical expression regardless of how
+//      the front end associated it
+//
+// All rewrites keep the outermost result in place: inst users are re-pushed
+// onto the worklist after any rewrite so they refold with the new shape.
+
+import muvm::passes::common { gVerbose };
+import muvm::irOps { IrOpcode, irOpcodeStr, irOpcodeIsCommutative };
+import muvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind, IrType, IrTypeKind };
+import std::ios { eprintln };
+import std::mman { alloc, dealloc };
+
+pub struct AlgebraicPass
+{
+    IrContext* ctx;
+    IrInst** work;
+    u64 nWork;
+    IrInst** dead;
+    u64 nDead;
+    u64 nAlgebras;
+
+    static AlgebraicPass new(IrContext* ctx)
+    {
+        return AlgebraicPass {
+            .ctx = ctx,
+            .work = alloc<IrInst*>((usize)64),
+            .nWork = 0,
+            .dead = alloc<IrInst*>((usize)64),
+            .nDead = 0,
+            .nAlgebras = 0
+        };
+    }
+
+    void freeAll()
+    {
+        dealloc<IrInst*>(self.work);
+        dealloc<IrInst*>(self.dead);
+    }
+
+    void push(IrInst* inst)
+    {
+        if (inst == null) return;
+        u64 nc = (u64)64;
+        (void)nc;
+        if (self.nWork >= (u64)64)
+        {
+            IrInst** nw = alloc<IrInst*>((usize)(self.nWork * 2));
+            for (u64 i = 0; i < self.nWork; i++) nw[i] = self.work[i];
+            dealloc<IrInst*>(self.work);
+            self.work = nw;
+        }
+        self.work[self.nWork++] = inst;
+    }
+
+    void markDead(IrInst* inst)
+    {
+        if (self.nDead >= (u64)64)
+        {
+            IrInst** nd = alloc<IrInst*>((usize)(self.nDead * 2));
+            for (u64 i = 0; i < self.nDead; i++) nd[i] = self.dead[i];
+            dealloc<IrInst*>(self.dead);
+            self.dead = nd;
+        }
+        self.dead[self.nDead++] = inst;
+    }
+
+    bool isConstInt(IrValue* v)
+    {
+        return v != null && v->kind == IrValueKind::ConstInt;
+    }
+
+    u32 widthOf(IrValue* v)
+    {
+        IrType* t = v->type;
+        if (t == null) return 64;
+        return t->width > 0 ? t->width : 64;
+    }
+
+    u64 maskOf(u32 w)
+    {
+        if (w >= 64) return ~(u64)0;
+        return ((u64)1 << (u64)w) - 1;
+    }
+
+    IrValue* iconst(IrType* ty, u64 v)
+    {
+        return self.ctx->constInt(ty, v);
+    }
+
+    // swap commutative operands to canonical order:
+    // const integers and const floats go right; inst/inst sorted by id.
+    bool commSwap(IrInst* inst)
+    {
+        if (inst->nops < 2) return false;
+        if (!irOpcodeIsCommutative(inst->opcode)) return false;
+        IrValue* l = inst->ops[0];
+        IrValue* r = inst->ops[1];
+        if (l == null || r == null) return false;
+        bool changed = false;
+        // lone constant (either side) moves right
+        if ((self.isConstInt(l) && !self.isConstInt(r) && r->kind != IrValueKind::ConstFloat) ||
+            (l->kind == IrValueKind::ConstFloat && r->kind != IrValueKind::ConstFloat && !self.isConstInt(r)))
+        {
+            IrValue* t = inst->ops[0];
+            inst->ops[0] = inst->ops[1];
+            inst->ops[1] = t;
+            changed = true;
+        }
+        else
+        {
+            IrValue* b0 = inst->ops[0];
+            IrValue* b1 = inst->ops[1];
+            bool bothInt = self.isConstInt(b0) && self.isConstInt(b1);
+            bool bothFloat = b0->kind == IrValueKind::ConstFloat && b1->kind == IrValueKind::ConstFloat;
+            bool bothInst = b0->kind == IrValueKind::Inst && b1->kind == IrValueKind::Inst;
+            bool sortable = bothInt || bothFloat || bothInst;
+            if (sortable && ((IrValue*)b0)->id > ((IrValue*)b1)->id)
+            {
+                IrValue* t = inst->ops[0];
+                inst->ops[0] = inst->ops[1];
+                inst->ops[1] = t;
+                changed = true;
+            }
+        }
+        if (changed)
+        {
+            if (gVerbose) eprintln("algebraic: comm-canon inst id={} op={}", inst->base.id, irOpcodeStr(inst->opcode));
+            self.nAlgebras++;
+        }
+        return changed;
+    }
+
+    // lex canon: flatten associative+commutative chains to one list of
+    // leaves and re-sort lexicographically. tree identity comparison:
+    // an inst is unchanged when it already has canonical operand order AND
+    // no nested same-op node differs from that order.
+    static bool isAssocOp(IrOpcode op)
+    {
+        return op == IrOpcode::Add || op == IrOpcode::Mul ||
+               op == IrOpcode::And || op == IrOpcode::Or ||
+               op == IrOpcode::Xor;
+    }
+
+    i64 sortKey(IrValue* v)
+    {
+        if (v == null) return 30000000;
+        if (v->kind == IrValueKind::ConstInt) return (i64)v->valData;
+        if (v->kind == IrValueKind::Arg) return 10000000 + (i64)v->id;
+        if (v->kind == IrValueKind::Inst) return 20000000 + (i64)v->id;
+        if (v->kind == IrValueKind::Block) return 40000000;
+        if (v->kind == IrValueKind::ConstFloat) return -1000000;
+        return 50000000;
+    }
+
+    u32 collectChain(IrInst* root, IrValue** leaves, u32 capacity)
+    {
+        if (root == null) return 0;
+        // worklist: node -> collect
+        IrInst** wl = alloc<IrInst*>((usize)capacity);
+        u32 n = 0;
+        u32 wnd = 0;
+        wl[wnd++] = root;
+        u32 count = 0;
+        while (wnd > 0)
+        {
+            IrInst* cur = wl[--wnd];
+            if (cur->opcode == root->opcode && cur == root ||
+                (cur->opcode == root->opcode && cur->nops == 2 &&
+                 cur->ops[0] != null && cur->ops[1] != null &&
+                 cur != root))
+            {
+                // actually simpler rule below — this branch unused
+            }
+            // flatten child when it has the same opcode AND was created by a chain
+            IrValue* o0 = cur->ops[0];
+            IrValue* o1 = cur->ops[1];
+            bool sameOp = cur->nops >= 2 && cur->opcode == root->opcode &&
+                          o0 != null && o1 != null &&
+                          o0->kind == IrValueKind::Inst &&
+                          ((IrInst*)o0)->opcode == root->opcode &&
+                          ((IrInst*)o0)->nops == 2;
+            bool sameOpRight = cur->nops >= 2 && cur->opcode == root->opcode &&
+                               o0 != null && o1 != null &&
+                               o1->kind == IrValueKind::Inst &&
+                               ((IrInst*)o1)->opcode == root->opcode &&
+                               ((IrInst*)o1)->nops == 2;
+            if (sameOp) wl[wnd++] = (IrInst*)o0;
+            else if (count >= capacity)
+            {
+                IrValue** nl = alloc<IrValue*>((usize)(capacity * 2));
+                for (u32 i = 0; i < count; i++) nl[i] = leaves[i];
+                dealloc<IrValue*>(leaves);
+                leaves = nl;
+                capacity *= 2;
+                leaves[count++] = o0;
+            }
+            else leaves[count++] = o0;
+            if (sameOpRight) wl[wnd++] = (IrInst*)o1;
+            else if (count >= capacity)
+            {
+                IrValue** nl = alloc<IrValue*>((usize)(capacity * 2));
+                for (u32 i = 0; i < count; i++) nl[i] = leaves[i];
+                dealloc<IrValue*>(leaves);
+                leaves = nl;
+                capacity *= 2;
+                leaves[count++] = o1;
+            }
+            else leaves[count++] = o1;
+        }
+        dealloc<IrInst*>(wl);
+        (void)n;
+        return count;
+    }
+
+    // --- extension collapse --------------------------------------------
+    IrValue* tryExt(IrInst* inst)
+    {
+        if (inst->nops != 1) return null;
+        IrValue* x = inst->ops[0];
+        if (x == null || x->kind != IrValueKind::Inst) return null;
+        IrInst* src = (IrInst*)x;
+        if (src->nops != 1) return null;
+        IrValue* inner = src->ops[0];
+        if (inner == null) return null;
+        u32 outW = self.widthOf(inst);
+        u32 innerW = self.widthOf(inner);
+
+        // zext(zext) / sext(sext): same opcode over the inner value
+        if (inst->opcode == src->opcode &&
+            (inst->opcode == IrOpcode::Zext || inst->opcode == IrOpcode::Sext))
+        {
+            IrValue** ops = alloc<IrValue*>((usize)1);
+            ops[0] = inner;
+            IrInst* ni = self.ctx->createInst(inst->opcode, inst->base.type, ops, 1, 0, 0);
+            dealloc<IrValue*>(ops);
+            inner->addUser(ni);
+            inst->parent->insertBefore(ni, inst);
+            if (gVerbose) eprintln("algebraic: {} (same-ext chain)", irOpcodeStr(inst->opcode));
+            return &ni->base;
+        }
+        // sext(zext(x)) -> zext(x): sign bit is zero, sign extension never changes value
+        if (inst->opcode == IrOpcode::Sext && src->opcode == IrOpcode::Zext)
+        {
+            IrValue** ops = alloc<IrValue*>((usize)1);
+            ops[0] = inner;
+            IrInst* ni = self.ctx->createInst(IrOpcode::Zext, inst->base.type, ops, 1, 0, 0);
+            dealloc<IrValue*>(ops);
+            inner->addUser(ni);
+            inst->parent->insertBefore(ni, inst);
+            if (gVerbose) eprintln("algebraic: sext(zext) -> zext");
+            return &ni->base;
+        }
+        // trunc(zext/sext(x)): extension irrelevant when width stays within inner's width
+        if (inst->opcode == IrOpcode::Trunc &&
+            (src->opcode == IrOpcode::Zext || src->opcode == IrOpcode::Sext))
+        {
+            if (outW == innerW) return inner;
+            IrOpcode op = (outW < innerW) ? IrOpcode::Trunc : src->opcode;
+            IrValue** ops = alloc<IrValue*>((usize)1);
+            ops[0] = inner;
+            IrInst* ni = self.ctx->createInst(op, inst->base.type, ops, 1, 0, 0);
+            dealloc<IrValue*>(ops);
+            inner->addUser(ni);
+            inst->parent->insertBefore(ni, inst);
+            if (gVerbose) eprintln("algebraic: trunc(ext) drop-ext");
+            return &ni->base;
+        }
+        return null;
+    }
+
+    // --- idempotent collapse -------------------------------------------
+    IrValue* tryIdem(IrInst* inst)
+    {
+        if (inst->nops != 2) return null;
+        IrValue* a = inst->ops[0];
+        IrValue* b = inst->ops[1];
+        if (a == null || b == null) return null;
+        if (a != b) return null;
+        switch (inst->opcode)
+        {
+            IrOpcode::And | IrOpcode::Or |
+            IrOpcode::SMin | IrOpcode::SMax |
+            IrOpcode::UMin | IrOpcode::UMax => { return a; },
+            else => { return null; }
+        }
+    }
+
+    // --- shift-ext collapse -------------------------------------------
+    IrValue* tryShiftExt(IrInst* inst)
+    {
+        if (inst->nops != 2) return null;
+        if (inst->opcode != IrOpcode::Lshr && inst->opcode != IrOpcode::Ashr) return null;
+        IrValue* s = inst->ops[1];
+        if (!self.isConstInt(s)) return null;
+        IrValue* a = inst->ops[0];
+        if (a->kind != IrValueKind::Inst) return null;
+        IrInst* aInst = (IrInst*)a;
+        if (aInst->nops != 2 || aInst->opcode != IrOpcode::Shl) return null;
+        IrValue* sh = aInst->ops[1];
+        if (!self.isConstInt(sh)) return null;
+        if (sh->valData != s->valData) return null;
+        u32 outW = self.widthOf(inst);
+        u32 inW = self.widthOf(aInst->ops[0]);
+        if (outW <= inW) return null;
+        IrOpcode op = (inst->opcode == IrOpcode::Lshr) ? IrOpcode::Zext : IrOpcode::Sext;
+        IrValue** ops = alloc<IrValue*>((usize)1);
+        ops[0] = aInst->ops[0];
+        IrInst* ni = self.ctx->createInst(op, inst->base.type, ops, 1, 0, 0);
+        dealloc<IrValue*>(ops);
+        aInst->ops[0]->addUser(ni);
+        inst->parent->insertBefore(ni, inst);
+        if (gVerbose) eprintln("algebraic: {}(shl,n){} -> {}(x)", inst->opcode == IrOpcode::Lshr ? "lshr" : "ashr", ",n", op == IrOpcode::Zext ? "zext" : "sext");
+        return &ni->base;
+    }
+
+    // --- strength reduction --------------------------------------------
+    IrValue* tryStrength(IrInst* inst)
+    {
+        if (inst->nops != 2) return null;
+        IrValue* a = inst->ops[0];
+        IrValue* b = inst->ops[1];
+
+        // mul by 2^n -> shl
+        if (inst->opcode == IrOpcode::Mul && self.isConstInt(b) && b->valData > 1)
+        {
+            if ((b->valData & (b->valData - 1)) == 0)
+            {
+                u32 amt = 0;
+                u64 v = b->valData;
+                while (v > 1) { v >>= 1; amt++; }
+                IrValue* amtV = self.ctx->constInt(b->type, (u64)amt);
+                IrValue** ops = alloc<IrValue*>((usize)2);
+                ops[0] = a;
+                ops[1] = amtV;
+                IrInst* shl = self.ctx->createInst(IrOpcode::Shl, inst->base.type, ops, 2, 0, 0);
+                dealloc<IrValue*>(ops);
+                a->addUser(shl);
+                amtV->addUser(shl);
+                inst->parent->insertBefore(shl, inst);
+                if (gVerbose) eprintln("algebraic: mul-2^n -> shl");
+                return &shl->base;
+            }
+        }
+        // sdiv/udiv by 1 -> x
+        if ((inst->opcode == IrOpcode::SDiv || inst->opcode == IrOpcode::UDiv) &&
+            self.isConstInt(b) && b->valData == 1) return a;
+        // srem/urem by 1 -> 0
+        if ((inst->opcode == IrOpcode::SRem || inst->opcode == IrOpcode::URem) &&
+            self.isConstInt(b) && b->valData == 1)
+            return self.ctx->constInt(inst->base.type, 0);
+        // udiv by 2^n -> lshr
+        if (inst->opcode == IrOpcode::UDiv && self.isConstInt(b) && b->valData > 1 &&
+            (b->valData & (b->valData - 1)) == 0)
+        {
+            u32 amt = 0;
+            u64 v = b->valData;
+            while (v > 1) { v >>= 1; amt++; }
+            IrValue* amtV = self.ctx->constInt(b->type, (u64)amt);
+            IrValue** ops = alloc<IrValue*>((usize)2);
+            ops[0] = a;
+            ops[1] = amtV;
+            IrInst* lshr = self.ctx->createInst(IrOpcode::Lshr, inst->base.type, ops, 2, 0, 0);
+            dealloc<IrValue*>(ops);
+            a->addUser(lshr);
+            amtV->addUser(lshr);
+            inst->parent->insertBefore(lshr, inst);
+            if (gVerbose) eprintln("algebraic: udiv-2^n -> lshr");
+            return &lshr->base;
+        }
+        return null;
+    }
+
+    // --- lexicographic re-canon of associative+commutative chains -----
+    // flatten every same-op child onto one operand list of leaves, sort
+    // leaves lexicographically, rebuild a left-leaning chain (a op b) op c
+    bool lexCanon(IrInst* inst)
+    {
+        if (inst == null) return false;
+        if (!AlgebraicPass::isAssocOp(inst->opcode)) return false;
+        if (inst->nops != 2) return false;
+
+        u32 capacity = 16;
+        IrValue** leaves = alloc<IrValue*>((usize)capacity);
+        u32 nLeaves = self.collectChain(inst, leaves, capacity);
+
+        // if the tree already has strictly canonical order of operands at
+        // every node AND no two leaves are out of order, do nothing
+        bool sorted = true;
+        for (u32 i = 1; i < nLeaves; i++)
+        {
+            if (self.sortKey(leaves[i]) < self.sortKey(leaves[i - 1])) { sorted = false; break; }
+        }
+        if (sorted)
+        {
+            // still need the tree rebuilt into left-leaning canonical
+            // shape — but only fire when the shape isn't already lean
+            if (inst->ops[0] != null && inst->ops[0]->kind == IrValueKind::Inst &&
+                ((IrInst*)inst->ops[0])->opcode == inst->opcode &&
+                (inst->ops[1] == null || self.sortKey(inst->ops[0]) <= self.sortKey(inst->ops[1])))
+            {
+                dealloc<IrValue*>(leaves);
+                return false;
+            }
+        }
+        if (nLeaves < 3 && sorted)
+        {
+            // single leaf promotion — nothing to flatten
+            dealloc<IrValue*>(leaves);
+            return false;
+        }
+
+        // sort leaves lexicographically
+        for (u32 i = 1; i < nLeaves; i++)
+        {
+            IrValue* key = leaves[i];
+            u32 j = i;
+            while (j > 0 && self.sortKey(leaves[j - 1]) > self.sortKey(key))
+            {
+                leaves[j] = leaves[j - 1];
+                j--;
+            }
+            leaves[j] = key;
+        }
+
+        if (gVerbose) eprintln("algebraic: lex-canon inst id={} op={} leaves={}", inst->base.id, irOpcodeStr(inst->opcode), nLeaves);
+
+        // rebuild left-leaning chain
+        IrValue* result = leaves[0];
+        for (u32 i = 1; i < nLeaves; i++)
+        {
+            IrValue** ops = alloc<IrValue*>((usize)2);
+            ops[0] = result;
+            ops[1] = leaves[i];
+            IrInst* merged = self.ctx->createInst(inst->opcode, inst->base.type, ops, 2, 0, 0);
+            dealloc<IrValue*>(ops);
+            result->addUser(merged);
+            leaves[i]->addUser(merged);
+            inst->parent->insertBefore(merged, inst);
+            result = &merged->base;
+        }
+        inst->base.replaceAllUses(result);
+        // the old chain's insts are now dead; detach worklist drivers
+        // inst->detach(); re-push not needed — old chain is dead
+        inst->detach();
+        dealloc<IrValue*>(leaves);
+        return true;
+    }
+
+    bool run(IrFunc* func)
+    {
+        if (func == null) return false;
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+                self.push(bb->insts[ii]);
+        }
+        u64 nChanged = 0;
+        while (self.nWork > 0)
+        {
+            IrInst* inst = self.work[--self.nWork];
+            if (inst->parent == null) continue;
+
+            // inst comm canon — never RAUs; only flips operands
+            if (self.commSwap(inst))
+            {
+                // operands moved; the instruction itself still valid, re-push users
+                u32 nu = inst->base.nusers;
+                if (nu > 0)
+                {
+                    IrInst** users = alloc<IrInst*>((usize)nu);
+                    for (u32 i = 0; i < nu; i++) users[i] = inst->base.users[i];
+                    for (u32 i = 0; i < nu; i++) self.push(users[i]);
+                    dealloc<IrInst*>(users);
+                }
+            }
+
+            // collect chain and flatten (this may DETACH and replace inst)
+            if (self.lexCanon(inst))
+            {
+                nChanged++;
+                continue;
+            }
+            if (inst->parent == null) continue;
+
+            IrValue* replacement = self.tryExt(inst);
+            if (replacement == null) replacement = self.tryIdem(inst);
+            if (replacement == null) replacement = self.tryShiftExt(inst);
+            if (replacement == null) replacement = self.tryStrength(inst);
+            if (replacement == null) continue;
+
+            if (gVerbose) eprintln("algebraic: rewrite inst id={} op={}", inst->base.id, irOpcodeStr(inst->opcode));
+            self.nAlgebras++;
+            nChanged++;
+            // capture users before RAU
+            u32 nu = inst->base.nusers;
+            IrInst** users = alloc<IrInst*>((usize)(nu > 0 ? nu : 1));
+            for (u32 i = 0; i < nu; i++) users[i] = inst->base.users[i];
+            inst->base.replaceAllUses(replacement);
+            for (u32 i = 0; i < nu; i++) self.push(users[i]);
+            dealloc<IrInst*>(users);
+            inst->detach();
+            self.markDead(inst);
+        }
+        for (u64 i = 0; i < self.nDead; i++) self.dead[i]->erase();
+        dealloc<IrInst**>(&null); // never type-erase this; placeholder no-op removal below
+        if (gVerbose) eprintln("algebraic: {} rewrite(s)", nChanged);
+        return nChanged > 0 || self.nAlgebras > 0;
+    }
+}
+
+pub bool muvmPassAlgebraic(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (func == null || ctx == null) return false;
+    AlgebraicPass pass = AlgebraicPass::new(ctx);
+    return pass.run(func);
+}
