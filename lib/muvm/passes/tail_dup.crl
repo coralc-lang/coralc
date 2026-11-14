@@ -1,0 +1,169 @@
+#[[no_drop_all]]
+// Tail duplication for muvm.
+//
+// Two equivalent forms of the same idea:
+//   - A has Br to B (a block that only contains instructions with no side
+//     effects and a final Br to C). Inline B's straight-line body into A
+//     and rewrite A's terminator to jump directly to C.
+//   - A has CondBr with one arm going to B with the same shape.
+//     Inline B's body, rewrite that arm to go to C.
+//
+// In both cases, B is unconditional-single-pred straight-line code with
+// no calls/stores/allocations; we consume its instructions into A rather
+// than going through a no-op block. The destination block's phis are
+// re-parented to A so the SSA chain still composes.
+// Because we can duplicate code into every caller, this is the
+// "expose more folding" rule for near-tagged switch tables — not the
+// most aggressive tail-duplicator, but the one we want for suboptimal CST
+// code shape.
+//
+// Hard cap on instructions copied as a sanity guard: if B's straight-line
+// is bigger than 8 ops, skip (code bloat).
+
+import muvm::passes::common { gVerbose };
+import muvm::irOps { IrOpcode, irOpcodeIsTerminator };
+import muvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind };
+import std::mman { alloc, dealloc };
+import std::ios { eprintln };
+
+pub struct TailDupPass
+{
+    IrContext* ctx;
+    u64 dups;
+
+    static TailDupPass new(IrContext* ctx)
+    {
+        return TailDupPass { .ctx = ctx, .dups = 0 };
+    }
+
+    void renamePhiPred(IrBlock* block, IrBlock* oldPred, IrBlock* newPred)
+    {
+        if (block == null) return;
+        for (u32 i = 0; i < block->ninsts; i++)
+        {
+            IrInst* phi = block->insts[i];
+            if (phi == null || phi->opcode != IrOpcode::Phi) continue;
+            for (u32 j = 1; j < phi->nops; j += 2)
+            {
+                if (phi->ops[j] == &oldPred->base)
+                {
+                    phi->ops[j]->removeUser(phi);
+                    phi->ops[j] = &newPred->base;
+                    (&newPred->base)->addUser(phi);
+                }
+            }
+        }
+    }
+
+
+    bool tryFunnel(IrBlock* predBlock, IrInst* terminator, bool trueArm)
+    {
+        u32 opIdx = trueArm ? 1 : 2;
+        IrValue* arm = terminator->ops[opIdx];
+        if (arm == null) return false;
+        IrBlock* b = (IrBlock*)arm;
+        if (b == null || b == predBlock) return false;
+        if (b->npreds != 1) return false;
+        if (b->parent != predBlock->parent) return false;
+        if (b->ninsts < 2) return false;
+
+        // skip if B contains a side-effecting op (store/call/atomic)
+        if (!b->hasNoSideEffects()) return false;
+
+        // last inst of B must be Br to some C
+        IrInst* bTerm = b->insts[b->ninsts - 1];
+        if (bTerm == null || bTerm->opcode != IrOpcode::Br) return false;
+        IrBlock* cBlock = (IrBlock*)bTerm->ops[0];
+        if (cBlock == null) return false;
+        if (cBlock == predBlock || cBlock == b) return false;
+
+        // only sweeep B body if it's tiny: at most 8 insts pre-terminator
+        if (b->ninsts - 1 > 8) return false;
+
+        // INLINE: detach B body into predBlock
+        u32 nb = b->ninsts;
+        IrInst** body = alloc<IrInst*>((usize)(nb > 0 ? nb : 1));
+        u32 nbs = 0;
+        for (u32 i = 0; i + 1 < nb; i++)
+        {
+            IrInst* inst = b->insts[i];
+            if (inst == null) continue;
+            body[nbs++] = inst;
+        }
+        for (u32 i = 0; i < nbs; i++)
+        {
+            IrInst* inst = body[i];
+            inst->detach();
+            predBlock->insertBefore(inst, terminator);
+        }
+        dealloc<IrInst*>(body);
+        b->ninsts = 1;                    // leave the Br
+        b->capInsts = 0;
+        // rename phis in cBlock to name predBlock rather than b
+        self.renamePhiPred(cBlock, b, predBlock);
+        // update predBlock's terminator arm to point at cBlock instead of b
+        terminator->ops[opIdx]->removeUser(terminator);
+        terminator->ops[opIdx] = &cBlock->base;
+        (&cBlock->base)->addUser(terminator);
+        // terminator ops[1]=then-arm=succ[0], ops[2]=else-arm=succ[1]; the
+        // terminator slot index (opIdx in [1,2]) maps to succs[opIdx-1]
+        predBlock->succs[opIdx - 1] = cBlock;
+        // b's preds: wipe; b's succs: never existed since body moved out
+        for (u32 sj = 0; sj < cBlock->npreds; sj++)
+            if (cBlock->preds[sj] == b) cBlock->preds[sj] = predBlock;
+        b->npreds = 0;
+        b->nsuccs = 0;
+        // detach b entirely — its body moved out already, nothing remains
+        for (u32 i = 0; i < b->ninsts; i++)
+            if (b->insts[i] != null) b->insts[i]->detach();
+        b->ninsts = 0;
+        IrFunc* f = b->parent;
+        f->removeBlock(b);
+        return true;
+    }
+
+    bool run(IrFunc* func)
+    {
+        if (func == null) return false;
+        if (gVerbose) eprintln("tail_dup: begin func={}", func->base.name);
+
+        bool changed = false;
+        u32 iters = 0;
+
+        loop {
+            iters++;
+            if (iters > 1000) break;
+            bool moved = false;
+
+            for (u32 bi = 0; bi < func->nblocks; bi++)
+            {
+                IrBlock* bb = func->blocks[bi];
+                if (bb == null || bb->ninsts == 0) continue;
+                IrInst* term = bb->insts[bb->ninsts - 1];
+                if (term == null) continue;
+
+                if (term->opcode == IrOpcode::Br)
+                {
+                    if (self.tryFunnel(bb, term, true)) { self.dups++; changed = true; moved = true; continue; }
+                }
+                else if (term->opcode == IrOpcode::CondBr)
+                {
+                    if (self.tryFunnel(bb, term, true))  { self.dups++; changed = true; moved = true; continue; }
+                    if (self.tryFunnel(bb, term, false)) { self.dups++; changed = true; moved = true; continue; }
+                }
+            }
+            if (!moved) break;
+        }
+
+        if (gVerbose) eprintln("tail_dup: dups={}", self.dups);
+        return changed;
+    }
+}
+
+pub bool muvmPassTailDup(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (func == null || ctx == null) return false;
+    TailDupPass pass = TailDupPass::new(ctx);
+    return pass.run(func);
+}
