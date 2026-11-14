@@ -17,7 +17,7 @@
 import muvm::passes::common { gVerbose };
 import muvm::irOps { IrOpcode, irOpcodeIsCommutative };
 import muvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind, IrType, IrTypeKind };
-import muvm::domtree { IrDomTree, irDomtreeNew, irDomtreeFree, irDomtreeBlockIndex, irDomtreeChildCount, irDomtreeChild, irDomtreeIdom };
+import muvm::domtree { IrDomTree, irDomtreeNew, irDomtreeFree, irDomtreeBlockIndex, irDomtreeChildCount, irDomtreeChild, irDomtreeIdom, irDomtreeDominates };
 import std::mman { alloc, dealloc };
 
 // ---------------------------------------------------------------------------
@@ -28,6 +28,7 @@ pub struct GvnEntry
 {
     u64 key;
     IrInst* inst;
+    IrBlock* block;
 }
 
 pub struct GvnPass
@@ -43,10 +44,6 @@ pub struct GvnPass
     u64* bucketKeys;
     u32* bucketSlot;
     u32 capBuckets;
-
-    u32[128] markStack;
-    u32 markTop;
-    u32 currentMark;
 
     // same-block load cache: flushed on every memory write/op
     IrValue** loadPtrs;
@@ -66,8 +63,6 @@ pub struct GvnPass
             .bucketKeys = null,
             .bucketSlot = null,
             .capBuckets = 0,
-            .markTop = 0,
-            .currentMark = 0,
             .loadPtrs = null,
             .loadInsts = null,
             .nLoads = 0,
@@ -82,18 +77,6 @@ pub struct GvnPass
         if (self.bucketSlot != null) dealloc<u32>(self.bucketSlot);
         if (self.loadPtrs != null) dealloc<IrValue*>(self.loadPtrs);
         if (self.loadInsts != null) dealloc<IrInst*>(self.loadInsts);
-    }
-
-    // -------- scope markers ---------------------------------------------
-    void enterScope()
-    {
-        self.markStack[self.markTop++] = self.currentMark;
-    }
-
-    void exitScope()
-    {
-        self.markTop--;
-        self.currentMark = self.markStack[self.markTop];
     }
 
     // -------- hash utilities --------------------------------------------
@@ -154,7 +137,7 @@ pub struct GvnPass
             self.bucketKeys[i] = 0;
             self.bucketSlot[i] = 0xFFFFFFFF;
         }
-        for (u32 i = 0; i < self.currentMark; i++)
+        for (u32 i = 0; i < self.nEnt; i++)
         {
             u64 key = self.entries[i].key;
             u32 slot = self.hashSlot(key);
@@ -166,22 +149,25 @@ pub struct GvnPass
     }
 
     // -------- table -----------------------------------------------------
-    u32 findOrAdd(u64 key, IrInst* inst)
+    u32 findOrAdd(u64 key, IrDomTree* dt, IrBlock* curBB)
     {
+        if (dt == null || curBB == null) return 0xFFFFFFFF;
         self.ensureBuckets();
         u32 slot = self.hashSlot(key);
         while (self.bucketSlot[slot] != 0xFFFFFFFF)
         {
             u32 idx = self.bucketSlot[slot];
-            // live probe — skip dead entries (index >= currentMark)
-            if (idx < self.currentMark && self.entries[idx].key == key)
-                return idx;
-            slot = (slot + 1) & (self.capBuckets - 1);
+            if (idx >= self.nEnt) { slot = (slot + 1) & (self.capBuckets - 1); continue; }
+            if (self.entries[idx].key != key) { slot = (slot + 1) & (self.capBuckets - 1); continue; }
+            // reject entries not dominating the query block (sibling scope)
+            if (!irDomtreeDominates(dt, self.entries[idx].block, curBB))
+                { slot = (slot + 1) & (self.capBuckets - 1); continue; }
+            return idx;
         }
         return 0xFFFFFFFF;
     }
 
-    bool insert(u64 key, IrInst* inst, u32* outIdx)
+    bool insert(u64 key, IrInst* inst, IrBlock* bb, u32* outIdx)
     {
         if (self.nEnt >= self.capEnt)
         {
@@ -192,22 +178,17 @@ pub struct GvnPass
         while (self.bucketSlot[slot] != 0xFFFFFFFF)
         {
             u32 idx = self.bucketSlot[slot];
-            if (idx < self.currentMark && self.entries[idx].key == key)
-                return false; // already there
+            if (self.entries[idx].key == key && self.entries[idx].block == bb)
+                return false; // already there with identical block+key
             slot = (slot + 1) & (self.capBuckets - 1);
-        }
-        if (self.nEnt >= self.currentMark)
-        {
-            // entries overwritten before being pushed by a child — grow
-            // and ensure the slot exists
         }
         self.entries[self.nEnt].key = key;
         self.entries[self.nEnt].inst = inst;
+        self.entries[self.nEnt].block = bb;
         self.bucketKeys[slot] = key;
         self.bucketSlot[slot] = self.nEnt;
         *outIdx = self.nEnt;
         self.nEnt++;
-        self.currentMark = self.nEnt;
         self.inserts++;
         return true;
     }
@@ -350,7 +331,7 @@ pub struct GvnPass
         self.nLoads++;
     }
 
-    u64 processBlock(IrBlock* bb)
+    u64 processBlock(IrDomTree* dt, IrBlock* bb)
     {
         if (bb == null) return 0;
         u64 hits = 0;
@@ -392,7 +373,7 @@ pub struct GvnPass
             if (inst->base.type == null) continue;
 
             u64 key = GvnPass::hashInst(inst);
-            u32 found = self.findOrAdd(key, inst);
+            u32 found = self.findOrAdd(key, dt, bb);
             if (found != 0xFFFFFFFF)
             {
                 // verify congruence before fusing
@@ -409,7 +390,7 @@ pub struct GvnPass
             }
             // insert in scope
             u32 slotIdx = 0;
-            self.insert(key, inst, &slotIdx);
+            self.insert(key, inst, bb, &slotIdx);
         }
         return hits;
     }
@@ -417,15 +398,13 @@ pub struct GvnPass
     void walkBlock(IrFunc* func, IrDomTree* dt, IrBlock* bb)
     {
         if (bb == null) return;
-        self.enterScope();
-        self.processBlock(bb);
+        self.processBlock(dt, bb);
         u32 nchildren = irDomtreeChildCount(dt, bb);
         for (u32 i = 0; i < nchildren; i++)
         {
             IrBlock* child = irDomtreeChild(dt, bb, i);
             self.walkBlock(func, dt, child);
         }
-        self.exitScope();
     }
 
     bool run(IrFunc* func)
