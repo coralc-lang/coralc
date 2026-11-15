@@ -48,7 +48,7 @@ error[T0006]: cannot use `.` to reach a field through a pointer
 
 It costs about 14 lines per error, which is why it's only used when there are few errors.
 
-## Tier :2 compact
+## Tier 3: compact
 
 ```
 error[T0006]: cannot use `.` through a pointer
@@ -173,7 +173,7 @@ The grammar lists many constructs that parse and are then dumped, ignored, or un
 | **T0059** | runtime value used in a comptime context, or comptime evaluation limit exceeded |
 | **T0060** | unknown intrinsic `@{name}` (P0018 only covers `@sizeof` syntax) |
 | **T0061** | generic instantiation depth exceeded (likely infinite recursion) |
-| **T0062** | type `{T}` contains itself and has infinite size |
+| **T0062** | type `{T}` contains itself and has infinite size | it can have a pointer to itself though, and even this should still have a warning.
 | **T0063** | `typedef` or `distinct` cycle |
 | **T0064** | duplicate enum value, or the value is not a constant |
 | **T0065** | `extend {S} : {Trait}` is missing required method `{m}` |
@@ -323,7 +323,7 @@ T0012 (unused), T0018 (unreachable code) and T0019 (no-op assignment) behave lik
 | **W0038** | lookalike character inside a string or comment (L0009 stays an error in code) | replace it with the ASCII spelling |
 | **W0039** | string literal spans a newline (interim for the lexer gap) | close the string, or use a raw string |
 | **W0040** | `/*` inside a block comment (comments don't nest) | the inner opener is ignored |
-| **W0041** | doc comment `///` is separated from its declaration by a blank line | the doc block attaches to nothing |
+| **W0041** | doc comment `///` is separated from its declaration by a blank line | the doc block attaches to nothing | // skip this, doc comment collection is turned of for the compiler to begin with. only the server worries aboult it.
 | **W0042** | numeric literal has a confusing form (leading zero like `0755`, ambiguous suffix) | use `0o` for octal |
 | **W0043** | naming style: types should be `PascalCase`, values `camelCase`, consts per your convention (pedantic) | rename |
 
@@ -411,8 +411,17 @@ The same code should also cover the other misuse cases: a brace initializer on a
 
 Please disregard my earlier note about checking the subject type before exhaustiveness. It was based on the wrong construct. The "uninitialized read" gap I mentioned also doesn't apply to this file, though it's still a missing code in general.
 
-missing flag is a keyword and ca't be useda s an identifier. it just says expected an expression
+missing flag is a keyword and can't be useda s an identifier. it just says expected an expression
 
 implicit conversion from srray to pointer or vice versa, should be flagged by a warning. not error, but warning. 
 
 
+error[T0002]: `voo` is not a type
+   ╭─▸ /home/cerie/Documents/coral/compiler/test/should work/circular.crl/ioo.crl:4:27
+ 4 │ i32 sub(foo voo, goo::voo koo) {
+   │                           ^~~ convert one side with an explicit cast, or fix the operand types
+   ╰─ docs: coralc --explain T0002 
+
+   for this above, we can clearly see a wrong help message. what do you mean by cast? is it not suppose to be to tell the user to declare it?
+
+   the shit that also flags sizeof if i spell it without the @ should be removed. sizeof should be treated as a user defined function, and be subjected to it's rules. like undeclared and shit. if it is not @sizeof, then, it is not @sizeof. that is the whole point of the @, If i am going to flag users for usign sizeof, then i dould have as well made @sizeof sizeof. 
