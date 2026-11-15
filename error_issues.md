@@ -118,6 +118,8 @@ I went through the grammar for constructs that parse (or are silently accepted) 
 
 Numbers continue from your current table. Renumber freely.
 
+> **Registration status (table-only):** the 107 codes below that were absent from `compiler/coral-diagnostics/code.crl` are now registered there and in `msg.crl` (enum, stable string, severity, format). Enum entries remain `DiagXXXX` scaffolding, with the intended descriptive name in a trailing comment; `--explain` returns a placeholder until the checks are wired. They are **not emitted yet**; deep verification and call-site wiring are still pending. Existing collisions `P0025`, `P0026`, and `T0025` were left unchanged.
+
 ## 1. Recognised but not implemented
 
 The grammar lists many constructs that parse and are then dumped, ignored, or unsupported. These need an honest error or warning instead of a codegen crash.
@@ -325,7 +327,6 @@ T0012 (unused), T0018 (unreachable code) and T0019 (no-op assignment) behave lik
 | **W0040** | `/*` inside a block comment (comments don't nest) | the inner opener is ignored |
 | **W0041** | doc comment `///` is separated from its declaration by a blank line | the doc block attaches to nothing | // skip this, doc comment collection is turned of for the compiler to begin with. only the server worries aboult it.
 | **W0042** | numeric literal has a confusing form (leading zero like `0755`, ambiguous suffix) | use `0o` for octal |
-| **W0043** | naming style: types should be `PascalCase`, values `camelCase`, consts per your convention (pedantic) | rename |
 
 Your `P0023` ("documentation comments belong on declarations") should be a warning when the doc comment is dangling or misplaced. The current error is stronger than it needs to be.
 
@@ -424,4 +425,18 @@ error[T0002]: `voo` is not a type
 
    for this above, we can clearly see a wrong help message. what do you mean by cast? is it not suppose to be to tell the user to declare it?
 
-   the shit that also flags sizeof if i spell it without the @ should be removed. sizeof should be treated as a user defined function, and be subjected to it's rules. like undeclared and shit. if it is not @sizeof, then, it is not @sizeof. that is the whole point of the @, If i am going to flag users for usign sizeof, then i dould have as well made @sizeof sizeof. 
+   the shit that also flags sizeof if i spell it without the @ should be removed. sizeof should be treated as a user defined function, and be subjected to it's rules. like undeclared and shit. if it is not @sizeof, then, it is not @sizeof. that is the whole point of the @, If i am going to flag users for usign sizeof, then i dould have as well made @sizeof sizeof.
+
+## Added code registry (table-only)
+
+These codes are registered in the diagnostic tables; no call site emits them yet.
+
+| Group | Codes | Status |
+|---|---|---|
+| Lexer | `L0010` | registered, not emitted |
+| Parser | `P0027`–`P0029` | registered, not emitted |
+| Semantics | `T0026`–`T0081` | registered, not emitted |
+| Codegen | `G0003` | registered, not emitted |
+| Driver | `D0004`–`D0007` | registered, not emitted |
+| Warnings | `W0001`–`W0042` | registered, not emitted |
+
