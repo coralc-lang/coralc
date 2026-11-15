@@ -7,12 +7,12 @@ error[T0006]: cannot use `.` to reach a field through a pointer
    ╭─▸ src/mu-backend/base.crl:60:27
    │
 12 │     Diag* diags;
-   │     ┬────
+   │     ------------
    │     ╰─ reference: field declared as a pointer here
    ⋮
 60 │         return self.diags.errors > 0;
-   │                          ┬─
-   │                          ╰─ `.` can't see through `Diag*`
+   │                          ^
+   │ `.` can't see through `Diag*`
    │
    ├─ help: dereference with `->`
    │
@@ -29,7 +29,7 @@ tier 2 would be more common than tier one
 error[T0006]: cannot use `.` to reach a field through a pointer
    ╭─▸ src/mu-backend/base.crl:60:27
 12 │     Diag* diags;
-   │     ┬──── declared as a pointer here
+   │     ----------- declared as a pointer here
    ⋮
 60 │         return self.diags.errors > 0;
    │                          ┬─ `.` can't see through `Diag*`
@@ -54,7 +54,7 @@ It costs about 14 lines per error, which is why it's only used when there are fe
 error[T0006]: cannot use `.` through a pointer
    ╭─▸ src/mu-backend/base.crl:60:27
 60 │         return self.diags.errors > 0;
-   │                          ┬─ use `->`
+   │                          ^ use `->`
    ╰─ ref: `diags` declared as `Diag*` at base.crl:12
 ```
 
