@@ -1,0 +1,85 @@
+#!/bin/bash
+# muvm driver test runner: .ir -> muvm_tool (parse + driver pipeline +
+# print) -> reparse fixture check.
+#
+# Checks:
+#   1. the tool exits 0 (driver ran the module without error)
+#   2. the module read back from the dump denotes the same IR as the dump
+#      itself (semantic fixpoint check, see semantic_eq.py)
+#   3. if <case>.gold exists, output must match it byte-for-byte at every
+#      level
+# LEVELS defaults to O0..O3. Error output (.err) goes to TMP, not OUT —
+# OUT only holds the .mir fixtures.
+set -u
+cd "$(dirname "$0")"
+CORALC="${CORALC:-coralc}"
+LEVELS="${LEVELS:-O0 O1 O2 O3}"
+CASES="${CASES:-../wallvm/cases}"
+EXTRA_CASES="${EXTRA_CASES-cases}"
+MODE="${MODE:-func}"
+EXPECTED="${EXPECTED:-expected}"
+OUT="${OUT:-output}"
+TOOLARGS=""
+if [ "$MODE" = "module" ]; then TOOLARGS="--module"; fi
+TMP=/tmp/opencode/muvm
+TIMEOUT="${TIMEOUT:-15}"
+mkdir -p "$TMP" "$OUT"
+
+if [ ! -x ./muvm_tool ] || [ "${REBUILD:-0}" = "1" ]; then
+    echo "building muvm_tool..."
+    "$CORALC" muvm_tool.crl -o muvm_tool || exit 1
+fi
+
+t() { timeout --kill-after=5 "$TIMEOUT" "$@"; }
+
+pass=0
+fail=0
+for caseset in "$CASES" $EXTRA_CASES; do
+    [ -d "$caseset" ] || continue
+for case in "$caseset"/*.ir; do
+    name=$(basename "$case" .ir)
+    for lv in $LEVELS; do
+        echo "TEST $name $lv"
+        t ./muvm_tool $TOOLARGS "$case" "$OUT/${name}_${lv}.mir" "$lv" 2>"$TMP/${name}_${lv}.err"
+        rc=$?
+        if [ "$rc" -ne 0 ]; then
+            echo "FAIL driver $name $lv (exit $rc)"
+            cat "$TMP/${name}_${lv}.err"
+            fail=$((fail+1))
+            continue
+        fi
+        t ./muvm_tool $TOOLARGS "$OUT/${name}_${lv}.mir" "$OUT/${name}_${lv}.mir2" "$lv" 2>"$TMP/${name}_${lv}.err2"
+        rc=$?
+        if [ "$rc" -ne 0 ]; then
+            echo "FAIL reparse $name $lv (exit $rc)"
+            fail=$((fail+1))
+            continue
+        fi
+        if ! python3 semantic_eq.py "$OUT/${name}_${lv}.mir" "$OUT/${name}_${lv}.mir2"; then
+            echo "FAIL fixpoint $name $lv (reparse produced a different module)"
+            fail=$((fail+1))
+            continue
+        fi
+        # Per-level goldens: ${name}_${lv}.gold preferred; fall back to the
+        # case-level ${name}.gold so old fixtures still run.
+        if [ -f "$EXPECTED/${name}_${lv}.gold" ]; then
+            cmp -s "$OUT/${name}_${lv}.mir" "$EXPECTED/${name}_${lv}.gold"
+            if [ "$?" -ne 0 ]; then
+                echo "FAIL golden $name $lv"
+                fail=$((fail+1))
+                continue
+            fi
+        elif [ -f "$EXPECTED/$name.gold" ]; then
+            cmp -s "$OUT/${name}_${lv}.mir" "$EXPECTED/$name.gold"
+            if [ "$?" -ne 0 ]; then
+                echo "FAIL golden $name $lv"
+                fail=$((fail+1))
+                continue
+            fi
+        fi
+        pass=$((pass+1))
+    done
+done
+done
+echo "pass=$pass fail=$fail"
+[ "$fail" -eq 0 ]
