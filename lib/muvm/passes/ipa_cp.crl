@@ -1,0 +1,313 @@
+#[[no_drop_all]]
+// Module-level interprocedural constant propagation for muvm.
+//
+// This ports the *intent* of wallvm's ipa_cp, not its implementation:
+// wallvm's entry point was a stub and its argument propagation looked for
+// stores to argument allocas, which does not match muvm's SSA argument
+// representation. Here the module is the unit of work and constants are
+// applied directly to IrValueKind::Arg uses.
+//
+// What it does:
+//   1. return propagation: if every ret in an internal function returns
+//      the same constant, replace uses of calls to that function with the
+//      constant. The call itself stays (it may have side effects or may
+//      not return); only the result uses change.
+//   2. argument propagation: if every direct call to an internal,
+//      non-address-taken function passes the same constant in a fixed
+//      parameter slot, replace that parameter's uses with the constant.
+//
+// Both steps run to a small fixed point, so a constant that makes a
+// caller return constant is visible to the caller's callers in the next
+// round.
+//
+// Known conservative choices:
+//   - only internal/private linkage is specialized; external linkage can
+//     be interposed or called from outside this module
+//   - address-taken functions are never argument-specialized
+//   - optnone/naked/entry functions are skipped
+//   - literal ConstInt/ConstFloat only; no folded-expression analysis
+//   - no cloning/specialization, so mixed call sites simply stay generic
+//
+// Entry point:
+//   bool muvmPassIpaCpModule(IrModule*, IrContext*)
+
+import muvm::irtypes
+{
+    IrContext, IrFunc, IrModule, IrBlock, IrInst, IrValue, IrValueKind,
+    IrTypeKind, irTypeEqual
+};
+import muvm::irOps { IrOpcode };
+import muvm::irMetadata
+{
+    funcIsOptNone, funcIsNaked, funcIsEntry, funcIsNoReturn, funcLinkage
+};
+import muvm::passes::common { gVerbose };
+import std::mman { alloc, dealloc };
+import std::ios { eprintln };
+
+const u32 IPA_NO_FUNC = 0xFFFFFFFFu;
+
+pub struct IpaCpPass
+{
+    IrContext* ctx;
+    IrModule* modd;
+    bool* addressTaken;
+    u64 propagations;
+
+    static IpaCpPass new(IrContext* ctx, IrModule* modulePtr)
+    {
+        return IpaCpPass {
+            .ctx = ctx,
+            .modd = modulePtr,
+            .addressTaken = null,
+            .propagations = 0
+        };
+    }
+
+    u32 funcIndex(IrFunc* f)
+    {
+        for (u32 i = 0; i < self.modd->nfuncs; i++)
+            if (self.modd->funcs[i] == f) return i;
+        return IPA_NO_FUNC;
+    }
+
+    bool isInternalLinkage(IrFunc* f)
+    {
+        u32 l = funcLinkage(f);
+        return l == 1 || l == 2;
+    }
+
+    bool sameConstant(IrValue* a, IrValue* b)
+    {
+        if (a == b) return true;
+        if (a == null || b == null) return false;
+        if (a->kind != b->kind) return false;
+        if (a->kind != IrValueKind::ConstInt && a->kind != IrValueKind::ConstFloat)
+            return false;
+        if (!irTypeEqual(a->type, b->type)) return false;
+        return a->valData == b->valData;
+    }
+
+    bool scalarConstant(IrValue* v)
+    {
+        if (v == null) return false;
+        return v->kind == IrValueKind::ConstInt || v->kind == IrValueKind::ConstFloat;
+    }
+
+    // A direct call use is operand 0 of a Call. Every other appearance of
+    // a function value (argument, store, bitcast, global initializer, ...)
+    // makes the function address-taken and blocks argument specialization.
+    void computeAddressTaken()
+    {
+        for (u32 i = 0; i < self.modd->nfuncs; i++) self.addressTaken[i] = false;
+        for (u32 fi = 0; fi < self.modd->nfuncs; fi++)
+        {
+            IrFunc* f = self.modd->funcs[fi];
+            if (f == null || f->isExtern) continue;
+            for (u32 bi = 0; bi < f->nblocks; bi++)
+            {
+                IrBlock* bb = f->blocks[bi];
+                for (u32 ii = 0; ii < bb->ninsts; ii++)
+                {
+                    IrInst* inst = bb->insts[ii];
+                    for (u32 oi = 0; oi < inst->nops; oi++)
+                    {
+                        IrValue* op = inst->ops[oi];
+                        if (op == null || op->kind != IrValueKind::Func) continue;
+                        bool direct = inst->opcode == IrOpcode::Call && oi == 0;
+                        if (direct) continue;
+                        u32 ci = self.funcIndex((IrFunc*)op);
+                        if (ci != IPA_NO_FUNC) self.addressTaken[ci] = true;
+                    }
+                }
+            }
+        }
+        for (u32 gi = 0; gi < self.modd->nglobals; gi++)
+        {
+            IrValue* init = self.modd->globals[gi]->initVal;
+            if (init == null || init->kind != IrValueKind::Func) continue;
+            u32 ci = self.funcIndex((IrFunc*)init);
+            if (ci != IPA_NO_FUNC) self.addressTaken[ci] = true;
+        }
+    }
+
+    IrValue* constantReturn(IrFunc* f)
+    {
+        if (f == null || f->isExtern || f->retType == null) return null;
+        if (f->retType->kind == IrTypeKind::Void) return null;
+        if (funcIsNoReturn(f)) return null;
+        IrValue* found = null;
+        bool sawRet = false;
+        for (u32 bi = 0; bi < f->nblocks; bi++)
+        {
+            IrBlock* bb = f->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* ret = bb->insts[ii];
+                if (ret->opcode != IrOpcode::Ret) continue;
+                if (ret->nops != 1 || ret->ops[0] == null) return null;
+                IrValue* v = ret->ops[0];
+                if (!self.scalarConstant(v)) return null;
+                if (!irTypeEqual(v->type, f->retType)) return null;
+                if (!sawRet) { found = v; sawRet = true; }
+                else if (!self.sameConstant(found, v)) return null;
+            }
+        }
+        return sawRet ? found : null;
+    }
+
+    bool propagateReturns(IrFunc* f, IrValue* c)
+    {
+        if (c == null) return false;
+        bool changed = false;
+        for (u32 fi = 0; fi < self.modd->nfuncs; fi++)
+        {
+            IrFunc* caller = self.modd->funcs[fi];
+            if (caller == null || caller->isExtern) continue;
+            for (u32 bi = 0; bi < caller->nblocks; bi++)
+            {
+                IrBlock* bb = caller->blocks[bi];
+                for (u32 ii = 0; ii < bb->ninsts; ii++)
+                {
+                    IrInst* call = bb->insts[ii];
+                    if (call->opcode != IrOpcode::Call || call->nops < 1) continue;
+                    if (call->ops[0] != &f->base) continue;
+                    if (!irTypeEqual(call->base.type, c->type)) continue;
+                    if (call->base.nusers == 0) continue;
+                    call->base.replaceAllUses(c);
+                    changed = true;
+                    self.propagations++;
+                }
+            }
+        }
+        return changed;
+    }
+
+    bool propagateArgs(IrFunc* f)
+    {
+        if (f == null || f->isExtern || f->nblocks == 0 || f->nparams == 0) return false;
+        if (funcIsOptNone(f) || funcIsNaked(f) || funcIsEntry(f)) return false;
+        if (!self.isInternalLinkage(f)) return false;
+        u32 fi = self.funcIndex(f);
+        if (fi == IPA_NO_FUNC || self.addressTaken[fi]) return false;
+        if (f->base.type != null && f->base.type->isVararg) return false;
+
+        u32 np = f->nparams;
+        IrValue** first = alloc<IrValue*>((usize)np);
+        bool* have = alloc<bool>((usize)np);
+        bool* allConst = alloc<bool>((usize)np);
+        for (u32 i = 0; i < np; i++)
+        {
+            first[i] = null;
+            have[i] = false;
+            allConst[i] = true;
+        }
+
+        u32 nCalls = 0;
+        for (u32 ci = 0; ci < self.modd->nfuncs; ci++)
+        {
+            IrFunc* caller = self.modd->funcs[ci];
+            if (caller == null || caller->isExtern) continue;
+            for (u32 bi = 0; bi < caller->nblocks; bi++)
+            {
+                IrBlock* bb = caller->blocks[bi];
+                for (u32 ii = 0; ii < bb->ninsts; ii++)
+                {
+                    IrInst* call = bb->insts[ii];
+                    if (call->opcode != IrOpcode::Call || call->nops < 1) continue;
+                    if (call->ops[0] != &f->base) continue;
+                    nCalls++;
+                    if (call->nops < np + 1)
+                    {
+                        for (u32 ai = 0; ai < np; ai++) allConst[ai] = false;
+                        continue;
+                    }
+                    for (u32 ai = 0; ai < np; ai++)
+                    {
+                        IrValue* arg = call->ops[ai + 1];
+                        if (!self.scalarConstant(arg) ||
+                            !irTypeEqual(arg->type, f->paramTypes[ai]))
+                        {
+                            allConst[ai] = false;
+                            continue;
+                        }
+                        if (!have[ai])
+                        {
+                            first[ai] = arg;
+                            have[ai] = true;
+                        }
+                        else if (!self.sameConstant(first[ai], arg))
+                        {
+                            allConst[ai] = false;
+                        }
+                    }
+                }
+            }
+        }
+
+        bool changed = false;
+        if (nCalls > 0)
+        {
+            for (u32 ai = 0; ai < np; ai++)
+            {
+                if (!allConst[ai] || !have[ai]) continue;
+                IrValue* a = f->args[ai];
+                if (a == null || a->nusers == 0) continue;
+                if (!irTypeEqual(a->type, first[ai]->type)) continue;
+                a->replaceAllUses(first[ai]);
+                changed = true;
+                self.propagations += (u64)a->nusers; // nusers is 0 now; informational only
+                if (gVerbose)
+                    eprintln("ipa_cp: {} param {} -> constant", f->base.name, ai);
+            }
+        }
+
+        dealloc<IrValue*>(first);
+        dealloc<bool>(have);
+        dealloc<bool>(allConst);
+        return changed;
+    }
+
+    bool run()
+    {
+        if (self.modd == null || self.ctx == null || self.modd->nfuncs == 0) return false;
+        self.addressTaken = alloc<bool>((usize)self.modd->nfuncs);
+        self.computeAddressTaken();
+
+        bool sawChange = false;
+        // Fixed point: argument constants can make a ret constant, which
+        // makes a caller's ret constant, and so on.
+        for (u32 round = 0; round < 8; round++)
+        {
+            bool changed = false;
+            for (u32 fi = 0; fi < self.modd->nfuncs; fi++)
+                if (self.propagateArgs(self.modd->funcs[fi])) changed = true;
+            for (u32 fi = 0; fi < self.modd->nfuncs; fi++)
+            {
+                IrFunc* f = self.modd->funcs[fi];
+                if (f == null || f->isExtern) continue;
+                if (funcIsOptNone(f) || funcIsNaked(f) || funcIsEntry(f)) continue;
+                if (!self.isInternalLinkage(f)) continue;
+                IrValue* c = self.constantReturn(f);
+                if (c == null) continue;
+                if (self.propagateReturns(f, c)) changed = true;
+            }
+            if (!changed) break;
+            sawChange = true;
+        }
+
+        if (gVerbose && self.propagations > 0)
+            eprintln("ipa_cp: {} constant propagations", self.propagations);
+
+        dealloc<bool>(self.addressTaken);
+        self.addressTaken = null;
+        return sawChange;
+    }
+}
+
+pub bool muvmPassIpaCpModule(IrModule* modd, IrContext* ctx)
+{
+    if (modd == null || ctx == null || modd->nfuncs == 0) return false;
+    IpaCpPass p = IpaCpPass::new(ctx, modd);
+    return p.run();
+}

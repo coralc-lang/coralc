@@ -1,0 +1,432 @@
+#[[no_drop_all]]
+// Fast x86_64 text codegen for muvm.
+// Simple stack-slot-based code generator:
+// Each virtual register / value gets a dedicated stack slot.
+// Emits standard AT&T syntax x86_64 assembly text.
+
+import muvm::irtypes {
+    IrModule, IrFunc, IrBlock, IrInst, IrValue, IrValueKind,
+    IrType, IrTypeKind, IrContext, IrGlobal, IrStringConst
+};
+import muvm::irOps { IrOpcode, IrICmpPred };
+import std::string { String };
+import std::mman { alloc, dealloc };
+import platform::libc { snprintf };
+import core::cchar { cchar };
+
+struct ValueSlot
+{
+    IrValue* val;
+    i32 offset; // negative offset from %rbp
+}
+
+struct FastX86Context
+{
+    String out;
+    ValueSlot* slots;
+    u32 nslots;
+    u32 capSlots;
+    i32 frameSize;
+    str funcName;
+
+    static FastX86Context new()
+    {
+        return FastX86Context {
+            .out = String::new(),
+            .slots = null,
+            .nslots = 0,
+            .capSlots = 0,
+            .frameSize = 0,
+            .funcName = str::empty()
+        };
+    }
+
+    void destroy()
+    {
+        if (self.slots != null) dealloc<ValueSlot>(self.slots);
+        self.out.free();
+    }
+
+    void emit(str s)
+    {
+        self.out.appendView(s);
+    }
+
+    void emitLine(str s)
+    {
+        self.out.appendView(s);
+        self.out.pushChar('\n');
+    }
+
+    void emitI64(i64 v)
+    {
+        cchar[32] buf;
+        i32 n = snprintf(buf, 32, C"%lld", v);
+        if (n > 0) self.out.appendView(str::fromParts((const u8*)buf, (usize)n));
+    }
+
+    void addSlot(IrValue* v, i32 off)
+    {
+        if (self.nslots >= self.capSlots)
+        {
+            u32 newCap = self.capSlots != 0 ? self.capSlots * 2 : 16;
+            ValueSlot* ns = alloc<ValueSlot>((usize)newCap);
+            for (u32 i = 0; i < self.nslots; i++) ns[i] = self.slots[i];
+            if (self.slots != null) dealloc<ValueSlot>(self.slots);
+            self.slots = ns;
+            self.capSlots = newCap;
+        }
+        self.slots[self.nslots].val = v;
+        self.slots[self.nslots].offset = off;
+        self.nslots++;
+    }
+
+    i32 getSlot(IrValue* v)
+    {
+        for (u32 i = 0; i < self.nslots; i++)
+        {
+            if (self.slots[i].val == v) return self.slots[i].offset;
+        }
+        return 0;
+    }
+}
+
+static str[] SYSV_ARG_REGS_64 = { "rdi", "rsi", "rdx", "rcx", "r8", "r9" };
+static str[] SYSV_ARG_REGS_32 = { "edi", "esi", "edx", "ecx", "r8d", "r9d" };
+
+void emitValueToReg(FastX86Context* ctx, IrValue* v, str reg64)
+{
+    if (v == null)
+    {
+        ctx->emit("    xorq %");
+        ctx->emit(reg64);
+        ctx->emit(", %");
+        ctx->emitLine(reg64);
+        return;
+    }
+
+    if (v->kind == IrValueKind::ConstInt)
+    {
+        ctx->emit("    movabsq $");
+        ctx->emitI64((i64)v->valData);
+        ctx->emit(", %");
+        ctx->emitLine(reg64);
+        return;
+    }
+
+    if (v->kind == IrValueKind::Global || v->kind == IrValueKind::Func)
+    {
+        ctx->emit("    leaq ");
+        ctx->emit(v->name);
+        ctx->emit("(%rip), %");
+        ctx->emitLine(reg64);
+        return;
+    }
+
+    i32 off = ctx->getSlot(v);
+    ctx->emit("    movq ");
+    ctx->emitI64((i64)off);
+    ctx->emit("(%rbp), %");
+    ctx->emitLine(reg64);
+}
+
+void emitRegToSlot(FastX86Context* ctx, IrValue* v, str reg64)
+{
+    i32 off = ctx->getSlot(v);
+    ctx->emit("    movq %");
+    ctx->emit(reg64);
+    ctx->emit(", ");
+    ctx->emitI64((i64)off);
+    ctx->emitLine("(%rbp)");
+}
+
+pub str emitFastX86Func(IrFunc* func, IrContext* ictx)
+{
+    if (func == null || func->isExtern) return "";
+
+    FastX86Context ctx = FastX86Context::new();
+    ctx.funcName = func->base.name;
+
+    // 1. Assign stack slots to args and value-producing instructions
+    i32 curOffset = 0;
+    for (u32 ai = 0; ai < func->nargs; ai++)
+    {
+        curOffset -= 8;
+        ctx.addSlot(func->args[ai], curOffset);
+    }
+
+    for (u32 bi = 0; bi < func->nblocks; bi++)
+    {
+        IrBlock* bb = func->blocks[bi];
+        if (bb == null) continue;
+        for (u32 ii = 0; ii < bb->ninsts; ii++)
+        {
+            IrInst* inst = bb->insts[ii];
+            if (inst == null) continue;
+            // Allocas reserve their own size, or 8 bytes minimum
+            if (inst->opcode == IrOpcode::Alloca)
+            {
+                u32 sz = 8;
+                if (inst->base.type != null && inst->base.type->elem != null)
+                {
+                    sz = (inst->base.type->elem->width + 7) / 8;
+                    if (sz < 8) sz = 8;
+                    sz = (sz + 7) & ~7u;
+                }
+                curOffset -= (i32)sz;
+                ctx.addSlot(&inst->base, curOffset);
+            }
+            else if (inst->base.type != null && inst->base.type->kind != IrTypeKind::Void)
+            {
+                curOffset -= 8;
+                ctx.addSlot(&inst->base, curOffset);
+            }
+        }
+    }
+
+    // Align stack frame to 16 bytes (x86_64 ABI requirement)
+    i32 rawFrame = -curOffset;
+    ctx.frameSize = (rawFrame + 15) & ~15;
+
+    // 2. Function Prologue
+    ctx.emit(".globl ");
+    ctx.emitLine(func->base.name);
+    ctx.emit(".type ");
+    ctx.emit(func->base.name);
+    ctx.emitLine(", @function");
+    ctx.emit(func->base.name);
+    ctx.emitLine(":");
+    ctx.emitLine("    pushq %rbp");
+    ctx.emitLine("    movq %rsp, %rbp");
+    if (ctx.frameSize > 0)
+    {
+        ctx.emit("    subq $");
+        ctx.emitI64((i64)ctx.frameSize);
+        ctx.emitLine(", %rsp");
+    }
+
+    // Save register arguments to their assigned stack slots
+    u32 nArgRegs = 6;
+    for (u32 ai = 0; ai < func->nargs && ai < nArgRegs; ai++)
+    {
+        emitRegToSlot(&ctx, func->args[ai], SYSV_ARG_REGS_64[ai]);
+    }
+
+    // 3. Emit blocks and instructions
+    for (u32 bi = 0; bi < func->nblocks; bi++)
+    {
+        IrBlock* bb = func->blocks[bi];
+        if (bb == null) continue;
+
+        // Block label
+        ctx.emit(".L");
+        ctx.emit(func->base.name);
+        ctx.emit("_");
+        ctx.emit(bb->base.name);
+        ctx.emitLine(":");
+
+        for (u32 ii = 0; ii < bb->ninsts; ii++)
+        {
+            IrInst* inst = bb->insts[ii];
+            if (inst == null) continue;
+
+            switch (inst->opcode)
+            {
+                IrOpcode::Ret => {
+                    if (inst->nops > 0 && inst->ops[0] != null)
+                    {
+                        emitValueToReg(&ctx, inst->ops[0], "rax");
+                    }
+                    ctx.emit("    jmp .L");
+                    ctx.emit(func->base.name);
+                    ctx.emitLine("_epilogue");
+                },
+                IrOpcode::Add => {
+                    emitValueToReg(&ctx, inst->ops[0], "rax");
+                    emitValueToReg(&ctx, inst->ops[1], "rcx");
+                    ctx.emitLine("    addq %rcx, %rax");
+                    emitRegToSlot(&ctx, &inst->base, "rax");
+                },
+                IrOpcode::Sub => {
+                    emitValueToReg(&ctx, inst->ops[0], "rax");
+                    emitValueToReg(&ctx, inst->ops[1], "rcx");
+                    ctx.emitLine("    subq %rcx, %rax");
+                    emitRegToSlot(&ctx, &inst->base, "rax");
+                },
+                IrOpcode::Mul => {
+                    emitValueToReg(&ctx, inst->ops[0], "rax");
+                    emitValueToReg(&ctx, inst->ops[1], "rcx");
+                    ctx.emitLine("    imulq %rcx, %rax");
+                    emitRegToSlot(&ctx, &inst->base, "rax");
+                },
+                IrOpcode::SDiv => {
+                    emitValueToReg(&ctx, inst->ops[0], "rax");
+                    emitValueToReg(&ctx, inst->ops[1], "rcx");
+                    ctx.emitLine("    cqto");
+                    ctx.emitLine("    idivq %rcx");
+                    emitRegToSlot(&ctx, &inst->base, "rax");
+                },
+                IrOpcode::UDiv => {
+                    emitValueToReg(&ctx, inst->ops[0], "rax");
+                    emitValueToReg(&ctx, inst->ops[1], "rcx");
+                    ctx.emitLine("    xorq %rdx, %rdx");
+                    ctx.emitLine("    divq %rcx");
+                    emitRegToSlot(&ctx, &inst->base, "rax");
+                },
+                IrOpcode::SRem => {
+                    emitValueToReg(&ctx, inst->ops[0], "rax");
+                    emitValueToReg(&ctx, inst->ops[1], "rcx");
+                    ctx.emitLine("    cqto");
+                    ctx.emitLine("    idivq %rcx");
+                    emitRegToSlot(&ctx, &inst->base, "rdx");
+                },
+                IrOpcode::URem => {
+                    emitValueToReg(&ctx, inst->ops[0], "rax");
+                    emitValueToReg(&ctx, inst->ops[1], "rcx");
+                    ctx.emitLine("    xorq %rdx, %rdx");
+                    ctx.emitLine("    divq %rcx");
+                    emitRegToSlot(&ctx, &inst->base, "rdx");
+                },
+                IrOpcode::And => {
+                    emitValueToReg(&ctx, inst->ops[0], "rax");
+                    emitValueToReg(&ctx, inst->ops[1], "rcx");
+                    ctx.emitLine("    andq %rcx, %rax");
+                    emitRegToSlot(&ctx, &inst->base, "rax");
+                },
+                IrOpcode::Or => {
+                    emitValueToReg(&ctx, inst->ops[0], "rax");
+                    emitValueToReg(&ctx, inst->ops[1], "rcx");
+                    ctx.emitLine("    orq %rcx, %rax");
+                    emitRegToSlot(&ctx, &inst->base, "rax");
+                },
+                IrOpcode::Xor => {
+                    emitValueToReg(&ctx, inst->ops[0], "rax");
+                    emitValueToReg(&ctx, inst->ops[1], "rcx");
+                    ctx.emitLine("    xorq %rcx, %rax");
+                    emitRegToSlot(&ctx, &inst->base, "rax");
+                },
+                IrOpcode::Shl => {
+                    emitValueToReg(&ctx, inst->ops[0], "rax");
+                    emitValueToReg(&ctx, inst->ops[1], "rcx");
+                    ctx.emitLine("    shlq %cl, %rax");
+                    emitRegToSlot(&ctx, &inst->base, "rax");
+                },
+                IrOpcode::Lshr => {
+                    emitValueToReg(&ctx, inst->ops[0], "rax");
+                    emitValueToReg(&ctx, inst->ops[1], "rcx");
+                    ctx.emitLine("    shrq %cl, %rax");
+                    emitRegToSlot(&ctx, &inst->base, "rax");
+                },
+                IrOpcode::Ashr => {
+                    emitValueToReg(&ctx, inst->ops[0], "rax");
+                    emitValueToReg(&ctx, inst->ops[1], "rcx");
+                    ctx.emitLine("    sarq %cl, %rax");
+                    emitRegToSlot(&ctx, &inst->base, "rax");
+                },
+                IrOpcode::Neg => {
+                    emitValueToReg(&ctx, inst->ops[0], "rax");
+                    ctx.emitLine("    negq %rax");
+                    emitRegToSlot(&ctx, &inst->base, "rax");
+                },
+                IrOpcode::Not => {
+                    emitValueToReg(&ctx, inst->ops[0], "rax");
+                    ctx.emitLine("    notq %rax");
+                    emitRegToSlot(&ctx, &inst->base, "rax");
+                },
+                IrOpcode::Alloca => {
+                    i32 off = ctx.getSlot(&inst->base);
+                    ctx.emit("    leaq ");
+                    ctx.emitI64((i64)off);
+                    ctx.emitLine("(%rbp), %rax");
+                    emitRegToSlot(&ctx, &inst->base, "rax");
+                },
+                IrOpcode::Load => {
+                    emitValueToReg(&ctx, inst->ops[0], "rax");
+                    ctx.emitLine("    movq (%rax), %rcx");
+                    emitRegToSlot(&ctx, &inst->base, "rcx");
+                },
+                IrOpcode::Store => {
+                    emitValueToReg(&ctx, inst->ops[0], "rax"); // val
+                    emitValueToReg(&ctx, inst->ops[1], "rcx"); // ptr
+                    ctx.emitLine("    movq %rax, (%rcx)");
+                },
+                IrOpcode::ICmp => {
+                    emitValueToReg(&ctx, inst->ops[0], "rax");
+                    emitValueToReg(&ctx, inst->ops[1], "rcx");
+                    ctx.emitLine("    cmpq %rcx, %rax");
+                    str setInst = "sete";
+                    switch (inst->icmpPred)
+                    {
+                        IrICmpPred::Eq => { setInst = "sete"; },
+                        IrICmpPred::Ne => { setInst = "setne"; },
+                        IrICmpPred::Slt => { setInst = "setl"; },
+                        IrICmpPred::Sle => { setInst = "setle"; },
+                        IrICmpPred::Sgt => { setInst = "setg"; },
+                        IrICmpPred::Sge => { setInst = "setge"; },
+                        IrICmpPred::Ult => { setInst = "setb"; },
+                        IrICmpPred::Ule => { setInst = "setbe"; },
+                        IrICmpPred::Ugt => { setInst = "seta"; },
+                        IrICmpPred::Uge => { setInst = "setae"; },
+                    }
+                    ctx.emit("    ");
+                    ctx.emit(setInst);
+                    ctx.emitLine(" %al");
+                    ctx.emitLine("    movzbq %al, %rax");
+                    emitRegToSlot(&ctx, &inst->base, "rax");
+                },
+                IrOpcode::Br => {
+                    if (inst->nops > 0 && inst->ops[0] != null)
+                    {
+                        ctx.emit("    jmp .L");
+                        ctx.emit(func->base.name);
+                        ctx.emit("_");
+                        ctx.emitLine(inst->ops[0]->name);
+                    }
+                },
+                IrOpcode::CondBr => {
+                    emitValueToReg(&ctx, inst->ops[0], "rax");
+                    ctx.emitLine("    testq %rax, %rax");
+                    ctx.emit("    jne .L");
+                    ctx.emit(func->base.name);
+                    ctx.emit("_");
+                    ctx.emitLine(inst->ops[1]->name);
+                    ctx.emit("    jmp .L");
+                    ctx.emit(func->base.name);
+                    ctx.emit("_");
+                    ctx.emitLine(inst->ops[2]->name);
+                },
+                IrOpcode::Call => {
+                    // Set up arguments
+                    u32 nArgs = inst->nops > 1 ? inst->nops - 1 : 0;
+                    for (u32 ai = 0; ai < nArgs && ai < 6; ai++)
+                    {
+                        emitValueToReg(&ctx, inst->ops[ai + 1], SYSV_ARG_REGS_64[ai]);
+                    }
+                    if (inst->ops[0] != null)
+                    {
+                        ctx.emit("    call ");
+                        ctx.emitLine(inst->ops[0]->name);
+                    }
+                    if (inst->base.type != null && inst->base.type->kind != IrTypeKind::Void)
+                    {
+                        emitRegToSlot(&ctx, &inst->base, "rax");
+                    }
+                },
+                else => {
+                    // Fallback nop for unhandled ops in minimal fast codegen
+                }
+            }
+        }
+    }
+
+    // 4. Function Epilogue
+    ctx.emit(".L");
+    ctx.emit(func->base.name);
+    ctx.emitLine("_epilogue:");
+    ctx.emitLine("    movq %rbp, %rsp");
+    ctx.emitLine("    popq %rbp");
+    ctx.emitLine("    retq");
+
+    str res = ctx.out.asView();
+    return res;
+}

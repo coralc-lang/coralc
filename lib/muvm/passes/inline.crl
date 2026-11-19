@@ -1,0 +1,661 @@
+#[[no_drop_all]]
+// Module-level bottom-up inliner for muvm.
+//
+// This is a port of the wallvm inliner's *shape*, not its code: the
+// module entry point owns call-graph ordering, while the per-call
+// rewrite is a fresh implementation over muvm's public IR.
+//
+// Improvements over the wallvm pass that this replaces:
+//   - module-level ordering (callees before callers), not per-function
+//     DFS that misses bottom-up composition
+//   - forward references in cloned phis are safe: instruction shells are
+//     allocated first, operands are remapped in a second pass
+//   - switch successors are wired (wallvm forgot them)
+//   - cloned instructions keep flags (nsw/nuw/exact/ffast), inline-asm
+//     text/constraints/clobbers, debug locations and var debug records
+//   - call arity/type/vararg checks happen before any mutation
+//   - new blocks are inserted directly after the call block so the
+//     fallthrough layout says call -> cloned body -> join/continuation
+//   - after splitting a block, phi predecessor names are retargeted from
+//     the old call block to the continuation block
+//
+// Known conservative choices (deliberately not hidden):
+//   - no inlining across an SCC (direct or mutual recursion is skipped)
+//   - no alloca-bearing callees (mem2reg/layout are a later concern)
+//   - no vararg callees and no indirect-call devirtualization
+//   - callee metadata pointers are shared with the clone; metadata is
+//     read-only today, but a future metadata-mutating pass must clone
+//   - the cost model is approximate and per-call, not a global budget
+//
+// Inline policy (Clang-shaped):
+//   - !noinline (or a negative !inlinehint) blocks the callee
+//   - !alwaysinline / !inlinehint = 3 overrides the cost model
+//   - !inlinehint = 1 is a hint: allowed at O1 and given a wider budget
+//   - at O2/O3 the cost model decides without needing a hint
+//   - requireHint = true (the O1 caller) rejects unhinted callees
+//
+// Entry points:
+//   bool muvmPassInlineModule(IrModule*, IrContext*, u32 maxInsts,
+//                             bool requireHint)
+
+import muvm::irtypes
+{
+    IrContext, IrFunc, IrModule, IrBlock, IrInst, IrValue, IrValueKind,
+    IrTypeKind, irTypeEqual
+};
+import muvm::irOps { IrOpcode };
+import muvm::irMetadata
+{
+    funcIsOptNone, funcIsNoInline, funcIsAlwaysInline, funcIsNaked,
+    funcIsEntry, funcIsNoReturn, funcInlineHint
+};
+import muvm::passes::common { gVerbose };
+import std::mman { alloc, dealloc };
+import std::ios { eprintln };
+import std::string { String };
+
+const u32 NO_FUNC = 0xFFFFFFFFu;
+
+str ownStr(str s)
+{
+    if (s.ptr == null) return "";
+    return String::from(s).asView();
+}
+
+pub struct InlinePass
+{
+    IrContext* ctx;
+    IrModule* modd;
+    u32 maxInsts;
+    u32 nextBlockId;
+    u32 nInlined;
+    u32 budget;
+    u32 nfuncs;
+    bool* reachSeen;
+    bool requireHint;
+
+    static InlinePass new(IrContext* ctx, IrModule* modulePtr, u32 maxInsts,
+                          bool requireHint)
+    {
+        return InlinePass {
+            .ctx = ctx,
+            .modd = modulePtr,
+            .maxInsts = maxInsts,
+            .nextBlockId = 0,
+            .nInlined = 0,
+            .budget = 128,
+            .nfuncs = modulePtr->nfuncs,
+            .reachSeen = null,
+            .requireHint = requireHint
+        };
+    }
+
+    u32 funcIndex(IrFunc* f)
+    {
+        for (u32 i = 0; i < self.modd->nfuncs; i++)
+            if (self.modd->funcs[i] == f) return i;
+        return NO_FUNC;
+    }
+
+    u32 countInsts(IrFunc* f)
+    {
+        if (f == null) return 0;
+        u32 n = 0;
+        for (u32 bi = 0; bi < f->nblocks; bi++)
+            n += f->blocks[bi]->ninsts;
+        return n;
+    }
+
+    u32 countCallsTo(IrFunc* callee)
+    {
+        u32 n = 0;
+        for (u32 fi = 0; fi < self.modd->nfuncs; fi++)
+        {
+            IrFunc* f = self.modd->funcs[fi];
+            if (f == null || f->isExtern) continue;
+            for (u32 bi = 0; bi < f->nblocks; bi++)
+            {
+                IrBlock* bb = f->blocks[bi];
+                for (u32 ii = 0; ii < bb->ninsts; ii++)
+                {
+                    IrInst* inst = bb->insts[ii];
+                    if (inst->opcode == IrOpcode::Call && inst->nops >= 1 &&
+                        inst->ops[0] == &callee->base)
+                        n++;
+                }
+            }
+        }
+        return n;
+    }
+
+    bool hasRet(IrFunc* f) { return self.retShapesOK(f); }
+
+    // A ret must consume exactly the function's result shape. This also
+    // rejects "no ret at all" functions; inlining those would leave a
+    // call whose result has no definition on any surviving path.
+    bool retShapesOK(IrFunc* f)
+    {
+        bool seenRet = false;
+        bool wantsVal = f->retType != null && f->retType->kind != IrTypeKind::Void;
+        for (u32 bi = 0; bi < f->nblocks; bi++)
+        {
+            IrBlock* bb = f->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst->opcode != IrOpcode::Ret) continue;
+                seenRet = true;
+                if (wantsVal)
+                {
+                    if (inst->nops != 1 || inst->ops[0] == null) return false;
+                }
+                else
+                {
+                    if (inst->nops != 0) return false;
+                }
+            }
+        }
+        return seenRet;
+    }
+
+    bool hasUnsupportedInst(IrFunc* f)
+    {
+        for (u32 bi = 0; bi < f->nblocks; bi++)
+        {
+            IrBlock* bb = f->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrOpcode op = bb->insts[ii]->opcode;
+                switch (op)
+                {
+                    IrOpcode::Alloca |
+                    IrOpcode::LandingPad => { return true; },
+                    else => { }
+                }
+            }
+        }
+        return false;
+    }
+
+    bool reaches(IrFunc* from, IrFunc* target)
+    {
+        u32 fi = self.funcIndex(from);
+        if (fi == NO_FUNC || self.reachSeen[fi]) return false;
+        self.reachSeen[fi] = true;
+        if (from == target) return true;
+        for (u32 bi = 0; bi < from->nblocks; bi++)
+        {
+            IrBlock* bb = from->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst->opcode != IrOpcode::Call || inst->nops < 1) continue;
+                IrValue* cv = inst->ops[0];
+                if (cv == null || cv->kind != IrValueKind::Func) continue;
+                if (self.reaches((IrFunc*)cv, target)) return true;
+            }
+        }
+        return false;
+    }
+
+    bool callGraphReaches(IrFunc* from, IrFunc* target)
+    {
+        if (self.reachSeen == null) return true;
+        for (u32 i = 0; i < self.nfuncs; i++) self.reachSeen[i] = false;
+        return self.reaches(from, target);
+    }
+
+    // A callee that participates in any cycle is left alone. Inlining a
+    // recursive body into a caller is legal, but it duplicates a function
+    // that cannot itself be bottom-up optimized, and the wallvm inliner's
+    // caller-only recursion test missed mutual cycles.
+    bool calleeIsRecursive(IrFunc* callee)
+    {
+        for (u32 bi = 0; bi < callee->nblocks; bi++)
+        {
+            IrBlock* bb = callee->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst->opcode != IrOpcode::Call || inst->nops < 1) continue;
+                IrValue* cv = inst->ops[0];
+                if (cv == null || cv->kind != IrValueKind::Func) continue;
+                if ((IrFunc*)cv == callee) return true;
+                if (self.callGraphReaches((IrFunc*)cv, callee)) return true;
+            }
+        }
+        return false;
+    }
+
+    bool eligible(IrFunc* caller, IrFunc* callee, IrInst* call)
+    {
+        if (caller == null || callee == null || call == null) return false;
+        if (callee == caller || callee->isExtern || callee->nblocks == 0) return false;
+        if (callee->retType == null || call->base.type == null) return false;
+        if (!irTypeEqual(callee->retType, call->base.type)) return false;
+        if (callee->base.type == null || callee->base.type->isVararg) return false;
+        if (call->nops != callee->nparams + 1) return false;
+        if (funcIsOptNone(callee) || funcIsNaked(callee) || funcIsEntry(callee)) return false;
+        if (funcIsNoReturn(callee)) return false;
+
+        i64 hint = funcInlineHint(callee);
+        bool always = funcIsAlwaysInline(callee) || hint == 3;
+        bool hinted = always || hint == 1;
+        if (funcIsNoInline(callee) && !always) return false;
+        if (hint < 0 && !always) return false;
+        if (self.requireHint && !hinted) return false;
+
+        if (self.hasUnsupportedInst(callee)) return false;
+        if (!self.hasRet(callee)) return false;
+        if (self.calleeIsRecursive(callee)) return false;
+        if (self.callGraphReaches(callee, caller)) return false;
+
+        if (always) return true;
+        u32 limit = hinted ? self.maxInsts * 2 : self.maxInsts;
+        u32 cost = self.countInsts(callee);
+        if (cost > limit) return false;
+        if (callee->nblocks > (hinted ? 12 : 8)) return false;
+        if (!hinted && self.countCallsTo(callee) > 1 && cost > limit / 2) return false;
+        return true;
+    }
+
+    IrBlock* newBlock(IrFunc* f, str prefix)
+    {
+        // Names only need to be unique inside the caller. Probe rather
+        // than trusting a module-wide counter, because parsed input may
+        // already contain an "__inl" label.
+        while (true)
+        {
+            u32 id = self.nextBlockId++;
+            u8[96] buf;
+            usize n = 0;
+            for (usize i = 0; i < prefix.len && n < 72; i++) buf[n++] = prefix.ptr[i];
+            buf[n++] = 46; // '.'
+            u8[10] digits;
+            u32 nd = 0;
+            if (id == 0) digits[nd++] = 48;
+            else
+            {
+                u32 v = id;
+                while (v > 0) { digits[nd++] = (u8)(48 + (v % 10)); v /= 10; }
+            }
+            while (nd > 0) { nd--; buf[n++] = digits[nd]; }
+            str name = str::fromParts((const u8*)buf, n);
+            bool exists = false;
+            for (u32 bi = 0; bi < f->nblocks; bi++)
+                if (f->blocks[bi]->base.name.equals(name)) { exists = true; break; }
+            if (exists) continue;
+            return self.ctx->createBlock(name);
+        }
+        return null;
+    }
+
+    void insertBlockAt(IrFunc* f, IrBlock* bb, u32 idx)
+    {
+        if (f->nblocks >= f->capBlocks)
+        {
+            u32 newCap = f->capBlocks ? f->capBlocks * 2 : 8;
+            IrBlock** nb = alloc<IrBlock*>((usize)newCap);
+            for (u32 i = 0; i < f->nblocks; i++) nb[i] = f->blocks[i];
+            if (f->blocks != null) dealloc<IrBlock*>(f->blocks);
+            f->blocks = nb;
+            f->capBlocks = newCap;
+        }
+        if (idx > f->nblocks) idx = f->nblocks;
+        for (u32 j = f->nblocks; j > idx; j--) f->blocks[j] = f->blocks[j - 1];
+        f->blocks[idx] = bb;
+        bb->parent = f;
+        f->nblocks++;
+    }
+
+    void detachSuccs(IrBlock* bb)
+    {
+        for (u32 sj = 0; sj < bb->nsuccs; sj++)
+        {
+            IrBlock* s = bb->succs[sj];
+            if (s != null) s->removePred(bb);
+        }
+        bb->nsuccs = 0;
+    }
+
+    void wireTerminator(IrBlock* bb)
+    {
+        if (bb == null || bb->ninsts == 0) return;
+        IrInst* t = bb->insts[bb->ninsts - 1];
+        switch (t->opcode)
+        {
+            IrOpcode::Br => {
+                if (t->nops >= 1 && t->ops[0] != null && t->ops[0]->kind == IrValueKind::Block)
+                    bb->addSucc((IrBlock*)t->ops[0]);
+            },
+            IrOpcode::CondBr => {
+                if (t->nops >= 3)
+                {
+                    if (t->ops[1] != null) bb->addSucc((IrBlock*)t->ops[1]);
+                    if (t->ops[2] != null) bb->addSucc((IrBlock*)t->ops[2]);
+                }
+            },
+            IrOpcode::Switch => {
+                if (t->nops >= 2 && t->ops[1] != null)
+                    bb->addSucc((IrBlock*)t->ops[1]);
+                for (u32 j = 2; j + 1 < t->nops; j += 2)
+                    if (t->ops[j + 1] != null)
+                        bb->addSucc((IrBlock*)t->ops[j + 1]);
+            },
+            else => { }
+        }
+    }
+
+    void renamePhiPred(IrBlock* bb, IrBlock* oldPred, IrBlock* newPred)
+    {
+        if (bb == null || oldPred == null || newPred == null) return;
+        for (u32 ii = 0; ii < bb->ninsts; ii++)
+        {
+            IrInst* phi = bb->insts[ii];
+            if (phi->opcode != IrOpcode::Phi) continue;
+            for (u32 j = 1; j < phi->nops; j += 2)
+            {
+                if (phi->ops[j] != &oldPred->base) continue;
+                phi->ops[j]->removeUser(phi);
+                phi->ops[j] = &newPred->base;
+                (&newPred->base)->addUser(phi);
+            }
+        }
+    }
+
+    IrValue* mapValue(IrValue* old, IrValue** vmap, u32 vcap)
+    {
+        if (old == null) return null;
+        if (old->kind == IrValueKind::Inst ||
+            old->kind == IrValueKind::Block ||
+            old->kind == IrValueKind::Arg)
+        {
+            u32 id = old->id;
+            if (id < vcap && vmap[id] != null) return vmap[id];
+        }
+        return old;
+    }
+
+    void cloneBlockInsts(IrFunc* caller, IrFunc* callee, IrBlock** newBlocks,
+                         IrValue** vmap, u32 vcap)
+    {
+        // Pass 1: allocate shells and register the value map. No operand
+        // is resolved yet, so phis may legally name a later definition.
+        for (u32 bi = 0; bi < callee->nblocks; bi++)
+        {
+            IrBlock* ob = callee->blocks[bi];
+            IrBlock* nb = newBlocks[bi];
+            for (u32 ii = 0; ii < ob->ninsts; ii++)
+            {
+                IrInst* old = ob->insts[ii];
+                IrInst* ni = self.ctx->createInst(old->opcode, old->base.type, null,
+                                                  old->nops, (u64)old->icmpPred,
+                                                  (u64)old->fcmpPred);
+                ni->flags = old->flags;
+                ni->icmpPred = old->icmpPred;
+                ni->fcmpPred = old->fcmpPred;
+                ni->asmNumSideEffects = old->asmNumSideEffects;
+                if (!old->asmString.isEmpty()) ni->asmString = ownStr(old->asmString);
+                if (!old->asmConstraints.isEmpty()) ni->asmConstraints = ownStr(old->asmConstraints);
+                if (!old->asmClobbers.isEmpty()) ni->asmClobbers = ownStr(old->asmClobbers);
+                if (!old->debugLoc.file.isEmpty())
+                    ni->setDebugLoc(old->debugLoc.file, old->debugLoc.line, old->debugLoc.col);
+                for (u32 vi = 0; vi < old->nvarDbg; vi++)
+                    ni->addVarDebug(old->varDbg[vi].varName, old->varDbg[vi].varType,
+                                    old->varDbg[vi].line, old->varDbg[vi].col,
+                                    old->varDbg[vi].argIndex);
+                // Shared read-only metadata; see the header's known issues.
+                ni->metadata = old->metadata;
+                nb->addInst(ni);
+                vmap[old->base.id] = &ni->base;
+            }
+        }
+
+        // Pass 2: remap operands and register use edges.
+        for (u32 bi = 0; bi < callee->nblocks; bi++)
+        {
+            IrBlock* ob = callee->blocks[bi];
+            for (u32 ii = 0; ii < ob->ninsts; ii++)
+            {
+                IrInst* old = ob->insts[ii];
+                IrInst* ni = (IrInst*)vmap[old->base.id];
+                for (u32 oi = 0; oi < old->nops; oi++)
+                {
+                    IrValue* nv = self.mapValue(old->ops[oi], vmap, vcap);
+                    ni->ops[oi] = nv;
+                    if (nv != null) nv->addUser(ni);
+                }
+            }
+        }
+    }
+
+    bool inlineCall(IrFunc* caller, IrBlock* cb, IrInst* call, IrFunc* callee)
+    {
+        // Locate the call inside its block. If the block changed under us,
+        // refuse rather than guessing.
+        u32 callIdx = NO_FUNC;
+        for (u32 i = 0; i < cb->ninsts; i++)
+            if (cb->insts[i] == call) { callIdx = i; break; }
+        if (callIdx == NO_FUNC) return false;
+
+        u32 nrets = 0;
+        for (u32 bi = 0; bi < callee->nblocks; bi++)
+            for (u32 ii = 0; ii < callee->blocks[bi]->ninsts; ii++)
+                if (callee->blocks[bi]->insts[ii]->opcode == IrOpcode::Ret) nrets++;
+        if (nrets == 0) return false;
+        bool wantsVal = call->base.type != null && call->base.type->kind != IrTypeKind::Void;
+        bool needsJoin = wantsVal && nrets > 1;
+
+        IrBlock* cont = self.newBlock(caller, "__inl.cont");
+        IrBlock* join = needsJoin ? self.newBlock(caller, "__inl.join") : null;
+        IrBlock** newBlocks = alloc<IrBlock*>((usize)callee->nblocks);
+        for (u32 bi = 0; bi < callee->nblocks; bi++)
+            newBlocks[bi] = self.newBlock(caller, "__inl.body");
+
+        // Layout: call block, cloned body, join (if any), continuation,
+        // then whatever used to follow the call block. The fallthrough
+        // chain is therefore call -> body -> join/cont -> old tail.
+        u32 callBlockIdx = 0;
+        for (u32 i = 0; i < caller->nblocks; i++)
+            if (caller->blocks[i] == cb) { callBlockIdx = i; break; }
+        u32 at = callBlockIdx + 1;
+        for (u32 bi = 0; bi < callee->nblocks; bi++)
+            self.insertBlockAt(caller, newBlocks[bi], at + bi);
+        at += callee->nblocks;
+        if (needsJoin) { self.insertBlockAt(caller, join, at); at++; }
+        self.insertBlockAt(caller, cont, at);
+
+        // Split the call block. The old terminator and everything after
+        // the call move to cont; cb will get a br to the cloned entry.
+        self.detachSuccs(cb);
+        while (cb->ninsts > callIdx + 1)
+        {
+            IrInst* tail = cb->insts[callIdx + 1];
+            tail->detach();
+            cont->addInst(tail);
+        }
+        self.wireTerminator(cont);
+        for (u32 sj = 0; sj < cont->nsuccs; sj++)
+            self.renamePhiPred(cont->succs[sj], cb, cont);
+
+        u32 vcap = self.ctx->nextValueId() + 1;
+        IrValue** vmap = alloc<IrValue*>((usize)vcap);
+        for (u32 i = 0; i < vcap; i++) vmap[i] = null;
+
+        u32 nargs = call->nops > 0 ? call->nops - 1 : 0;
+        for (u32 ai = 0; ai < callee->nparams && ai < nargs; ai++)
+            vmap[callee->args[ai]->id] = call->ops[ai + 1];
+        for (u32 bi = 0; bi < callee->nblocks; bi++)
+            vmap[callee->blocks[bi]->base.id] = &newBlocks[bi]->base;
+
+        self.cloneBlockInsts(caller, callee, newBlocks, vmap, vcap);
+        for (u32 bi = 0; bi < callee->nblocks; bi++)
+            self.wireTerminator(newBlocks[bi]);
+
+        IrBlock* retTarget = needsJoin ? join : cont;
+        IrValue* result = null;
+        IrValue** retVals = alloc<IrValue*>((usize)(nrets > 0u ? nrets : 1u));
+        IrBlock** retBlocks = alloc<IrBlock*>((usize)(nrets > 0u ? nrets : 1u));
+        u32 nretVals = 0;
+        for (u32 bi = 0; bi < callee->nblocks; bi++)
+        {
+            IrBlock* nb = newBlocks[bi];
+            if (nb->ninsts == 0) continue;
+            IrInst* ret = nb->insts[nb->ninsts - 1];
+            if (ret->opcode != IrOpcode::Ret) continue;
+            IrValue* rv = ret->nops > 0 ? ret->ops[0] : null;
+            ret->erase();
+            IrValue** brOps = alloc<IrValue*>((usize)1);
+            brOps[0] = &retTarget->base;
+            IrInst* br = self.ctx->createInst(IrOpcode::Br, self.ctx->tyVoid(), brOps, 1, 0, 0);
+            dealloc<IrValue*>(brOps);
+            nb->addInst(br);
+            br->ops[0]->addUser(br);
+            nb->addSucc(retTarget);
+            if (rv != null)
+            {
+                retVals[nretVals] = rv;
+                retBlocks[nretVals] = nb;
+                nretVals++;
+            }
+        }
+
+        if (needsJoin)
+        {
+            u32 nops = nretVals * 2;
+            IrValue** phiOps = alloc<IrValue*>((usize)(nops > 0u ? nops : 1u));
+            IrInst* phi = self.ctx->createInst(IrOpcode::Phi, call->base.type,
+                                               phiOps, nops, 0, 0);
+            dealloc<IrValue*>(phiOps);
+            join->addInst(phi);
+            for (u32 i = 0; i < nretVals; i++)
+            {
+                phi->ops[i * 2] = retVals[i];
+                phi->ops[i * 2 + 1] = &retBlocks[i]->base;
+                retVals[i]->addUser(phi);
+                (&retBlocks[i]->base)->addUser(phi);
+            }
+            IrValue** brOps = alloc<IrValue*>((usize)1);
+            brOps[0] = &cont->base;
+            IrInst* br = self.ctx->createInst(IrOpcode::Br, self.ctx->tyVoid(), brOps, 1, 0, 0);
+            dealloc<IrValue*>(brOps);
+            join->addInst(br);
+            br->ops[0]->addUser(br);
+            join->addSucc(cont);
+            result = &phi->base;
+        }
+        else if (wantsVal && nretVals == 1)
+        {
+            result = retVals[0];
+        }
+
+        if (result != null) call->base.replaceAllUses(result);
+
+        call->detach();
+        call->erase();
+
+        IrValue** brOps = alloc<IrValue*>((usize)1);
+        brOps[0] = &newBlocks[0]->base;
+        IrInst* br = self.ctx->createInst(IrOpcode::Br, self.ctx->tyVoid(), brOps, 1, 0, 0);
+        dealloc<IrValue*>(brOps);
+        cb->addInst(br);
+        br->ops[0]->addUser(br);
+        cb->addSucc(newBlocks[0]);
+
+        self.nInlined++;
+        if (gVerbose)
+            eprintln("inline: {} -> {} at call {}", callee->base.name, caller->base.name, call->base.id);
+
+        dealloc<IrBlock*>(newBlocks);
+        dealloc<IrValue*>(retVals);
+        dealloc<IrBlock*>(retBlocks);
+        dealloc<IrValue*>(vmap);
+        return true;
+    }
+
+    void dfsOrder(u32 idx, bool* seen, u32* order, u32* norder)
+    {
+        if (seen[idx]) return;
+        seen[idx] = true;
+        IrFunc* f = self.modd->funcs[idx];
+        if (f != null && !f->isExtern)
+        {
+            for (u32 bi = 0; bi < f->nblocks; bi++)
+            {
+                IrBlock* bb = f->blocks[bi];
+                for (u32 ii = 0; ii < bb->ninsts; ii++)
+                {
+                    IrInst* inst = bb->insts[ii];
+                    if (inst->opcode != IrOpcode::Call || inst->nops < 1) continue;
+                    IrValue* cv = inst->ops[0];
+                    if (cv == null || cv->kind != IrValueKind::Func) continue;
+                    u32 ci = self.funcIndex((IrFunc*)cv);
+                    if (ci != NO_FUNC && !seen[ci]) self.dfsOrder(ci, seen, order, norder);
+                }
+            }
+        }
+        order[(*norder)++] = idx;
+    }
+
+    bool run()
+    {
+        if (self.modd == null || self.ctx == null || self.modd->nfuncs == 0) return false;
+        self.nfuncs = self.modd->nfuncs;
+        self.reachSeen = alloc<bool>((usize)self.nfuncs);
+        bool* seen = alloc<bool>((usize)self.nfuncs);
+        u32* order = alloc<u32>((usize)self.nfuncs);
+        for (u32 i = 0; i < self.nfuncs; i++) { seen[i] = false; self.reachSeen[i] = false; }
+        u32 norder = 0;
+        for (u32 i = 0; i < self.nfuncs; i++)
+            if (!seen[i]) self.dfsOrder(i, seen, order, &norder);
+
+        bool changed = false;
+        for (u32 oi = 0; oi < norder && self.nInlined < self.budget; oi++)
+        {
+            u32 fi = order[oi];
+            IrFunc* f = self.modd->funcs[fi];
+            if (f == null || f->isExtern || f->nblocks == 0) continue;
+            if (funcIsOptNone(f) || funcIsNaked(f)) continue;
+
+            bool progress = true;
+            while (progress && self.nInlined < self.budget)
+            {
+                progress = false;
+                u32 nb = f->nblocks;
+                for (u32 bi = 0; bi < nb; bi++)
+                {
+                    IrBlock* bb = f->blocks[bi];
+                    u32 ni = bb->ninsts;
+                    for (u32 ii = 0; ii < ni; ii++)
+                    {
+                        IrInst* inst = bb->insts[ii];
+                        if (inst->opcode != IrOpcode::Call || inst->nops < 1) continue;
+                        IrValue* cv = inst->ops[0];
+                        if (cv == null || cv->kind != IrValueKind::Func) continue;
+                        IrFunc* callee = (IrFunc*)cv;
+                        if (!self.eligible(f, callee, inst)) continue;
+                        if (!self.inlineCall(f, bb, inst, callee)) continue;
+                        changed = true;
+                        progress = true;
+                        break;
+                    }
+                    if (progress) break;
+                }
+            }
+        }
+
+        dealloc<bool>(seen);
+        dealloc<u32>(order);
+        dealloc<bool>(self.reachSeen);
+        self.reachSeen = null;
+        return changed;
+    }
+}
+
+pub bool muvmPassInlineModule(IrModule* modd, IrContext* ctx, u32 maxInsts,
+                              bool requireHint)
+{
+    if (modd == null || ctx == null || modd->nfuncs == 0) return false;
+    InlinePass p = InlinePass::new(ctx, modd, maxInsts, requireHint);
+    return p.run();
+}

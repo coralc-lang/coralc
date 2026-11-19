@@ -1,0 +1,620 @@
+#[[no_drop_all]]
+// microopt — optional pattern rewrites deliberately kept out of the O1
+// fold pass. Runs only in the O2/O3 pipeline.
+//
+// Patterns:
+//   - rotate recognition: (x << k) | (x >> (n-k)) -> rotl/rotr
+//   - byte-concat loads: shift/or chains of i8 loads -> one i16/i32/i64
+//     load, plus bswap for the big-endian byte order
+//   - division/remainder by non-power-of-two constants -> mulhi/smulhi
+//     magic sequences (unsigned and signed, widths <= 32)
+//
+// The byte-concat rewrite assumes a little-endian target. Alignment is
+// not a concern (muvm loads are unaligned-safe).
+//
+// O1 output for these patterns must stay unchanged; only O2/O3 schedules
+// this pass.
+
+import muvm::passes::common { gVerbose };
+import muvm::irOps { IrOpcode };
+import muvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind, IrType, IrTypeKind };
+import muvm::irOps { irOpcodeStr };
+import std::ios { eprintln };
+import std::mman { alloc, dealloc };
+
+struct MagicU
+{
+    u64 m;
+    u32 s;
+    bool add;
+    bool valid;
+}
+
+struct ByteLeaf
+{
+    IrInst* load;
+    u32 off;
+    u32 shift;
+}
+
+pub struct MicroOptPass
+{
+    IrContext* ctx;
+    IrInst** work;
+    u32 nwork;
+    u32 capWork;
+    IrInst** dead;
+    u32 ndead;
+    u32 capDead;
+    u64 nFolds;
+
+    static MicroOptPass new(IrContext* ctx)
+    {
+        return MicroOptPass {
+            .ctx = ctx,
+            .work = null,
+            .nwork = 0,
+            .capWork = 0,
+            .dead = null,
+            .ndead = 0,
+            .capDead = 0,
+            .nFolds = 0
+        };
+    }
+
+    void deinit()
+    {
+        if (self.work != null) dealloc<IrInst*>(self.work);
+        self.work = null;
+        self.nwork = 0;
+        self.capWork = 0;
+        if (self.dead != null) dealloc<IrInst*>(self.dead);
+        self.dead = null;
+        self.ndead = 0;
+        self.capDead = 0;
+    }
+
+    void push(IrInst* inst)
+    {
+        if (inst == null) return;
+        if (self.nwork >= self.capWork)
+        {
+            u32 nc = self.capWork ? self.capWork * 2 : 32;
+            IrInst** nw = alloc<IrInst*>((usize)nc);
+            for (u32 i = 0; i < self.nwork; i++) nw[i] = self.work[i];
+            if (self.work != null) dealloc<IrInst*>(self.work);
+            self.work = nw;
+            self.capWork = nc;
+        }
+        self.work[self.nwork++] = inst;
+    }
+
+    void markDead(IrInst* inst)
+    {
+        if (self.ndead >= self.capDead)
+        {
+            u32 nc = self.capDead ? self.capDead * 2 : 16;
+            IrInst** nd = alloc<IrInst*>((usize)nc);
+            for (u32 i = 0; i < self.ndead; i++) nd[i] = self.dead[i];
+            if (self.dead != null) dealloc<IrInst*>(self.dead);
+            self.dead = nd;
+            self.capDead = nc;
+        }
+        self.dead[self.ndead++] = inst;
+    }
+
+    bool run(IrFunc* func)
+    {
+        if (func == null) return false;
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        
+        {
+            IrBlock* bb = func->blocks[bi];
+            if (bb == null) continue;
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+                self.push(bb->insts[ii]);
+        }
+        while (self.nwork > 0)
+        {
+            IrInst* inst = self.work[--self.nwork];
+            if (inst->parent == null) continue;
+            IrValue* replacement = self.tryFold(inst);
+            if (replacement == null) continue;
+            if (gVerbose) eprintln("microopt: inst id={} op={} -> const/peer {}", inst->base.id, irOpcodeStr(inst->opcode), replacement != null ? replacement->id : 0);
+            self.nFolds++;
+            // Capture the users before RAU (RAU drains the list),
+            // re-enqueue them after rewiring so they refold.
+            u32 nu = inst->base.nusers;
+            IrInst** users = alloc<IrInst*>((usize)(nu ? nu : 1));
+            for (u32 i = 0; i < nu; i++) users[i] = inst->base.users[i];
+            inst->base.replaceAllUses(replacement);
+            for (u32 i = 0; i < nu; i++) self.push(users[i]);
+            dealloc<IrInst*>(users);
+            inst->detach();
+            self.markDead(inst);
+        }
+        // Deferred teardown: the worklist held inst pointers above.
+        for (u32 i = 0; i < self.ndead; i++)
+            self.dead[i]->erase();
+        return self.nFolds > 0;
+    }
+
+    // ------------------------------------------------------------------
+    bool isConstInt(IrValue* v)
+    {
+        return v != null && v->kind == IrValueKind::ConstInt;
+    }
+
+    u32 typeWidth(IrType* t)
+    {
+        if (t == null) return 64;
+        return t->width > 0 ? t->width : 64;
+    }
+
+    u64 maskFor(u32 w)
+    {
+        if (w >= 64) return ~(u64)0;
+        return ((u64)1 << (u64)w) - 1;
+    }
+
+    IrValue* iconst(IrType* ty, u64 v)
+    {
+        return self.ctx->constInt(ty, v);
+    }
+
+    u32 widthOf(IrInst* inst)
+    {
+        return self.typeWidth(inst->base.type);
+    }
+
+    bool isIntType(IrType* t)
+    {
+        return t != null && t->kind == IrTypeKind::Int;
+    }
+
+    // --- instruction construction -------------------------------------
+    IrInst* newUn(IrOpcode op, IrType* ty, IrValue* a, IrInst* anchor)
+    {
+        IrValue** ops = alloc<IrValue*>((usize)1);
+        ops[0] = a;
+        IrInst* ni = self.ctx->createInst(op, ty, ops, 1, 0, 0);
+        dealloc<IrValue*>(ops);
+        if (a != null) a->addUser(ni);
+        anchor->parent->insertBefore(ni, anchor);
+        self.copyLoc(anchor, ni);
+        return ni;
+    }
+
+    IrInst* newBin(IrOpcode op, IrType* ty, IrValue* a, IrValue* b, IrInst* anchor)
+    {
+        IrValue** ops = alloc<IrValue*>((usize)2);
+        ops[0] = a;
+        ops[1] = b;
+        IrInst* ni = self.ctx->createInst(op, ty, ops, 2, 0, 0);
+        dealloc<IrValue*>(ops);
+        if (a != null) a->addUser(ni);
+        if (b != null) b->addUser(ni);
+        anchor->parent->insertBefore(ni, anchor);
+        self.copyLoc(anchor, ni);
+        return ni;
+    }
+
+    void copyLoc(IrInst* from, IrInst* to)
+    {
+        if (from == null || to == null) return;
+        if (!from->debugLoc.file.isEmpty())
+            to->setDebugLoc(from->debugLoc.file, from->debugLoc.line, from->debugLoc.col);
+    }
+    // --- rotate recognition -------------------------------------------
+    IrInst* asShift(IrValue* v)
+    {
+        if (v == null || v->kind != IrValueKind::Inst) return null;
+        IrInst* i = (IrInst*)v;
+        if (i->opcode != IrOpcode::Shl && i->opcode != IrOpcode::Lshr) return null;
+        if (i->nops != 2 || !self.isConstInt(i->ops[1])) return null;
+        return i;
+    }
+
+    IrValue* tryRotate(IrInst* inst)
+    {
+        if (inst->nops != 2 || !self.isIntType(inst->base.type)) return null;
+        if (inst->base.nusers == 0) return null;
+        u32 n = self.widthOf(inst);
+        if (n < 8) return null;
+        IrInst* a = self.asShift(inst->ops[0]);
+        IrInst* b = self.asShift(inst->ops[1]);
+        if (a == null || b == null) return null;
+        if (a->base.type != inst->base.type || b->base.type != inst->base.type) return null;
+        if (a->ops[0] != b->ops[0]) return null;
+        u64 mask = self.maskFor(n);
+        u64 ka = a->ops[1]->valData & mask;
+        u64 kb = b->ops[1]->valData & mask;
+        if (ka == 0 || kb == 0 || ka >= (u64)n || kb >= (u64)n) return null;
+        if (ka + kb != (u64)n) return null;
+        IrOpcode rop;
+        u64 amt;
+        if (a->opcode == IrOpcode::Shl && b->opcode == IrOpcode::Lshr)
+        {
+            rop = IrOpcode::Rotl;
+            amt = ka;
+        }
+        else if (a->opcode == IrOpcode::Lshr && b->opcode == IrOpcode::Shl)
+        {
+            rop = IrOpcode::Rotr;
+            amt = kb;
+        }
+        else return null;
+        return &self.newBin(rop, inst->base.type, a->ops[0],
+                            self.iconst(inst->base.type, amt), inst)->base;
+    }
+
+    // --- byte-concat load recognition ---------------------------------
+    bool isMemWriter(IrOpcode op)
+    {
+        switch (op)
+        {
+            IrOpcode::Store | IrOpcode::AtomicStore |
+            IrOpcode::AtomicRmw | IrOpcode::AtomicCmpXchg |
+            IrOpcode::Fence | IrOpcode::Call | IrOpcode::InlineAsm |
+            IrOpcode::LandingPad | IrOpcode::GcWriteBarrier |
+            IrOpcode::GcSafepoint => { return true; },
+            else => { return false; }
+        }
+    }
+
+    // Stride of one GEP index on `base`, in bytes. Only byte-strided GEPs
+    // participate: that covers ptr/i8*, array i8, and the usual
+    // gep %p, k / gep %p, 0, k shapes.
+    u32 gepStride(IrValue* base)
+    {
+        if (base == null || base->type == null) return 0;
+        IrType* t = base->type;
+        if (t->kind == IrTypeKind::Ptr)
+        {
+            IrType* e = t->elem;
+            if (e == null) return 1;
+            if (e->kind == IrTypeKind::Array || e->kind == IrTypeKind::Vector)
+                return self.ctx->irTypeSizeOf(e->elem);
+            return self.ctx->irTypeSizeOf(e);
+        }
+        if (t->kind == IrTypeKind::Array || t->kind == IrTypeKind::Vector)
+            return self.ctx->irTypeSizeOf(t->elem);
+        return 0;
+    }
+
+    bool gepByteOffset(IrValue* p, IrValue** base, u64* off)
+    {
+        if (p == null || p->kind != IrValueKind::Inst) return false;
+        IrInst* g = (IrInst*)p;
+        if (g->opcode != IrOpcode::Gep || g->nops < 2) return false;
+        IrValue* b = g->ops[0];
+        if (b == null || self.gepStride(b) != 1) return false;
+        u64 idx = 0;
+        if (g->nops == 2)
+        {
+            if (!self.isConstInt(g->ops[1])) return false;
+            idx = g->ops[1]->valData;
+        }
+        else if (g->nops == 3)
+        {
+            if (!self.isConstInt(g->ops[1]) || !self.isConstInt(g->ops[2])) return false;
+            if ((g->ops[1]->valData & (u64)0xFFFFFFFF) != 0) return false;
+            idx = g->ops[2]->valData;
+        }
+        else return false;
+        if (idx > (u64)0xFFFFFFFF) return false;
+        *base = b;
+        *off = idx;
+        return true;
+    }
+
+    bool collectByteLeaves(IrValue* v, IrType* rootTy, ByteLeaf* leaves, u32* nl)
+    {
+        if (v == null || v->kind != IrValueKind::Inst) return false;
+        IrInst* i = (IrInst*)v;
+        if (i->opcode == IrOpcode::Or && i->nops == 2)
+        {
+            if (i->base.type != rootTy) return false;
+            if (!self.collectByteLeaves(i->ops[0], rootTy, leaves, nl)) return false;
+            return self.collectByteLeaves(i->ops[1], rootTy, leaves, nl);
+        }
+        if (*nl >= 8) return false;
+        u32 shift = 0;
+        IrValue* cur = v;
+        if (cur->kind == IrValueKind::Inst && ((IrInst*)cur)->opcode == IrOpcode::Shl)
+        {
+            IrInst* sh = (IrInst*)cur;
+            if (sh->nops != 2 || !self.isConstInt(sh->ops[1])) return false;
+            if (sh->base.type != rootTy) return false;
+            u64 a = sh->ops[1]->valData;
+            if (a > 63) return false;
+            shift = (u32)a;
+            cur = sh->ops[0];
+        }
+        if (cur == null || cur->kind != IrValueKind::Inst) return false;
+        IrInst* z = (IrInst*)cur;
+        if (z->opcode != IrOpcode::Zext || z->nops != 1) return false;
+        if (z->base.type != rootTy) return false;
+        cur = z->ops[0];
+        if (cur == null || cur->kind != IrValueKind::Inst) return false;
+        IrInst* ld = (IrInst*)cur;
+        if (ld->opcode != IrOpcode::Load || ld->nops != 1) return false;
+        if (ld->base.type == null || !self.isIntType(ld->base.type) ||
+            ld->base.type->width != 8) return false;
+        if (ld->ops[0] == null) return false;
+        leaves[*nl].load = ld;
+        leaves[*nl].off = 0;
+        leaves[*nl].shift = shift;
+        *nl += 1;
+        return true;
+    }
+
+    IrValue* tryByteLoad(IrInst* inst)
+    {
+        if (inst->nops != 2 || !self.isIntType(inst->base.type)) return null;
+        if (inst->base.nusers == 0) return null;
+        u32 w = self.widthOf(inst);
+        if (w != 16 && w != 32 && w != 64) return null;
+        // Only the outermost OR of the tree; inner nodes are left for
+        // the root match so we get one wide load, not two narrow ones.
+        for (u32 ui = 0; ui < inst->base.nusers; ui++)
+        {
+            IrInst* u = inst->base.users[ui];
+            if (u != null && u->opcode == IrOpcode::Or) return null;
+        }
+        ByteLeaf[8] leaves;
+        u32 nl = 0;
+        if (!self.collectByteLeaves(&inst->base, inst->base.type, &leaves[0], &nl)) return null;
+        if (nl != 2 && nl != 4 && nl != 8) return null;
+        u32 width = nl * 8;
+        if (w < width) return null;
+        u32 seen = 0;
+        IrValue* base = null;
+        for (u32 i = 0; i < nl; i++)
+        {
+            IrValue* b = null;
+            u64 off = 0;
+            if (!self.gepByteOffset(leaves[i].load->ops[0], &b, &off)) return null;
+            if (off >= (u64)nl) return null;
+            u32 bit = (u32)1 << (u32)off;
+            if ((seen & bit) != 0) return null;
+            seen |= bit;
+            leaves[i].off = (u32)off;
+            if (base == null) base = b;
+            else if (base != b) return null;
+        }
+        IrBlock* bb = inst->parent;
+        if (bb == null) return null;
+        u32 rootIdx = 0;
+        bool foundRoot = false;
+        for (u32 i = 0; i < bb->ninsts; i++)
+            if (bb->insts[i] == inst) { rootIdx = i; foundRoot = true; break; }
+        if (!foundRoot) return null;
+        u32 minIdx = bb->ninsts;
+        for (u32 i = 0; i < nl; i++)
+        {
+            if (leaves[i].load->parent != bb) return null;
+            u32 li = 0;
+            bool found = false;
+            for (u32 j = 0; j < bb->ninsts; j++)
+                if (bb->insts[j] == leaves[i].load) { li = j; found = true; break; }
+            if (!found || li >= rootIdx) return null;
+            if (li < minIdx) minIdx = li;
+        }
+        for (u32 i = minIdx; i < rootIdx; i++)
+            if (self.isMemWriter(bb->insts[i]->opcode)) return null;
+        bool le = true;
+        bool be = true;
+        for (u32 i = 0; i < nl; i++)
+        {
+            u32 wantLe = leaves[i].off * 8;
+            u32 wantBe = (nl - 1 - leaves[i].off) * 8;
+            if (leaves[i].shift != wantLe) le = false;
+            if (leaves[i].shift != wantBe) be = false;
+        }
+        if (!le && !be) return null;
+        IrValue* p0 = null;
+        for (u32 i = 0; i < nl; i++)
+            if (leaves[i].off == 0) { p0 = leaves[i].load->ops[0]; break; }
+        if (p0 == null) return null;
+        IrType* wideTy = self.ctx->tyInt(width);
+        IrInst* ld = self.newUn(IrOpcode::Load, wideTy, p0, inst);
+        IrInst* val = ld;
+        if (!le)
+            val = self.newUn(IrOpcode::Bswap, wideTy, &ld->base, inst);
+        if (w > width)
+            val = self.newUn(IrOpcode::Zext, inst->base.type, &val->base, inst);
+        return &val->base;
+    }
+
+    // --- magic division by a constant ---------------------------------
+    // Widths <= 32 only: computing a 64-bit magic number needs more than
+    // 64 bits of compile-time arithmetic, so a 64-bit divide is left alone.
+    //
+    // Unsigned: for s = floor(log2(d)), m = floor(2^(n+s)/d)+1, the
+    // shift-only form q = mulhi(x, m) >> s works when the rounding error
+    // e = m*d - 2^(n+s) is < 2^s. The fallback doubles s and uses the add
+    // form: m' = m - 2^n, t = mulhi(x, m'),
+    // q = (t + ((x-t)>>1)) >> (s-1).
+    //
+    // Signed: the same m, s, with smulhi. When m has its top bit set its
+    // n-bit pattern is negative, so add x once to recover the high half of
+    // x * m (the positive magic). Then q0 = h >> s and q = q0 - (x>>(n-1)):
+    // the sign word is 0 or -1, so subtracting it adds the +1 correction
+    // for negative x and rounds toward zero. Divisors >= 2^(n-1) and
+    // powers of two (and 0/1) are left alone.
+    MagicU magicUnsigned(u64 d, u32 n)
+    {
+        MagicU r = MagicU { 0, 0, false, false };
+        if (n < 8 || n > 32 || d < 2) return r;
+        if (d >= ((u64)1 << (u64)(n - 1))) return r;
+        u32 sf = 0;
+        u64 p = 1;
+        while ((p << 1) <= d)
+        {
+            p <<= 1;
+            sf += 1;
+        }
+        u64 numF = (u64)1 << (u64)(n + sf);
+        u64 mF = numF / d + 1;
+        u64 e = mF * d - numF;
+        if (e < ((u64)1 << (u64)sf))
+        {
+            r.m = mF;
+            r.s = sf;
+            r.add = false;
+            r.valid = true;
+            return r;
+        }
+        u32 sc = sf + 1;
+        u64 numC = (u64)1 << (u64)(n + sc);
+        u64 q = numC / d + 1;
+        u64 top = (u64)1 << (u64)n;
+        r.s = sc;
+        r.valid = true;
+        if (q < top)
+        {
+            r.m = q;
+            r.add = false;
+        }
+        else
+        {
+            r.m = q - top;
+            r.add = true;
+        }
+        return r;
+    }
+
+    MagicU magicSigned(u64 d, u32 n)
+    {
+        MagicU r = MagicU { 0, 0, false, false };
+        if (n < 8 || n > 32 || d < 2) return r;
+        if (d >= ((u64)1 << (u64)(n - 1))) return r;
+        u32 s = 0;
+        u64 p = 1;
+        while ((p << 1) <= d)
+        {
+            p <<= 1;
+            s += 1;
+        }
+        u64 m = ((u64)1 << (u64)(n + s)) / d + 1;
+        if (m >= ((u64)1 << (u64)n)) return r;
+        r.m = m;
+        r.s = s;
+        r.add = false;
+        r.valid = true;
+        return r;
+    }
+
+    IrInst* emitMulHi(IrValue* x, u64 m, bool isSigned, IrInst* anchor)
+    {
+        return self.newBin(isSigned ? IrOpcode::SMulHi : IrOpcode::MulHi,
+                           x->type, x, self.iconst(x->type, m), anchor);
+    }
+
+    IrInst* emitUDivMagic(IrValue* x, u64 d, u32 n, IrInst* anchor)
+    {
+        MagicU mg = self.magicUnsigned(d, n);
+        if (!mg.valid) return null;
+        IrType* ty = x->type;
+        IrInst* hi = self.emitMulHi(x, mg.m, false, anchor);
+        if (!mg.add)
+        {
+            if (mg.s == 0) return hi;
+            return self.newBin(IrOpcode::Lshr, ty, &hi->base,
+                               self.iconst(ty, (u64)mg.s), anchor);
+        }
+        IrInst* diff = self.newBin(IrOpcode::Sub, ty, x, &hi->base, anchor);
+        IrInst* half = self.newBin(IrOpcode::Lshr, ty, &diff->base,
+                                   self.iconst(ty, 1), anchor);
+        IrInst* sum = self.newBin(IrOpcode::Add, ty, &hi->base, &half->base, anchor);
+        return self.newBin(IrOpcode::Lshr, ty, &sum->base,
+                           self.iconst(ty, (u64)(mg.s - 1)), anchor);
+    }
+
+    IrInst* emitSDivMagic(IrValue* x, u64 du, u32 n, IrInst* anchor)
+    {
+        u64 mask = self.maskFor(n);
+        u64 absd = du & mask;
+        bool negd = ((absd >> (u64)(n - 1)) & 1) != 0;
+        if (negd) absd = (0 - absd) & mask;
+        if (absd < 2) return null;
+        MagicU mg = self.magicSigned(absd, n);
+        if (!mg.valid) return null;
+        IrType* ty = x->type;
+        IrInst* hi = self.emitMulHi(x, mg.m, true, anchor);
+        IrInst* h = hi;
+        if (((mg.m >> (u64)(n - 1)) & 1) != 0)
+            h = self.newBin(IrOpcode::Add, ty, &hi->base, x, anchor);
+        IrInst* q0 = h;
+        if (mg.s > 0)
+            q0 = self.newBin(IrOpcode::Ashr, ty, &h->base,
+                             self.iconst(ty, (u64)mg.s), anchor);
+        IrInst* sign = self.newBin(IrOpcode::Ashr, ty, x,
+                                   self.iconst(ty, (u64)(n - 1)), anchor);
+        IrInst* q = self.newBin(IrOpcode::Sub, ty, &q0->base, &sign->base, anchor);
+        if (!negd) return q;
+        return self.newUn(IrOpcode::Neg, ty, &q->base, anchor);
+    }
+
+    IrValue* tryMagicDiv(IrInst* inst)
+    {
+        if (inst->nops != 2 || !self.isIntType(inst->base.type)) return null;
+        IrValue* l = inst->ops[0];
+        IrValue* r = inst->ops[1];
+        if (l == null || r == null || self.isConstInt(l)) return null;
+        if (!self.isIntType(l->type)) return null;
+        if (!self.isConstInt(r)) return null;
+        if (inst->base.nusers == 0) return null;
+        u32 n = self.widthOf(inst);
+        if (n < 8 || n > 32) return null;
+        u64 mask = self.maskFor(n);
+        u64 du = r->valData & mask;
+        if (du < 2) return null;
+        bool isSigned = inst->opcode == IrOpcode::SDiv ||
+                        inst->opcode == IrOpcode::SRem;
+        u64 absd = du;
+        if (isSigned)
+        {
+            bool neg = ((du >> (u64)(n - 1)) & 1) != 0;
+            if (neg) absd = (0 - du) & mask;
+        }
+        if (absd >= ((u64)1 << (u64)(n - 1))) return null;
+        if ((absd & (absd - 1)) == 0) return null;
+        IrInst* q = null;
+        if (isSigned) q = self.emitSDivMagic(l, du, n, inst);
+        else q = self.emitUDivMagic(l, absd, n, inst);
+        if (q == null) return null;
+        if (inst->opcode == IrOpcode::UDiv || inst->opcode == IrOpcode::SDiv)
+            return &q->base;
+        IrInst* prod = self.newBin(IrOpcode::Mul, inst->base.type, &q->base,
+                                   self.iconst(inst->base.type, du), inst);
+        return &self.newBin(IrOpcode::Sub, inst->base.type, l, &prod->base, inst)->base;
+    }
+
+    // --- entry ----------------------------------------------------------
+    IrValue* tryFold(IrInst* inst)
+    {
+        if (inst->opcode == IrOpcode::Or)
+        {
+            IrValue* r = self.tryRotate(inst);
+            if (r != null) return r;
+            return self.tryByteLoad(inst);
+        }
+        if (inst->opcode == IrOpcode::SDiv || inst->opcode == IrOpcode::UDiv ||
+            inst->opcode == IrOpcode::SRem || inst->opcode == IrOpcode::URem)
+            return self.tryMagicDiv(inst);
+        return null;
+    }
+}
+
+pub bool muvmPassMicroOpt(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (func == null || ctx == null) return false;
+    MicroOptPass pass = MicroOptPass::new(ctx);
+    bool changed = pass.run(func);
+    pass.deinit();
+    if (gVerbose) eprintln("microopt: {} rewrites", pass.nFolds);
+    return changed;
+}
