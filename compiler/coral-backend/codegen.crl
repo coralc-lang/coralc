@@ -2577,6 +2577,46 @@ bool cgHasField(Codegen* cg, Ty t, Str name)
     return false;
 }
 
+/* declared type node of struct/union field `name` (or field `index`
+ * when name == 0); 0 when the type or field is unknown. Generic
+ * parameters stay symbolic — callers only need the type constructor
+ * (Reference/Pointer/…), which substitution cannot change. */
+Ty cgFindFieldTy(Codegen* cg, Ty t, Str name, u32 index)
+{
+    Ty u = cgTyUnwrap(cg, t);
+    if (u != 0 && (cg->ctx->types + u)->kind.tag == TypeKind::Pointer)
+        u = cgTyUnwrap(cg, (cg->ctx->types + u)->kind.payload.Pointer.base);
+    if (u == 0 || (cg->ctx->types + u)->kind.tag != TypeKind::Named) return 0;
+    Str tn = (cg->ctx->types + u)->kind.payload.Named.name;
+    NodeId d = cgFindDecl(cg, tn, (u32)DeclKind::Struct);
+    if (d.index == 0) d = cgFindDecl(cg, tn, (u32)DeclKind::Union);
+    if (d.index == 0) return 0;
+    Node* dn = cgNode(cg, d);
+    if (dn->kind.tag != NodeKind::Decl) return 0;
+    Decl* dd = &dn->kind.payload.Decl.value;
+    NodeId* fields = null;
+    u32 flen = 0;
+    if (dd->kind.tag == DeclKind::Struct) {
+        fields = dd->kind.payload.Struct.fields;
+        flen = dd->kind.payload.Struct.fieldsLen;
+    } else if (dd->kind.tag == DeclKind::Union) {
+        fields = dd->kind.payload.Union.fields;
+        flen = dd->kind.payload.Union.fieldsLen;
+    } else return 0;
+    u32 i = 0;
+    while (i < flen)
+    {
+        Node* fn = cgNode(cg, fields[i]);
+        if (fn->kind.tag == NodeKind::Field)
+        {
+            bool match = name != 0 ? fn->kind.payload.Field.value.name == name : i == index;
+            if (match) return fn->kind.payload.Field.value.typeNode;
+        }
+        i++;
+    }
+    return 0;
+}
+
 /* receiver for a method call: 0 = none (static), 1 = by value,
  * 2 = explicit `self` parameter (pointer); *found = the method exists
  * on the receiver type (false = not a real method, e.g. a fn-pointer
@@ -3923,12 +3963,31 @@ Slice cgExprRaw(Codegen* cg, NodeId id)
             while (i < fvLen) {
                 if (first) first = false;
                 else stP(&vs, ", ");
+                Str fname = 0;
                 if (e->kind.payload.StructLiteral.fieldNames != 0) {
                     stP(&vs, ".");
-                    stPS(&vs, cgIdent(cg, e->kind.payload.StructLiteral.fieldNames[i]));
+                    fname = e->kind.payload.StructLiteral.fieldNames[i];
+                    stPS(&vs, cgIdent(cg, fname));
                     stP(&vs, " = ");
                 }
-                stPS(&vs, cgInitValue(cg, e->kind.payload.StructLiteral.fieldValues[i]));
+                NodeId fv = e->kind.payload.StructLiteral.fieldValues[i];
+                /* a `T&` field stores the referent's address: a
+                 * reference-typed value passes its pointer, any other
+                 * lvalue binds by `&` (same rule as ref parameters) */
+                Ty fty = cgFindFieldTy(cg, e->kind.payload.StructLiteral.typeNode, fname, i);
+                fty = cgTyUnwrap(cg, fty);
+                bool fIsRef = fty != 0 && cgTyIsRef(cg, cgSubstTy(cg, fty));
+                if (fIsRef)
+                {
+                    Node* fvn = cgNode(cg, fv);
+                    Ty fvt = 0;
+                    if (fvn->kind.tag == NodeKind::Expr) fvt = fvn->kind.payload.Expr.value.resolvedType;
+                    if (fvt != 0 && cgTyIsRef(cg, cgSubstTy(cg, fvt)))
+                        stPS(&vs, cgExprPtr(cg, fv));
+                    else
+                        stPS(&vs, cgAddrOfValue(cg, fv, cgLvalue(cg, fv)));
+                }
+                else stPS(&vs, cgInitValue(cg, fv));
                 i++;
             }
             if (fvLen > 256) cgError(cg, "too many struct fields (cap 256)");
@@ -4500,8 +4559,11 @@ Slice cgLvalueRaw(Codegen* cg, NodeId id)
             return stTail(&cg->ebuf, rs);
         },
         else => {
-            // not an lvalue: fall back to value path (error surfaces in C)
-            return cgExpr(cg, id);
+            /* calls and other non-lvalue shapes: emit the raw form —
+             * for a `T&`-returning call that is already the pointer,
+             * and cgLvalue adds the single `(*())` deref. cgExpr would
+             * wrap it a second time. */
+            return cgExprRaw(cg, id);
         },
     }
     return stTail(&cg->ebuf, es);
@@ -5312,7 +5374,12 @@ void cgStmt(Codegen* cg, NodeId id)
                 Node* vn0 = cgNode(cg, v);
                 Ty vt0 = 0;
                 if (vn0->kind.tag == NodeKind::Expr) vt0 = vn0->kind.payload.Expr.value.resolvedType;
-                t = (vt0 != 0 && cgTyIsRef(cg, cgSubstTy(cg, vt0))) ? cgExprPtr(cg, v) : cgExpr(cg, v);
+                if (vt0 != 0 && cgTyIsRef(cg, cgSubstTy(cg, vt0)))
+                    t = cgExprPtr(cg, v);
+                else
+                    /* `return self.val` in a `T&` fn: the lvalue's address
+                     * is the result, not its value */
+                    t = cgAddrOfValue(cg, v, cgLvalue(cg, v));
             }
             else t = cgExpr(cg, v);
             if (cg->dropsLen > cg->fnDropMark)
@@ -6616,13 +6683,33 @@ void cgEmitInitValue(Codegen* cg, NodeId v)
         while (i < se->kind.payload.StructLiteral.fieldValuesLen)
         {
             if (i > 0) stP(&cg->defs, ", ");
+            Str fname = 0;
             if (se->kind.payload.StructLiteral.fieldNames != 0)
             {
                 stP(&cg->defs, ".");
-                stPS(&cg->defs, cgIdent(cg, se->kind.payload.StructLiteral.fieldNames[i]));
+                fname = se->kind.payload.StructLiteral.fieldNames[i];
+                stPS(&cg->defs, cgIdent(cg, fname));
                 stP(&cg->defs, " = ");
             }
-            cgEmitInitValue(cg, se->kind.payload.StructLiteral.fieldValues[i]);
+            NodeId fv = se->kind.payload.StructLiteral.fieldValues[i];
+            Ty fty = cgTyUnwrap(cg, cgFindFieldTy(cg, se->kind.payload.StructLiteral.typeNode, fname, i));
+            if (fty != 0 && cgTyIsRef(cg, cgSubstTy(cg, fty)))
+            {
+                Node* fvn = cgNode(cg, fv);
+                Ty fvt = 0;
+                if (fvn->kind.tag == NodeKind::Expr) fvt = fvn->kind.payload.Expr.value.resolvedType;
+                if (fvt != 0 && cgTyIsRef(cg, cgSubstTy(cg, fvt)))
+                    stPS(&cg->defs, cgExprPtr(cg, fv));
+                else
+                {
+                    /* file scope: no temp statements — sema already
+                     * guaranteed an lvalue, so `&name` is inline-safe */
+                    stP(&cg->defs, "(&(");
+                    stPS(&cg->defs, cgLvalue(cg, fv));
+                    stP(&cg->defs, "))");
+                }
+            }
+            else cgEmitInitValue(cg, fv);
             i++;
         }
         stCh(&cg->defs, '}');

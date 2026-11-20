@@ -1,0 +1,229 @@
+#[[no_drop_all]]
+import muvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind };
+import muvm::irOps { IrOpcode };
+import std::mman { alloc, dealloc };
+
+// Select-to-Branch conversion — converts select instructions into branching
+// when the selected value has side effects (calls, stores) or when branching
+// is more efficient (e.g., for cmov which requires both values computed).
+struct SelectToBranchPass
+{
+    IrContext* ctx;
+    u64 conversions;
+    u32 unnamedCounter;
+
+    static SelectToBranchPass new(IrContext* ctx)
+    {
+        return SelectToBranchPass {
+            .ctx = ctx,
+            .conversions = 0,
+            .unnamedCounter = 0
+        };
+    }
+
+    // Blocks created here must carry a distinct name: the emitter writes
+    // every block label from bb->name, so an unnamed (or identically named)
+    // block collapses onto an existing label.
+    IrBlock* createBlock(IrFunc* func)
+    {
+        u8[32] buf;
+        usize n = 0;
+        const u8[6] prefix = { 115, 101, 108, 50, 98, 114 }; // "sel2br"
+        for (usize i = 0; i < 6; i++) buf[n++] = prefix[i];
+        u32 id = self.unnamedCounter++;
+        u8[10] digits;
+        u32 nd = 0;
+        if (id == 0) digits[nd++] = 48;
+        else
+        {
+            u32 v = id;
+            while (v > 0) { digits[nd++] = (u8)(48 + (v % 10)); v /= 10; }
+        }
+        while (nd > 0) { nd--; buf[n++] = digits[nd]; }
+        str name = str::fromParts((const u8*)buf, n);
+        IrBlock* bb = self.ctx->createBlock(name);
+        func->addBlock(bb);
+        return bb;
+    }
+
+    IrInst* createTerminator(IrBlock* parent, IrOpcode op, u32 nops)
+    {
+        IrInst* inst = self.ctx->createInst(op, self.ctx->tyVoid(), null, nops, 0, 0);
+        inst->parent = parent;
+        return inst;
+    }
+
+    void redirectPhis(IrBlock* succ, IrBlock* from, IrBlock* to)
+    {
+        if (succ == null || from == null || to == null) return;
+        for (u32 i = 0; i < succ->ninsts; i++)
+        {
+            IrInst* phi = succ->insts[i];
+            if (phi->opcode != IrOpcode::Phi) continue;
+            for (u32 j = 0; j + 1 < phi->nops; j += 2)
+            {
+                if (phi->ops[j + 1] != &from->base) continue;
+                phi->ops[j + 1] = &to->base;
+                from->base.removeUser(phi);
+                to->base.addUser(phi);
+            }
+        }
+    }
+
+    bool run(IrFunc* func)
+    {
+        self.conversions = 0;
+        bool changed = false;
+
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst->opcode != IrOpcode::Select) continue;
+                if (inst->nops < 3) continue;
+
+                IrValue* trueVal = inst->ops[1];
+                IrValue* falseVal = inst->ops[2];
+                bool trueHasSideEffects = self.hasSideEffects(trueVal);
+                bool falseHasSideEffects = self.hasSideEffects(falseVal);
+
+                if (!trueHasSideEffects && !falseHasSideEffects) continue;
+
+                IrValue* cond = inst->ops[0];
+
+                IrBlock* trueBB = self.createBlock(func);
+                IrBlock* falseBB = self.createBlock(func);
+                IrBlock* mergeBB = self.createBlock(func);
+
+                // Terminate original block with condbr
+                IrInst* term = self.createTerminator(bb, IrOpcode::CondBr, 3);
+                term->ops[0] = cond;
+                term->ops[1] = &trueBB->base;
+                term->ops[2] = &falseBB->base;
+                cond->addUser(term);
+                trueBB->base.addUser(term);
+                falseBB->base.addUser(term);
+
+                bb->addSucc(trueBB);
+                bb->addSucc(falseBB);
+
+                // trueBB branches to mergeBB
+                IrInst* trueTerm = self.createTerminator(trueBB, IrOpcode::Br, 1);
+                trueTerm->ops[0] = &mergeBB->base;
+                mergeBB->base.addUser(trueTerm);
+                trueBB->addInst(trueTerm);
+                trueBB->addSucc(mergeBB);
+
+                // falseBB branches to mergeBB
+                IrInst* falseTerm = self.createTerminator(falseBB, IrOpcode::Br, 1);
+                falseTerm->ops[0] = &mergeBB->base;
+                mergeBB->base.addUser(falseTerm);
+                falseBB->addInst(falseTerm);
+                falseBB->addSucc(mergeBB);
+
+                // Move instructions after the select into the merge block
+                // (bb->addInst(term) happens below, so the new CondBr is not
+                // swept into mergeBB)
+                u32 remaining = bb->ninsts - (ii + 1);
+                if (remaining > 0)
+                {
+                    for (u32 sxi = ii + 1; sxi < bb->ninsts; sxi++)
+                    {
+                        IrInst* si2 = bb->insts[sxi];
+                        si2->parent = mergeBB;
+                        mergeBB->addInst(si2);
+                    }
+                }
+                // Drop the select from bb too, it becomes the phi in mergeBB
+                bb->ninsts = ii;
+
+                bb->addInst(term);
+
+                // Convert the select into a phi in mergeBB. Reusing the
+                // select value keeps all its users valid, but a Select has
+                // three operand slots while a phi needs four.
+                for (u32 oi = 0; oi < inst->nops; oi++)
+                    if (inst->ops[oi] != null) inst->ops[oi]->removeUser(inst);
+                if (inst->capOps < 4)
+                {
+                    IrValue** newOps = alloc<IrValue*>((usize)4);
+                    for (u32 oi = 0; oi < inst->nops; oi++) newOps[oi] = inst->ops[oi];
+                    if (inst->capOps > 0) dealloc<IrValue*>(inst->ops);
+                    inst->ops = newOps;
+                    inst->capOps = 4;
+                }
+                inst->opcode = IrOpcode::Phi;
+                inst->nops = 4;
+                inst->ops[0] = trueVal;
+                inst->ops[1] = &trueBB->base;
+                inst->ops[2] = falseVal;
+                inst->ops[3] = &falseBB->base;
+                trueVal->addUser(inst);
+                trueBB->base.addUser(inst);
+                falseVal->addUser(inst);
+                falseBB->base.addUser(inst);
+
+                // Phi goes at the beginning of mergeBB
+                if (mergeBB->ninsts > 0)
+                {
+                    mergeBB->insertBefore(inst, mergeBB->insts[0]);
+                }
+                else
+                {
+                    mergeBB->addInst(inst);
+                }
+                inst->parent = mergeBB;
+
+                // bb's old terminator moved into mergeBB, so bb's stale
+                // successor edges now belong on mergeBB
+                for (u32 sxi = 0; sxi < bb->nsuccs; )
+                {
+                    IrBlock* s = bb->succs[sxi];
+                    if (s == trueBB || s == falseBB) { sxi++; continue; }
+                    bb->removeSucc(s);
+                    s->removePred(bb);
+                    self.redirectPhis(s, bb, mergeBB);
+                    mergeBB->addSucc(s);
+                }
+
+                self.conversions++;
+                changed = true;
+                break;
+            }
+        }
+
+        return changed;
+    }
+
+    bool hasSideEffects(IrValue* val)
+    {
+        if (val == null) return false;
+        if (val->kind != IrValueKind::Inst) return false;
+        IrInst* inst = (IrInst*)val;
+        switch (inst->opcode)
+        {
+            IrOpcode::Call |
+            IrOpcode::Store |
+            IrOpcode::AtomicStore |
+            IrOpcode::AtomicRmw |
+            IrOpcode::AtomicCmpXchg |
+            IrOpcode::Fence |
+            IrOpcode::GcWriteBarrier |
+            IrOpcode::GcSafepoint |
+            IrOpcode::InlineAsm => { return true; },
+
+            else => { return false; },
+        }
+    }
+}
+
+pub bool muvmPassSelectToBranch(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (func == null || ctx == null) return false;
+
+    SelectToBranchPass pass = SelectToBranchPass::new(ctx);
+    return pass.run(func);
+}
