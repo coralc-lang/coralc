@@ -144,6 +144,322 @@ pub IrValue* muvSwitchTest(Muv* w, SwitchCase* c, IrValue* scrut, Ty scrutTy,
     return acc;
 }
 
+/* ── switch fast path: one muvm Switch terminator ───────────── */
+
+/* collect the constant values one pattern matches into vals (bounded
+ * by cap); *wild set when the pattern matches every value. false →
+ * the pattern isn't switch-able (range/guard/aggregate) and the whole
+ * switch falls back to the compare chain. Only ConstInt patterns whose
+ * IrType is exactly the scrutinee's qualify — mixed-width cases stay
+ * on the chain, which promotes them correctly. */
+bool muvSwitchPatVals(Muv* w, NodeId patId, IrType* sty,
+                      IrValue** vals, u32* nvals, u32 cap, bool* wild)
+{
+    if (patId.index == 0) { *wild = true; return true; }
+    Node* n = muvNode(w, patId);
+    if (n->kind.tag == NodeKind::Pat)
+    {
+        Pat* p = &n->kind.payload.Pat.value;
+        if (p->kind.tag == PatKind::Wildcard) { *wild = true; return true; }
+        if (p->kind.tag == PatKind::Lit || p->kind.tag == PatKind::Ident ||
+            p->kind.tag == PatKind::Or)
+        {
+            NodeId ev;
+            ev.index = 0;
+            if (p->kind.tag == PatKind::Lit) ev = p->kind.payload.Lit.expr;
+            else if (p->kind.tag == PatKind::Ident)
+            {
+                NodeId cd = muvResolveConst(w, p->kind.payload.Ident.name, patId);
+                if (cd.index == 0) return false;
+                Node* cn = muvNode(w, cd);
+                if (cn->kind.tag != NodeKind::Decl) return false;
+                ev = cn->kind.payload.Decl.value->kind.payload.Constant.value;
+            }
+            else
+            {
+                u32 i = 0;
+                while (i < p->kind.payload.Or.alternativesLen)
+                {
+                    if (!muvSwitchPatVals(w, p->kind.payload.Or.alternatives[i],
+                                          sty, vals, nvals, cap, wild))
+                        return false;
+                    i++;
+                }
+                return true;
+            }
+            IrValue* v = muvExpr(w, ev);
+            if (v == null || v->kind != IrValueKind::ConstInt || v->type != sty)
+                return false;
+            if (*nvals >= cap) return false;
+            vals[(*nvals)++] = v;
+            return true;
+        }
+        return false;
+    }
+    if (n->kind.tag == NodeKind::Expr)
+    {
+        IrValue* v = muvExpr(w, patId);
+        if (v == null || v->kind != IrValueKind::ConstInt || v->type != sty)
+            return false;
+        if (*nvals >= cap) return false;
+        vals[(*nvals)++] = v;
+        return true;
+    }
+    return false;
+}
+
+/* lower the whole switch to a single Switch terminator when every live
+ * arm is integer-constant patterns (or one catch-all) with no guards —
+ * the shape the chain lowering would produce anyway, but as real
+ * switch IR the backend can turn into a jump table. Returns false to
+ * keep the compare-chain path. */
+bool muvSwitchFast(Muv* w, IrValue* scrut, SwitchCase* cases, u32 n,
+                   NodeId id, IrValue* slot, IrType* vt)
+{
+    IrType* sty = scrut != null ? scrut->type : null;
+    if (sty == null || sty->kind != IrTypeKind::Int) return false;
+
+    u32 cap = n * 8 + 16;
+    IrValue** vals = (IrValue**)muvArr(w, (usize)cap, 8);
+    u32* valArm = (u32*)muvArr(w, (usize)cap, 4);
+    u8* armKind = (u8*)muvArr(w, (usize)n, 1);  // 0 dead, 1 const, 2 wild, 3 else
+    IrBlock** armBb = (IrBlock**)muvArr(w, (usize)n, 8);
+    if (vals == null || valArm == null || armKind == null || armBb == null)
+        return false;
+
+    u32 nvals = 0;
+    u32 elseIdx = 0xFFFFFFFF;
+    u32 defaultArm = 0xFFFFFFFF;
+    bool bail = false;
+    u32 i = 0;
+    while (i < n && !bail)
+    {
+        SwitchCase* c = cases + i;
+        armKind[i] = 0;
+        armBb[i] = null;
+        if ((c->flags & 4) != 0 || c->patternsLen == 0)
+        {
+            /* the else arm is the chain's terminal fallback — first one
+             * wins, later else-flagged arms are dead in both paths */
+            if (elseIdx == 0xFFFFFFFF) { elseIdx = i; armKind[i] = 3; }
+            i++;
+            continue;
+        }
+        if (defaultArm != 0xFFFFFFFF) { i++; continue; } // past the catch-all: dead
+        if ((c->flags & 1) != 0 && c->guard.index != 0) { bail = true; break; }
+        u32 armStart = nvals;
+        bool wild = false;
+        u32 p = 0;
+        while (p < c->patternsLen)
+        {
+            if (!muvSwitchPatVals(w, c->patterns[p], sty, vals, &nvals, cap, &wild))
+                { bail = true; break; }
+            p++;
+        }
+        if (bail) break;
+        if (wild)
+        {
+            nvals = armStart;
+            defaultArm = i;
+            armKind[i] = 2;
+        }
+        else
+        {
+            u32 k = armStart;
+            while (k < nvals) { valArm[k] = i; k++; }
+            armKind[i] = nvals > armStart ? 1 : 0;
+        }
+        i++;
+    }
+    if (bail) return false;
+
+    /* first occurrence wins on duplicate values — the chain tests arms
+     * in order, so a later arm's duplicate is unreachable */
+    u32 m = 0;
+    u32 k = 0;
+    while (k < nvals)
+    {
+        bool dup = false;
+        u32 j = 0;
+        while (j < m)
+        {
+            if (vals[j] == vals[k]) { dup = true; break; }
+            j++;
+        }
+        if (!dup) { vals[m] = vals[k]; valArm[m] = valArm[k]; m++; }
+        k++;
+    }
+
+    IrBlock* joinBb = muvBlock(w, "sw.end");
+    /* default target: the catch-all arm's body, else the else arm's,
+     * else the join (no match falls through) */
+    u32 dfltArm = defaultArm != 0xFFFFFFFF ? defaultArm
+                 : (elseIdx != 0xFFFFFFFF ? elseIdx : 0xFFFFFFFF);
+    IrBlock** cblks = (IrBlock**)muvArr(w, (usize)(m > 0 ? m : 1), 8);
+    if (cblks == null) return false;
+    i = 0;
+    while (i < n)
+    {
+        if (armKind[i] == 1 || i == dfltArm) armBb[i] = muvBlock(w, "sw.body");
+        i++;
+    }
+    k = 0;
+    while (k < m) { cblks[k] = armBb[valArm[k]]; k++; }
+    IrBlock* dfltBb = dfltArm != 0xFFFFFFFF ? armBb[dfltArm] : joinBb;
+
+    w->b.switchInst(scrut, dfltBb, vals, cblks, m);
+
+    IrBlock* savedBreak = w->breakT;
+    u32 savedBreakMark = w->breakDropMark;
+    u32 savedBreakDefers = w->breakDeferMark;
+    w->breakT = joinBb;
+    w->breakDropMark = w->dropLen;
+    w->breakDeferMark = w->deferLen;
+    w->loopDepth++;
+
+    i = 0;
+    while (i < n)
+    {
+        if (armBb[i] == null) { i++; continue; }
+        muvSetBlock(w, armBb[i]);
+        if (slot != null)
+        {
+            IrValue* v = muvValBody(w, cases[i].body, vt);
+            if (v != null) w->b.store(v, slot);
+        }
+        else muvStmt(w, cases[i].body);
+        if (!w->term) w->b.br(joinBb);
+        i++;
+    }
+
+    w->breakT = savedBreak;
+    w->breakDropMark = savedBreakMark;
+    w->breakDeferMark = savedBreakDefers;
+    w->loopDepth--;
+    muvSetBlock(w, joinBb);
+    return true;
+}
+
+/* hybrid lowering for mixed switches: the leading run of arms whose
+ * patterns are all integer constants (no guards, no catch-alls) lowers
+ * to a native Switch terminator; its default edge enters a block that
+ * recursively lowers the remaining arms — which may themselves be all
+ * constant (another Switch), guarded, or reach the plain chain. Arm
+ * order is preserved because a guarded/binding arm can match any
+ * value, so only the prefix is safe to dispatch on the scrutinee. */
+bool muvSwitchHybrid(Muv* w, IrValue* scrut, Ty scrutTy,
+                     SwitchCase* cases, u32 n, NodeId id,
+                     IrValue* slot, IrType* vt)
+{
+    IrType* sty = scrut != null ? scrut->type : null;
+    if (sty == null || sty->kind != IrTypeKind::Int) return false;
+
+    u32 cap = n * 8 + 16;
+    IrValue** vals = (IrValue**)muvArr(w, (usize)cap, 8);
+    u32* valArm = (u32*)muvArr(w, (usize)cap, 4);
+    u8* armKind = (u8*)muvArr(w, (usize)n, 1);
+    IrBlock** armBb = (IrBlock**)muvArr(w, (usize)n, 8);
+    if (vals == null || valArm == null || armKind == null || armBb == null)
+        return false;
+
+    /* collect the switchable prefix; stop at the first arm that needs
+     * the chain (guard, wildcard/binding, range, non-constant) or at
+     * the else arm — both hand off to the suffix lowering */
+    u32 nvals = 0;
+    u32 prefixN = 0;
+    bool bail = false;
+    while (prefixN < n && !bail)
+    {
+        SwitchCase* c = cases + prefixN;
+        if ((c->flags & 4) != 0 || c->patternsLen == 0 ||
+            ((c->flags & 1) != 0 && c->guard.index != 0))
+            break;
+        u32 armStart = nvals;
+        bool wild = false;
+        u32 p = 0;
+        while (p < c->patternsLen)
+        {
+            if (!muvSwitchPatVals(w, c->patterns[p], sty, vals, &nvals, cap, &wild))
+                { bail = true; break; }
+            p++;
+        }
+        if (bail || wild) { nvals = armStart; break; }
+        u32 k = armStart;
+        while (k < nvals) { valArm[k] = prefixN; k++; }
+        armKind[prefixN] = nvals > armStart ? 1 : 0;
+        prefixN++;
+    }
+    if (bail || prefixN == 0 || prefixN >= n) return false;
+
+    /* dedup case values — first arm wins, same as the chain's order */
+    u32 m = 0;
+    u32 k = 0;
+    while (k < nvals)
+    {
+        bool dup = false;
+        u32 j = 0;
+        while (j < m)
+        {
+            if (vals[j] == vals[k]) { dup = true; break; }
+            j++;
+        }
+        if (!dup) { vals[m] = vals[k]; valArm[m] = valArm[k]; m++; }
+        k++;
+    }
+
+    IrBlock* joinBb = muvBlock(w, "sw.end");
+    IrBlock* chainBb = muvBlock(w, "sw.chain");
+    IrBlock** cblks = (IrBlock**)muvArr(w, (usize)(m > 0 ? m : 1), 8);
+    if (cblks == null) return false;
+    u32 i = 0;
+    while (i < prefixN)
+    {
+        if (armKind[i] == 1) armBb[i] = muvBlock(w, "sw.body");
+        i++;
+    }
+    k = 0;
+    while (k < m) { cblks[k] = armBb[valArm[k]]; k++; }
+
+    w->b.switchInst(scrut, chainBb, vals, cblks, m);
+
+    IrBlock* savedBreak = w->breakT;
+    u32 savedBreakMark = w->breakDropMark;
+    u32 savedBreakDefers = w->breakDeferMark;
+    w->breakT = joinBb;
+    w->breakDropMark = w->dropLen;
+    w->breakDeferMark = w->deferLen;
+    w->loopDepth++;
+
+    i = 0;
+    while (i < prefixN)
+    {
+        if (armBb[i] == null) { i++; continue; }
+        muvSetBlock(w, armBb[i]);
+        if (slot != null)
+        {
+            IrValue* v = muvValBody(w, cases[i].body, vt);
+            if (v != null) w->b.store(v, slot);
+        }
+        else muvStmt(w, cases[i].body);
+        if (!w->term) w->b.br(joinBb);
+        i++;
+    }
+
+    w->breakT = savedBreak;
+    w->breakDropMark = savedBreakMark;
+    w->breakDeferMark = savedBreakDefers;
+    w->loopDepth--;
+
+    /* default edge: lower the remaining arms recursively — the suffix
+     * may itself split into another Switch plus chain */
+    muvSetBlock(w, chainBb);
+    muvSwitchCoreVal(w, scrut, scrutTy, cases + prefixN, n - prefixN,
+                     id, slot, vt);
+    if (!w->term) w->b.br(joinBb);
+    muvSetBlock(w, joinBb);
+    return true;
+}
+
 /* value switch as a compare chain in blocks (no phis). Each arm owns a
  * test block and a body block; a failed test or a failed guard branches
  * to the next arm's test block, then to the else arm, then to the join.
@@ -151,17 +467,19 @@ pub IrValue* muvSwitchTest(Muv* w, SwitchCase* c, IrValue* scrut, Ty scrutTy,
  * source — the same shape cgEmitSwitchChain prints as if/else-if.
  * slot/vt are null for the statement form; a switch-expr passes its
  * result slot and every arm's body value is stored into it. */
-pub void muvSwitchCore(Muv* w, NodeId scrutId, SwitchCase* cases, u32 n,
-                      NodeId id, IrValue* slot, IrType* vt)
+/* everything after the scrutinee is evaluated: fast switch, hybrid
+ * prefix+chain, or the full compare chain. Takes the already-lowered
+ * scrutinee so the hybrid path can recurse on a suffix without
+ * re-evaluating it (which would duplicate side effects). */
+pub void muvSwitchCoreVal(Muv* w, IrValue* scrut, Ty scrutTy,
+                        SwitchCase* cases, u32 n, NodeId id,
+                        IrValue* slot, IrType* vt)
 {
-    if (scrutId.index == 0) { muvErr(w, id, "switch without a scrutinee"); return; }
-    Node* sn = muvNode(w, scrutId);
-    if (sn->kind.tag != NodeKind::Expr) { muvErr(w, id, "switch scrutinee"); return; }
-    IrValue* scrut = muvExpr(w, scrutId);
-    if (scrut == null) return;
-    Ty scrutTy = muvResolved(w, sn->kind.payload.Expr.value.resolvedType);
-
-    if (cases == null || n == 0) { muvErr(w, id, "switch without cases"); return; }
+    /* constant-only switches lower to a real Switch terminator; anything
+     * richer (ranges, guards, or-patterns over non-constants, floats)
+     * stays on the compare chain */
+    if (muvSwitchFast(w, scrut, cases, n, id, slot, vt)) return;
+    if (muvSwitchHybrid(w, scrut, scrutTy, cases, n, id, slot, vt)) return;
 
     IrBlock** tbb = (IrBlock**)muvArr(w, (usize)n, 8);
     IrBlock** bbb = (IrBlock**)muvArr(w, (usize)n, 8);
@@ -270,6 +588,20 @@ pub void muvSwitchCore(Muv* w, NodeId scrutId, SwitchCase* cases, u32 n,
     w->breakDeferMark = savedBreakDefers;
     w->loopDepth--;
     muvSetBlock(w, joinBb);
+}
+
+pub void muvSwitchCore(Muv* w, NodeId scrutId, SwitchCase* cases, u32 n,
+                      NodeId id, IrValue* slot, IrType* vt)
+{
+    if (scrutId.index == 0) { muvErr(w, id, "switch without a scrutinee"); return; }
+    Node* sn = muvNode(w, scrutId);
+    if (sn->kind.tag != NodeKind::Expr) { muvErr(w, id, "switch scrutinee"); return; }
+    IrValue* scrut = muvExpr(w, scrutId);
+    if (scrut == null) return;
+    Ty scrutTy = muvResolved(w, sn->kind.payload.Expr.value.resolvedType);
+
+    if (cases == null || n == 0) { muvErr(w, id, "switch without cases"); return; }
+    muvSwitchCoreVal(w, scrut, scrutTy, cases, n, id, slot, vt);
 }
 
 /* the statement form: no result slot, every arm lowers as statements */
@@ -797,14 +1129,14 @@ void muvForIn(Muv* w, Stmt* s, NodeId id)
             IrValue* iv = muvV(w->b.load(cntTy, iSlot));
             if (iv == null) { muvErr(w, id, "for-in index"); w->locLen = scopeMark; return; }
             if (te->kind.tag == TypeKind::Array)
-                eAddr = muvIndexAddr(w, stor, elemIr, iv, true);
+                eAddr = muvIndexAddr(w, stor, elemIr, iv, true, id);
             else
             {
                 IrValue* pSlot = muvGepField(w, stor, 0);
                 if (pSlot == null) { w->locLen = scopeMark; return; }
                 IrValue* p = muvV(w->b.load(w->ir->tyPtr(elemIr), pSlot));
                 if (p == null) { w->locLen = scopeMark; return; }
-                eAddr = muvIndexAddr(w, p, elemIr, iv, false);
+                eAddr = muvIndexAddr(w, p, elemIr, iv, false, id);
             }
             if (eAddr == null) { muvErr(w, id, "for-in element address"); w->locLen = scopeMark; return; }
         }

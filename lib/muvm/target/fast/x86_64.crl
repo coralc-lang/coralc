@@ -171,6 +171,85 @@ void emitRegToSlot(FastX86Context* ctx, IrValue* v, str reg64)
     ctx->emitLine("(%rbp)");
 }
 
+/* per-block label `.L<func>_BB<id>`: block names are NOT unique —
+ * lowering reuses "if.then"/"sw.body" in every function — so the label
+ * keys off the block's unique value id, gcc `.LBB<number>` style. */
+void emitBBLabel(FastX86Context* ctx, IrFunc* func, IrValue* bv)
+{
+    ctx->emit(".L");
+    ctx->emit(func->base.name);
+    ctx->emit("_BB");
+    ctx->emitU64(bv != null ? (u64)bv->id : (u64)0);
+}
+
+/* emit the incoming-value copies for phis in each successor block.
+ * phi operands are interleaved (val, block)*; the copy for predecessor
+ * `pred` must run on the edge pred->succ, i.e. at the end of `pred`
+ * before its terminator. Values live in stack slots, so a slot-to-slot
+ * move is sufficient. */
+void emitPhiCopies(FastX86Context* ctx, IrBlock* pred, IrInst* term)
+{
+    u32 nsucc = 0;
+    IrValue*[64] succs;
+    if (term->opcode == IrOpcode::Br && term->nops > 0)
+    {
+        succs[nsucc++] = term->ops[0];
+    }
+    else if (term->opcode == IrOpcode::CondBr && term->nops > 2)
+    {
+        /* ops: cond, thenBlock, elseBlock */
+        succs[nsucc++] = term->ops[1];
+        succs[nsucc++] = term->ops[2];
+    }
+    else if (term->opcode == IrOpcode::Switch && term->nops > 1)
+    {
+        /* ops: sel, default, (val, blk)* — block operands at odd idx */
+        for (u32 k = 1; k < term->nops; k += 2)
+            if (nsucc < 64) succs[nsucc++] = term->ops[k];
+    }
+    for (u32 s = 0; s < nsucc; s++)
+    {
+        IrValue* sv = succs[s];
+        if (sv == null || sv->kind != IrValueKind::Block) continue;
+        IrBlock* sb = (IrBlock*)sv;
+        for (u32 pi = 0; pi < sb->ninsts; pi++)
+        {
+            IrInst* phi = sb->insts[pi];
+            if (phi == null || phi->opcode != IrOpcode::Phi) continue;
+            for (u32 k = 0; k + 1 < phi->nops; k += 2)
+            {
+                if (phi->ops[k + 1] == &pred->base && phi->ops[k] != null)
+                {
+                    emitValueToReg(ctx, phi->ops[k], "rax");
+                    emitRegToSlot(ctx, &phi->base, "rax");
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/* byte offset of field `fi` in a struct IrType, recomputed with the
+ * same alignment rules createStructTypeFlags uses (packed = tflags bit0) */
+u64 emitStructFieldOff(IrContext* ictx, IrType* sty, u32 fi)
+{
+    if (sty == null || fi >= sty->nparams) return 0;
+    bool packed = (sty->tflags & 1) != 0;
+    u64 off = 0;
+    for (u32 i = 0; i <= fi; i++)
+    {
+        IrType* ft = sty->params[i];
+        if (!packed && ft != null)
+        {
+            u64 al = (u64)ictx->irTypeAlignOf(ft);
+            if (al > 1) off = (off + al - 1) / al * al;
+        }
+        if (i == fi) return off;
+        if (ft != null) off += (u64)ictx->irTypeSizeOf(ft);
+    }
+    return 0;
+}
+
 // Emits textual assembly for a single function
 pub str emitFastX86Func(IrFunc* func, IrContext* ictx, bool isWindows)
 {
@@ -204,14 +283,24 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx, bool isWindows)
             if (inst == null) continue;
             if (inst->opcode == IrOpcode::Alloca)
             {
+                /* two regions: `sz` bytes for the POINTEE plus 8 for the
+                 * pointer value itself. The object sits immediately above
+                 * the pointer slot (slotOff+8); sharing one region made
+                 * field-0 stores overwrite the pointer and crash. */
                 u32 sz = 8;
-                if (inst->base.type != null && inst->base.type->elem != null)
+                if (inst->base.type != null)
                 {
-                    sz = (inst->base.type->elem->width + 7) / 8;
-                    if (sz < 8) sz = 8;
-                    sz = (sz + 7) & ~7u;
+                    IrType* pt = inst->base.type->kind == IrTypeKind::Ptr
+                        ? inst->base.type->elem : inst->base.type;
+                    if (pt != null)
+                    {
+                        sz = (u32)ictx->irTypeSizeOf(pt);
+                        if (sz < 8) sz = 8;
+                        sz = (sz + 7) & ~7u;
+                    }
                 }
                 curOffset -= (i32)sz;
+                curOffset -= 8;
                 ctx.addSlot(&inst->base, curOffset);
             }
             else if (inst->base.type != null && inst->base.type->kind != IrTypeKind::Void)
@@ -337,10 +426,7 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx, bool isWindows)
         IrBlock* bb = func->blocks[bi];
         if (bb == null) continue;
 
-        ctx.emit(".L");
-        ctx.emit(func->base.name);
-        ctx.emit("_");
-        ctx.emit(bb->base.name);
+        emitBBLabel(&ctx, func, &bb->base);
         ctx.emitLine(":");
 
         for (u32 ii = 0; ii < bb->ninsts; ii++)
@@ -358,8 +444,18 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx, bool isWindows)
                 ctx.emitLine("");
             }
 
+            if (inst->opcode == IrOpcode::Br ||
+                inst->opcode == IrOpcode::CondBr ||
+                inst->opcode == IrOpcode::Switch)
+                emitPhiCopies(&ctx, bb, inst);
+
             switch (inst->opcode)
             {
+                IrOpcode::Unreachable | IrOpcode::Noret => {
+                    /* no legitimate successor — trap loudly rather than
+                     * falling through into whatever code follows */
+                    ctx.emitLine("    ud2");
+                },
                 IrOpcode::Ret => {
                     if (inst->nops > 0 && inst->ops[0] != null)
                     {
@@ -462,9 +558,10 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx, bool isWindows)
                     emitRegToSlot(&ctx, &inst->base, "rax");
                 },
                 IrOpcode::Alloca => {
+                    /* object lives at slotOff+8 (see the slot pass) */
                     i32 off = ctx.getSlot(&inst->base);
                     ctx.emit("    leaq ");
-                    ctx.emitI64((i64)off);
+                    ctx.emitI64((i64)off + 8);
                     ctx.emitLine("(%rbp), %rax");
                     emitRegToSlot(&ctx, &inst->base, "rax");
                 },
@@ -523,23 +620,20 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx, bool isWindows)
                 IrOpcode::Br => {
                     if (inst->nops > 0 && inst->ops[0] != null)
                     {
-                        ctx.emit("    jmp .L");
-                        ctx.emit(func->base.name);
-                        ctx.emit("_");
-                        ctx.emitLine(inst->ops[0]->name);
+                        ctx.emit("    jmp ");
+                        emitBBLabel(&ctx, func, inst->ops[0]);
+                        ctx.emitLine("");
                     }
                 },
                 IrOpcode::CondBr => {
                     emitValueToReg(&ctx, inst->ops[0], "rax");
                     ctx.emitLine("    testq %rax, %rax");
-                    ctx.emit("    jne .L");
-                    ctx.emit(func->base.name);
-                    ctx.emit("_");
-                    ctx.emitLine(inst->ops[1]->name);
-                    ctx.emit("    jmp .L");
-                    ctx.emit(func->base.name);
-                    ctx.emit("_");
-                    ctx.emitLine(inst->ops[2]->name);
+                    ctx.emit("    jne ");
+                    emitBBLabel(&ctx, func, inst->ops[1]);
+                    ctx.emitLine("");
+                    ctx.emit("    jmp ");
+                    emitBBLabel(&ctx, func, inst->ops[2]);
+                    ctx.emitLine("");
                 },
                 IrOpcode::Call => {
                     u32 nArgs = inst->nops > 1 ? inst->nops - 1 : 0;
@@ -560,11 +654,355 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx, bool isWindows)
 
                     if (inst->ops[0] != null)
                     {
-                        ctx.emit("    call ");
-                        ctx.emitLine(inst->ops[0]->name);
+                        if (inst->ops[0]->kind == IrValueKind::Func ||
+                            inst->ops[0]->kind == IrValueKind::Global)
+                        {
+                            ctx.emit("    call ");
+                            ctx.emitLine(inst->ops[0]->name);
+                        }
+                        else
+                        {
+                            /* indirect call: the callee is a computed
+                             * pointer value, not a named symbol */
+                            emitValueToReg(&ctx, inst->ops[0], "r10");
+                            ctx.emitLine("    call *%r10");
+                        }
                     }
                     if (inst->base.type != null && inst->base.type->kind != IrTypeKind::Void)
                     {
+                        emitRegToSlot(&ctx, &inst->base, "rax");
+                    }
+                },
+                IrOpcode::Gep => {
+                    /* ops[0] = base ptr, ops[1..] = indices. Constant
+                     * offsets accumulate; dynamic indices emit
+                     * idx*elemSize adds. Struct indices are field
+                     * numbers (no leading struct-element index). */
+                    if (inst->nops >= 1 && inst->ops[0] != null)
+                    {
+                        emitValueToReg(&ctx, inst->ops[0], "rax");
+                        IrType* cur = inst->ops[0]->type;
+                        if (cur != null && cur->kind == IrTypeKind::Ptr) cur = cur->elem;
+                        i64 cOff = 0;
+                        for (u32 gi = 1; gi < inst->nops; gi++)
+                        {
+                            IrValue* ix = inst->ops[gi];
+                            if (ix == null) continue;
+                            bool isConst = ix->kind == IrValueKind::ConstInt;
+                            if (cur != null && cur->kind == IrTypeKind::Struct)
+                            {
+                                u32 fi = isConst ? (u32)(ix->valData & 0xFFFFFFFF) : 0;
+                                cOff += (i64)emitStructFieldOff(ictx, cur, fi);
+                                cur = fi < cur->nparams ? cur->params[fi] : null;
+                            }
+                            else
+                            {
+                                IrType* et = null;
+                                u64 esz = 1;
+                                if (cur != null &&
+                                    (cur->kind == IrTypeKind::Array ||
+                                     cur->kind == IrTypeKind::Vector))
+                                {
+                                    et = cur->elem;
+                                }
+                                else if (cur != null && cur->kind == IrTypeKind::Ptr)
+                                {
+                                    et = cur->elem;
+                                }
+                                if (et != null) esz = (u64)ictx->irTypeSizeOf(et);
+                                if (isConst)
+                                    cOff += (i64)ix->valData * (i64)esz;
+                                else
+                                {
+                                    emitValueToReg(&ctx, ix, "rcx");
+                                    if (esz != 1)
+                                    {
+                                        ctx.emit("    imulq $");
+                                        ctx.emitI64((i64)esz);
+                                        ctx.emitLine(", %rcx, %rcx");
+                                    }
+                                    ctx.emitLine("    addq %rcx, %rax");
+                                }
+                                cur = et;
+                            }
+                        }
+                        if (cOff != 0)
+                        {
+                            ctx.emit("    addq $");
+                            ctx.emitI64(cOff);
+                            ctx.emitLine(", %rax");
+                        }
+                        emitRegToSlot(&ctx, &inst->base, "rax");
+                    }
+                },
+                IrOpcode::Select => {
+                    /* ops: cond, trueVal, falseVal */
+                    if (inst->nops >= 3)
+                    {
+                        emitValueToReg(&ctx, inst->ops[0], "rax");
+                        emitValueToReg(&ctx, inst->ops[1], "rcx");
+                        emitValueToReg(&ctx, inst->ops[2], "rdx");
+                        ctx.emitLine("    testq %rax, %rax");
+                        ctx.emitLine("    cmove %rdx, %rcx");
+                        emitRegToSlot(&ctx, &inst->base, "rcx");
+                    }
+                },
+                IrOpcode::Trunc | IrOpcode::Bitcast => {
+                    /* sub-width trunc keeps the low bits — the slot is
+                     * already 64-bit and consumers mask by type width */
+                    if (inst->nops >= 1)
+                    {
+                        emitValueToReg(&ctx, inst->ops[0], "rax");
+                        emitRegToSlot(&ctx, &inst->base, "rax");
+                    }
+                },
+                IrOpcode::Zext => {
+                    if (inst->nops >= 1)
+                    {
+                        emitValueToReg(&ctx, inst->ops[0], "rax");
+                        u32 sw = inst->ops[0]->type != null ? inst->ops[0]->type->width : 64;
+                        if (sw <= 8) ctx.emitLine("    movzbl %al, %eax");
+                        else if (sw <= 16) ctx.emitLine("    movzwl %ax, %eax");
+                        else if (sw <= 32) ctx.emitLine("    movl %eax, %eax");
+                        emitRegToSlot(&ctx, &inst->base, "rax");
+                    }
+                },
+                IrOpcode::Sext => {
+                    if (inst->nops >= 1)
+                    {
+                        emitValueToReg(&ctx, inst->ops[0], "rax");
+                        u32 sw = inst->ops[0]->type != null ? inst->ops[0]->type->width : 64;
+                        if (sw <= 8) ctx.emitLine("    movsbl %al, %eax");
+                        else if (sw <= 16) ctx.emitLine("    movswl %ax, %eax");
+                        else if (sw <= 32) ctx.emitLine("    movslq %eax, %rax");
+                        emitRegToSlot(&ctx, &inst->base, "rax");
+                    }
+                },
+                IrOpcode::FAdd | IrOpcode::FSub | IrOpcode::FMul | IrOpcode::FDiv => {
+                    if (inst->nops >= 2)
+                    {
+                        bool isF32 = inst->base.type != null && inst->base.type->width == 32;
+                        emitValueToReg(&ctx, inst->ops[0], "rax");
+                        ctx.emitLine("    movq %rax, %xmm0");
+                        emitValueToReg(&ctx, inst->ops[1], "rcx");
+                        ctx.emitLine("    movq %rcx, %xmm1");
+                        str sop = "addsd";
+                        if (inst->opcode == IrOpcode::FSub) sop = "subsd";
+                        else if (inst->opcode == IrOpcode::FMul) sop = "mulsd";
+                        else if (inst->opcode == IrOpcode::FDiv) sop = "divsd";
+                        if (isF32)
+                        {
+                            if (inst->opcode == IrOpcode::FAdd) sop = "addss";
+                            else if (inst->opcode == IrOpcode::FSub) sop = "subss";
+                            else if (inst->opcode == IrOpcode::FMul) sop = "mulss";
+                            else sop = "divss";
+                        }
+                        ctx.emit("    ");
+                        ctx.emit(sop);
+                        ctx.emitLine(" %xmm1, %xmm0");
+                        ctx.emitLine("    movq %xmm0, %rax");
+                        emitRegToSlot(&ctx, &inst->base, "rax");
+                    }
+                },
+                IrOpcode::FCmp => {
+                    if (inst->nops >= 2)
+                    {
+                        bool isF32 = inst->ops[0]->type != null && inst->ops[0]->type->width == 32;
+                        emitValueToReg(&ctx, inst->ops[0], "rax");
+                        ctx.emitLine("    movq %rax, %xmm0");
+                        emitValueToReg(&ctx, inst->ops[1], "rcx");
+                        ctx.emitLine("    movq %rcx, %xmm1");
+                        ctx.emitLine(isF32 ? "    ucomiss %xmm1, %xmm0" : "    ucomisd %xmm1, %xmm0");
+                        str setInst = "sete";
+                        if (inst->icmpPred == IrICmpPred::Ne) setInst = "setne";
+                        else if (inst->icmpPred == IrICmpPred::Slt) setInst = "seta";
+                        else if (inst->icmpPred == IrICmpPred::Sle) setInst = "setae";
+                        else if (inst->icmpPred == IrICmpPred::Sgt) setInst = "setb";
+                        else if (inst->icmpPred == IrICmpPred::Sge) setInst = "setbe";
+                        else if (inst->icmpPred == IrICmpPred::Ult) setInst = "seta";
+                        else if (inst->icmpPred == IrICmpPred::Ule) setInst = "setae";
+                        else if (inst->icmpPred == IrICmpPred::Ugt) setInst = "setb";
+                        else if (inst->icmpPred == IrICmpPred::Uge) setInst = "setbe";
+                        ctx.emit("    ");
+                        ctx.emit(setInst);
+                        ctx.emitLine(" %al");
+                        ctx.emitLine("    movzbq %al, %rax");
+                        emitRegToSlot(&ctx, &inst->base, "rax");
+                    }
+                },
+                IrOpcode::SiToFp | IrOpcode::UiToFp => {
+                    /* int slot → xmm → float/double slot. UiToFp on a
+                     * 64-bit source uses the (v>>1)*2+(v&1) split so the
+                     * signed cvtsi2sd never sees the sign bit. */
+                    if (inst->nops >= 1)
+                    {
+                        bool toF32 = inst->base.type != null && inst->base.type->width == 32;
+                        u32 sw = inst->ops[0]->type != null ? inst->ops[0]->type->width : 64;
+                        emitValueToReg(&ctx, inst->ops[0], "rax");
+                        if (inst->opcode == IrOpcode::UiToFp && sw > 32)
+                        {
+                            ctx.emitLine("    movq %rax, %rcx");
+                            ctx.emitLine("    shrq $1, %rcx");
+                            ctx.emitLine("    andq $1, %rax");
+                            ctx.emit(toF32 ? "    cvtsi2ss %rcx, %xmm0\n" : "    cvtsi2sd %rcx, %xmm0\n");
+                            ctx.emit(toF32 ? "    addss %xmm0, %xmm0\n" : "    addsd %xmm0, %xmm0\n");
+                            ctx.emitLine("    movq %rax, %rcx");
+                            ctx.emit(toF32 ? "    cvtsi2ss %rcx, %xmm1\n" : "    cvtsi2sd %rcx, %xmm1\n");
+                            ctx.emit(toF32 ? "    addss %xmm1, %xmm0\n" : "    addsd %xmm1, %xmm0\n");
+                        }
+                        else
+                        {
+                            if (sw <= 32) ctx.emitLine("    movl %eax, %eax");
+                            ctx.emit(toF32 ? "    cvtsi2ss %rax, %xmm0\n" : "    cvtsi2sd %rax, %xmm0\n");
+                        }
+                        if (toF32)
+                        {
+                            ctx.emitLine("    movd %xmm0, %eax");
+                            ctx.emitLine("    movl %eax, %eax");
+                            emitRegToSlot(&ctx, &inst->base, "rax");
+                        }
+                        else
+                        {
+                            ctx.emitLine("    movq %xmm0, %rax");
+                            emitRegToSlot(&ctx, &inst->base, "rax");
+                        }
+                    }
+                },
+                IrOpcode::FpToSi | IrOpcode::FpToUi => {
+                    /* float slot → cvtt → int slot. Signed convert —
+                     * unsigned destinations above INT64_MAX are a known
+                     * gap (needs the magic-number adjust sequence). */
+                    if (inst->nops >= 1)
+                    {
+                        bool fromF32 = inst->ops[0]->type != null && inst->ops[0]->type->width == 32;
+                        u32 dw = inst->base.type != null ? inst->base.type->width : 64;
+                        emitValueToReg(&ctx, inst->ops[0], "rax");
+                        if (fromF32)
+                        {
+                            ctx.emitLine("    movd %eax, %xmm0");
+                            if (dw <= 32) ctx.emitLine("    cvttss2si %xmm0, %eax");
+                            else ctx.emitLine("    cvttss2si %xmm0, %rax");
+                        }
+                        else
+                        {
+                            ctx.emitLine("    movq %rax, %xmm0");
+                            if (dw <= 32) ctx.emitLine("    cvttsd2si %xmm0, %eax");
+                            else ctx.emitLine("    cvttsd2si %xmm0, %rax");
+                        }
+                        if (dw <= 32) ctx.emitLine("    movl %eax, %eax");
+                        emitRegToSlot(&ctx, &inst->base, "rax");
+                    }
+                },
+                IrOpcode::FpTrunc | IrOpcode::FpExt => {
+                    /* f64↔f32 narrowing/widening through xmm */
+                    if (inst->nops >= 1)
+                    {
+                        bool toF32 = inst->opcode == IrOpcode::FpTrunc;
+                        emitValueToReg(&ctx, inst->ops[0], "rax");
+                        if (toF32)
+                        {
+                            ctx.emitLine("    movq %rax, %xmm0");
+                            ctx.emitLine("    cvtsd2ss %xmm0, %xmm0");
+                            ctx.emitLine("    movd %xmm0, %eax");
+                            ctx.emitLine("    movl %eax, %eax");
+                        }
+                        else
+                        {
+                            ctx.emitLine("    movd %eax, %xmm0");
+                            ctx.emitLine("    cvtss2sd %xmm0, %xmm0");
+                            ctx.emitLine("    movq %xmm0, %rax");
+                        }
+                        emitRegToSlot(&ctx, &inst->base, "rax");
+                    }
+                },
+                IrOpcode::Switch => {
+                    /* ops: [scrutinee, defaultBlock, caseVal, caseBlock]* —
+                     * compare-chain form; a jump table is a future opt */
+                    if (inst->nops >= 2 && inst->ops[0] != null)
+                    {
+                        emitValueToReg(&ctx, inst->ops[0], "rax");
+                        u32 nCases = inst->nops >= 2 ? (inst->nops - 2) / 2 : 0;
+                        u32 ci = 0;
+                        while (ci < nCases)
+                        {
+                            IrValue* cv = inst->ops[2 + ci * 2];
+                            IrValue* cb = inst->ops[3 + ci * 2];
+                            if (cv != null && cb != null)
+                            {
+                                emitValueToReg(&ctx, cv, "rcx");
+                                ctx.emitLine("    cmpq %rcx, %rax");
+                                ctx.emit("    je ");
+                                emitBBLabel(&ctx, func, cb);
+                                ctx.emitLine("");
+                            }
+                            ci++;
+                        }
+                        IrValue* db = inst->ops[1];
+                        if (db != null)
+                        {
+                            ctx.emit("    jmp ");
+                            emitBBLabel(&ctx, func, db);
+                            ctx.emitLine("");
+                        }
+                    }
+                },
+                IrOpcode::MulHi | IrOpcode::SMulHi => {
+                    /* high half of the 2n-bit product: mul/imul leave
+                     * it in rdx */
+                    if (inst->nops >= 2)
+                    {
+                        emitValueToReg(&ctx, inst->ops[0], "rax");
+                        emitValueToReg(&ctx, inst->ops[1], "rcx");
+                        ctx.emitLine(inst->opcode == IrOpcode::MulHi ? "    mulq %rcx" : "    imulq %rcx");
+                        ctx.emitLine("    movq %rdx, %rax");
+                        emitRegToSlot(&ctx, &inst->base, "rax");
+                    }
+                },
+                IrOpcode::Abs | IrOpcode::CtPop | IrOpcode::CtLz | IrOpcode::CtTz | IrOpcode::Bswap => {
+                    if (inst->nops >= 1)
+                    {
+                        emitValueToReg(&ctx, inst->ops[0], "rax");
+                        if (inst->opcode == IrOpcode::Abs)
+                        {
+                            ctx.emitLine("    movq %rax, %rcx");
+                            ctx.emitLine("    sarq $63, %rcx");
+                            ctx.emitLine("    xorq %rcx, %rax");
+                            ctx.emitLine("    subq %rcx, %rax");
+                        }
+                        else if (inst->opcode == IrOpcode::CtPop)
+                            ctx.emitLine("    popcntq %rax, %rax");
+                        else if (inst->opcode == IrOpcode::CtLz)
+                            ctx.emitLine("    lzcntq %rax, %rax");
+                        else if (inst->opcode == IrOpcode::CtTz)
+                            ctx.emitLine("    tzcntq %rax, %rax");
+                        else
+                        {
+                            u32 w = inst->ops[0]->type != null ? inst->ops[0]->type->width : 64;
+                            ctx.emitLine(w <= 32 ? "    bswapl %eax" : "    bswapq %rax");
+                        }
+                        emitRegToSlot(&ctx, &inst->base, "rax");
+                    }
+                },
+                IrOpcode::SMin | IrOpcode::SMax | IrOpcode::UMin | IrOpcode::UMax | IrOpcode::Rotl | IrOpcode::Rotr => {
+                    if (inst->nops >= 2)
+                    {
+                        emitValueToReg(&ctx, inst->ops[0], "rax");
+                        emitValueToReg(&ctx, inst->ops[1], "rcx");
+                        if (inst->opcode == IrOpcode::Rotl)
+                            ctx.emitLine("    roll %cl, %rax");
+                        else if (inst->opcode == IrOpcode::Rotr)
+                            ctx.emitLine("    rorq %cl, %rax");
+                        else
+                        {
+                            ctx.emitLine("    cmpq %rcx, %rax");
+                            str cc = "cmovg";
+                            if (inst->opcode == IrOpcode::SMax) cc = "cmovl";
+                            else if (inst->opcode == IrOpcode::UMin) cc = "cmova";
+                            else if (inst->opcode == IrOpcode::UMax) cc = "cmovb";
+                            ctx.emit("    ");
+                            ctx.emit(cc);
+                            ctx.emitLine(" %rcx, %rax");
+                        }
                         emitRegToSlot(&ctx, &inst->base, "rax");
                     }
                 },
