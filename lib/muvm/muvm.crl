@@ -44,6 +44,8 @@ import muvm::passes::jump_thread { muvmPassJumpThread };
 import muvm::passes::branchprop { muvmPassBranchProp };
 import muvm::passes::loop_canon { muvmPassLoopCanon };
 import muvm::passes::loop_cse { muvmPassLoopCse };
+import muvm::passes::inline { muvmPassInlineModule };
+import muvm::passes::ipa_cp { muvmPassIpaCpModule };
 import muvm::passes::algebraic { muvmPassAlgebraic };
 import muvm::passes::tail_dup { muvmPassTailDup };
 import muvm::passes::mem2reg { muvmPassMem2Reg };
@@ -54,6 +56,7 @@ import muvm::passes::sccp { muvmPassSccp };
 import muvm::passes::dce { muvmPassAdce };
 import muvm::passes::gvn { muvmPassGvn };
 import muvm::passes::diagnostics::verify { muvmPassVerify };
+import muvm::target::fast::x86_64 { emitModuleAsmTarget };
 
 import std::mman { alloc, dealloc };
 import std::ios { eprintln };
@@ -77,9 +80,118 @@ pub enum CallingConvention
     Wasm64,
 }
 
-bool ccIsWasm(CallingConvention cc)
+pub enum TargetArch
 {
-    return cc == CallingConvention::Wasm32 || cc == CallingConvention::Wasm64;
+    X86_64,
+    X86,
+    Arm64,
+    Wasm32,
+    Wasm64,
+}
+
+pub enum TargetOS
+{
+    Linux,
+    Windows,
+    MacOS,
+    BareMetal,
+    Unknown,
+}
+
+pub enum BackendKind
+{
+    Fast,
+    Primary,
+}
+
+pub struct MuvmTarget
+{
+    TargetArch arch;
+    TargetOS os;
+    BackendKind backend;
+}
+
+pub MuvmTarget muvmTarget(TargetArch arch, TargetOS os, BackendKind backend)
+{
+    return MuvmTarget {
+        .arch = arch,
+        .os = os,
+        .backend = backend
+    };
+}
+
+pub MuvmTarget muvmDefaultTarget()
+{
+    return muvmTarget(TargetArch::X86_64, TargetOS::Linux, BackendKind::Fast);
+}
+
+pub MuvmTarget muvmTargetFromCC(CallingConvention cc)
+{
+    switch (cc)
+    {
+        CallingConvention::Win64 |
+        CallingConvention::SyscallWin64 => {
+            return muvmTarget(TargetArch::X86_64, TargetOS::Windows, BackendKind::Fast);
+        },
+        CallingConvention::WinX86_32 => {
+            return muvmTarget(TargetArch::X86, TargetOS::Windows, BackendKind::Fast);
+        },
+        CallingConvention::SyscallMacOS => {
+            return muvmTarget(TargetArch::X86_64, TargetOS::MacOS, BackendKind::Fast);
+        },
+        CallingConvention::Wasm32 => {
+            return muvmTarget(TargetArch::Wasm32, TargetOS::Unknown, BackendKind::Fast);
+        },
+        CallingConvention::Wasm64 => {
+            return muvmTarget(TargetArch::Wasm64, TargetOS::Unknown, BackendKind::Fast);
+        },
+        CallingConvention::Cdecl |
+        CallingConvention::Stdcall |
+        CallingConvention::Fastcall |
+        CallingConvention::SyscallX86 => {
+            return muvmTarget(TargetArch::X86, TargetOS::Linux, BackendKind::Fast);
+        },
+        else => {
+            return muvmTarget(TargetArch::X86_64, TargetOS::Linux, BackendKind::Fast);
+        },
+    }
+}
+
+pub CallingConvention muvmTargetCallingConvention(MuvmTarget t)
+{
+    switch (t.arch)
+    {
+        TargetArch::X86_64 => {
+            if (t.os == TargetOS::Windows) return CallingConvention::Win64;
+            return CallingConvention::SystemV;
+        },
+        TargetArch::X86 => {
+            if (t.os == TargetOS::Windows) return CallingConvention::WinX86_32;
+            return CallingConvention::Cdecl;
+        },
+        TargetArch::Wasm32 => { return CallingConvention::Wasm32; },
+        TargetArch::Wasm64 => { return CallingConvention::Wasm64; },
+        else => { return CallingConvention::SystemV; },
+    }
+}
+
+pub str muvmTargetArchName(TargetArch arch)
+{
+    switch (arch)
+    {
+        TargetArch::X86_64 => { return "x86_64"; },
+        TargetArch::X86 => { return "x86"; },
+        TargetArch::Arm64 => { return "arm64"; },
+        TargetArch::Wasm32 => { return "wasm32"; },
+        TargetArch::Wasm64 => { return "wasm64"; },
+        else => { return "unknown"; },
+    }
+}
+
+pub bool muvmTargetIsImplemented(MuvmTarget t)
+{
+    if (t.backend != BackendKind::Fast) return false;
+    return t.arch == TargetArch::X86_64;
 }
 
 // Options — a value, not a global
@@ -547,45 +659,137 @@ pub bool muvmStructureLane(IrFunc* func, IrContext* ctx, MuvmOptions o)
     return true;
 }
 
-// Phase 1 (optimize + structure lane) runs for every non-extern function
-// before any regalloc/codegen touches the module — inlining clones
-// pre-regalloc IR, so callees must still be in that form here.
-// Phases 2 and 3 are stubbed with an honest error: muvm has no allocator
-// and no backends yet.
-pub CompileResult muvmCompileModule(IrModule* modd, IrContext* ctx, CallingConvention cc, MuvmOptions o)
+// Module stage: interprocedural work runs before the per-function lane
+// so cloned bodies and propagated constants are seen by the normal
+// function pipeline in the same compilation. O2 gets the conservative
+// thresholds; O3 widens the inline budget. O1 runs only hinted/always
+// inlines (no IPA), and O0/Debug run no module stage at all.
+pub bool muvmModuleStage(IrModule* modd, IrContext* ctx, MuvmOptions o)
+{
+    if (modd == null || ctx == null) return false;
+    if (o.level != OptLevel::O1 && o.level != OptLevel::O2 &&
+        o.level != OptLevel::O3) return false;
+
+    bool requireHint = o.level == OptLevel::O1;
+    u32 inlineMax = o.level == OptLevel::O3 ? 48 : (o.level == OptLevel::O1 ? 24 : 32);
+    bool changed = false;
+    if (muvmPassInlineModule(modd, ctx, inlineMax, requireHint)) changed = true;
+    if (!requireHint && muvmPassIpaCpModule(modd, ctx)) changed = true;
+    if (o.verify)
+    {
+        for (u32 fi = 0; fi < modd->nfuncs; fi++)
+        {
+            IrFunc* func = modd->funcs[fi];
+            if (func == null || func->isExtern) continue;
+            if (!muvmPassVerify(func, null))
+            {
+                eprintln("; muvmModuleStage verify failed func={}", func->base.name);
+                return changed;
+            }
+        }
+    }
+    if (o.verbose)
+        eprintln("; muvmModuleStage done changed={}", changed ? 1 : 0);
+    return changed;
+}
+
+// Full module path: module stage + function lane to a small fixed point,
+// then the structure lane once. The fixpoint matters: IPA's first round
+// can expose a constant return, which the function lane folds, which lets
+// the next IPA round propagate that return to callers. Without it, simply
+// recompiling the printed module would produce different IR.
+pub bool muvmOptimizeModule(IrModule* modd, IrContext* ctx, CallingConvention cc, MuvmOptions o)
+{
+    if (modd == null || ctx == null) return false;
+    for (u32 round = 0; round < 8; round++)
+    {
+        bool moduleChanged = muvmModuleStage(modd, ctx, o);
+        if (round > 0 && !moduleChanged) break;
+        for (u32 fi = 0; fi < modd->nfuncs; fi++)
+        {
+            IrFunc* func = modd->funcs[fi];
+            if (func == null || func->isExtern) continue;
+            if (o.verbose) eprintln("; muvmOptimizeModule optimizing func={}", func->base.name);
+            muvmOptimize(func, ctx, cc, o);
+        }
+        if (o.verify)
+        {
+            for (u32 fi = 0; fi < modd->nfuncs; fi++)
+            {
+                IrFunc* func = modd->funcs[fi];
+                if (func == null || func->isExtern) continue;
+                if (!muvmPassVerify(func, null)) return false;
+            }
+        }
+    }
+    for (u32 fi = 0; fi < modd->nfuncs; fi++)
+    {
+        IrFunc* func = modd->funcs[fi];
+        if (func == null || func->isExtern) continue;
+        if (!muvmStructureLane(func, ctx, o)) return false;
+    }
+    return true;
+}
+
+pub str muvmEmitModuleAsmForTarget(IrModule* modd, IrContext* ctx, MuvmTarget t)
+{
+    if (modd == null || ctx == null) return "";
+    switch (t.backend)
+    {
+        BackendKind::Fast =>
+        {
+            switch (t.arch)
+            {
+                TargetArch::X86_64 =>
+                {
+                    return emitModuleAsmTarget(modd, ctx, t.os == TargetOS::Windows);
+                },
+                else => { return ""; },
+            }
+        },
+        BackendKind::Primary => { return ""; },
+        else => { return ""; },
+    }
+    return "";
+}
+
+// Phase 1 (module + optimize + structure lane) runs before any
+// regalloc/codegen touches the module — inlining clones pre-regalloc IR,
+// so callees must still be in that form here.
+pub CompileResult muvmCompileModuleForTarget(IrModule* modd, IrContext* ctx, MuvmTarget t, MuvmOptions o)
 {
     if (modd == null) return muvmError("null module", 0);
     if (ctx == null) return muvmError("null context", 0);
+    if (!muvmTargetIsImplemented(t))
+        return muvmError("codegen backend not implemented for target", 0);
 
-    for (u32 fi = 0; fi < modd->nfuncs; fi++)
-    {
-        IrFunc* func = modd->funcs[fi];
-        if (func == null) continue;
-        if (func->isExtern) continue;
-        if (o.verbose) eprintln("; muvmCompileModule optimizing func={}", func->base.name);
-        muvmOptimize(func, ctx, cc, o);
-        if (!muvmStructureLane(func, ctx, o))
-            return muvmError("structure lane failed", 0);
-    }
+    CallingConvention cc = muvmTargetCallingConvention(t);
+    if (!muvmOptimizeModule(modd, ctx, cc, o))
+        return muvmError("module optimization failed", 0);
     if (o.verbose) eprintln("; muvmCompileModule phase1 done");
-    if (ccIsWasm(cc))
-        return muvmError("wasm backend not implemented yet", 0);
-    return muvmError("codegen backend not implemented yet", 0);
+    str asmText = muvmEmitModuleAsmForTarget(modd, ctx, t);
+    if (asmText.len == 0 && modd->nfuncs > 0)
+        return muvmError("codegen backend failed to emit assembly", 0);
+    return muvmSuccess();
+}
+
+pub CompileResult muvmCompileModule(IrModule* modd, IrContext* ctx, CallingConvention cc, MuvmOptions o)
+{
+    return muvmCompileModuleForTarget(modd, ctx, muvmTargetFromCC(cc), o);
 }
 
 // Test-support export. Returns the generated assembly text, or an empty
-// str on failure (len == 0). Currently always empty — see muvmCompileModule.
-pub str muvmCompileAsm(IrModule* modd, IrContext* ctx, CallingConvention cc, MuvmOptions o)
+// str on failure (len == 0).
+pub str muvmCompileAsmForTarget(IrModule* modd, IrContext* ctx, MuvmTarget t, MuvmOptions o)
 {
     if (modd == null || ctx == null) return "";
+    if (!muvmTargetIsImplemented(t)) return "";
+    CallingConvention cc = muvmTargetCallingConvention(t);
+    if (!muvmOptimizeModule(modd, ctx, cc, o)) return "";
+    return muvmEmitModuleAsmForTarget(modd, ctx, t);
+}
 
-    for (u32 fi = 0; fi < modd->nfuncs; fi++)
-    {
-        IrFunc* func = modd->funcs[fi];
-        if (func == null) continue;
-        if (func->isExtern) continue;
-        muvmOptimize(func, ctx, cc, o);
-        if (!muvmStructureLane(func, ctx, o)) return "";
-    }
-    return "";
+pub str muvmCompileAsm(IrModule* modd, IrContext* ctx, CallingConvention cc, MuvmOptions o)
+{
+    return muvmCompileAsmForTarget(modd, ctx, muvmTargetFromCC(cc), o);
 }

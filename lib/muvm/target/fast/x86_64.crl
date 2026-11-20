@@ -1,14 +1,16 @@
 #[[no_drop_all]]
 // Fast x86_64 text codegen for muvm.
-// Simple stack-slot-based code generator:
-// Each virtual register / value gets a dedicated stack slot.
-// Emits standard AT&T syntax x86_64 assembly text.
+// Supports both Linux (SystemV ABI) and Windows (Win64 ABI).
+// Emits rich assembly metadata, section placement (hot/cold),
+// and full data emission (strings, arrays, integers, structs).
 
 import muvm::irtypes {
     IrModule, IrFunc, IrBlock, IrInst, IrValue, IrValueKind,
-    IrType, IrTypeKind, IrContext, IrGlobal, IrStringConst
+    IrType, IrTypeKind, IrContext, IrGlobal, IrStringConst,
+    IrArrayConst, IrStructConst
 };
 import muvm::irOps { IrOpcode, IrICmpPred };
+import muvm::irMetadata { funcIsHot, funcIsCold, funcIsLeaf, funcIsOptNone, funcIsNoReturn };
 import std::string { String };
 import std::mman { alloc, dealloc };
 import platform::libc { snprintf };
@@ -20,7 +22,7 @@ struct ValueSlot
     i32 offset; // negative offset from %rbp
 }
 
-struct FastX86Context
+pub struct FastX86Context
 {
     String out;
     ValueSlot* slots;
@@ -28,8 +30,9 @@ struct FastX86Context
     u32 capSlots;
     i32 frameSize;
     str funcName;
+    bool isWindows;
 
-    static FastX86Context new()
+    static FastX86Context new(bool isWindows)
     {
         return FastX86Context {
             .out = String::new(),
@@ -37,7 +40,8 @@ struct FastX86Context
             .nslots = 0,
             .capSlots = 0,
             .frameSize = 0,
-            .funcName = str::empty()
+            .funcName = str::empty(),
+            .isWindows = isWindows
         };
     }
 
@@ -62,6 +66,13 @@ struct FastX86Context
     {
         cchar[32] buf;
         i32 n = snprintf(buf, 32, C"%lld", v);
+        if (n > 0) self.out.appendView(str::fromParts((const u8*)buf, (usize)n));
+    }
+
+    void emitU64(u64 v)
+    {
+        cchar[32] buf;
+        i32 n = snprintf(buf, 32, C"%llu", v);
         if (n > 0) self.out.appendView(str::fromParts((const u8*)buf, (usize)n));
     }
 
@@ -91,8 +102,19 @@ struct FastX86Context
     }
 }
 
+// SystemV ABI (Linux / macOS / BSD)
 static str[] SYSV_ARG_REGS_64 = { "rdi", "rsi", "rdx", "rcx", "r8", "r9" };
-static str[] SYSV_ARG_REGS_32 = { "edi", "esi", "edx", "ecx", "r8d", "r9d" };
+
+// Win64 ABI (Windows)
+static str[] WIN64_ARG_REGS_64 = { "rcx", "rdx", "r8", "r9" };
+
+bool funcUsesWin64(IrFunc* func, bool targetIsWindows)
+{
+    // Calling conventions: SystemV = 0, Win64 = 1, SyscallWin64 = 2
+    if (func->cc == 1 || func->cc == 2) return true;
+    if (func->cc == 0 && targetIsWindows) return true;
+    return targetIsWindows;
+}
 
 void emitValueToReg(FastX86Context* ctx, IrValue* v, str reg64)
 {
@@ -114,7 +136,16 @@ void emitValueToReg(FastX86Context* ctx, IrValue* v, str reg64)
         return;
     }
 
-    if (v->kind == IrValueKind::Global || v->kind == IrValueKind::Func)
+    if (v->kind == IrValueKind::ConstFloat)
+    {
+        ctx->emit("    movabsq $");
+        ctx->emitU64(v->valData);
+        ctx->emit(", %");
+        ctx->emitLine(reg64);
+        return;
+    }
+
+    if (v->kind == IrValueKind::Global || v->kind == IrValueKind::Func || v->kind == IrValueKind::StringConst)
     {
         ctx->emit("    leaq ");
         ctx->emit(v->name);
@@ -140,12 +171,20 @@ void emitRegToSlot(FastX86Context* ctx, IrValue* v, str reg64)
     ctx->emitLine("(%rbp)");
 }
 
-pub str emitFastX86Func(IrFunc* func, IrContext* ictx)
+// Emits textual assembly for a single function
+pub str emitFastX86Func(IrFunc* func, IrContext* ictx, bool isWindows)
 {
     if (func == null || func->isExtern) return "";
 
-    FastX86Context ctx = FastX86Context::new();
+    bool win64 = funcUsesWin64(func, isWindows);
+    FastX86Context ctx = FastX86Context::new(win64);
     ctx.funcName = func->base.name;
+
+    bool isHot = funcIsHot(func);
+    bool isCold = funcIsCold(func);
+    bool isOptNone = funcIsOptNone(func);
+    bool isLeaf = funcIsLeaf(func);
+    bool isNoRet = funcIsNoReturn(func);
 
     // 1. Assign stack slots to args and value-producing instructions
     i32 curOffset = 0;
@@ -163,7 +202,6 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx)
         {
             IrInst* inst = bb->insts[ii];
             if (inst == null) continue;
-            // Allocas reserve their own size, or 8 bytes minimum
             if (inst->opcode == IrOpcode::Alloca)
             {
                 u32 sz = 8;
@@ -184,16 +222,86 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx)
         }
     }
 
-    // Align stack frame to 16 bytes (x86_64 ABI requirement)
+    // Win64 ABI requires 32 bytes shadow store on stack for outbound calls
+    if (win64 && !isLeaf)
+    {
+        curOffset -= 32;
+    }
+
+    // Align stack frame to 16 bytes
     i32 rawFrame = -curOffset;
     ctx.frameSize = (rawFrame + 15) & ~15;
 
-    // 2. Function Prologue
+    // 2. Emit rich metadata header
+    ctx.emitLine("# ========================================================");
+    ctx.emit("# Function: @");
+    ctx.emitLine(func->base.name);
+    ctx.emit("# ABI: ");
+    ctx.emitLine(win64 ? "Win64 (Windows)" : "SystemV (Linux/Unix)");
+    ctx.emit("# Attributes: [");
+    if (isHot) ctx.emit(" hot");
+    if (isCold) ctx.emit(" cold");
+    if (isOptNone) ctx.emit(" optnone");
+    if (isLeaf) ctx.emit(" leaf");
+    if (isNoRet) ctx.emit(" noreturn");
+    ctx.emitLine(" ]");
+    ctx.emit("# Stack Frame: ");
+    ctx.emitI64((i64)ctx.frameSize);
+    ctx.emitLine(" bytes");
+    for (u32 ai = 0; ai < func->nargs; ai++)
+    {
+        ctx.emit("#   arg[");
+        ctx.emitI64((i64)ai);
+        ctx.emit("] -> ");
+        ctx.emitI64((i64)ctx.getSlot(func->args[ai]));
+        ctx.emitLine("(%rbp)");
+    }
+    ctx.emitLine("# ========================================================");
+
+    // 3. Section placement based on hot/cold
+    if (isHot)
+    {
+        if (win64)
+            ctx.emitLine("    .section .text$hot, \"xr\"");
+        else
+        {
+            ctx.emit("    .section .text.hot.");
+            ctx.emit(func->base.name);
+            ctx.emitLine(", \"ax\", @progbits");
+        }
+    }
+    else if (isCold)
+    {
+        if (win64)
+            ctx.emitLine("    .section .text$cold, \"xr\"");
+        else
+        {
+            ctx.emit("    .section .text.unlikely.");
+            ctx.emit(func->base.name);
+            ctx.emitLine(", \"ax\", @progbits");
+        }
+    }
+    else
+    {
+        ctx.emitLine("    .text");
+    }
+
+    // Function symbol directives
     ctx.emit(".globl ");
     ctx.emitLine(func->base.name);
-    ctx.emit(".type ");
-    ctx.emit(func->base.name);
-    ctx.emitLine(", @function");
+    if (win64)
+    {
+        ctx.emit(".def ");
+        ctx.emit(func->base.name);
+        ctx.emitLine("; .scl 2; .type 32; .endef");
+    }
+    else
+    {
+        ctx.emit(".type ");
+        ctx.emit(func->base.name);
+        ctx.emitLine(", @function");
+    }
+
     ctx.emit(func->base.name);
     ctx.emitLine(":");
     ctx.emitLine("    pushq %rbp");
@@ -205,20 +313,30 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx)
         ctx.emitLine(", %rsp");
     }
 
-    // Save register arguments to their assigned stack slots
-    u32 nArgRegs = 6;
-    for (u32 ai = 0; ai < func->nargs && ai < nArgRegs; ai++)
+    // Spill incoming arguments into their assigned slots
+    if (win64)
     {
-        emitRegToSlot(&ctx, func->args[ai], SYSV_ARG_REGS_64[ai]);
+        u32 maxWinArgs = 4;
+        for (u32 ai = 0; ai < func->nargs && ai < maxWinArgs; ai++)
+        {
+            emitRegToSlot(&ctx, func->args[ai], WIN64_ARG_REGS_64[ai]);
+        }
+    }
+    else
+    {
+        u32 maxSysVArgs = 6;
+        for (u32 ai = 0; ai < func->nargs && ai < maxSysVArgs; ai++)
+        {
+            emitRegToSlot(&ctx, func->args[ai], SYSV_ARG_REGS_64[ai]);
+        }
     }
 
-    // 3. Emit blocks and instructions
+    // 4. Emit basic blocks and instructions
     for (u32 bi = 0; bi < func->nblocks; bi++)
     {
         IrBlock* bb = func->blocks[bi];
         if (bb == null) continue;
 
-        // Block label
         ctx.emit(".L");
         ctx.emit(func->base.name);
         ctx.emit("_");
@@ -229,6 +347,16 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx)
         {
             IrInst* inst = bb->insts[ii];
             if (inst == null) continue;
+
+            // Optional debug location comment
+            if (inst->debugLoc.line > 0)
+            {
+                ctx.emit("    # loc line=");
+                ctx.emitU64((u64)inst->debugLoc.line);
+                ctx.emit(" col=");
+                ctx.emitU64((u64)inst->debugLoc.col);
+                ctx.emitLine("");
+            }
 
             switch (inst->opcode)
             {
@@ -342,13 +470,31 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx)
                 },
                 IrOpcode::Load => {
                     emitValueToReg(&ctx, inst->ops[0], "rax");
-                    ctx.emitLine("    movq (%rax), %rcx");
+                    u32 w = 64;
+                    if (inst->base.type != null) w = inst->base.type->width;
+                    if (w == 8)
+                        ctx.emitLine("    movzbl (%rax), %ecx");
+                    else if (w == 16)
+                        ctx.emitLine("    movzwl (%rax), %ecx");
+                    else if (w == 32)
+                        ctx.emitLine("    movl (%rax), %ecx");
+                    else
+                        ctx.emitLine("    movq (%rax), %rcx");
                     emitRegToSlot(&ctx, &inst->base, "rcx");
                 },
                 IrOpcode::Store => {
                     emitValueToReg(&ctx, inst->ops[0], "rax"); // val
                     emitValueToReg(&ctx, inst->ops[1], "rcx"); // ptr
-                    ctx.emitLine("    movq %rax, (%rcx)");
+                    u32 w = 64;
+                    if (inst->ops[0] != null && inst->ops[0]->type != null) w = inst->ops[0]->type->width;
+                    if (w == 8)
+                        ctx.emitLine("    movb %al, (%rcx)");
+                    else if (w == 16)
+                        ctx.emitLine("    movw %ax, (%rcx)");
+                    else if (w == 32)
+                        ctx.emitLine("    movl %eax, (%rcx)");
+                    else
+                        ctx.emitLine("    movq %rax, (%rcx)");
                 },
                 IrOpcode::ICmp => {
                     emitValueToReg(&ctx, inst->ops[0], "rax");
@@ -396,12 +542,22 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx)
                     ctx.emitLine(inst->ops[2]->name);
                 },
                 IrOpcode::Call => {
-                    // Set up arguments
                     u32 nArgs = inst->nops > 1 ? inst->nops - 1 : 0;
-                    for (u32 ai = 0; ai < nArgs && ai < 6; ai++)
+                    if (win64)
                     {
-                        emitValueToReg(&ctx, inst->ops[ai + 1], SYSV_ARG_REGS_64[ai]);
+                        for (u32 ai = 0; ai < nArgs && ai < 4; ai++)
+                        {
+                            emitValueToReg(&ctx, inst->ops[ai + 1], WIN64_ARG_REGS_64[ai]);
+                        }
                     }
+                    else
+                    {
+                        for (u32 ai = 0; ai < nArgs && ai < 6; ai++)
+                        {
+                            emitValueToReg(&ctx, inst->ops[ai + 1], SYSV_ARG_REGS_64[ai]);
+                        }
+                    }
+
                     if (inst->ops[0] != null)
                     {
                         ctx.emit("    call ");
@@ -412,14 +568,12 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx)
                         emitRegToSlot(&ctx, &inst->base, "rax");
                     }
                 },
-                else => {
-                    // Fallback nop for unhandled ops in minimal fast codegen
-                }
+                else => { }
             }
         }
     }
 
-    // 4. Function Epilogue
+    // 5. Function Epilogue
     ctx.emit(".L");
     ctx.emit(func->base.name);
     ctx.emitLine("_epilogue:");
@@ -429,4 +583,268 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx)
 
     str res = ctx.out.asView();
     return res;
+}
+
+void emitEscapedAsciz(FastX86Context* ctx, const u8* data, u32 len)
+{
+    ctx->emit("    .asciz \"");
+    for (u32 i = 0; i < len; i++)
+    {
+        u8 c = data[i];
+        if (c == 10) ctx->emit("\\n");
+        else if (c == 9) ctx->emit("\\t");
+        else if (c == 13) ctx->emit("\\r");
+        else if (c == 34) ctx->emit("\\\"");
+        else if (c == 92) ctx->emit("\\\\");
+        else if (c >= 32 && c <= 126)
+        {
+            u8[1] ch;
+            ch[0] = c;
+            ctx->emit(str::fromParts((const u8*)ch, 1));
+        }
+        else
+        {
+            cchar[8] oct;
+            snprintf(oct, 8, C"\\%03o", (u32)c);
+            ctx->emit(str::fromCstr((cchar*)oct));
+        }
+    }
+    ctx->emitLine("\"");
+}
+
+// Emits constant value directives (.byte, .short, .long, .quad, .asciz, etc.)
+void emitConstantData(FastX86Context* ctx, IrValue* v)
+{
+    if (v == null)
+    {
+        ctx->emitLine("    .quad 0");
+        return;
+    }
+
+    switch (v->kind)
+    {
+        IrValueKind::ConstInt => {
+            u32 w = v->type != null ? v->type->width : 64;
+            if (w == 8)
+            {
+                ctx->emit("    .byte ");
+                ctx->emitI64((i64)(u8)v->valData);
+                ctx->emitLine("");
+            }
+            else if (w == 16)
+            {
+                ctx->emit("    .short ");
+                ctx->emitI64((i64)(u16)v->valData);
+                ctx->emitLine("");
+            }
+            else if (w == 32)
+            {
+                ctx->emit("    .long ");
+                ctx->emitI64((i64)(i32)v->valData);
+                ctx->emitLine("");
+            }
+            else
+            {
+                ctx->emit("    .quad ");
+                ctx->emitI64((i64)v->valData);
+                ctx->emitLine("");
+            }
+        },
+        IrValueKind::ConstFloat => {
+            u32 w = v->type != null ? v->type->width : 64;
+            if (w == 32)
+            {
+                ctx->emit("    .long ");
+                ctx->emitU64((u64)(u32)v->valData);
+                ctx->emitLine("");
+            }
+            else
+            {
+                ctx->emit("    .quad ");
+                ctx->emitU64(v->valData);
+                ctx->emitLine("");
+            }
+        },
+        IrValueKind::StringConst => {
+            IrStringConst* sc = (IrStringConst*)v;
+            emitEscapedAsciz(ctx, sc->data, sc->length);
+        },
+        IrValueKind::ConstArray => {
+            IrArrayConst* ac = (IrArrayConst*)v;
+            for (u32 i = 0; i < ac->nelems; i++)
+            {
+                emitConstantData(ctx, ac->elems[i]);
+            }
+        },
+        IrValueKind::StructConst => {
+            IrStructConst* st = (IrStructConst*)v;
+            for (u32 i = 0; i < st->nelems; i++)
+            {
+                emitConstantData(ctx, st->elems[i]);
+            }
+        },
+        IrValueKind::Global | IrValueKind::Func => {
+            ctx->emit("    .quad ");
+            ctx->emitLine(v->name);
+        },
+        else => {
+            ctx->emitLine("    .quad 0");
+        }
+    }
+}
+
+// Emits strings, global variables, and arrays for the module
+pub str emitFastX86Data(IrModule* modd, bool isWindows)
+{
+    if (modd == null) return "";
+
+    FastX86Context ctx = FastX86Context::new(isWindows);
+
+    // 1. String Constants (.rodata on Linux, .rdata on Windows)
+    if (modd->nconstStrings > 0)
+    {
+        ctx.emitLine("# ---- String Constants ----");
+        if (isWindows)
+            ctx.emitLine("    .section .rdata, \"dr\"");
+        else
+            ctx.emitLine("    .section .rodata");
+
+        for (u32 i = 0; i < modd->nconstStrings; i++)
+        {
+            IrStringConst* sc = modd->constStrings[i];
+            if (sc == null) continue;
+
+            ctx.emitLine("    .align 1");
+            if (!sc->base.name.isEmpty())
+            {
+                ctx.emit(sc->base.name);
+                ctx.emitLine(":");
+            }
+            else
+            {
+                ctx.emit(".Lstr_");
+                ctx.emitU64((u64)sc->base.id);
+                ctx.emitLine(":");
+            }
+
+            emitEscapedAsciz(&ctx, sc->data, sc->length);
+        }
+        ctx.emitLine("");
+    }
+
+    // 2. Global Variables (.data or .rodata/.rdata)
+    if (modd->nglobals > 0)
+    {
+        ctx.emitLine("# ---- Global Variables ----");
+        for (u32 gi = 0; gi < modd->nglobals; gi++)
+        {
+            IrGlobal* g = modd->globals[gi];
+            if (g == null || g->isExtern) continue;
+
+            if (g->isConst)
+            {
+                if (isWindows)
+                    ctx.emitLine("    .section .rdata, \"dr\"");
+                else
+                    ctx.emitLine("    .section .rodata");
+            }
+            else
+            {
+                ctx.emitLine("    .data");
+            }
+
+            u32 align = g->alignment != 0 ? g->alignment : 8;
+            ctx.emit("    .align ");
+            ctx.emitU64((u64)align);
+            ctx.emitLine("");
+
+            ctx.emit(".globl ");
+            ctx.emitLine(g->base.name);
+            ctx.emit(g->base.name);
+            ctx.emitLine(":");
+
+            if (g->initVal != null)
+            {
+                emitConstantData(&ctx, g->initVal);
+            }
+            else
+            {
+                u32 sz = 8;
+                if (g->base.type != null && g->base.type->elem != null)
+                {
+                    sz = (g->base.type->elem->width + 7) / 8;
+                    if (sz == 0) sz = 8;
+                }
+                ctx.emit("    .zero ");
+                ctx.emitU64((u64)sz);
+                ctx.emitLine("");
+            }
+        }
+        ctx.emitLine("");
+    }
+
+    str res = ctx.out.asView();
+    return res;
+}
+
+pub str emitFuncAsm(IrFunc* func, IrContext* ctx)
+{
+    if (func == null || ctx == null) return "";
+    return emitFastX86Func(func, ctx, false);
+}
+
+pub str emitFuncAsmTarget(IrFunc* func, IrContext* ctx, bool isWindows)
+{
+    if (func == null || ctx == null) return "";
+    return emitFastX86Func(func, ctx, isWindows);
+}
+
+pub str emitModuleAsmTarget(IrModule* modd, IrContext* ctx, bool isWindows)
+{
+    if (modd == null || ctx == null) return "";
+
+    String out = String::new();
+
+    // 1. Module-level metadata header
+    out.appendView("# ========================================================\n");
+    out.appendView("# Module: ");
+    out.appendView(modd->name);
+    out.appendView("\n# Target OS: ");
+    out.appendView(isWindows ? "Windows (Win64 ABI)\n" : "Linux / Unix (SystemV ABI)\n");
+    out.appendView("# ========================================================\n\n");
+
+    // 2. Data Section (Strings, Arrays, Global Variables, Structs)
+    str dataAsm = emitFastX86Data(modd, isWindows);
+    if (dataAsm.len > 0)
+    {
+        out.appendView(dataAsm);
+    }
+
+    // 3. Functions (with section placement and metadata)
+    for (u32 fi = 0; fi < modd->nfuncs; fi++)
+    {
+        IrFunc* func = modd->funcs[fi];
+        if (func == null || func->isExtern) continue;
+
+        str fAsm = emitFastX86Func(func, ctx, isWindows);
+        if (fAsm.len > 0)
+        {
+            out.appendView(fAsm);
+            out.pushChar('\n');
+        }
+    }
+
+    return out.asView();
+}
+
+pub str emitModuleAsm(IrModule* modd, IrContext* ctx)
+{
+    return emitModuleAsmTarget(modd, ctx, false);
+}
+
+pub bool compileModule(IrModule* modd, IrContext* ctx)
+{
+    if (modd == null || ctx == null) return false;
+    str asmText = emitModuleAsm(modd, ctx);
+    return asmText.len > 0 || modd->nfuncs == 0;
 }
