@@ -26,6 +26,8 @@ f32 f32OfU32(u32 b)
 // stack — which is exactly why this target can port before the register
 // allocator and asm rules exist for the native backends.
 
+static str[] WASM_TEMP_NAMES = { "$tI32_", "$tI64_", "$tF32_", "$tF64_", "$tV128_" };
+
 pub struct WasmEmitter
 {
     IrContext* ctx;
@@ -1253,17 +1255,20 @@ pub struct WasmCodeGen
     {
         if (inst->nops == 0 || inst->ops[0] == null) return false;
         IrType* tb = inst->ops[0]->type;
-        if (tb == null || tb->kind != IrTypeKind::Ptr)
+        // base may be ptr-to-T or the aggregate T itself (alloca results
+        // carry the pointee type); ptr decays to its element
+        if (tb == null)
         {
-            self.failMsg(null, "gep base is not a pointer");
+            self.failMsg(null, "gep base has no type");
             return false;
         }
+        if (tb->kind == IrTypeKind::Ptr) tb = tb->elem;
         // collect the descent plan first so failures leave no stack mess
         u32[64] sizes;
         u32[64] isStructIx;
         u32 nIx = inst->nops - 1;
         if (nIx > 64) { self.failMsg(null, "gep too many indices"); return false; }
-        IrType* t = tb->elem;
+        IrType* t = tb;
         for (u32 i = 0; i < nIx; i++)
         {
             if (t == null)
@@ -1572,12 +1577,15 @@ pub struct WasmCodeGen
     bool emitAlloca(IrInst* inst)
     {
         IrType* pt = inst->base.type;
-        if (pt == null || pt->kind != IrTypeKind::Ptr || pt->elem == null)
+        // the result type is either ptr-to-T or the pointee T itself —
+        // the x86 backend accepts both, so does this one
+        if (pt != null && pt->kind == IrTypeKind::Ptr) pt = pt->elem;
+        if (pt == null)
         {
             self.failMsg(null, "alloca without an element type");
             return false;
         }
-        u32 sz = self.wasmSize(pt->elem);
+        u32 sz = self.wasmSize(pt);
         sz = (sz + 15) / 16 * 16;
         if (sz == 0) sz = 16;
         self.emitter.emitLine("global.get $__stack_pointer");
@@ -2256,12 +2264,40 @@ pub struct WasmCodeGen
         }
     }
 
+    // temp class for a value's wasm local type: 0=i32 1=i64 2=f32
+    // 3=f64 4=v128 — the phi-copy staging pool is indexed per class
+    u32 tempClassFor(IrType* t)
+    {
+        if (t == null) return 1;
+        switch (t->kind)
+        {
+            IrTypeKind::Int => { return t->width <= 32 ? 0 : 1; },
+            IrTypeKind::Float => { return t->width <= 32 ? 2 : 3; },
+            IrTypeKind::Vector => { return 4; },
+            else => { return 1; }
+        }
+    }
+
+    void emitTempAccess(u32 cls, u32 seq, bool isGet)
+    {
+        self.emitter.emit(isGet ? "local.get " : "local.set ");
+        self.emitter.emit(WASM_TEMP_NAMES[cls]);
+        self.emitter.emitU32(seq);
+        self.emitter.emitLine("");
+    }
+
     // phi incoming copies for the edge from -> to, emitted at the end of
-    // the source region before the pc update
+    // the source region before the pc update. Copies are parallel: a
+    // source that is itself a destination in this set is staged through
+    // a scratch local first, or the sequential writes would feed the
+    // new value back (a<-b; b<-r must not read the updated b)
     bool emitPhiIncomings(IrBlock* from, IrBlock* to)
     {
         if (to == null) return true;
-        for (u32 i = 0; i < to->ninsts; i++)
+        IrInst*[32] phis;
+        IrValue*[32] srcs;
+        u32 n = 0;
+        for (u32 i = 0; i < to->ninsts && n < 32; i++)
         {
             IrInst* phi = to->insts[i];
             if (phi->opcode != IrOpcode::Phi) break;
@@ -2269,16 +2305,108 @@ pub struct WasmCodeGen
             {
                 if ((IrBlock*)phi->ops[j + 1] == from)
                 {
-                    if (!self.emitValuePush(phi->ops[j])) return false;
-                    u32 s = self.slotOf(&phi->base);
-                    if (s == 0xFFFFFFFF) return false;
-                    self.emitter.emit("local.set $v");
-                    self.emitter.emitU32(s);
-                    self.emitter.emitLine("");
+                    phis[n] = phi;
+                    srcs[n] = phi->ops[j];
+                    n += 1;
                     break;
                 }
             }
         }
+        if (n == 0) return true;
+        IrValue*[32] stagedVal;
+        u32[32] stagedCls;
+        u32[32] stagedSeq;
+        u32[5] seqs;
+        for (u32 i = 0; i < 5; i++) seqs[i] = 0;
+        u32 nst = 0;
+        for (u32 i = 0; i < n; i++)
+        {
+            IrValue* sv = srcs[i];
+            if (sv == null) continue;
+            u32 sslot = self.slotOf(sv);
+            if (sslot == 0xFFFFFFFF) continue;
+            bool isDst = false;
+            for (u32 k = 0; k < n; k++)
+                if (self.slotOf(&phis[k]->base) == sslot) { isDst = true; break; }
+            if (!isDst) continue;
+            bool already = false;
+            for (u32 k = 0; k < nst; k++)
+                if (stagedVal[k] == sv) { already = true; break; }
+            if (already) continue;
+            u32 cls = self.tempClassFor(sv->type);
+            if (seqs[cls] >= 8) { self.failMsg(null, "too many parallel phi copies"); return false; }
+            if (!self.emitValuePush(sv)) return false;
+            self.emitTempAccess(cls, seqs[cls], false);
+            stagedVal[nst] = sv;
+            stagedCls[nst] = cls;
+            stagedSeq[nst] = seqs[cls];
+            seqs[cls] += 1;
+            nst += 1;
+        }
+        for (u32 i = 0; i < n; i++)
+        {
+            IrValue* sv = srcs[i];
+            bool found = false;
+            for (u32 k = 0; k < nst; k++)
+            {
+                if (stagedVal[k] == sv)
+                {
+                    self.emitTempAccess(stagedCls[k], stagedSeq[k], true);
+                    found = true;
+                    break;
+                }
+            }
+            if (!found && !self.emitValuePush(sv)) return false;
+            u32 s = self.slotOf(&phis[i]->base);
+            if (s == 0xFFFFFFFF) return false;
+            self.emitter.emit("local.set $v");
+            self.emitter.emitU32(s);
+            self.emitter.emitLine("");
+        }
+        return true;
+    }
+
+    // one level of the switch if/else chain: case i compares the saved
+    // scrutinee against its constant; the taken arm runs that edge's
+    // phi copies, sets $pc and re-enters the dispatch loop. The else
+    // arm recurses; the default lives at the bottom
+    bool emitSwitchChain(IrFunc* func, IrBlock* bb, IrInst* term, u32 i, bool is64, u32 depth)
+    {
+        if (depth > 512) { self.failMsg(func, "switch too deep"); return false; }
+        u32 npairs = (term->nops - 2) / 2;
+        if (i >= npairs)
+        {
+            // default edge
+            IrBlock* db = (IrBlock*)term->ops[1];
+            if (!self.emitPhiIncomings(bb, db)) return false;
+            u32 rdef = self.blkIndexOf(db);
+            if (rdef == 0xFFFFFFFF) { self.failMsg(func, "switch default outside the function"); return false; }
+            self.emitter.emit("i32.const ");
+            self.emitter.emitU32(rdef);
+            self.emitter.emitLine("");
+            self.emitter.emitLine("local.set $pc");
+            self.emitter.emitLine("br $L");
+            return true;
+        }
+        IrValue* cv = term->ops[2 + i * 2];
+        IrBlock* cb = (IrBlock*)term->ops[3 + i * 2];
+        if (cv == null || cb == null) return self.emitSwitchChain(func, bb, term, i + 1, is64, depth + 1);
+        u32 rc = self.blkIndexOf(cb);
+        if (rc == 0xFFFFFFFF) { self.failMsg(func, "switch case outside the function"); return false; }
+        self.emitter.emit(is64 ? "local.get $swI64" : "local.get $swI32");
+        self.emitter.emitLine("");
+        if (!self.emitValuePush(cv)) return false;
+        self.emitter.emitLine(is64 ? "i64.eq" : "i32.eq");
+        self.emitter.emitLine("if");
+        if (!self.emitPhiIncomings(bb, cb)) return false;
+        self.emitter.emit("i32.const ");
+        self.emitter.emitU32(rc);
+        self.emitter.emitLine("");
+        self.emitter.emitLine("local.set $pc");
+        self.emitter.emitLine("br $L");
+        self.emitter.emitLine("else");
+        if (!self.emitSwitchChain(func, bb, term, i + 1, is64, depth + 1)) return false;
+        self.emitter.emitLine("end");
         return true;
     }
 
@@ -2328,18 +2456,38 @@ pub struct WasmCodeGen
                 if (term->nops < 3) return false;
                 IrBlock* tt = (IrBlock*)term->ops[1];
                 IrBlock* ft = (IrBlock*)term->ops[2];
-                if (!self.emitPhiIncomings(bb, tt)) return false;
-                if (ft != tt && !self.emitPhiIncomings(bb, ft)) return false;
                 u32 rt = self.blkIndexOf(tt);
                 u32 rf = self.blkIndexOf(ft);
                 if (rt == 0xFFFFFFFF || rf == 0xFFFFFFFF) { self.failMsg(func, "cond_br to a block outside the function"); return false; }
+                if (!self.emitValuePush(term->ops[0])) return false;
+                // the condition feeds both the edge-select and the
+                // copy guard, so it lives in $condT across the if
+                if (term->ops[0]->type != null && self.isI64(term->ops[0]->type))
+                    self.emitter.emitLine("i32.wrap_i64");
+                self.emitter.emitLine("local.set $condT");
+                if (tt == ft)
+                {
+                    if (!self.emitPhiIncomings(bb, tt)) return false;
+                }
+                else
+                {
+                    // each edge's phi copies run only on that edge —
+                    // unconditional copies would apply the not-taken
+                    // edge's values (swap_phi class of bug)
+                    self.emitter.emitLine("local.get $condT");
+                    self.emitter.emitLine("if");
+                    if (!self.emitPhiIncomings(bb, tt)) return false;
+                    self.emitter.emitLine("else");
+                    if (!self.emitPhiIncomings(bb, ft)) return false;
+                    self.emitter.emitLine("end");
+                }
                 self.emitter.emit("i32.const ");
                 self.emitter.emitU32(rt);
                 self.emitter.emitLine("");
                 self.emitter.emit("i32.const ");
                 self.emitter.emitU32(rf);
                 self.emitter.emitLine("");
-                if (!self.emitValuePush(term->ops[0])) return false;
+                self.emitter.emitLine("local.get $condT");
                 self.emitter.emitLine("select");
                 self.emitter.emitLine("local.set $pc");
                 self.emitter.emitLine("br $L");
@@ -2347,47 +2495,20 @@ pub struct WasmCodeGen
             },
             IrOpcode::Switch => {
                 // ops: [scrutinee, defaultBlock, caseValue, caseBlock, ...]
-                // each pair picks its block index when the scrutinee equals
-                // the case constant; the chain folds right-to-left so the
-                // first matching case wins, matching IR semantics
+                // lowered as a nested if/else chain so each edge's phi
+                // copies run only when that edge is actually taken
                 if (term->nops < 2 || term->ops[0] == null || term->ops[1] == null)
                     return false;
-                u32 npairs = (term->nops - 2) / 2;
                 IrType* sty = term->ops[0]->type;
-                bool is64 = self.isI64(sty);
-                // phi copies for every reachable target before any pc move
-                for (u32 i = 0; i < npairs; i++)
+                bool is64 = sty != null && sty->kind == IrTypeKind::Int && sty->width > 32;
+                if (sty == null || sty->kind != IrTypeKind::Int)
                 {
-                    IrBlock* cb = (IrBlock*)term->ops[3 + i * 2];
-                    IrBlock* db = (IrBlock*)term->ops[1];
-                    if (cb != null && !self.emitPhiIncomings(bb, cb)) return false;
-                    if (db != cb && !self.emitPhiIncomings(bb, db)) return false;
+                    self.failMsg(func, "switch scrutinee is not an integer");
+                    return false;
                 }
-                u32 rdef = self.blkIndexOf((IrBlock*)term->ops[1]);
-                if (rdef == 0xFFFFFFFF) { self.failMsg(func, "switch default outside the function"); return false; }
-                // accumulate into $pc: per case push [casePc, accPc, cond]
-                // so select yields casePc when scrutinee == case value
-                self.emitter.emit("i32.const ");
-                self.emitter.emitU32(rdef);
-                self.emitter.emitLine("");
-                self.emitter.emitLine("local.set $pc");
-                for (u32 i = 0; i < npairs; i++)
-                {
-                    IrValue* cv = term->ops[2 + i * 2];
-                    IrBlock* cb = (IrBlock*)term->ops[3 + i * 2];
-                    if (cv == null || cb == null) continue;
-                    u32 rc = self.blkIndexOf(cb);
-                    if (rc == 0xFFFFFFFF) { self.failMsg(func, "switch case outside the function"); return false; }
-                    self.emitter.emit("i32.const ");
-                    self.emitter.emitU32(rc);
-                    self.emitter.emitLine("");
-                    self.emitter.emitLine("local.get $pc");
-                    if (!self.emitValuePush(term->ops[0])) return false;
-                    if (!self.emitValuePush(cv)) return false;
-                    self.emitter.emitLine(is64 ? "i64.eq" : "i32.eq");
-                    self.emitter.emitLine("select");
-                    self.emitter.emitLine("local.set $pc");
-                }
+                if (!self.emitValuePush(term->ops[0])) return false;
+                self.emitter.emitLine(is64 ? "local.set $swI64" : "local.set $swI32");
+                if (!self.emitSwitchChain(func, bb, term, 0, is64, 0)) return false;
                 self.emitter.emitLine("br $L");
                 return true;
             },
@@ -2682,6 +2803,27 @@ pub struct WasmCodeGen
         if (needAtR64) self.emitter.emitLine("(local $atR64 i64)");
         if (needVecA) self.emitter.emitLine("(local $vecA v128)");
         if (needVecB) self.emitter.emitLine("(local $vecB v128)");
+        self.emitter.emitLine("(local $condT i32)");
+        self.emitter.emitLine("(local $swI32 i32)");
+        self.emitter.emitLine("(local $swI64 i64)");
+        for (u32 ti = 0; ti < 8; ti++)
+        {
+            self.emitter.emit("(local $tI32_");
+            self.emitter.emitU32(ti);
+            self.emitter.emitLine(" i32)");
+            self.emitter.emit("(local $tI64_");
+            self.emitter.emitU32(ti);
+            self.emitter.emitLine(" i64)");
+            self.emitter.emit("(local $tF32_");
+            self.emitter.emitU32(ti);
+            self.emitter.emitLine(" f32)");
+            self.emitter.emit("(local $tF64_");
+            self.emitter.emitU32(ti);
+            self.emitter.emitLine(" f64)");
+            self.emitter.emit("(local $tV128_");
+            self.emitter.emitU32(ti);
+            self.emitter.emitLine(" v128)");
+        }
         for (u32 i = 0; i < self.nsl; i++)
         {
             if (self.sls[i] < func->nargs) continue;

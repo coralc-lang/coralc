@@ -14,7 +14,8 @@
 - [ ] Search for constructs not supported at all (silent codegen failures)
 - [ ] Check CODEGEN_GAPS.md for documented gaps, mark in the codegen gap doc and implement them in the muvm codegen for the compiler. you can skip implementation in the c backend.
 - [ ] Verify all error paths reach upper pipeline before codegen.
-- [ ] naked attribute should have constraints, the function can only have an inline asm block or a couple of them, no arguments, no local variables.
+- [ ] naked attribute should have constraints, the function can only have an inline asm block or a couple of them, no arguments, no local variables. it should also not be available on methods.
+- [ ] Inline asm must be a hard compile error on targets that cannot carry it (wasm32/wasm64, and any future non-asm backend) — reject in the frontend/backend dispatch with a proper diagnostic, not a codegen-time failure.
 
 ## Testing
 - [ ] Run extensive test suite to catch secretly failing cases
