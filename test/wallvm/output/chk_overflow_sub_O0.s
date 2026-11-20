@@ -20,7 +20,7 @@ main:
 	movq %rax, %rsi
 	movq $0x000000007fffffff, %rax
 	ret
-.section .rodata.str1.1,"aM",@progbits,1
+.section .rodata,"a",@progbits
 .Lcs11:
 	.asciz "main"
 .Lcs12:

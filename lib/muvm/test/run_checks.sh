@@ -25,7 +25,7 @@ fail=0
 ok()  { pass=$((pass+1)); }
 bad() { echo "FAIL $1"; fail=$((fail+1)); }
 
-for case in ../wallvm/checks/*.ir; do
+for case in /home/cerie/Documents/coral/test/wallvm/checks/*.ir; do
     name=$(basename "$case" .ir)
 
     # 1. instrumented O0: _trap must appear in the printed IR

@@ -439,3 +439,42 @@ These codes are registered in the diagnostic tables; no call site emits them yet
 | Driver | `D0004`–`D0007` | registered and emitted |
 | Warnings | `W0001`–`W0042` (`W0041` removed) | registered; `W0001`, `W0006`, `W0007`, `W0010` emitted |
 
+pub i32 foo()
+{
+    i32 a = 42;
+    i32& b = a;
+
+
+    return b + 1;
+}
+
+
+pub void main()
+{
+    u8* a = (u8*)0x0000;
+    u8 c = *a;
+    println("{}", c);
+}
+
+// [cerie@cerie foo]$ coralc run --show-gcc
+// coral: build plan: 1 modules, 0 aliases, 1 stale
+//    Compiling src
+// <stdin>:291:9: warning: conflicting types for built-in function ‘vsnprintf’; expected ‘int(char *, long unsigned int,  const char *, __va_list_tag *)’ [-Wbuiltin-declaration-mismatch]
+// <stdin>:5:1: note: ‘vsnprintf’ is declared in header ‘<stdio.h>’
+// <stdin>:895:58: warning: integer constant is so large that it is unsigned
+// <stdin>:903:55: warning: integer constant is so large that it is unsigned
+// <stdin>: In function ‘crl__lib__std__x86_64__linux__intrinsics__string__strlen’:
+// <stdin>:1095:80: warning: integer constant is so large that it is unsigned
+// <stdin>: In function ‘crl__lib__std__x86_64__linux__allocators__mimalloc__MiAlloc_calloc’:
+// <stdin>:3472:64: warning: integer constant is so large that it is unsigned
+// <stdin>: In function ‘crl__lib__std__x86_64__linux__ios__parseI64’:
+// <stdin>:5145:43: warning: integer constant is so large that it is unsigned
+// <stdin>:5163:36: warning: integer constant is so large that it is unsigned
+// <stdin>: In function ‘crl__lib__std__x86_64__linux__ios__parseU64’:
+// <stdin>:5195:39: warning: integer constant is so large that it is unsigned
+// <stdin>: In function ‘crl__loc__src__lib__foo’:
+// <stdin>:5256:18: error: initialization of ‘int32_t *’ {aka ‘int *’} from ‘int32_t’ {aka ‘int’} makes pointer from integer without a cast [-Wint-conversion]
+// <stdin>:5257:16: error: returning ‘int32_t *’ {aka ‘int *’} from a function with return type ‘int32_t’ {aka ‘int’} makes integer from pointer without a cast [-Wint-conversion]
+// error[D0004]: C backend failed (status 1); rerun with --show-gcc for details
+//   fix: ensure gcc is installed and on PATH
+// [cerie@cerie foo]$

@@ -44,7 +44,7 @@ main:
 	movq %rax, %rsi
 	movq $0x0000000000000000, %rax
 	ret
-.section .rodata.str1.1,"aM",@progbits,1
+.section .rodata,"a",@progbits
 .Lcs16:
 	.asciz "main"
 .Lcs17:

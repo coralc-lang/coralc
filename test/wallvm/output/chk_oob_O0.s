@@ -57,7 +57,7 @@ main:
 	popq %rbx
 	leave
 	ret
-.section .rodata.str1.1,"aM",@progbits,1
+.section .rodata,"a",@progbits
 .Lcs27:
 	.asciz "main"
 .Lcs28:

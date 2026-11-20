@@ -16,7 +16,7 @@ main:
 	movq %rsi, %rax
 	popq %rbx
 	ret
-.section .rodata.str1.1,"aM",@progbits,1
+.section .rodata,"a",@progbits
 .Lcs10:
 	.asciz "main"
 .Lcs11:
