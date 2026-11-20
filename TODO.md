@@ -1,8 +1,8 @@
 # Coral Compiler TODO
 
 ## Modules & Imports
-- [ ] Fix qualified type paths `module::Type` (parser drops qualifier; `bitset::Bitset` fails) — do before other module work
-- [ ] Circular imports should resolve rather than causing cascading errors
+- [x] Fix qualified type paths `module::Type` — parser keeps full `a::b::C` name, sema resolves via module members, `bitset::Bitset` + `bitset::Bitset::new()` work end-to-end
+- [x] Circular imports resolve (foo↔goo↔ioo test moved wrong/ → works/)
 - [ ] Make IR backend work as actual modules (not single TU)
 - [ ] More test files for module/import scenarios (sibling use, selective use, qualified paths, circular)
 
@@ -22,6 +22,13 @@
 - [ ] wasm32 gaps: ExtractValue/InsertValue, aggregate locals, SIMD v128 vs scalarize decision, Switch compare/select chains vs br_table
 - [ ] arm64: emit .pdata/.xdata unwind info for Windows (currently SEH cannot unwind through fast-backend frames)
 - [ ] arm64: >16-byte aggregate returns and call args (x8 indirect-result path)
+
+## Optimizer (muvm)
+- [x] Inlining policy: hints-only at O0/O1/Debug, cost model at O2/O3; simplifycfg flattens post-inline CFG; parallel-edge phi bug fixed
+- [ ] Audit CFG-mutating passes for duplicate-predecessor/parallel-edge hazards (jump_thread, branchprop, licm, loop_cse, sccp, gvn, mem2reg, ipa_cp) — verify-each over full corpus
+- [ ] Port wallvm passes (self-contained first): unroll, tco, dse, sroa, idiom, range, macro_fusion, select_to_branch, branch_inversion, branch_factoring
+- [ ] Port wallvm passes (need infra): memory_ssa + alias_analysis (for dse/sroa), comm_canon/idempotent/involution/lex_canon/cast_elim/cse (check overlap with algebraic/gvn first)
+- [ ] Port wallvm passes (backend-adjacent, decide fit for fast backend): lower_phis, stack_layout, machine_opt, peephole, simd_vec, validate
 
 ## Attributes
 - [ ] Audit which attributes exist vs are honored; add missing attributes and honor them through sema/IR/backend
@@ -49,6 +56,7 @@
 - [ ] Check docs/markdown files for reported failing cases
 
 ## Language Cleanup
+- [x] Remove all compiler `cchar` hardcodes — `cchar` is a library `distinct` over `flag(arch)`; `C"..."` types as `const u8*` and binds to any integer pointer; bare module name in type position errors "is a module, not a type"; ~40 lib files now import `core::cchar { cchar }` explicitly
 - [ ] Strip 'static' keyword; mark methods without self as static
 - [ ] Remove remaining 'as' references if any
 - [ ] Quality of life polishes
