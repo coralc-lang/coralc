@@ -204,6 +204,9 @@ pub struct Codegen
     u32 bodyFnCap;
     MonoSubstitution* subs;
     u32 subsLen;
+    /* return type of the function being emitted: `return x` where both
+     * sides are `T&` passes the pointer, not the dereferenced value */
+    Ty fnRetTy;
     u32 errors;
 
     /* file-scope `var` globals whose initializer is not a C constant:
@@ -2716,6 +2719,7 @@ Slice cgCallArgsText(Codegen* cg, NodeId fdecl, NodeId* args, u32 argsLen)
         bool skip = false;
         bool dec = false;
         Ty sliceTy = 0;
+        Ty refPty = 0;
         if (fdecl.index != 0) {
             Node* fdn = cgNode(cg, fdecl);
             Decl* fd = &fdn->kind.payload.Decl.value;
@@ -2724,15 +2728,25 @@ Slice cgCallArgsText(Codegen* cg, NodeId fdecl, NodeId* args, u32 argsLen)
                 if (pn->kind.tag == NodeKind::Param) {
                     Param* pp = &pn->kind.payload.Param.value;
                     if ((pp->flags & 8) != 0) skip = true;
-                    else dec = cgStrToPtr(cg, pp->typeNode, args[i]);
-                    if (!dec) sliceTy = cgArrayToSliceParam(cg, pp->typeNode, args[i]);
+                    else {
+                        dec = cgStrToPtr(cg, pp->typeNode, args[i]);
+                        if (!dec) sliceTy = cgArrayToSliceParam(cg, pp->typeNode, args[i]);
+                        Ty pt = cgSubstTy(cg, pp->typeNode);
+                        if (pt != 0 && cgTyIsRef(cg, pt)) refPty = pt;
+                    }
                 }
             }
         }
         if (!skip) {
             if (first) first = false;
             else stP(&abuf, ", ");
-            if (sliceTy != 0)
+            if (refPty != 0)
+            {
+                /* `T&` param: pass the pointer — a reference arg yields it
+                 * directly, any other lvalue binds by address */
+                stPS(&abuf, cgRefArgText(cg, refPty, args[i]));
+            }
+            else if (sliceTy != 0)
             {
                 Node* san = cgNode(cg, args[i]);
                 Ty sat = cgSubstTy(cg, san->kind.payload.Expr.value.resolvedType);
@@ -2754,13 +2768,17 @@ Slice cgCallArgsText(Codegen* cg, NodeId fdecl, NodeId* args, u32 argsLen)
 }
 
 extern("C") Slice cgExpr(Codegen* cg, NodeId id);
+extern("C") Slice cgExprRaw(Codegen* cg, NodeId id);
+extern("C") Slice cgExprPtr(Codegen* cg, NodeId id);
+extern("C") Slice cgRefArgText(Codegen* cg, Ty pty, NodeId arg);
 extern("C") Slice cgLvalue(Codegen* cg, NodeId id);
+extern("C") Slice cgLvalueRaw(Codegen* cg, NodeId id);
 extern("C") Slice cgValBody(Codegen* cg, NodeId id);
 extern("C") void cgStmt(Codegen* cg, NodeId id);
 extern("C") Slice cgAddrOfValue(Codegen* cg, NodeId oid, Slice vtext);
 extern("C") Slice cgInitValue(Codegen* cg, NodeId v);
 
-Slice cgExpr(Codegen* cg, NodeId id)
+Slice cgExprRaw(Codegen* cg, NodeId id)
 {
     if (id.index == 0) {
         stP(&cg->ebuf, "0");
@@ -3482,8 +3500,68 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 }
                 else
                 {
-                    calleeText = cgExpr(cg, calleeId);
-                    retTy = cgResultTy(cg, id, e);
+                    /* nested `a::b::…` callee: paths are left-nested binary
+                     * nodes, so flatten. The tail may be `Type::method`
+                     * inside module `a::b`, or `module::func`. */
+                    Str[16] pn;
+                    u32 nc = cg->sema != null ? cg->sema->flattenPath(calleeId, pn, 16) : 0;
+                    bool nestedDone = false;
+                    if (nc >= 3)
+                    {
+                        /* try `mod::…::Type::method(...)`: owner = penultimate */
+                        usize os = cg->ebuf.len;
+                        Slice owner = cgIntern(cg, pn[nc - 2]);
+                        stPS(&cg->ebuf, owner);
+                        stCh(&cg->ebuf, '_');
+                        stPS(&cg->ebuf, cgIntern(cg, pn[nc - 1]));
+                        Slice rawCallee = stTail(&cg->ebuf, os);
+                        NodeId mdecl = cgFindMethodDeclOwner(cg, owner, pn[nc - 1]);
+                        if (mdecl.index != 0 && !cgDeclIsGeneric(cg, mdecl))
+                        {
+                            calleeText = cgMangleS(cg, mdecl, rawCallee, 0);
+                            fdecl = mdecl;
+                            retTy = cgResultTy(cg, id, e);
+                            nestedDone = true;
+                        }
+                        if (!nestedDone)
+                        {
+                            /* try `mod::…::func(...)`: join all but the last
+                             * segment into a module path */
+                            u8[512] mb;
+                            usize ml = 0;
+                            u32 i = 0;
+                            while (i + 1 < nc && ml + 4 < 512)
+                            {
+                                InternEntry* ie = cg->ctx->interns + pn[i];
+                                usize k = 0;
+                                while (k < ie->len && ml < 500) { mb[ml] = ie->ptr[k]; ml++; k++; }
+                                mb[ml] = 58; mb[ml + 1] = 58; ml += 2;
+                                i++;
+                            }
+                            if (ml >= 2)
+                            {
+                                Str mpath = cg->ctx->intern(str { .ptr = mb, .len = ml - 2 });
+                                u32 mf = cgFileForModulePath(cg, mpath);
+                                if (mf != 0)
+                                {
+                                    NodeId md = cgFindDeclFrom(cg, pn[nc - 1], (u32)DeclKind::Func, mf);
+                                    if (md.index != 0)
+                                    {
+                                        calleeText = cgCallFromDecl(cg, md, 0, e->kind.payload.Call.args,
+                                                                    e->kind.payload.Call.argsLen,
+                                                                    &rty, &resolved, &fdecl);
+                                        retTy = cgResultTy(cg, id, e);
+                                        nestedDone = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if (!nestedDone)
+                    {
+                        calleeText = cgExpr(cg, calleeId);
+                        retTy = cgResultTy(cg, id, e);
+                    }
                 }
             }
             else if (cn->kind.tag == NodeKind::Expr && cn->kind.payload.Expr.value.kind.tag == ExprKind::TypeRef) {
@@ -3541,25 +3619,39 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 recvTy = cgTyUnwrap(cg, recvTy);
                 if (recvTy != 0 && (cg->ctx->types + recvTy)->kind.tag == TypeKind::Pointer)
                     recvTy = cgTyUnwrap(cg, (cg->ctx->types + recvTy)->kind.payload.Pointer.base);
+                if (recvTy != 0 && (cg->ctx->types + recvTy)->kind.tag == TypeKind::Reference)
+                    recvTy = cgTyUnwrap(cg, (cg->ctx->types + recvTy)->kind.payload.Reference.base);
                 if (recvTy != 0) owner = cgOwnerName(cg, recvTy);
                 else owner = Slice::fromStr("Unknown");
             } else {
                 owner = Slice::fromStr("Unknown");
             }
-            Slice recvText = cgExpr(cg, recv);
-            bool recvIsPtr = false;
+            bool recvIsRef = false;
             Ty rawRecvTy = 0;
             if (rn->kind.tag == NodeKind::Expr) {
                 rawRecvTy = rn->kind.payload.Expr.value.resolvedType;
-                if (rawRecvTy != 0 && cgTyIsPtr(cg, rawRecvTy)) recvIsPtr = true;
+                if (rawRecvTy != 0) recvIsRef = cgTyIsRef(cg, cgSubstTy(cg, rawRecvTy));
+            }
+            /* a `T&` receiver is already a pointer: pass it directly and
+             * resolve methods on the base type */
+            Slice recvText = recvIsRef ? cgExprPtr(cg, recv) : cgExpr(cg, recv);
+            bool recvIsPtr = recvIsRef;
+            if (rawRecvTy != 0 && cgTyIsPtr(cg, rawRecvTy)) recvIsPtr = true;
+            Ty methTy = rawRecvTy;
+            if (recvIsRef)
+            {
+                Ty rt = cgSubstTy(cg, rawRecvTy);
+                while (rt != 0 && (cg->ctx->types + rt)->kind.tag == TypeKind::Reference)
+                    rt = (cg->ctx->types + rt)->kind.payload.Reference.base;
+                methTy = rt;
             }
             Str methName = e->kind.payload.MethodCall.method;
             cgMoveDisposeRecv(cg, methName, rn);
             bool mFound = false;
-            u8 recvKind = cgMethodRecvKind(cg, rawRecvTy, methName, &mFound);
+            u8 recvKind = cgMethodRecvKind(cg, methTy, methName, &mFound);
             /* `p->alloc(ctx, size)` parses as a method call but names a
              * fn-pointer field: lower to `(p->alloc)(ctx, size)` */
-            bool fieldCall = !mFound && cgHasField(cg, rawRecvTy, methName);
+            bool fieldCall = !mFound && cgHasField(cg, methTy, methName);
             Slice callee;
             NodeId mdef;
             mdef.index = 0;
@@ -3583,7 +3675,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 Slice rawCallee = stTail(&cg->ebuf, cs);
                 /* resolve the method's own decl for file-correct mangling
                    (def side: cgEmitMethodSet composes the same base) */
-                mdef = cgFindMethodDecl(cg, rawRecvTy, methName);
+                mdef = cgFindMethodDecl(cg, methTy, methName);
                 if (mdef.index != 0) callee = cgMangleS(cg, mdef, rawCallee, 0);
                 else callee = rawCallee;
             }
@@ -3614,6 +3706,22 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 while (i < argsLen && n < 64) {
                     if (first) first = false;
                     else stP(&abuf, ", ");
+                    /* `T&` parameter: pass the pointer / bind by address */
+                    Ty mrefPty = 0;
+                    if (mdef.index != 0)
+                    {
+                        Node* mdn0 = cgNode(cg, mdef);
+                        if (mdn0->kind.tag == NodeKind::Decl &&
+                            i < mdn0->kind.payload.Decl.value.kind.payload.Func.paramsLen)
+                        {
+                            Node* mpn0 = cgNode(cg, mdn0->kind.payload.Decl.value.kind.payload.Func.params[i]);
+                            if (mpn0->kind.tag == NodeKind::Param)
+                            {
+                                Ty mpt = cgSubstTy(cg, mpn0->kind.payload.Param.value.typeNode);
+                                if (mpt != 0 && cgTyIsRef(cg, mpt)) mrefPty = mpt;
+                            }
+                        }
+                    }
                     /* `null` in a str parameter position is the empty slice */
                     bool nullStr = false;
                     if (mdef.index != 0)
@@ -3639,7 +3747,8 @@ Slice cgExpr(Codegen* cg, NodeId id)
                             }
                         }
                     }
-                    if (nullStr) stP(&abuf, "(_coral_str){0}");
+                    if (mrefPty != 0) stPS(&abuf, cgRefArgText(cg, mrefPty, args[i]));
+                    else if (nullStr) stP(&abuf, "(_coral_str){0}");
                     else
                     {
                         /* array → slice decay, as in plain calls */
@@ -4134,6 +4243,59 @@ Slice cgExpr(Codegen* cg, NodeId id)
     return stTail(&cg->ebuf, es);
 }
 
+/* `T&` lowers to `T*` in C. cgExprRaw yields the pointer form; the
+ * value form every expression context wants dereferences it. Pointer
+ * contexts (ref-typed params, ref returns, ref initializers) call
+ * cgExprPtr / cgRefArgText instead. */
+bool cgTyIsRef(Codegen* cg, Ty t)
+{
+    if (t == 0) return false;
+    TypeEntry* e = cg->ctx->types + t;
+    while (e->kind.tag == TypeKind::Const || e->kind.tag == TypeKind::Comptime)
+    {
+        if (e->kind.tag == TypeKind::Const) t = e->kind.payload.Const.base;
+        else t = e->kind.payload.Comptime.base;
+        if (t == 0) return false;
+        e = cg->ctx->types + t;
+    }
+    return e->kind.tag == TypeKind::Reference;
+}
+
+Slice cgExpr(Codegen* cg, NodeId id)
+{
+    Slice v = cgExprRaw(cg, id);
+    if (id.index == 0) return v;
+    Node* n = cgNode(cg, id);
+    if (n->kind.tag != NodeKind::Expr) return v;
+    Ty rt = n->kind.payload.Expr.value.resolvedType;
+    if (rt == 0) return v;
+    if (!cgTyIsRef(cg, cgSubstTy(cg, rt))) return v;
+    usize rs = cg->ebuf.len;
+    stP(&cg->ebuf, "(*(");
+    stPS(&cg->ebuf, v);
+    stP(&cg->ebuf, "))");
+    return stTail(&cg->ebuf, rs);
+}
+
+/* pointer form of a reference-typed expression: the raw emission
+ * already yields `T*` (the variable, call result, or field slot) */
+Slice cgExprPtr(Codegen* cg, NodeId id)
+{
+    return cgExprRaw(cg, id);
+}
+
+/* argument text for a `T&` parameter: an argument that is itself a
+ * reference passes its pointer; any other lvalue binds by address */
+Slice cgRefArgText(Codegen* cg, Ty pty, NodeId arg)
+{
+    Node* an = cgNode(cg, arg);
+    Ty at = 0;
+    if (an->kind.tag == NodeKind::Expr) at = an->kind.payload.Expr.value.resolvedType;
+    if (at != 0 && cgTyIsRef(cg, cgSubstTy(cg, at)))
+        return cgExprPtr(cg, arg);
+    return cgAddrOfValue(cg, arg, cgExpr(cg, arg));
+}
+
 /* A field of a temporary (`f().field`) is not a C lvalue even though
  * the field expression itself is an lvalue shape; walk back through
  * value receivers until a real storage location or a pointer base. */
@@ -4212,7 +4374,7 @@ Slice cgForInRecv(Codegen* cg, bool simpleIter, bool iterIsPtr, Str simpleName, 
     return stTail(&cg->tybuf, rs);
 }
 
-Slice cgLvalue(Codegen* cg, NodeId id)
+Slice cgLvalueRaw(Codegen* cg, NodeId id)
 {
     if (id.index == 0) {
         stP(&cg->ebuf, "0");
@@ -4349,6 +4511,25 @@ Slice cgLvalue(Codegen* cg, NodeId id)
         },
     }
     return stTail(&cg->ebuf, es);
+}
+
+/* assigning through a `T&` writes to the referent: `b = v` lowers to
+ * `(*(b)) = v`, so the lvalue of a reference-typed expr dereferences
+ * the pointer form */
+Slice cgLvalue(Codegen* cg, NodeId id)
+{
+    Slice v = cgLvalueRaw(cg, id);
+    if (id.index == 0) return v;
+    Node* n = cgNode(cg, id);
+    if (n->kind.tag != NodeKind::Expr) return v;
+    Ty rt = n->kind.payload.Expr.value.resolvedType;
+    if (rt == 0) return v;
+    if (!cgTyIsRef(cg, cgSubstTy(cg, rt))) return v;
+    usize rs = cg->ebuf.len;
+    stP(&cg->ebuf, "(*(");
+    stPS(&cg->ebuf, v);
+    stP(&cg->ebuf, "))");
+    return stTail(&cg->ebuf, rs);
 }
 
 /* ── value of a body used as expression (if/switch branches) ─── */
@@ -5035,7 +5216,20 @@ void cgStmt(Codegen* cg, NodeId id)
             } else {
                 bool hasInit = init.index != 0;
                 Slice initText;
-                if (hasInit) initText = cgExpr(cg, init);
+                if (hasInit && ty != 0 && cgTyIsRef(cg, cgSubstTy(cg, ty)))
+                {
+                    /* `T& x = e`: the storage is `T*`; a reference-typed
+                     * init already yields the pointer, anything else
+                     * binds by address of the lvalue */
+                    Node* iin = cgNode(cg, init);
+                    Ty iit = 0;
+                    if (iin->kind.tag == NodeKind::Expr) iit = iin->kind.payload.Expr.value.resolvedType;
+                    if (iit != 0 && cgTyIsRef(cg, cgSubstTy(cg, iit)))
+                        initText = cgExprPtr(cg, init);
+                    else
+                        initText = cgAddrOfValue(cg, init, cgExpr(cg, init));
+                }
+                else if (hasInit) initText = cgExpr(cg, init);
                 if (hasInit && cgIntToPtrInit(cg, init, ty)) initText = cgWrapPtrCast(cg, tyText, initText);
                 stNL(&cg->body, cg->ind);
                 if ((s->kind.payload.VarDecl.flags & 4) != 0) stP(&cg->body, "static ");
@@ -5115,7 +5309,18 @@ void cgStmt(Codegen* cg, NodeId id)
                 cgEmitStmt(cg, "return");
                 return;
             }
-            Slice t = cgExpr(cg, v);
+            /* `return x` where the function yields `T&` and x is a
+             * reference: pass the pointer, not the dereferenced value */
+            bool retWantsRef = cg->fnRetTy != 0 && cgTyIsRef(cg, cgSubstTy(cg, cg->fnRetTy));
+            Slice t;
+            if (retWantsRef)
+            {
+                Node* vn0 = cgNode(cg, v);
+                Ty vt0 = 0;
+                if (vn0->kind.tag == NodeKind::Expr) vt0 = vn0->kind.payload.Expr.value.resolvedType;
+                t = (vt0 != 0 && cgTyIsRef(cg, cgSubstTy(cg, vt0))) ? cgExprPtr(cg, v) : cgExpr(cg, v);
+            }
+            else t = cgExpr(cg, v);
             if (cg->dropsLen > cg->fnDropMark)
             {
                 /* `return s;` moves the local out: its drop must not run,
@@ -6031,6 +6236,7 @@ void cgEmitFuncCommon(Codegen* cg, NodeId declId, Slice cname, Ty retTy, Ty* par
     u32 oldSubsLen = cg->subsLen;
     cg->subs = subs;
     cg->subsLen = subsLen;
+    cg->fnRetTy = retTy;
 
     // body first: it allocates temps whose declarations go at fn top
     usize bodyStart = cg->body.len;
