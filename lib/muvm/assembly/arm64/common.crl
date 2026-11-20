@@ -1,0 +1,982 @@
+#[[no_drop_all]]
+// AArch64 register model, operand model, and the GNU as syntax front end.
+// One source line in, one Arm64Line out; the encoder consumes Arm64Line.
+// Syntax notes (verified against aarch64-linux-gnu-as):
+//   - immediates are '#' prefixed: mov x0, #42 / add x1, x2, #4, lsl #12
+//   - '#' is a comment ONLY as the first non-space char of a line;
+//     '//' and '/* */' comments work anywhere
+//   - memory: [x0], [x0, #8], [x0, #8]!, [x0], #8, [x0, x1, lsl #3],
+//     [x0, w1, uxtw #2], [x0, #:lo12:sym]
+//   - register modifiers lsl/lsr/asr/ror #n and uxtb/uxth/uxtw/
+//     sxtb/sxth/sxtw #n attach to the preceding operand
+//   - vector regs carry an arrangement: v0.16b, v0.4s, v0.2d, ...
+//   - condition codes appear as dotted mnemonics: b.eq, csel ... eq
+import muvm::assembly::common { AsmParseError, AsmLexer };
+import core::char_util { isDigit, isAlpha, isAlnum, isSpace, isHexDigit, digitValue };
+import platform::libc { free };
+
+// register classes
+pub enum Arm64RegCls
+{
+    RcNone,
+    RcW,      // w0-w30 (32-bit view)
+    RcX,      // x0-x30 (64-bit view)
+    RcWsp,    // wsp
+    RcSp,     // sp
+    RcWzr,    // wzr
+    RcXzr,    // xzr
+    RcB,      // b0-b31 (8-bit fp/scalar)
+    RcH,      // h0-h31 (16-bit)
+    RcS,      // s0-s31 (32-bit fp/scalar)
+    RcD,      // d0-d31 (64-bit fp/scalar)
+    RcQ,      // q0-q31 (128-bit)
+    RcV       // v0-v31 without arrangement
+}
+
+pub struct Arm64Reg
+{
+    str name;
+    u8 num;    // register number 0-31
+    u8 cls;    // Arm64RegCls
+    u8 size;   // access size in bytes: w/s=4, x/d=8, q/v=16, b=1, h=2
+    bool isSp; // sp/wsp: allowed where a base or 31-as-sp applies
+    bool isZr; // wzr/xzr: allowed where 31-as-zero applies
+}
+
+// parse "x12"/"wsp"/"q3"/"v0" style names (no arrangement suffix here —
+// the operand parser strips ".4s" etc. before calling). Returns false on
+// no match. Pattern-based: no table needed, names are formulaic.
+pub bool parseRegName(str name, Arm64Reg* out)
+{
+    out->name = name;
+    out->num = 0;
+    out->cls = (u8)Arm64RegCls::RcNone;
+    out->size = 0;
+    out->isSp = false;
+    out->isZr = false;
+    if (name.isEmpty()) return false;
+    u8 c0 = name.ptr[0];
+
+    // wsp / sp / wzr / xzr
+    if (name.equals("wsp")) { out->cls = (u8)Arm64RegCls::RcWsp; out->size = 4; out->isSp = true; return true; }
+    if (name.equals("sp"))  { out->cls = (u8)Arm64RegCls::RcSp;  out->size = 8; out->isSp = true; return true; }
+    if (name.equals("wzr")) { out->cls = (u8)Arm64RegCls::RcWzr; out->size = 4; out->isZr = true; return true; }
+    if (name.equals("xzr")) { out->cls = (u8)Arm64RegCls::RcXzr; out->size = 8; out->isZr = true; return true; }
+
+    if (name.len < 2) return false;
+    u32 n = 0;
+    bool digits = true;
+    for (usize i = 1; i < name.len; i++)
+    {
+        u8 c = name.ptr[i];
+        if (c < (u8)'0' || c > (u8)'9') { digits = false; break; }
+        n = n * 10 + (u32)(c - (u8)'0');
+        if (n > 255) return false;
+    }
+    if (!digits || n > 31) return false;
+
+    switch (c0)
+    {
+        'w' => { out->cls = (u8)Arm64RegCls::RcW; out->size = 4; },
+        'x' => { out->cls = (u8)Arm64RegCls::RcX; out->size = 8; },
+        'b' => { out->cls = (u8)Arm64RegCls::RcB; out->size = 1; },
+        'h' => { out->cls = (u8)Arm64RegCls::RcH; out->size = 2; },
+        's' => { out->cls = (u8)Arm64RegCls::RcS; out->size = 4; },
+        'd' => { out->cls = (u8)Arm64RegCls::RcD; out->size = 8; },
+        'q' => { out->cls = (u8)Arm64RegCls::RcQ; out->size = 16; },
+        'v' => { out->cls = (u8)Arm64RegCls::RcV; out->size = 16; },
+        else => { return false; },
+    }
+    out->num = (u8)n;
+    return true;
+}
+
+pub bool regIsGpr64(Arm64Reg* r) { return r->cls == (u8)Arm64RegCls::RcX || r->cls == (u8)Arm64RegCls::RcSp || r->cls == (u8)Arm64RegCls::RcXzr; }
+pub bool regIsGpr32(Arm64Reg* r) { return r->cls == (u8)Arm64RegCls::RcW || r->cls == (u8)Arm64RegCls::RcWsp || r->cls == (u8)Arm64RegCls::RcWzr; }
+pub bool regIsGpr(Arm64Reg* r)   { return regIsGpr32(r) || regIsGpr64(r); }
+pub bool regIsFp(Arm64Reg* r)
+{
+    return r->cls >= (u8)Arm64RegCls::RcB && r->cls <= (u8)Arm64RegCls::RcV;
+}
+
+// vector arrangement codes — packed into u8 for the operand model
+pub enum Arm64Arr
+{
+    ArrNone = 0,
+    ArrB,    // .8b / .16b handled via q flag? keep single code + count
+    ArrH,
+    ArrS,
+    ArrD,
+    ArrQ
+}
+
+// full arrangement specifiers as GAS spells them; decoded to (esize, n)
+pub struct Arm64VecArr
+{
+    str name;     // "16b" "4s" ...
+    u8 esize;     // element bytes: 1,2,4,8,16
+    u32 count;    // lanes
+    bool isScalar; // scalar arrangement (b/h/s/d/q without lanes)
+}
+
+// parse ".4s" style suffix already split off, or "4s" text. Returns false
+// on no match.
+pub bool parseVecArr(str s, Arm64VecArr* out)
+{
+    out->name = s;
+    out->esize = 0;
+    out->count = 0;
+    out->isScalar = false;
+    if (s.isEmpty()) return false;
+    // scalar forms
+    if (s.equals("b")) { out->esize = 1; out->count = 1; out->isScalar = true; return true; }
+    if (s.equals("h")) { out->esize = 2; out->count = 1; out->isScalar = true; return true; }
+    if (s.equals("s")) { out->esize = 4; out->count = 1; out->isScalar = true; return true; }
+    if (s.equals("d")) { out->esize = 8; out->count = 1; out->isScalar = true; return true; }
+    if (s.equals("q")) { out->esize = 16; out->count = 1; out->isScalar = true; return true; }
+    // vector forms: <count><letter>
+    if (s.len < 2) return false;
+    u32 n = 0;
+    usize i = 0;
+    while (i < s.len && isDigit(s.ptr[i]))
+    {
+        n = n * 10 + (u32)(s.ptr[i] - (u8)'0');
+        i++;
+    }
+    if (i == 0 || i >= s.len || n == 0 || n > 16) return false;
+    u8 c = s.ptr[i];
+    if (i + 1 != s.len) return false;
+    switch (c)
+    {
+        'b' => { out->esize = 1; },
+        'h' => { out->esize = 2; },
+        's' => { out->esize = 4; },
+        'd' => { out->esize = 8; },
+        'q' => { out->esize = 16; },
+        else => { return false; },
+    }
+    out->count = n;
+    return true;
+}
+
+// arrangement → Q bit + size field for SIMD encodings:
+//   Q=0 covers 8B/4H/2S/1D, Q=1 covers 16B/8H/4S/2D; scalar b/h/s/d/q
+//   use the FP&SIMD scalar encoding space instead.
+pub bool arrToQSize(Arm64VecArr* a, u8* q, u8* size)
+{
+    if (a->isScalar) return false;
+    switch (a->esize)
+    {
+        1 => { if (a->count != 8 && a->count != 16) return false; *size = 0; *q = a->count == 16 ? 1 : 0; return true; },
+        2 => { if (a->count != 4 && a->count != 8) return false; *size = 1; *q = a->count == 8 ? 1 : 0; return true; },
+        4 => { if (a->count != 2 && a->count != 4) return false; *size = 2; *q = a->count == 4 ? 1 : 0; return true; },
+        8 => { if (a->count != 1 && a->count != 2) return false; *size = 3; *q = a->count == 2 ? 1 : 0; return true; },
+        else => { return false; },
+    }
+}
+
+// ------------------------------------------------------------------
+// operand model
+// ------------------------------------------------------------------
+
+pub enum Arm64OpKind
+{
+    OpNone,
+    OpReg,     // register (gpr/fp/v) possibly with arrangement
+    OpImm,     // #imm — numeric or char literal or fp literal bits
+    OpMem,     // [ ... ]
+    OpSym      // bare symbol — branch target or address
+}
+
+// extend option codes, same numbering as the ARM "option" field
+pub enum Arm64Ext
+{
+    ExtNone = 0,
+    ExtUXTB = 2,
+    ExtUXTH = 3,
+    ExtUXTW = 4,
+    ExtSXTB = 6,
+    ExtSXTH = 7,
+    ExtSXTW = 8
+}
+
+// shift kinds on register operands
+pub enum Arm64Shift
+{
+    ShNone = 0,
+    ShLSL = 1,
+    ShLSR = 2,
+    ShASR = 3,
+    ShROR = 4
+}
+
+// #:lo12: / #:pg_hi21: style relocation modifiers on symbolic operands
+pub enum Arm64RelocMod
+{
+    RmNone = 0,
+    RmLo12,        // #:lo12: — low 12 bits (add imm / ldr offset)
+    RmPgHi21,      // #:pg_hi21: — adrp page
+    RmGotPage,     // #:gotpage: — adrp to GOT entry
+    RmGotLo12,     // #:gotlo12: — ldr offset into GOT
+    RmTpoff,       // #:tpoff: / #:tlsdesc: — skip for now, treated as error
+    RmPage         // #:page: — adr page (rare)
+}
+
+pub struct Arm64Operand
+{
+    Arm64OpKind kind;
+    str text;         // raw operand text (diagnostics)
+
+    // register payload
+    Arm64Reg reg;
+    bool hasReg;
+    u8 arrSize;        // arrangement esize for vector regs, 0 = none
+    u32 arrCount;      // arrangement lanes, 0 = scalar/none
+    bool arrScalar;    // scalar b/h/s/d/q spelling
+    bool arrPresent;   // an arrangement suffix was written
+
+    // register/imm modifiers
+    u8 shift;          // Arm64Shift
+    u32 shiftAmt;
+    bool shiftIsReg;   // lsl xN register-specified shift
+    Arm64Reg shiftReg;
+    u8 ext;            // Arm64Ext for extended-register operands
+    u32 extAmt;
+
+    // immediate payload
+    i64 imm;
+    bool hasImm;
+    bool immIsFp;      // fmov #1.5 style: imm holds f64 bits
+    u8 immShift;       // add/sub imm: 0 or 12 (lsl #12)
+
+    // symbol payload
+    str sym;
+    bool hasSym;
+    i64 addend;
+    u8 relocMod;       // Arm64RelocMod
+
+    // memory payload
+    Arm64Reg base;
+    bool hasBase;
+    Arm64Reg index;
+    bool hasIndex;
+    i64 disp;
+    bool hasDisp;
+    bool preIdx;       // [x, #n]!
+    bool postIdx;      // [x], #n
+    bool isLiteral;    // ldr literal: operand was a bare label, not [..]
+}
+
+pub struct Arm64Line
+{
+    str mnem;
+    Arm64Operand ops[5];
+    u32 nops;
+    u32 lineNo;
+    bool isDirective;
+    bool isEmpty;
+    str label;
+    bool hasLabel;
+    str dargs;
+}
+
+pub Arm64Operand arm64OpEmpty()
+{
+    return Arm64Operand {
+        .kind = Arm64OpKind::OpNone,
+        .text = "",
+        .reg = Arm64Reg { .name = "", .num = 0, .cls = 0, .size = 0, .isSp = false, .isZr = false },
+        .hasReg = false,
+        .arrSize = 0,
+        .arrCount = 0,
+        .arrScalar = false,
+        .arrPresent = false,
+        .shift = 0,
+        .shiftAmt = 0,
+        .shiftIsReg = false,
+        .shiftReg = Arm64Reg { .name = "", .num = 0, .cls = 0, .size = 0, .isSp = false, .isZr = false },
+        .ext = 0,
+        .extAmt = 0,
+        .imm = 0,
+        .hasImm = false,
+        .immIsFp = false,
+        .immShift = 0,
+        .sym = "",
+        .hasSym = false,
+        .addend = 0,
+        .relocMod = 0,
+        .base = Arm64Reg { .name = "", .num = 0, .cls = 0, .size = 0, .isSp = false, .isZr = false },
+        .hasBase = false,
+        .index = Arm64Reg { .name = "", .num = 0, .cls = 0, .size = 0, .isSp = false, .isZr = false },
+        .hasIndex = false,
+        .disp = 0,
+        .hasDisp = false,
+        .preIdx = false,
+        .postIdx = false,
+        .isLiteral = false
+    };
+}
+
+// ------------------------------------------------------------------
+// small parse helpers over AsmLexer
+// ------------------------------------------------------------------
+
+// "#123" / "123" / "0x1f" / "-4" → number. Returns false when the text
+// is not numeric.
+bool lexNumOpt(AsmLexer* lx, i64* out)
+{
+    return lx->lexNumber(out);
+}
+
+// strip a leading '#' if present; immediates in GAS are #-prefixed but
+// the parser also accepts bare numbers for robustness.
+void skipImmHash(AsmLexer* lx)
+{
+    lx->skipSpace();
+    if (!lx->done() && lx->peek() == (u8)'#') lx->pos++;
+    lx->skipSpace();
+}
+
+// parse "#:lo12:sym+4" / "#sym" / "#123" / "#'a'" / "#1.5" into the
+// operand's immediate-or-symbol fields. Handles the reloc modifiers.
+bool parseImmOrSym(AsmLexer* lx, Arm64Operand* op, AsmParseError* err)
+{
+    skipImmHash(lx);
+    if (lx->done()) { err->msg = "missing immediate"; err->lineNo = lx->lineNo; return false; }
+
+    // #:modifier:sym — the ':' right after '#' (or after the hash was
+    // already consumed, a leading ':')
+    if (!lx->done() && lx->peek() == (u8)':')
+    {
+        lx->pos++;
+        str mod = lx->lexIdent();
+        u8 rm = 0;
+        if (mod.equals("lo12")) rm = (u8)Arm64RelocMod::RmLo12;
+        else if (mod.equals("pg_hi21")) rm = (u8)Arm64RelocMod::RmPgHi21;
+        else if (mod.equals("gotpage")) rm = (u8)Arm64RelocMod::RmGotPage;
+        else if (mod.equals("gotlo12")) rm = (u8)Arm64RelocMod::RmGotLo12;
+        else if (mod.equals("page")) rm = (u8)Arm64RelocMod::RmPage;
+        else if (mod.equals("tpoff") || mod.equals("dtpoff") ||
+                 mod.equals("gottpoff") || mod.equals("tlsdesc")) rm = (u8)Arm64RelocMod::RmTpoff;
+        else { err->msg = "unknown relocation modifier"; err->lineNo = lx->lineNo; return false; }
+        if (!lx->eat((u8)':')) { err->msg = "expected ':' after reloc modifier"; err->lineNo = lx->lineNo; return false; }
+        op->relocMod = rm;
+        // fall through to symbol parse below
+    }
+
+    lx->skipSpace();
+    if (lx->done()) { err->msg = "missing immediate value"; err->lineNo = lx->lineNo; return false; }
+
+    // character literal #'a'
+    if (lx->peek() == (u8)'\'')
+    {
+        i64 cv = 0;
+        if (!lx->lexChar(&cv)) { err->msg = "bad character literal"; err->lineNo = lx->lineNo; return false; }
+        op->kind = Arm64OpKind::OpImm;
+        op->imm = cv;
+        op->hasImm = true;
+        return true;
+    }
+
+    // numeric: integer or float. Hex (0x..) is always integer; a '.' or
+    // exponent in a decimal literal makes it a float (fmov #1.5).
+    if (!lx->done() && (isDigit(lx->peek()) || lx->peek() == (u8)'-' || lx->peek() == (u8)'+'))
+    {
+        usize save = lx->pos;
+        // detect hex → integer path directly
+        bool isHex = false;
+        {
+            usize p = lx->pos;
+            if (lx->src.ptr[p] == (u8)'-' || lx->src.ptr[p] == (u8)'+') p++;
+            if (p + 1 < lx->src.len && lx->src.ptr[p] == (u8)'0' &&
+                (lx->src.ptr[p + 1] == (u8)'x' || lx->src.ptr[p + 1] == (u8)'X'))
+                isHex = true;
+        }
+        if (!isHex)
+        {
+            // scan the decimal token for '.' or exponent
+            usize p = lx->pos;
+            if (lx->src.ptr[p] == (u8)'-' || lx->src.ptr[p] == (u8)'+') p++;
+            bool seenDot = false;
+            bool seenE = false;
+            while (p < lx->src.len)
+            {
+                u8 c = lx->src.ptr[p];
+                if (isDigit(c)) { p++; continue; }
+                if (c == (u8)'.' && !seenDot && !seenE) { seenDot = true; p++; continue; }
+                if ((c == (u8)'e' || c == (u8)'E') && !seenE) { seenE = true; p++; continue; }
+                if ((c == (u8)'-' || c == (u8)'+') && p > lx->pos &&
+                    (lx->src.ptr[p - 1] == (u8)'e' || lx->src.ptr[p - 1] == (u8)'E')) { p++; continue; }
+                break;
+            }
+            if (seenDot || seenE)
+            {
+                str ftxt = str { (const u8*)(lx->src.ptr + lx->pos), p - lx->pos };
+                f64 fv = 0.0;
+                if (!parseF64View(ftxt, &fv)) { err->msg = "bad floating immediate"; err->lineNo = lx->lineNo; return false; }
+                lx->pos = p;
+                u64 bits = 0;
+                memcpyRaw<u8>((u8*)&bits, (const u8*)&fv, 8);
+                op->kind = Arm64OpKind::OpImm;
+                op->imm = (i64)bits;
+                op->hasImm = true;
+                op->immIsFp = true;
+                return true;
+            }
+        }
+        lx->pos = save;
+        i64 v = 0;
+        if (lx->lexNumber(&v))
+        {
+            op->kind = Arm64OpKind::OpImm;
+            op->imm = v;
+            op->hasImm = true;
+            return true;
+        }
+        lx->pos = save;
+    }
+
+    // symbol: ident [+- number]
+    if (isAlpha(lx->peek()) || lx->peek() == (u8)'_' || lx->peek() == (u8)'.')
+    {
+        str name = lx->lexIdent();
+        if (name.isEmpty()) { err->msg = "bad immediate symbol"; err->lineNo = lx->lineNo; return false; }
+        i64 add = 0;
+        lx->skipSpace();
+        if (!lx->done() && (lx->peek() == (u8)'+' || lx->peek() == (u8)'-'))
+        {
+            if (!lx->lexNumber(&add)) { err->msg = "bad symbol addend"; err->lineNo = lx->lineNo; return false; }
+        }
+        op->kind = Arm64OpKind::OpSym;
+        op->sym = name;
+        op->hasSym = true;
+        op->addend = add;
+        op->text = name;
+        return true;
+    }
+
+    err->msg = "bad immediate";
+    err->lineNo = lx->lineNo;
+    return false;
+}
+
+// bit-copy helper without pulling std::intrinsics into the parser
+void memcpyRaw(u8* dst, const u8* src, usize n)
+{
+    for (usize i = 0; i < n; i++) dst[i] = src[i];
+}
+
+// f64 parse for literals — std::ios has parseF64 for null-terminated;
+// do a small hand parser for the decimal forms GAS accepts.
+bool parseF64View(str s, f64* out)
+{
+    // sign
+    bool neg = false;
+    usize i = 0;
+    if (i < s.len && (s.ptr[i] == (u8)'-' || s.ptr[i] == (u8)'+'))
+    {
+        neg = s.ptr[i] == (u8)'-';
+        i++;
+    }
+    f64 v = 0.0;
+    bool any = false;
+    while (i < s.len && isDigit(s.ptr[i]))
+    {
+        v = v * 10.0 + (f64)(s.ptr[i] - (u8)'0');
+        i++;
+        any = true;
+    }
+    if (i < s.len && s.ptr[i] == (u8)'.')
+    {
+        i++;
+        f64 scale = 0.1;
+        while (i < s.len && isDigit(s.ptr[i]))
+        {
+            v += (f64)(s.ptr[i] - (u8)'0') * scale;
+            scale *= 0.1;
+            i++;
+            any = true;
+        }
+    }
+    if (!any) return false;
+    if (i < s.len && (s.ptr[i] == (u8)'e' || s.ptr[i] == (u8)'E'))
+    {
+        i++;
+        bool eneg = false;
+        if (i < s.len && (s.ptr[i] == (u8)'-' || s.ptr[i] == (u8)'+'))
+        {
+            eneg = s.ptr[i] == (u8)'-';
+            i++;
+        }
+        i64 e = 0;
+        bool eany = false;
+        while (i < s.len && isDigit(s.ptr[i]))
+        {
+            e = e * 10 + (i64)(s.ptr[i] - (u8)'0');
+            i++;
+            eany = true;
+        }
+        if (!eany) return false;
+        // v * 10^±e via repeated multiply/divide (adequate for literals)
+        if (eneg) { for (i64 k = 0; k < e; k++) v /= 10.0; }
+        else { for (i64 k = 0; k < e; k++) v *= 10.0; }
+    }
+    if (i != s.len) return false;
+    *out = neg ? -v : v;
+    return true;
+}
+
+// parse one bracketed memory operand at the cursor (cursor is ON '[').
+// Forms:
+//   [Xn]                     unsigned offset 0
+//   [Xn, #imm]               unsigned offset
+//   [Xn, #imm]!              pre-index
+//   [Xn], #imm               post-index
+//   [Xn, Xm]                 register offset
+//   [Xn, Wm, uxtw #s]        extended register offset
+//   [Xn, Xm, lsl #s]         shifted register offset
+//   [Xn, #:lo12:sym]         symbolic lo12 offset
+bool parseMemOperand(AsmLexer* lx, Arm64Operand* op, AsmParseError* err)
+{
+    op->kind = Arm64OpKind::OpMem;
+    if (!lx->eat((u8)'[')) { err->msg = "expected '['"; err->lineNo = lx->lineNo; return false; }
+
+    lx->skipSpace();
+    // first item must be a base register
+    str bname = lx->lexIdent();
+    if (bname.isEmpty()) { err->msg = "expected base register"; err->lineNo = lx->lineNo; return false; }
+    if (!parseRegName(bname, &op->base) || op->base.cls == (u8)Arm64RegCls::RcNone ||
+        (!regIsGpr64(&op->base) && !regIsGpr32(&op->base)))
+    {
+        // allow v/q base for SIMD ldr/str
+        Arm64Reg vr;
+        if (parseRegName(bname, &vr) && regIsFp(&vr)) { op->base = vr; }
+        else { err->msg = "bad base register"; err->lineNo = lx->lineNo; return false; }
+    }
+    op->hasBase = true;
+
+    lx->skipSpace();
+    if (lx->done() || lx->peek() == (u8']'))
+    {
+        // [Xn]
+        if (!lx->eat((u8']'))) { err->msg = "missing ']'"; err->lineNo = lx->lineNo; return false; }
+        lx->skipSpace();
+        // post-index [Xn], #imm
+        if (lx->eat((u8)','))
+        {
+            op->postIdx = true;
+            if (!parseImmOrSym(lx, op, err)) return false;
+            op->hasDisp = true;
+        }
+        return true;
+    }
+
+    if (!lx->eat((u8)',')) { err->msg = "expected ',' in memory operand"; err->lineNo = lx->lineNo; return false; }
+    lx->skipSpace();
+
+    // second item: #imm | reg | #modifier:sym
+    if (!lx->done() && lx->peek() == (u8)'#')
+    {
+        // could be #imm, #:lo12:sym
+        usize save = lx->pos;
+        lx->pos++; // consume '#'
+        if (!lx->done() && lx->peek() == (u8)':')
+        {
+            lx->pos = save;
+            Arm64Operand tmp = arm64OpEmpty();
+            if (!parseImmOrSym(lx, &tmp, err)) return false;
+            if (tmp.kind != Arm64OpKind::OpSym) { err->msg = "expected symbol"; err->lineNo = lx->lineNo; return false; }
+            op->hasSym = true;
+            op->sym = tmp.sym;
+            op->addend = tmp.addend;
+            op->relocMod = tmp.relocMod;
+            op->hasDisp = true;
+            op->disp = 0;
+        }
+        else
+        {
+            lx->pos = save;
+            i64 v = 0;
+            if (!lx->lexNumber(&v)) { err->msg = "bad memory displacement"; err->lineNo = lx->lineNo; return false; }
+            op->hasDisp = true;
+            op->disp = v;
+        }
+    }
+    else if (isAlpha(lx->peek()) || lx->peek() == (u8)'_' || lx->peek() == (u8)'.')
+    {
+        // register offset / extended register
+        str iname = lx->lexIdent();
+        // arrangement suffix on index (rare) — ignore/strip
+        Arm64Reg ireg;
+        if (!parseRegName(iname, &ireg)) { err->msg = "bad index register"; err->lineNo = lx->lineNo; return false; }
+        op->index = ireg;
+        op->hasIndex = true;
+    }
+    else
+    {
+        err->msg = "bad memory operand";
+        err->lineNo = lx->lineNo;
+        return false;
+    }
+
+    lx->skipSpace();
+    // optional extend/shift spec after index register, still inside []
+    if (op->hasIndex && !lx->done() && lx->peek() != (u8']'))
+    {
+        if (!lx->eat((u8)',')) { err->msg = "expected ',' in memory operand"; err->lineNo = lx->lineNo; return false; }
+        lx->skipSpace();
+        str kw = lx->lexIdent();
+        u8 sh = 0, ex = 0;
+        if (kw.equals("lsl")) sh = (u8)Arm64Shift::ShLSL;
+        else if (kw.equals("lsr")) sh = (u8)Arm64Shift::ShLSR;
+        else if (kw.equals("asr")) sh = (u8)Arm64Shift::ShASR;
+        else if (kw.equals("ror")) sh = (u8)Arm64Shift::ShROR;
+        else if (kw.equals("uxtb")) ex = (u8)Arm64Ext::ExtUXTB;
+        else if (kw.equals("uxth")) ex = (u8)Arm64Ext::ExtUXTH;
+        else if (kw.equals("uxtw")) ex = (u8)Arm64Ext::ExtUXTW;
+        else if (kw.equals("sxtb")) ex = (u8)Arm64Ext::ExtSXTB;
+        else if (kw.equals("sxth")) ex = (u8)Arm64Ext::ExtSXTH;
+        else if (kw.equals("sxtw")) ex = (u8)Arm64Ext::ExtSXTW;
+        else { err->msg = "bad extend/shift"; err->lineNo = lx->lineNo; return false; }
+        skipImmHash(lx);
+        i64 amt = 0;
+        if (isAlpha(lx->peek()) || lx->peek() == (u8)'_' || lx->peek() == (u8)'x' || lx->peek() == (u8)'w')
+        {
+            // register-specified shift amount
+            str rname = lx->lexIdent();
+            if (!parseRegName(rname, &op->shiftReg)) { err->msg = "bad shift register"; err->lineNo = lx->lineNo; return false; }
+            op->shiftIsReg = true;
+        }
+        else if (!lx->lexNumber(&amt)) { err->msg = "bad shift amount"; err->lineNo = lx->lineNo; return false; }
+        else op->shiftAmt = (u32)amt;
+        if (sh != 0) op->shift = sh;
+        if (ex != 0) op->ext = ex;
+    }
+
+    lx->skipSpace();
+    if (!lx->eat((u8']'))) { err->msg = "missing ']'"; err->lineNo = lx->lineNo; return false; }
+    lx->skipSpace();
+
+    // '! ' pre-index or ', #imm' post-index writeback
+    if (lx->peek() == (u8)'!')
+    {
+        lx->pos++;
+        op->preIdx = true;
+        return true;
+    }
+    if (lx->eat((u8)','))
+    {
+        op->postIdx = true;
+        if (!parseImmOrSym(lx, op, err)) return false;
+        op->hasDisp = true;
+    }
+    return true;
+}
+
+// parse a register token including an optional ".arr" vector suffix.
+// The arrangement is stored on the operand; the register keeps its base
+// name. e.g. "v0.4s" → reg v0 + arrSize 4, arrCount 4.
+bool parseRegOperandText(str text, Arm64Operand* op, AsmParseError* err, u32 lineNo)
+{
+    op->hasReg = true;
+    op->kind = Arm64OpKind::OpReg;
+    op->text = text;
+
+    // split off ".suffix" — but only when the base parses as vN (vector)
+    // or when it's a scalar arrangement letter already in the name.
+    str base = text;
+    str arrTxt = "";
+    usize dot = text.len;
+    for (usize i = 0; i < text.len; i++)
+    {
+        if (text.ptr[i] == (u8)'.') { dot = i; break; }
+    }
+    if (dot < text.len)
+    {
+        base = str { (const u8*)text.ptr, dot };
+        arrTxt = str { (const u8*)(text.ptr + dot + 1), text.len - dot - 1 };
+    }
+
+    if (!parseRegName(base, &op->reg))
+    {
+        err->msg = "unknown register";
+        err->lineNo = lineNo;
+        return false;
+    }
+    if (!arrTxt.isEmpty())
+    {
+        Arm64VecArr va;
+        if (!parseVecArr(arrTxt, &va))
+        {
+            err->msg = "bad vector arrangement";
+            err->lineNo = lineNo;
+            return false;
+        }
+        op->arrPresent = true;
+        op->arrSize = va.esize;
+        op->arrCount = va.count;
+        op->arrScalar = va.isScalar;
+    }
+    return true;
+}
+
+// shift/extend keyword following a register operand
+u8 shiftKw(str w)
+{
+    if (w.equals("lsl")) return (u8)Arm64Shift::ShLSL;
+    if (w.equals("lsr")) return (u8)Arm64Shift::ShLSR;
+    if (w.equals("asr")) return (u8)Arm64Shift::ShASR;
+    if (w.equals("ror")) return (u8)Arm64Shift::ShROR;
+    return 0;
+}
+
+u8 extKw(str w)
+{
+    if (w.equals("uxtb")) return (u8)Arm64Ext::ExtUXTB;
+    if (w.equals("uxth")) return (u8)Arm64Ext::ExtUXTH;
+    if (w.equals("uxtw")) return (u8)Arm64Ext::ExtUXTW;
+    if (w.equals("sxtb")) return (u8)Arm64Ext::ExtSXTB;
+    if (w.equals("sxth")) return (u8)Arm64Ext::ExtSXTH;
+    if (w.equals("sxtw")) return (u8)Arm64Ext::ExtSXTW;
+    return 0;
+}
+
+// after a register operand, GAS allows ", lsl #n" / ", uxtw #n" as a
+// separate comma-item belonging to that operand. The operand splitter
+// calls this to glue such items back on.
+bool tryAttachModifier(AsmLexer* lx, Arm64Operand* op, AsmParseError* err)
+{
+    lx->skipSpace();
+    if (lx->done() || lx->peek() != (u8)',')) return true;
+    usize save = lx->pos;
+    lx->pos++;
+    lx->skipSpace();
+    if (lx->done()) { lx->pos = save; return true; }
+    str kw = lx->lexIdent();
+    u8 sh = shiftKw(kw);
+    u8 ex = extKw(kw);
+    if (sh == 0 && ex == 0) { lx->pos = save; return true; }
+    skipImmHash(lx);
+    i64 amt = 0;
+    bool isReg = false;
+    Arm64Reg r;
+    if (isAlpha(lx->peek()) || lx->peek() == (u8)'_' || lx->peek() == (u8)'x' || lx->peek() == (u8)'w')
+    {
+        str rname = lx->lexIdent();
+        if (!parseRegName(rname, &r)) { lx->pos = save; return true; }
+        isReg = true;
+    }
+    else if (!lx->lexNumber(&amt)) { lx->pos = save; return true; }
+    if (sh != 0)
+    {
+        op->shift = sh;
+        op->shiftIsReg = isReg;
+        op->shiftAmt = (u32)amt;
+        if (isReg) op->shiftReg = r;
+    }
+    else
+    {
+        op->ext = ex;
+        op->extAmt = (u32)amt;
+    }
+    return true;
+}
+
+// one operand at the cursor: mem [...], #-imm/sym, register (with
+// optional .arr), or bare symbol/number (branch targets).
+bool parseArm64Operand(AsmLexer* lx, Arm64Operand* op, AsmParseError* err)
+{
+    lx->skipSpace();
+    if (lx->done()) { err->msg = "missing operand"; err->lineNo = lx->lineNo; return false; }
+    u8 c = lx->peek();
+
+    if (c == (u8)'[')
+    {
+        return parseMemOperand(lx, op, err);
+    }
+
+    if (c == (u8)'#')
+    {
+        return parseImmOrSym(lx, op, err);
+    }
+
+    // quoted string? not an operand — error
+    if (c == (u8)'\'' || c == (u8)'"')
+    {
+        err->msg = "unexpected literal";
+        err->lineNo = lx->lineNo;
+        return false;
+    }
+
+    // number without '#'? GAS requires '#' for immediates in most
+    // contexts; accept bare numbers only for branch targets — the
+    // caller decides. We parse them as OpSym-free immediates here and
+    // let the encoder reject where inappropriate.
+    if (isDigit(c) || c == (u8)'-' || c == (u8)'+')
+    {
+        i64 v = 0;
+        if (!lx->lexNumber(&v)) { err->msg = "bad operand"; err->lineNo = lx->lineNo; return false; }
+        op->kind = Arm64OpKind::OpImm;
+        op->imm = v;
+        op->hasImm = true;
+        op->text = "";
+        return true;
+    }
+
+    // identifier: register (with optional .arr) or bare symbol
+    if (isAlpha(c) || c == (u8)'_' || c == (u8)'.')
+    {
+        // need the raw text incl. .arr — lexIdent stops at '.', so
+        // rescan manually
+        usize start = lx->pos;
+        while (lx->pos < lx->src.len)
+        {
+            u8 ch = lx->src.ptr[lx->pos];
+            if (isAlnum(ch) || ch == (u8)'_' || ch == (u8)'.' || ch == (u8)'$') lx->pos++;
+            else break;
+        }
+        str text = str { (const u8*)(lx->src.ptr + start), lx->pos - start };
+        // register?
+        Arm64Operand tmp = arm64OpEmpty();
+        if (parseRegOperandText(text, &tmp, err, lx->lineNo))
+        {
+            *op = tmp;
+            // optional shift/extend modifier as a following comma item —
+            // handled by the caller loop; nothing more here
+            return true;
+        }
+        // not a register — restore and treat as symbol
+        lx->pos = start;
+        str name = lx->lexIdent();
+        if (name.isEmpty()) { err->msg = "bad operand"; err->lineNo = lx->lineNo; return false; }
+        op->kind = Arm64OpKind::OpSym;
+        op->sym = name;
+        op->hasSym = true;
+        op->text = name;
+        // sym+N
+        lx->skipSpace();
+        if (!lx->done() && (lx->peek() == (u8)'+' || lx->peek() == (u8)'-'))
+        {
+            i64 add = 0;
+            if (!lx->lexNumber(&add)) { err->msg = "bad symbol addend"; err->lineNo = lx->lineNo; return false; }
+            op->addend = add;
+        }
+        return true;
+    }
+
+    err->msg = "bad operand";
+    err->lineNo = lx->lineNo;
+    return false;
+}
+
+// whole line: [label:] mnemonic op, op, ... | .directive args
+pub bool parseArm64Line(str src, u32 lineNo, Arm64Line* out, AsmParseError* err)
+{
+    out->mnem = "";
+    out->nops = 0;
+    out->lineNo = lineNo;
+    out->isDirective = false;
+    out->isEmpty = true;
+    out->label = "";
+    out->hasLabel = false;
+    out->dargs = "";
+
+    AsmLexer lx = AsmLexer::new(src, lineNo);
+    lx.skipSpace();
+    // '#' first non-space char = whole-line comment
+    if (lx.done() || lx.peek() == (u8)'#') return true;
+    // '//' comment
+    if (lx.pos + 1 < lx.src.len && lx.peek() == (u8)'/' && lx.peekAt(1) == (u8)'/') return true;
+
+    // strip trailing // or /* */ comments: find them outside brackets —
+    // simplest: scan for "//" not inside quotes; block comments handled
+    // by truncating at "/*"
+    {
+        usize cut = lx.src.len;
+        bool inq = false;
+        for (usize i = lx.pos; i + 1 < lx.src.len; i++)
+        {
+            u8 c = lx.src.ptr[i];
+            if (c == (u8)'\'') inq = !inq;
+            if (inq) continue;
+            if (c == (u8)'/' && lx.src.ptr[i + 1] == (u8)'/') { cut = i; break; }
+            if (c == (u8)'/' && lx.src.ptr[i + 1] == (u8)'*') { cut = i; break; }
+        }
+        if (cut < lx.src.len)
+        {
+            lx.src = str { (const u8*)lx.src.ptr, cut };
+        }
+    }
+
+    lx.skipSpace();
+    if (lx.done() || lx.peek() == (u8)'#') return true;
+
+    // label: ident ':' — GAS also allows "label:" then instruction
+    usize save = lx.pos;
+    str maybeLabel = lx.lexIdent();
+    lx.skipSpace();
+    if (!maybeLabel.isEmpty() && !lx.done() && lx.peek() == (u8)':')
+    {
+        lx.pos++;
+        out->label = maybeLabel;
+        out->hasLabel = true;
+        lx.skipSpace();
+        if (lx.done() || lx.peek() == (u8)'#') return true;
+    }
+    else
+    {
+        lx.pos = save;
+    }
+
+    // directives
+    if (lx.peek() == (u8)'.')
+    {
+        out->isDirective = true;
+        out->isEmpty = false;
+        str full = lx.lexIdent();
+        out->mnem = full;
+        lx.skipSpace();
+        if (!lx.done())
+        {
+            out->dargs = str { (const u8*)(lx.src.ptr + lx.pos), lx.src.len - lx.pos };
+        }
+        return true;
+    }
+
+    str mnem = lx.lexIdent();
+    if (mnem.isEmpty()) { err->msg = "expected mnemonic"; err->lineNo = lineNo; return false; }
+    out->mnem = mnem;
+    out->isEmpty = false;
+
+    // operands: comma-separated at bracket depth 0. Memory operands
+    // contain commas inside [ ]; we parse operand-by-operand instead:
+    // parse one operand, then if the next char is ',' check whether it
+    // begins a shift/extend modifier (glue) or a real next operand.
+    while (true)
+    {
+        if (out->nops >= 5) { err->msg = "too many operands"; err->lineNo = lineNo; return false; }
+        Arm64Operand op = arm64OpEmpty();
+        if (!parseArm64Operand(&lx, &op, err)) return false;
+        // glue one shift/extend modifier item (", lsl #4") onto this
+        // operand when present; tryAttachModifier restores the cursor
+        // when the next item is a real operand instead
+        tryAttachModifier(&lx, &op, err);
+        out->ops[out->nops] = op;
+        out->nops++;
+        lx.skipSpace();
+        if (lx.done()) break;
+        if (lx.peek() != (u8',') )
+        {
+            // allow trailing comment '#'? mid-line '#' is NOT a comment
+            // in GAS — but be lenient: treat rest starting with '# ' as
+            // comment only if followed by space? No — error like GAS.
+            err->msg = "unexpected characters after operand";
+            err->lineNo = lineNo;
+            return false;
+        }
+        lx.pos++;
+        lx.skipSpace();
+        if (lx.done()) { err->msg = "trailing comma"; err->lineNo = lineNo; return false; }
+    }
+    return true;
+}

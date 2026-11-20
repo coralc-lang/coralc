@@ -1,0 +1,520 @@
+#[[no_drop_all]]
+import std::ios { eprintln };
+import muvm::passes::common { gVerbose };
+import muvm::irtypes { IrContext, IrValue, IrInst, IrBlock, IrFunc, IrValueKind, FunctionAnalysisCache };
+import muvm::irOps { IrOpcode };
+import std::mman { alloc, dealloc };
+
+// Points-to analysis.
+//
+// Computes for each pointer SSA value the memory object it may refer to:
+// - Alloca instructions (local variables)
+// - Global variables
+// - Unknown (returned by functions, loaded from pointers)
+//
+// Handles GEP offsets and bitcasts (base object propagated), phi nodes
+// (conservative: only a single agreed object resolves, disagreement or
+// any unknown arm yields UNKNOWN), and marks phi cycles via an
+// in-progress sentinel instead of recursing forever.
+//
+// Other passes query isNoAlias / isMustAlias / mayClobber. The result is
+// published into FunctionAnalysisCache.aliasAnalysis stamped with the
+// context's analysisGeneration; consumers rebuild on demand when stale.
+//
+// Ported from wallvm's alias_analysis with the MemorySSA scaffolding
+// dropped — wallvm's own memory_ssa pass builds the real dependency web
+// on top of this analysis and never consumed those arrays.
+
+pub const u32 OBJECT_UNKNOWN = 0;
+const u32 OBJECT_MAX = 256;
+// Walk marker: a value whose object is being computed right now. Re-entering
+// it means the def graph has a cycle (phi -> phi), which cuts to UNKNOWN
+// instead of recursing forever.
+const u32 OBJECT_INPROGRESS = 0xFFFFFFFE;
+
+pub enum AliasResult
+{
+    NoAlias,    // Definitely don't alias
+    MayAlias,   // May alias (conservative)
+    MustAlias   // Definitely alias (same base, no offset difference)
+}
+
+pub struct MemoryObject
+{
+    u32 id;
+    IrValue* baseValue;  // The defining SSA value (alloca, global, etc.)
+    IrValue* baseAddr;   // The address (alloca result, global addr)
+    bool isGlobal;
+    bool isEscaped;   // Address taken or passed to callee
+    u32 sizeBytes;    // Known size (0 = unknown)
+}
+
+pub struct AliasAnalysis
+{
+    IrContext* ctx;
+    MemoryObject* objects;
+    u32 numObjects;
+    u32 capObjects;
+
+    // Mapping — SSA value id -> object id (or OBJECT_UNKNOWN)
+    u32* valToObject;
+    u32 valToObjectCap;
+
+    static AliasAnalysis new(IrContext* ctx)
+    {
+        return AliasAnalysis {
+            .ctx = ctx,
+            .objects = null,
+            .numObjects = 0,
+            .capObjects = 0,
+            .valToObject = null,
+            .valToObjectCap = 0
+        };
+    }
+
+    void deinit()
+    {
+        if (self.objects != null) dealloc<MemoryObject>(self.objects);
+        if (self.valToObject != null) dealloc<u32>(self.valToObject);
+    }
+
+    void ensureObjects(u32 needed)
+    {
+        if (needed <= self.capObjects) return;
+        u32 newCap = self.capObjects ? self.capObjects * 2 : 64;
+        while (newCap < needed) newCap *= 2;
+        MemoryObject* newArr = alloc<MemoryObject>((usize)newCap);
+        if (self.objects != null)
+        {
+            for (u32 i = 0; i < self.numObjects; i++)
+                newArr[i] = self.objects[i];
+            dealloc<MemoryObject>(self.objects);
+        }
+        self.objects = newArr;
+        self.capObjects = newCap;
+    }
+
+    void ensureValToObject(u32 needed)
+    {
+        if (needed < self.valToObjectCap) return;
+        u32 newCap = self.valToObjectCap ? self.valToObjectCap * 2 : 256;
+        while (newCap <= needed) newCap *= 2;
+        u32* newArr = alloc<u32>((usize)newCap);
+        for (u32 i = 0; i < self.valToObjectCap; i++)
+            newArr[i] = self.valToObject[i];
+        for (u32 i = self.valToObjectCap; i < newCap; i++)
+            newArr[i] = OBJECT_UNKNOWN;
+        if (self.valToObject != null) dealloc<u32>(self.valToObject);
+        self.valToObject = newArr;
+        self.valToObjectCap = newCap;
+    }
+
+    u32 getObjectForValue(IrValue* val)
+    {
+        if (val == null) return OBJECT_UNKNOWN;
+        u32 id = val->id;
+        if (id >= self.valToObjectCap) return OBJECT_UNKNOWN;
+        return self.valToObject[id];
+    }
+
+    void setObjectForValue(IrValue* val, u32 objId)
+    {
+        if (val == null) return;
+        self.ensureValToObject(val->id + 1);
+        self.valToObject[val->id] = objId;
+    }
+
+    u32 createObject(IrValue* baseValue, IrValue* baseAddr, bool isGlobal, u32 sizeBytes)
+    {
+        self.ensureObjects(self.numObjects + 1);
+        // Object ids are 1-based: 0 is OBJECT_UNKNOWN, and a 0 id would
+        // read back as "no object" through getObjectForValue (wallvm's
+        // port had this collision — the first object was always
+        // duplicated and its slot orphaned).
+        u32 id = self.numObjects + 1;
+        MemoryObject* obj = &self.objects[self.numObjects];
+        obj->id = id;
+        obj->baseValue = baseValue;
+        obj->baseAddr = baseAddr;
+        obj->isGlobal = isGlobal;
+        obj->isEscaped = false;
+        obj->sizeBytes = sizeBytes;
+        self.numObjects++;
+        return id;
+    }
+
+    // Walk the address operand to find the base object.
+    // Handles: alloca, global, GEP(base, ...), bitcast(x), phi(...)
+    u32 walkAddr(IrValue* addr)
+    {
+        if (addr == null) return OBJECT_UNKNOWN;
+
+        if (addr->kind == IrValueKind::Global)
+        {
+            u32 cached = self.getObjectForValue(addr);
+            if (cached != OBJECT_UNKNOWN) return cached;
+            u32 objId = self.createObject(addr, addr, true, 0);
+            self.setObjectForValue(addr, objId);
+            return objId;
+        }
+
+        if (addr->kind != IrValueKind::Inst) return OBJECT_UNKNOWN;
+
+        IrInst* inst = (IrInst*)addr;
+        u32 cached = self.getObjectForValue(addr);
+        if (cached == OBJECT_INPROGRESS) return OBJECT_UNKNOWN; // cycle cut
+        if (cached != OBJECT_UNKNOWN) return cached;
+
+        switch (inst->opcode)
+        {
+            IrOpcode::Alloca => {
+                u32 sz = 0;
+                if (inst->nops > 0 && inst->ops[0] != null && inst->ops[0]->kind == IrValueKind::ConstInt)
+                    sz = (u32)inst->ops[0]->valData;
+                u32 objId = self.createObject(&inst->base, &inst->base, false, sz);
+                self.setObjectForValue(&inst->base, objId);
+                return objId;
+            },
+
+            IrOpcode::Gep => {
+                if (inst->nops > 0)
+                    return self.walkAddr(inst->ops[0]);
+                return OBJECT_UNKNOWN;
+            },
+
+            IrOpcode::Bitcast => {
+                if (inst->nops > 0)
+                    return self.walkAddr(inst->ops[0]);
+                return OBJECT_UNKNOWN;
+            },
+
+            IrOpcode::Phi => {
+                // Mark in-progress first: a phi cycle (self- or mutually
+                // referencing phis) cuts to UNKNOWN instead of recursing
+                // forever.
+                self.setObjectForValue(addr, OBJECT_INPROGRESS);
+                u32 result = OBJECT_UNKNOWN;
+                // Phi operands are interleaved value/block pairs, so step by 2
+                // and read only the value slot of each pair.
+                for (u32 j = 0; j + 1 < inst->nops; j += 2)
+                {
+                    IrValue* incoming = inst->ops[j];
+                    if (incoming == null)
+                        continue;
+                    // self-edge: same object by definition, no new information
+                    if (incoming == &inst->base)
+                        continue;
+                    u32 incomingObj = self.walkAddr(incoming);
+                    if (incomingObj == OBJECT_UNKNOWN) {
+                        result = OBJECT_UNKNOWN;
+                        break;
+                    }
+                    if (result == OBJECT_UNKNOWN)
+                        result = incomingObj;
+                    else if (result != incomingObj) {
+                        result = OBJECT_UNKNOWN;
+                        break;
+                    }
+                }
+                // always clear the in-progress marker (0 == UNKNOWN == not
+                // cached, so storing it is equivalent to removing it)
+                self.setObjectForValue(addr, result);
+                return result;
+            },
+
+            IrOpcode::Load | IrOpcode::Call => { return OBJECT_UNKNOWN; },
+
+            else => { return OBJECT_UNKNOWN; }
+        }
+    }
+
+    // Main analysis entry point.
+    // 1. Scan all allocas to create objects
+    // 2. Walk all store/load/gep/bitcast/phi addresses to build the
+    //    value -> object map
+    void analyze(IrFunc* func)
+    {
+        self.numObjects = 0;
+        // Reset the value->object map: entries from a previous analyze
+        // would otherwise leak into this run.
+        for (u32 i = 0; i < self.valToObjectCap; i++)
+            self.valToObject[i] = OBJECT_UNKNOWN;
+
+        // Pass 1 — Create objects for all allocas
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst->opcode == IrOpcode::Alloca)
+                {
+                    u32 sz = 0;
+                    if (inst->nops > 0 && inst->ops[0] != null && inst->ops[0]->kind == IrValueKind::ConstInt)
+                        sz = (u32)inst->ops[0]->valData;
+                    u32 objId = self.createObject(&inst->base, &inst->base, false, sz);
+                    self.setObjectForValue(&inst->base, objId);
+                }
+            }
+        }
+
+        // Pass 2 — Walk all memory-address operands to discover objects.
+        // GEP/bitcast propagate their base's object; a phi caches only
+        // when every arm resolves to the SAME object — caching the first
+        // arm made queries through the phi answer NoAlias against the
+        // other arm's real object. Any disagreement/unknown arm caches
+        // nothing and walkAddr's own phi rule answers UNKNOWN
+        // (conservative may-alias) at query time.
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+
+                // Store — walk the address operand (ops[1])
+                if (inst->opcode == IrOpcode::Store && inst->nops >= 2)
+                {
+                    u32 objId = self.walkAddr(inst->ops[1]);
+                    (void)objId;
+                }
+
+                // Load — walk the address operand (ops[0])
+                if (inst->opcode == IrOpcode::Load && inst->nops >= 1)
+                {
+                    u32 objId = self.walkAddr(inst->ops[0]);
+                    (void)objId;
+                }
+
+                // AtomicStore — walk the address operand (ops[1])
+                if (inst->opcode == IrOpcode::AtomicStore && inst->nops >= 2)
+                {
+                    u32 objId = self.walkAddr(inst->ops[1]);
+                    (void)objId;
+                }
+                if (inst->opcode == IrOpcode::AtomicLoad && inst->nops >= 1)
+                {
+                    u32 objId = self.walkAddr(inst->ops[0]);
+                    (void)objId;
+                }
+                if (inst->opcode == IrOpcode::AtomicRmw && inst->nops >= 2)
+                {
+                    u32 objId = self.walkAddr(inst->ops[0]);
+                    (void)objId;
+                }
+                if (inst->opcode == IrOpcode::AtomicCmpXchg && inst->nops >= 1)
+                {
+                    u32 objId = self.walkAddr(inst->ops[0]);
+                    (void)objId;
+                }
+
+                // Gep — propagate the base object's id onto the result
+                if (inst->opcode == IrOpcode::Gep && inst->nops > 0)
+                {
+                    u32 objId = self.walkAddr(inst->ops[0]);
+                    if (objId != OBJECT_UNKNOWN)
+                        self.setObjectForValue(&inst->base, objId);
+                }
+
+                // Bitcast — propagate
+                if (inst->opcode == IrOpcode::Bitcast && inst->nops > 0)
+                {
+                    u32 objId = self.walkAddr(inst->ops[0]);
+                    if (objId != OBJECT_UNKNOWN)
+                        self.setObjectForValue(&inst->base, objId);
+                }
+
+                // Phi — merge incoming objects: cache only when every arm
+                // resolves to the SAME object.
+                if (inst->opcode == IrOpcode::Phi)
+                {
+                    u32 merged = OBJECT_UNKNOWN;
+                    bool bad = false;
+                    // Phi operands are interleaved value/block pairs, so step by 2
+                    // and read only the value slot of each pair.
+                    for (u32 j = 0; j + 1 < inst->nops; j += 2)
+                    {
+                        IrValue* incoming = inst->ops[j];
+                        if (incoming == null || incoming == &inst->base)
+                            continue;
+                        u32 objId = self.walkAddr(incoming);
+                        if (objId == OBJECT_UNKNOWN) { bad = true; break; }
+                        if (merged == OBJECT_UNKNOWN)
+                            merged = objId;
+                        else if (merged != objId) { bad = true; break; }
+                    }
+                    if (!bad && merged != OBJECT_UNKNOWN)
+                        self.setObjectForValue(&inst->base, merged);
+                }
+            }
+        }
+
+        // Pass 3 — escape marking: a pointer that flows into a call,
+        // store value, return, or inline asm may be retained or observed
+        // by code we cannot see. Conservative and one-directional: once
+        // escaped, always escaped.
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                u32 first = 0xFFFFFFFF;
+                u32 last = 0;
+                switch (inst->opcode)
+                {
+                    // call args: every operand is a potential escape
+                    IrOpcode::Call | IrOpcode::InlineAsm => { first = 0; last = inst->nops; },
+                    // store value operand (ops[0]); the address is ops[1]
+                    IrOpcode::Store => { first = 0; last = inst->nops > 0 ? 1 : 0; },
+                    // ret value
+                    IrOpcode::Ret => { first = 0; last = inst->nops; },
+                    else => { continue; }
+                }
+                for (u32 oi = first; oi < last; oi++)
+                {
+                    IrValue* v = inst->ops[oi];
+                    if (v == null || v->kind != IrValueKind::Inst) continue;
+                    u32 objId = self.walkAddr(v);
+                    if (objId != OBJECT_UNKNOWN && objId <= self.numObjects)
+                        self.objects[objId - 1].isEscaped = true;
+                }
+            }
+        }
+    }
+
+    // Query — do two values definitely not alias?
+    bool isNoAlias(IrValue* a, IrValue* b)
+    {
+        if (a == null || b == null) return true;
+        if (a->id == b->id) return false;
+
+        u32 objA = self.walkAddr(a);
+        u32 objB = self.walkAddr(b);
+
+        if (objA != OBJECT_UNKNOWN && objB != OBJECT_UNKNOWN && objA != objB)
+            return true;
+
+        return false;
+    }
+
+    // Query — do two values definitely alias?
+    // Conservative: only identical SSA values qualify. Two distinct GEPs
+    // into the same object may still differ by offset, so same-object is
+    // not sufficient for must-alias.
+    bool isMustAlias(IrValue* a, IrValue* b)
+    {
+        if (a == null || b == null) return false;
+        if (a->id == b->id) return true;
+        return false;
+    }
+
+    // Query — can a load at address 'loadAddr' be clobbered by a store at address 'storeAddr'?
+    // Returns true if the store may overwrite the memory read by the load.
+    bool mayClobber(IrValue* loadAddr, IrValue* storeAddr)
+    {
+        if (loadAddr == null || storeAddr == null) return true;
+        u32 loadObj = self.walkAddr(loadAddr);
+        u32 storeObj = self.walkAddr(storeAddr);
+
+        if (loadObj == OBJECT_UNKNOWN || storeObj == OBJECT_UNKNOWN) return true;
+        if (loadObj == storeObj) return true;
+        return false;
+    }
+
+    // Query — does a store to 'storeAddr' kill a prior load from 'loadAddr'?
+    // (i.e., do they definitely alias)
+    bool doesStoreKillLoad(IrValue* storeAddr, IrValue* loadAddr)
+    {
+        return self.isMustAlias(storeAddr, loadAddr);
+    }
+
+    // Debug dump: every memory object and every resolved value -> object
+    // edge. Values print as <kind>:<id> plus the defining opcode for
+    // insts so the mapping can be checked against the IR text.
+    void dump(IrFunc* func)
+    {
+        eprintln("aa: func={} objects={}", func->base.name, (u64)self.numObjects);
+        for (u32 i = 0; i < self.numObjects; i++)
+        {
+            MemoryObject* o = &self.objects[i];
+            eprintln("  obj {}: {}val={} size={} escaped={}",
+                     (u64)o->id,
+                     o->isGlobal ? "global " : "alloca ",
+                     o->baseValue != null ? (u64)o->baseValue->id : 0,
+                     (u64)o->sizeBytes, o->isEscaped ? 1 : 0);
+        }
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                u32 obj = self.getObjectForValue(&inst->base);
+                if (obj == OBJECT_UNKNOWN) continue;
+                eprintln("  {}:{} -> obj {}", bb->base.name, (u64)inst->base.id, (u64)obj);
+            }
+        }
+        // Query exercise: for every load, report mayClobber against each
+        // earlier store in the same block — the verdict a DSE/load-
+        // forwarding pass would act on.
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* li = bb->insts[ii];
+                if (li->opcode != IrOpcode::Load || li->nops < 1) continue;
+                for (u32 sj = 0; sj < ii; sj++)
+                {
+                    IrInst* si = bb->insts[sj];
+                    if (si->opcode != IrOpcode::Store || si->nops < 2) continue;
+                    bool mc = self.mayClobber(li->ops[0], si->ops[1]);
+                    eprintln("  query {}:{} load mayClobber store {}:{} = {}",
+                             bb->base.name, (u64)li->base.id,
+                             bb->base.name, (u64)si->base.id, mc ? 1 : 0);
+                }
+            }
+        }
+    }
+}
+
+// Registered as FunctionAnalysisCache.destroyAliasAnalysis: the cache owns
+// the published heap copy, so both the internal buffers (deinit) and the
+// copy itself (dealloc) are released here.
+void destroyCachedAliasAnalysis(rawptr p)
+{
+    AliasAnalysis* aa = (AliasAnalysis*)p;
+    aa->deinit();
+    dealloc<AliasAnalysis>(aa);
+}
+
+pub bool muvmPassAliasAnalysis(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (ctx == null || func == null) return false;
+
+    // Check if we already have cached results for this function
+    FunctionAnalysisCache* cache = ctx->getOrCreateAnalysisCache(func);
+    if (cache->aliasAnalysis != null)
+    {
+        if (cache->generation == ctx->analysisGeneration) return false;
+        // Stale — the IR mutated since this AA was built. Free it via the
+        // registered destroyer and rebuild below.
+        if (cache->destroyAliasAnalysis != null)
+            cache->destroyAliasAnalysis(cache->aliasAnalysis);
+        cache->aliasAnalysis = null;
+    }
+
+    AliasAnalysis aa = AliasAnalysis::new(ctx);
+    aa.analyze(func);
+    if (gVerbose) aa.dump(func);
+
+    // Store in cache (heap-allocated copy)
+    AliasAnalysis* cached = alloc<AliasAnalysis>((usize)1);
+    *cached = aa;
+    cache->aliasAnalysis = cached;
+    cache->generation = ctx->analysisGeneration;
+    cache->destroyAliasAnalysis = destroyCachedAliasAnalysis;
+    return false;
+}
