@@ -9,8 +9,9 @@ import muvm::irtypes {
     IrType, IrTypeKind, IrContext, IrGlobal, IrStringConst,
     IrArrayConst, IrStructConst
 };
-import muvm::irOps { IrOpcode, IrICmpPred };
+import muvm::irOps { IrOpcode, IrICmpPred, IrAtomicRmwOp, IrAtomicOrdering, irOpcodeStr };
 import muvm::irMetadata { funcIsHot, funcIsCold, funcIsLeaf, funcIsOptNone, funcIsNoReturn };
+import muvm::assembly::common { parseConstraints, AsmConstraint, AsmConClass, AsmParseError };
 import std::string { String };
 import std::mman { alloc, dealloc };
 import platform::libc { snprintf };
@@ -250,6 +251,1247 @@ u64 emitStructFieldOff(IrContext* ictx, IrType* sty, u32 fi)
     return 0;
 }
 
+// ── shared lowering helpers (vector lanes, inline asm, atomics) ─────
+
+str x86Reg32(str r)
+{
+    if (r.equals("rax")) return "eax";
+    if (r.equals("rcx")) return "ecx";
+    if (r.equals("rdx")) return "edx";
+    if (r.equals("rsi")) return "esi";
+    if (r.equals("rdi")) return "edi";
+    if (r.equals("r8")) return "r8d";
+    if (r.equals("r9")) return "r9d";
+    if (r.equals("r10")) return "r10d";
+    if (r.equals("r11")) return "r11d";
+    if (r.equals("rbx")) return "ebx";
+    if (r.equals("r12")) return "r12d";
+    if (r.equals("r13")) return "r13d";
+    if (r.equals("r14")) return "r14d";
+    if (r.equals("r15")) return "r15d";
+    return r;
+}
+
+str x86Reg16(str r)
+{
+    if (r.equals("rax")) return "ax";
+    if (r.equals("rcx")) return "cx";
+    if (r.equals("rdx")) return "dx";
+    if (r.equals("rsi")) return "si";
+    if (r.equals("rdi")) return "di";
+    if (r.equals("r8")) return "r8w";
+    if (r.equals("r9")) return "r9w";
+    if (r.equals("r10")) return "r10w";
+    if (r.equals("r11")) return "r11w";
+    if (r.equals("rbx")) return "bx";
+    if (r.equals("r12")) return "r12w";
+    if (r.equals("r13")) return "r13w";
+    if (r.equals("r14")) return "r14w";
+    if (r.equals("r15")) return "r15w";
+    return r;
+}
+
+str x86Reg8(str r)
+{
+    if (r.equals("rax")) return "al";
+    if (r.equals("rcx")) return "cl";
+    if (r.equals("rdx")) return "dl";
+    if (r.equals("rsi")) return "sil";
+    if (r.equals("rdi")) return "dil";
+    if (r.equals("r8")) return "r8b";
+    if (r.equals("r9")) return "r9b";
+    if (r.equals("r10")) return "r10b";
+    if (r.equals("r11")) return "r11b";
+    if (r.equals("rbx")) return "bl";
+    if (r.equals("r12")) return "r12b";
+    if (r.equals("r13")) return "r13b";
+    if (r.equals("r14")) return "r14b";
+    if (r.equals("r15")) return "r15b";
+    return r;
+}
+
+// reg-name for a width: emit the right sub-register of `reg64`
+str x86RegForWidth(str reg64, u32 width)
+{
+    if (width <= 8) return x86Reg8(reg64);
+    if (width <= 16) return x86Reg16(reg64);
+    if (width <= 32) return x86Reg32(reg64);
+    return reg64;
+}
+
+// Load `width` bits from `disp(%rbp)` into `reg` (zero-extended unless
+// signExt, which uses the movs* forms for sub-64 lanes).
+void emitSlotLoad(FastX86Context* ctx, i32 disp, u32 width, str reg, bool signExt)
+{
+    if (width <= 8)
+    {
+        ctx->emit(signExt ? "    movsbl " : "    movzbl ");
+        ctx->emitI64((i64)disp);
+        ctx->emit("(%rbp), %");
+        ctx->emitLine(x86Reg32(reg));
+    }
+    else if (width <= 16)
+    {
+        ctx->emit(signExt ? "    movswl " : "    movzwl ");
+        ctx->emitI64((i64)disp);
+        ctx->emit("(%rbp), %");
+        ctx->emitLine(x86Reg32(reg));
+    }
+    else if (width <= 32)
+    {
+        if (signExt)
+        {
+            ctx->emit("    movslq ");
+            ctx->emitI64((i64)disp);
+            ctx->emit("(%rbp), %");
+            ctx->emitLine(reg);
+        }
+        else
+        {
+            ctx->emit("    movl ");
+            ctx->emitI64((i64)disp);
+            ctx->emit("(%rbp), %");
+            ctx->emitLine(x86Reg32(reg));
+        }
+    }
+    else
+    {
+        ctx->emit("    movq ");
+        ctx->emitI64((i64)disp);
+        ctx->emit("(%rbp), %");
+        ctx->emitLine(reg);
+    }
+}
+
+void emitSlotStore(FastX86Context* ctx, i32 disp, u32 width, str reg)
+{
+    ctx->emit("    ");
+    if (width <= 8)
+    {
+        ctx->emit("movb %");
+        ctx->emit(x86Reg8(reg));
+    }
+    else if (width <= 16)
+    {
+        ctx->emit("movw %");
+        ctx->emit(x86Reg16(reg));
+    }
+    else if (width <= 32)
+    {
+        ctx->emit("movl %");
+        ctx->emit(x86Reg32(reg));
+    }
+    else
+    {
+        ctx->emit("movq %");
+        ctx->emit(reg);
+    }
+    ctx->emit(", ");
+    ctx->emitI64((i64)disp);
+    ctx->emitLine("(%rbp)");
+}
+
+// load/store through a pointer held in `baseReg` (e.g. (%rbx))
+void emitIndLoad(FastX86Context* ctx, str baseReg, u32 width, str reg, bool signExt)
+{
+    str mn = "movq";
+    str rn = reg;
+    if (width <= 8) { mn = signExt ? "movsbl" : "movzbl"; rn = x86Reg32(reg); }
+    else if (width <= 16) { mn = signExt ? "movswl" : "movzwl"; rn = x86Reg32(reg); }
+    else if (width <= 32)
+    {
+        if (signExt) { mn = "movslq"; }
+        else { mn = "movl"; rn = x86Reg32(reg); }
+    }
+    ctx->emit("    ");
+    ctx->emit(mn);
+    ctx->emit(" (%");
+    ctx->emit(baseReg);
+    ctx->emit("), %");
+    ctx->emitLine(rn);
+}
+
+void emitIndStore(FastX86Context* ctx, str baseReg, u32 width, str reg)
+{
+    str mn = "movq";
+    str rn = reg;
+    if (width <= 8) { mn = "movb"; rn = x86Reg8(reg); }
+    else if (width <= 16) { mn = "movw"; rn = x86Reg16(reg); }
+    else if (width <= 32) { mn = "movl"; rn = x86Reg32(reg); }
+    ctx->emit("    ");
+    ctx->emit(mn);
+    ctx->emit(" %");
+    ctx->emit(rn);
+    ctx->emit(", (%");
+    ctx->emit(baseReg);
+    ctx->emitLine(")");
+}
+
+// ── vector support ──────────────────────────────────────────────────
+// Vector values occupy a byte region inside their stack slot (the slot
+// pass reserves irTypeSizeOf bytes for Vector/Array-typed results), so
+// every lane is addressed as slotOff + lane*elemSize. This is the
+// "simplified" lowering: per-lane scalar ops, no packed instructions.
+
+IrType* vecValueTy(IrInst* inst)
+{
+    if (inst->base.type != null && inst->base.type->kind == IrTypeKind::Vector)
+        return inst->base.type;
+    if (inst->nops > 0 && inst->ops[0] != null && inst->ops[0]->type != null &&
+        inst->ops[0]->type->kind == IrTypeKind::Vector)
+        return inst->ops[0]->type;
+    return null;
+}
+
+u32 vecLaneBytes(IrContext* ictx, IrType* vt)
+{
+    if (vt == null || vt->elem == null) return 8;
+    u32 s = ictx->irTypeSizeOf(vt->elem);
+    return s != 0 ? s : 1;
+}
+
+void vecBadOp(FastX86Context* ctx, IrInst* inst)
+{
+    ctx->emit("    # unsupported vector operand shape for ");
+    ctx->emitLine(inst->opcode == IrOpcode::VecAdd ? "vadd" : "vec op");
+    ctx->emitLine("    ud2");
+}
+
+// can `v` be lane-addressed? slot-backed values and globals yes;
+// constants have no memory image — reject.
+bool vecLaneOk(IrValue* v)
+{
+    if (v == null) return false;
+    if (v->kind == IrValueKind::Global || v->kind == IrValueKind::StringConst) return true;
+    if (v->kind == IrValueKind::ConstInt || v->kind == IrValueKind::ConstFloat ||
+        v->kind == IrValueKind::ConstArray || v->kind == IrValueKind::StructConst)
+        return false;
+    return true;
+}
+
+// load lane `lane` of vector `v` into `reg`; width = element width in
+// bits. Globals use name+disp(%rip), slots use disp(%rbp).
+void emitVecLaneLoad(FastX86Context* ctx, IrValue* v, i32 laneOff, u32 width, str reg, bool signExt)
+{
+    if (v->kind == IrValueKind::Global || v->kind == IrValueKind::StringConst)
+    {
+        str mn = "movq";
+        str rn = reg;
+        if (width <= 8) { mn = signExt ? "movsbl" : "movzbl"; rn = x86Reg32(reg); }
+        else if (width <= 16) { mn = signExt ? "movswl" : "movzwl"; rn = x86Reg32(reg); }
+        else if (width <= 32)
+        {
+            if (signExt) mn = "movslq";
+            else { mn = "movl"; rn = x86Reg32(reg); }
+        }
+        ctx->emit("    ");
+        ctx->emit(mn);
+        ctx->emit(" ");
+        ctx->emit(v->name);
+        ctx->emit("+");
+        ctx->emitI64((i64)laneOff);
+        ctx->emit("(%rip), %");
+        ctx->emitLine(rn);
+        return;
+    }
+    emitSlotLoad(ctx, ctx->getSlot(v) + laneOff, width, reg, signExt);
+}
+
+void emitVecLaneStore(FastX86Context* ctx, IrValue* v, i32 laneOff, u32 width, str reg)
+{
+    if (v->kind == IrValueKind::Global || v->kind == IrValueKind::StringConst)
+    {
+        str mn = "movq";
+        str rn = reg;
+        if (width <= 8) { mn = "movb"; rn = x86Reg8(reg); }
+        else if (width <= 16) { mn = "movw"; rn = x86Reg16(reg); }
+        else if (width <= 32) { mn = "movl"; rn = x86Reg32(reg); }
+        ctx->emit("    ");
+        ctx->emit(mn);
+        ctx->emit(" %");
+        ctx->emit(rn);
+        ctx->emit(", ");
+        ctx->emit(v->name);
+        ctx->emit("+");
+        ctx->emitI64((i64)laneOff);
+        ctx->emitLine("(%rip)");
+        return;
+    }
+    emitSlotStore(ctx, ctx->getSlot(v) + laneOff, width, reg);
+}
+
+// integer binary vector op: vadd/vsub/vmul lane-wise. signExt=false —
+// add/sub/mul low bits are extension-agnostic.
+void emitVecIntBin(FastX86Context* ctx, IrContext* ictx, IrInst* inst, str alu)
+{
+    IrType* vt = vecValueTy(inst);
+    if (vt == null || inst->nops < 2 || !vecLaneOk(inst->ops[0]) || !vecLaneOk(inst->ops[1]))
+    { vecBadOp(ctx, inst); return; }
+    IrType* et = vt->elem;
+    u32 ew = et != null ? et->width : 64;
+    u32 lb = vecLaneBytes(ictx, vt);
+    i32 laneOff = 0;
+    for (u32 lane = 0; lane < vt->count; lane++)
+    {
+        emitVecLaneLoad(ctx, inst->ops[0], laneOff, ew, "rax", false);
+        emitVecLaneLoad(ctx, inst->ops[1], laneOff, ew, "rcx", false);
+        ctx->emit("    ");
+        ctx->emit(alu);
+        if (alu.equals("imul")) ctx->emit("q %rcx, %rax");
+        else { ctx->emit("q %rcx, %rax"); }
+        ctx->emitLine("");
+        emitVecLaneStore(ctx, &inst->base, laneOff, ew, "rax");
+        laneOff += (i32)lb;
+    }
+}
+
+// signed lane-wise divide — no packed int divide exists; widen each
+// lane to 64 bits, idiv, truncate back. INT_MIN/-1 wraps instead of
+// trapping (documented simplification vs. per-width idiv).
+void emitVecIntDiv(FastX86Context* ctx, IrContext* ictx, IrInst* inst)
+{
+    IrType* vt = vecValueTy(inst);
+    if (vt == null || inst->nops < 2 || !vecLaneOk(inst->ops[0]) || !vecLaneOk(inst->ops[1]))
+    { vecBadOp(ctx, inst); return; }
+    IrType* et = vt->elem;
+    u32 ew = et != null ? et->width : 64;
+    u32 lb = vecLaneBytes(ictx, vt);
+    i32 laneOff = 0;
+    for (u32 lane = 0; lane < vt->count; lane++)
+    {
+        emitVecLaneLoad(ctx, inst->ops[0], laneOff, ew, "rax", true);
+        emitVecLaneLoad(ctx, inst->ops[1], laneOff, ew, "rcx", true);
+        ctx->emitLine("    cqto");
+        ctx->emitLine("    idivq %rcx");
+        emitVecLaneStore(ctx, &inst->base, laneOff, ew, "rax");
+        laneOff += (i32)lb;
+    }
+}
+
+// unsigned integer min/max lane-wise (the VecMin/VecMax contract for
+// integer lanes is unsigned — see wallvm wasm backend comment).
+void emitVecIntMinMax(FastX86Context* ctx, IrContext* ictx, IrInst* inst, bool isMin)
+{
+    IrType* vt = vecValueTy(inst);
+    if (vt == null || inst->nops < 2 || !vecLaneOk(inst->ops[0]) || !vecLaneOk(inst->ops[1]))
+    { vecBadOp(ctx, inst); return; }
+    IrType* et = vt->elem;
+    u32 ew = et != null ? et->width : 64;
+    u32 lb = vecLaneBytes(ictx, vt);
+    i32 laneOff = 0;
+    for (u32 lane = 0; lane < vt->count; lane++)
+    {
+        emitVecLaneLoad(ctx, inst->ops[0], laneOff, ew, "rax", false);
+        emitVecLaneLoad(ctx, inst->ops[1], laneOff, ew, "rcx", false);
+        ctx->emitLine("    cmpq %rcx, %rax");
+        ctx->emit(isMin ? "    cmova " : "    cmovb ");
+        ctx->emitLine("%rcx, %rax");
+        emitVecLaneStore(ctx, &inst->base, laneOff, ew, "rax");
+        laneOff += (i32)lb;
+    }
+}
+
+void emitVecLaneLoadF(FastX86Context* ctx, IrValue* v, i32 laneOff, u32 width)
+{
+    if (v->kind == IrValueKind::Global || v->kind == IrValueKind::StringConst)
+    {
+        ctx->emit("    ");
+        ctx->emit(width <= 32 ? "movd " : "movq ");
+        ctx->emit(v->name);
+        ctx->emit("+");
+        ctx->emitI64((i64)laneOff);
+        ctx->emitLine("(%rip), %xmm0");
+        return;
+    }
+    i32 disp = ctx->getSlot(v) + laneOff;
+    ctx->emit(width <= 32 ? "    movd " : "    movq ");
+    ctx->emitI64((i64)disp);
+    ctx->emitLine("(%rbp), %xmm0");
+}
+
+void emitVecLaneStoreF(FastX86Context* ctx, IrValue* v, i32 laneOff, u32 width)
+{
+    if (v->kind == IrValueKind::Global || v->kind == IrValueKind::StringConst)
+    {
+        ctx->emit("    ");
+        ctx->emit(width <= 32 ? "movd %xmm0, " : "movq %xmm0, ");
+        ctx->emit(v->name);
+        ctx->emit("+");
+        ctx->emitI64((i64)laneOff);
+        ctx->emitLine("(%rip)");
+        return;
+    }
+    i32 disp = ctx->getSlot(v) + laneOff;
+    ctx->emit(width <= 32 ? "    movd %xmm0, " : "    movq %xmm0, ");
+    ctx->emitI64((i64)disp);
+    ctx->emitLine("(%rbp)");
+}
+
+// float binary vector op lane-wise through xmm0
+void emitVecFloatBin(FastX86Context* ctx, IrContext* ictx, IrInst* inst, str sop32, str sop64)
+{
+    IrType* vt = vecValueTy(inst);
+    if (vt == null || inst->nops < 2 || !vecLaneOk(inst->ops[0]) || !vecLaneOk(inst->ops[1]))
+    { vecBadOp(ctx, inst); return; }
+    IrType* et = vt->elem;
+    u32 ew = et != null ? et->width : 64;
+    u32 lb = vecLaneBytes(ictx, vt);
+    bool isF32v = ew <= 32;
+    i32 laneOff = 0;
+    for (u32 lane = 0; lane < vt->count; lane++)
+    {
+        emitVecLaneLoadF(ctx, inst->ops[0], laneOff, ew);
+        /* second operand through xmm1 */
+        IrValue* b = inst->ops[1];
+        if (b->kind == IrValueKind::Global || b->kind == IrValueKind::StringConst)
+        {
+            ctx->emit("    ");
+            ctx->emit(isF32v ? "movd " : "movq ");
+            ctx->emit(b->name);
+            ctx->emit("+");
+            ctx->emitI64((i64)laneOff);
+            ctx->emitLine("(%rip), %xmm1");
+        }
+        else
+        {
+            i32 d2 = ctx->getSlot(b) + laneOff;
+            ctx->emit(isF32v ? "    movd " : "    movq ");
+            ctx->emitI64((i64)d2);
+            ctx->emitLine("(%rbp), %xmm1");
+        }
+        ctx->emit("    ");
+        ctx->emit(isF32v ? sop32 : sop64);
+        ctx->emitLine(" %xmm1, %xmm0");
+        emitVecLaneStoreF(ctx, &inst->base, laneOff, ew);
+        laneOff += (i32)lb;
+    }
+}
+
+void emitVecFloatMinMax(FastX86Context* ctx, IrContext* ictx, IrInst* inst, bool isMin)
+{
+    /* x86 minss/minsd return the SECOND source on NaN — operands are
+     * loaded a→xmm0, b→xmm1 so min(a,b) matches the scalar contract
+     * closely enough for the simplified backend. */
+    IrType* vt = vecValueTy(inst);
+    if (vt == null || inst->nops < 2 || !vecLaneOk(inst->ops[0]) || !vecLaneOk(inst->ops[1]))
+    { vecBadOp(ctx, inst); return; }
+    IrType* et = vt->elem;
+    u32 ew = et != null ? et->width : 64;
+    u32 lb = vecLaneBytes(ictx, vt);
+    bool isF32v = ew <= 32;
+    str sop = isF32v ? (isMin ? "minss" : "maxss") : (isMin ? "minsd" : "maxsd");
+    i32 laneOff = 0;
+    for (u32 lane = 0; lane < vt->count; lane++)
+    {
+        emitVecLaneLoadF(ctx, inst->ops[0], laneOff, ew);
+        IrValue* b = inst->ops[1];
+        if (b->kind == IrValueKind::Global || b->kind == IrValueKind::StringConst)
+        {
+            ctx->emit("    ");
+            ctx->emit(isF32v ? "movd " : "movq ");
+            ctx->emit(b->name);
+            ctx->emit("+");
+            ctx->emitI64((i64)laneOff);
+            ctx->emitLine("(%rip), %xmm1");
+        }
+        else
+        {
+            i32 d2 = ctx->getSlot(b) + laneOff;
+            ctx->emit(isF32v ? "    movd " : "    movq ");
+            ctx->emitI64((i64)d2);
+            ctx->emitLine("(%rbp), %xmm1");
+        }
+        ctx->emit("    ");
+        ctx->emit(sop);
+        ctx->emitLine(" %xmm1, %xmm0");
+        emitVecLaneStoreF(ctx, &inst->base, laneOff, ew);
+        laneOff += (i32)lb;
+    }
+}
+
+// broadcast scalar ops[0] into every lane of the result vector
+void emitVecBroadcast(FastX86Context* ctx, IrContext* ictx, IrInst* inst)
+{
+    IrType* vt = vecValueTy(inst);
+    if (vt == null || inst->nops < 1 || inst->ops[0] == null)
+    { vecBadOp(ctx, inst); return; }
+    IrType* et = vt->elem;
+    u32 ew = et != null ? et->width : 64;
+    u32 lb = vecLaneBytes(ictx, vt);
+    emitValueToReg(ctx, inst->ops[0], "rax");
+    i32 laneOff = 0;
+    for (u32 lane = 0; lane < vt->count; lane++)
+    {
+        emitVecLaneStore(ctx, &inst->base, laneOff, ew, "rax");
+        laneOff += (i32)lb;
+    }
+}
+
+void emitVecExtract(FastX86Context* ctx, IrContext* ictx, IrInst* inst)
+{
+    IrType* vt = vecValueTy(inst);
+    if (vt == null || inst->nops < 2 || inst->ops[0] == null || !vecLaneOk(inst->ops[0]))
+    { vecBadOp(ctx, inst); return; }
+    IrType* et = vt->elem;
+    u32 ew = et != null ? et->width : 64;
+    u32 lb = vecLaneBytes(ictx, vt);
+    IrValue* idx = inst->ops[1];
+    if (idx != null && idx->kind == IrValueKind::ConstInt)
+    {
+        i32 laneOff = (i32)(idx->valData & 0xFFFFFFFF) * (i32)lb;
+        emitVecLaneLoad(ctx, inst->ops[0], laneOff, ew, "rax", false);
+        emitRegToSlot(ctx, &inst->base, "rax");
+        return;
+    }
+    /* dynamic index: addr = rbp + slotOff + idx*elemSize — compute via
+     * lea with index register, then a plain memory load */
+    if (idx == null) { vecBadOp(ctx, inst); return; }
+    emitValueToReg(ctx, idx, "rcx");
+    if (lb != 1)
+    {
+        ctx->emit("    imulq $");
+        ctx->emitI64((i64)lb);
+        ctx->emitLine(", %rcx, %rcx");
+    }
+    i32 base = ctx->getSlot(inst->ops[0]);
+    ctx->emit("    leaq ");
+    ctx->emitI64((i64)base);
+    ctx->emit("(%rbp,%rcx,1), %rax");
+    ctx->emitLine("");
+    /* load through %rax — width-aware, unsigned (consistent with Load) */
+    if (ew <= 8) ctx->emitLine("    movzbl (%rax), %ecx");
+    else if (ew <= 16) ctx->emitLine("    movzwl (%rax), %ecx");
+    else if (ew <= 32) ctx->emitLine("    movl (%rax), %ecx");
+    else ctx->emitLine("    movq (%rax), %rcx");
+    emitRegToSlot(ctx, &inst->base, "rcx");
+}
+
+// copy `size` bytes of vector region src→dst, qword chunks (regions are
+// 8-byte aligned and sized, padding bytes copy harmlessly)
+void emitVecCopy(FastX86Context* ctx, IrValue* src, IrValue* dst, u32 size)
+{
+    u32 nq = (size + 7) / 8;
+    i32 sOff = ctx->getSlot(src);
+    i32 dOff = ctx->getSlot(dst);
+    for (u32 q = 0; q < nq; q++)
+    {
+        i32 o = (i32)(q * 8);
+        emitSlotLoad(ctx, sOff + o, 64, "rax", false);
+        emitSlotStore(ctx, dOff + o, 64, "rax");
+    }
+}
+
+void emitVecInsert(FastX86Context* ctx, IrContext* ictx, IrInst* inst)
+{
+    IrType* vt = vecValueTy(inst);
+    if (vt == null || inst->nops < 3 || inst->ops[0] == null || inst->ops[1] == null ||
+        !vecLaneOk(inst->ops[0]))
+    { vecBadOp(ctx, inst); return; }
+    IrType* et = vt->elem;
+    u32 ew = et != null ? et->width : 64;
+    u32 lb = vecLaneBytes(ictx, vt);
+    u32 vsize = (u32)ictx->irTypeSizeOf(vt);
+    /* result = copy of input vector, then lane overwrite */
+    emitVecCopy(ctx, inst->ops[0], &inst->base, vsize);
+    IrValue* idx = inst->ops[2];
+    emitValueToReg(ctx, inst->ops[1], "rdx");
+    if (idx != null && idx->kind == IrValueKind::ConstInt)
+    {
+        i32 laneOff = (i32)(idx->valData & 0xFFFFFFFF) * (i32)lb;
+        /* store from rdx, not rax — reuse lane store with reg swap */
+        emitSlotStore(ctx, ctx->getSlot(&inst->base) + laneOff, ew, "rdx");
+        return;
+    }
+    if (idx == null) { vecBadOp(ctx, inst); return; }
+    emitValueToReg(ctx, idx, "rcx");
+    if (lb != 1)
+    {
+        ctx->emit("    imulq $");
+        ctx->emitI64((i64)lb);
+        ctx->emitLine(", %rcx, %rcx");
+    }
+    i32 base = ctx->getSlot(&inst->base);
+    ctx->emit("    leaq ");
+    ctx->emitI64((i64)base);
+    ctx->emit("(%rbp,%rcx,1), %rax");
+    ctx->emitLine("");
+    emitIndStore(ctx, "rax", ew, "rdx");
+}
+
+void emitVecShuffle(FastX86Context* ctx, IrContext* ictx, IrInst* inst)
+{
+    IrType* vt = vecValueTy(inst);
+    if (vt == null || inst->nops < 3 || !vecLaneOk(inst->ops[0]) || !vecLaneOk(inst->ops[1]))
+    { vecBadOp(ctx, inst); return; }
+    IrType* et = vt->elem;
+    u32 ew = et != null ? et->width : 64;
+    u32 lb = vecLaneBytes(ictx, vt);
+    u32 n1 = inst->ops[0]->type != null ? inst->ops[0]->type->count : vt->count;
+    u32 nmask = inst->nops - 2;
+    for (u32 j = 0; j < nmask; j++)
+    {
+        IrValue* m = inst->ops[2 + j];
+        if (m == null || m->kind != IrValueKind::ConstInt)
+        { vecBadOp(ctx, inst); return; }
+        u64 mi = m->valData;
+        IrValue* src = inst->ops[0];
+        u64 lane = mi;
+        if (mi >= (u64)n1)
+        {
+            src = inst->ops[1];
+            lane = mi - (u64)n1;
+        }
+        emitVecLaneLoad(ctx, src, (i32)((u64)lane * (u64)lb), ew, "rax", false);
+        emitVecLaneStore(ctx, &inst->base, (i32)((u64)j * (u64)lb), ew, "rax");
+    }
+}
+
+// ── inline asm ──────────────────────────────────────────────────────
+// gcc-style extended asm lowered into the template text with %0..%9
+// operand substitution. Constraint classes: m → memory operand, r/f/reg
+// letter → register, i → immediate, digit → tied to another operand.
+// Pointer-typed operands with output/inout constraints are AddrOf
+// lvalues: the value register is written back through the pointer after
+// the template (the pointer itself is pinned in a callee-saved reg so a
+// clobbering template cannot lose it).
+
+struct AsmSubText
+{
+    u8[80] buf;
+    u32 len;
+}
+
+void asmSubFill(AsmSubText* s, str text)
+{
+    usize n = text.len;
+    if (n > 79) n = 79;
+    for (usize i = 0; i < n; i++) s->buf[i] = text.ptr[i];
+    s->len = (u32)n;
+}
+
+void asmSubReg(AsmSubText* s, str reg)
+{
+    s->buf[0] = '%';
+    usize n = reg.len;
+    if (n > 77) n = 77;
+    for (usize i = 0; i < n; i++) s->buf[i + 1] = reg.ptr[i];
+    s->len = (u32)(n + 1);
+}
+
+void asmSubI64(AsmSubText* s, i64 v)
+{
+    /* AT&T immediates need a '$' — bare digits parse as an absolute
+     * memory address, not an immediate */
+    cchar[24] nb;
+    i32 n = snprintf(nb, 24, C"$%lld", v);
+    if (n < 0) n = 0;
+    if (n > 79) n = 79;
+    for (i32 i = 0; i < n; i++) s->buf[i] = (u8)nb[i];
+    s->len = (u32)n;
+}
+
+void asmSubMemOff(AsmSubText* s, i32 off)
+{
+    cchar[40] nb;
+    i32 n = snprintf(nb, 40, C"%d(%%rbp)", off);
+    if (n < 0) n = 0;
+    if (n > 79) n = 79;
+    for (i32 i = 0; i < n; i++) s->buf[i] = (u8)nb[i];
+    s->len = (u32)n;
+}
+
+void asmSubMemReg(AsmSubText* s, str reg)
+{
+    /* "(%reg)" — a memory operand through a pointer register */
+    s->buf[0] = (u8)'(';
+    s->buf[1] = (u8)'%';
+    usize n = reg.len;
+    if (n > 75) n = 75;
+    for (usize i = 0; i < n; i++) s->buf[i + 2] = reg.ptr[i];
+    s->buf[n + 2] = (u8)')';
+    s->len = (u32)(n + 3);
+}
+
+bool asmRegTaken(str* taken, u32 ntaken, str r)
+{
+    for (u32 i = 0; i < ntaken; i++)
+        if (taken[i].equals(r)) return true;
+    return false;
+}
+
+void asmRegTake(str* taken, u32* ntaken, str r)
+{
+    if (*ntaken < 32 && !asmRegTaken(taken, *ntaken, r))
+    {
+        taken[*ntaken] = r;
+        (*ntaken)++;
+    }
+}
+
+str asmPickInt(str* taken, u32* ntaken, bool win64)
+{
+    /* caller-saved scratch; r11 reserved for xmm staging, rsi/rdi are
+     * callee-saved under Win64 so they leave the pool there */
+    if (!win64)
+    {
+        str[8] c = { "rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10" };
+        for (u32 i = 0; i < 8; i++)
+        {
+            if (!asmRegTaken(taken, *ntaken, c[i]))
+            {
+                asmRegTake(taken, ntaken, c[i]);
+                return c[i];
+            }
+        }
+    }
+    else
+    {
+        str[6] c = { "rax", "rcx", "rdx", "r8", "r9", "r10" };
+        for (u32 i = 0; i < 6; i++)
+        {
+            if (!asmRegTaken(taken, *ntaken, c[i]))
+            {
+                asmRegTake(taken, ntaken, c[i]);
+                return c[i];
+            }
+        }
+    }
+    return str::empty();
+}
+
+str asmPickXmm(str* taken, u32* ntaken)
+{
+    str[8] c = { "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7" };
+    for (u32 i = 0; i < 8; i++)
+    {
+        if (!asmRegTaken(taken, *ntaken, c[i]))
+        {
+            asmRegTake(taken, ntaken, c[i]);
+            return c[i];
+        }
+    }
+    return str::empty();
+}
+
+str asmFixedReg(str letter, bool win64)
+{
+    if (letter.equals("a")) return "rax";
+    if (letter.equals("b")) return "rbx";
+    if (letter.equals("c")) return "rcx";
+    if (letter.equals("d")) return "rdx";
+    if (letter.equals("S")) return "rsi";
+    if (letter.equals("D")) return "rdi";
+    return str::empty();
+}
+
+bool asmRegIsCalleeSaved(str r, bool win64)
+{
+    if (r.equals("rbx") || r.equals("r12") || r.equals("r13") ||
+        r.equals("r14") || r.equals("r15") || r.equals("rbp"))
+        return true;
+    if (win64 && (r.equals("rsi") || r.equals("rdi"))) return true;
+    return false;
+}
+
+// value → xmm register (for 'f' constraints)
+void emitValueToXmm(FastX86Context* ctx, IrValue* v, str xmm, bool isF32)
+{
+    if (v == null)
+    {
+        ctx->emit("    pxor ");
+        ctx->emit(xmm);
+        ctx->emit(", ");
+        ctx->emitLine(xmm);
+        return;
+    }
+    if (v->kind == IrValueKind::ConstFloat)
+    {
+        ctx->emit("    movabsq $");
+        ctx->emitU64(v->valData);
+        ctx->emitLine(", %r11");
+        ctx->emit(isF32 ? "    movd %r11d, %" : "    movq %r11, %");
+        ctx->emitLine(xmm);
+        return;
+    }
+    if (v->kind == IrValueKind::Global || v->kind == IrValueKind::Func ||
+        v->kind == IrValueKind::StringConst)
+    {
+        ctx->emit("    leaq ");
+        ctx->emit(v->name);
+        ctx->emitLine("(%rip), %r11");
+        ctx->emit(isF32 ? "    movd %r11d, %" : "    movq %r11, %");
+        ctx->emitLine(xmm);
+        return;
+    }
+    i32 off = ctx->getSlot(v);
+    ctx->emit(isF32 ? "    movd " : "    movq ");
+    ctx->emitI64((i64)off);
+    ctx->emit(isF32 ? "(%rbp), %" : "(%rbp), %");
+    ctx->emitLine(xmm);
+}
+
+void emitXmmToSlot(FastX86Context* ctx, IrValue* v, str xmm, bool isF32)
+{
+    /* route through rax so the full slot qword stays clean */
+    ctx->emit(isF32 ? "    movd %" : "    movq %");
+    ctx->emit(xmm);
+    ctx->emitLine(isF32 ? ", %eax" : ", %rax");
+    emitRegToSlot(ctx, v, "rax");
+}
+
+// per-operand state for inline asm
+struct AsmOp
+{
+    u8 mode;        // 0 unset, 1 reg-in, 2 reg-out, 3 reg-inout, 4 mem, 5 imm
+    bool isXmm;
+    str reg;        // assigned register name ("" for mem/imm)
+    AsmSubText sub; // substitution text for %N
+    // writeback record
+    u8 wbKind;      // 0 none, 1 store reg→slot, 2 store reg→(ptrreg), 9 tied-input load
+    IrValue* wbVal; // slot-store target value / tied input value
+    str wbReg;      // value register for write-back
+    str wbPtr;      // pointer register for ptr-store
+    u32 wbWidth;    // pointee width in bits (ptr-store)
+    bool wbXmm;
+}
+
+void emitInlineAsm(FastX86Context* ctx, IrInst* inst, bool win64)
+{
+    u32 nops = inst->nops;
+    if (nops > 24)
+    {
+        ctx->emitLine("    # inline asm: too many operands");
+        ctx->emitLine("    ud2");
+        return;
+    }
+
+    AsmConstraint[24] cc;
+    AsmParseError perr = AsmParseError { .msg = str::empty(), .lineNo = 0 };
+    u32 nc = parseConstraints(inst->asmConstraints, cc, 24, &perr);
+    if (nc == 0xFFFF || nc != nops)
+    {
+        ctx->emit("    # inline asm: ");
+        if (nc == 0xFFFF && !perr.msg.isEmpty()) ctx->emit(perr.msg);
+        else ctx->emit("constraint/operand count mismatch");
+        ctx->emitLine("");
+        ctx->emitLine("    ud2");
+        return;
+    }
+
+    // clobber check: regs the template may freely trash are the ones we
+    // never keep live across it; callee-saved regs we cannot save for
+    // the user, so reject them loudly
+    {
+        str cb = inst->asmClobbers;
+        usize ci = 0;
+        bool bad = false;
+        str badName = str::empty();
+        while (ci < cb.len && !bad)
+        {
+            usize st = ci;
+            while (ci < cb.len && cb.ptr[ci] != (u8)',') ci++;
+            usize en = ci;
+            usize a = st;
+            while (a < en && (cb.ptr[a] == (u8)' ' || cb.ptr[a] == (u8)'\t')) a++;
+            while (en > a && (cb.ptr[en - 1] == (u8)' ' || cb.ptr[en - 1] == (u8)'\t')) en--;
+            if (en > a)
+            {
+                str nm = str::fromParts((const u8*)(cb.ptr + a), en - a);
+                if (!nm.equals("memory") && !nm.equals("cc") &&
+                    asmRegIsCalleeSaved(nm, win64))
+                {
+                    bad = true;
+                    badName = nm;
+                }
+            }
+            if (ci < cb.len) ci++;
+        }
+        if (bad)
+        {
+            ctx->emit("    # inline asm: clobber of callee-saved register ");
+            ctx->emitLine(badName);
+            ctx->emitLine("    ud2");
+            return;
+        }
+    }
+
+    // ---- pass 1: assign registers and substitution texts ------------
+    AsmOp[24] ops2;
+    str[32] taken;
+    for (u32 ti = 0; ti < 32; ti++) taken[ti] = str::empty();
+    u32 ntaken = 0;
+    str[5] pinPool = { "rbx", "r12", "r13", "r14", "r15" };
+    str[8] pins;
+    for (u32 pi = 0; pi < 8; pi++) pins[pi] = str::empty();
+    u32 npins = 0;
+    str resReg = str::empty();
+    bool resXmm = false;
+    bool failed = false;
+
+    for (u32 k = 0; k < nops && !failed; k++)
+    {
+        AsmOp* o = &ops2[k];
+        o->mode = 0;
+        o->isXmm = false;
+        o->reg = str::empty();
+        o->wbKind = 0;
+        o->wbVal = null;
+        o->wbPtr = str::empty();
+        o->wbWidth = 64;
+        o->wbXmm = false;
+        o->sub.len = 0;
+
+        AsmConstraint c = cc[k];
+        if (c.cls == AsmConClass::ConTied) continue; // pass 2
+
+        IrValue* v = inst->ops[k];
+        bool isPtr = v != null && v->type != null && v->type->kind == IrTypeKind::Ptr;
+        bool dirOut = c.isOut && !c.isInOut;
+        bool dirInOut = c.isInOut;
+        bool isOutAny = c.isOut || c.isInOut;
+
+        if (c.cls == AsmConClass::ConMem)
+        {
+            if (isPtr)
+            {
+                str preg = asmPickInt(taken, &ntaken, win64);
+                if (preg.len == 0) { failed = true; break; }
+                o->mode = 4;
+                o->reg = preg;
+                asmSubMemReg(&o->sub, preg);
+                /* pointer load emitted in pass 2 via reg */
+            }
+            else if (v != null)
+            {
+                o->mode = 4;
+                asmSubMemOff(&o->sub, ctx->getSlot(v));
+            }
+            else { failed = true; break; }
+            continue;
+        }
+
+        if (c.cls == AsmConClass::ConImm)
+        {
+            if (v != null && v->kind == IrValueKind::ConstInt)
+            {
+                o->mode = 5;
+                asmSubI64(&o->sub, (i64)v->valData);
+            }
+            else if (v != null)
+            {
+                /* non-constant "immediate": fall back to a register —
+                 * the template still gets a usable operand */
+                str r = asmPickInt(taken, &ntaken, win64);
+                if (r.len == 0) { failed = true; break; }
+                o->mode = 1;
+                o->reg = r;
+                asmSubReg(&o->sub, r);
+            }
+            else { o->mode = 5; asmSubI64(&o->sub, 0); }
+            continue;
+        }
+
+        if (c.cls != AsmConClass::ConGeneral && c.cls != AsmConClass::ConRegName &&
+            c.cls != AsmConClass::ConFloat)
+        {
+            failed = true;
+            break;
+        }
+
+        bool isXmm = c.cls == AsmConClass::ConFloat;
+        str r = str::empty();
+        if (c.cls == AsmConClass::ConRegName && c.regName.len > 0)
+        {
+            if (c.regName.equals("q"))
+            {
+                r = isXmm ? asmPickXmm(taken, &ntaken) : asmPickInt(taken, &ntaken, win64);
+            }
+            else
+            {
+                r = asmFixedReg(c.regName, win64);
+                if (r.len == 0)
+                    r = isXmm ? asmPickXmm(taken, &ntaken) : asmPickInt(taken, &ntaken, win64);
+            }
+        }
+        else
+        {
+            r = isXmm ? asmPickXmm(taken, &ntaken) : asmPickInt(taken, &ntaken, win64);
+        }
+        if (r.len == 0) { failed = true; break; }
+        asmRegTake(taken, &ntaken, r);
+
+        o->isXmm = isXmm;
+        o->reg = r;
+        asmSubReg(&o->sub, r);
+
+        if (v == null)
+        {
+            if (!isOutAny) { failed = true; break; }
+            o->mode = 2;
+        }
+        else if (isPtr && isOutAny)
+        {
+            /* pointer-model operand: pin the address in a callee-saved
+             * register, the asm result lands in `r` and is written back
+             * through the pointer afterwards */
+            str cs = str::empty();
+            for (u32 pi = 0; pi < 5; pi++)
+            {
+                if (!asmRegTaken(taken, ntaken, pinPool[pi])) { cs = pinPool[pi]; break; }
+            }
+            if (cs.len == 0 || npins >= 8) { failed = true; break; }
+            asmRegTake(taken, &ntaken, cs);
+            pins[npins] = cs;
+            npins++;
+            o->mode = dirInOut ? 3 : 2;
+            o->wbKind = 2;
+            o->wbPtr = cs;
+            o->wbReg = r;
+            o->wbXmm = isXmm;
+            u32 pw = 64;
+            if (v->type->elem != null && v->type->elem->width > 0)
+                pw = v->type->elem->width;
+            o->wbWidth = pw;
+            if (dirInOut)
+            {
+                /* inout through a pointer: preload the pointee */
+                /* handled in pass 2 — needs the pinned pointer */
+            }
+        }
+        else
+        {
+            if (dirInOut)
+            {
+                o->mode = 3;
+                o->wbKind = 1;
+                o->wbVal = v;
+                o->wbReg = r;
+                o->wbXmm = isXmm;
+                o->wbWidth = 0;
+            }
+            else if (dirOut)
+            {
+                o->mode = 2;
+            }
+            else
+            {
+                o->mode = 1;
+            }
+        }
+
+        /* result candidate: register output that is not a pointer
+         * write-back (those produce memory, not the inst value) */
+        if (isOutAny && !isPtr && o->mode != 0)
+        {
+            if (resReg.len == 0) { resReg = r; resXmm = isXmm; }
+        }
+    }
+
+    // ---- pass 2: tied operands borrow their target's location --------
+    for (u32 k = 0; k < nops && !failed; k++)
+    {
+        AsmConstraint c = cc[k];
+        if (c.cls != AsmConClass::ConTied) continue;
+        u32 t = c.tieIdx;
+        u32 guard = 0;
+        while (t < nops && cc[t].cls == AsmConClass::ConTied && guard < 24)
+        {
+            t = cc[t].tieIdx;
+            guard++;
+        }
+        if (t >= nops || guard >= 24) { failed = true; break; }
+        AsmOp* o = &ops2[k];
+        AsmOp* tgt = &ops2[t];
+        IrValue* v = inst->ops[k];
+        if (v != null && tgt->mode >= 1 && tgt->mode <= 3)
+        {
+            /* tied input into a register target: share the location and
+             * load this operand's value into it (marker 9 → pass 3) */
+            o->mode = tgt->mode;
+            o->isXmm = tgt->isXmm;
+            o->reg = tgt->reg;
+            o->wbKind = 9;
+            o->wbVal = v;
+        }
+        else
+        {
+            /* memory/immediate target: the location is already set up,
+             * the tied operand contributes no code of its own */
+            o->mode = 0;
+        }
+        asmSubFill(&o->sub, str::fromParts((const u8*)&tgt->sub.buf[0], (usize)tgt->sub.len));
+    }
+
+    if (failed)
+    {
+        ctx->emitLine("    # inline asm: operand setup failed");
+        ctx->emitLine("    ud2");
+        return;
+    }
+
+    // ---- pass 3: emit loads ------------------------------------------
+    // tied inputs load LAST so they cannot be overwritten by their
+    // target operand's own setup
+    for (u32 k = 0; k < nops; k++)
+    {
+        AsmOp* o = &ops2[k];
+        if (o->wbKind != 9) continue;
+        IrValue* v = o->wbVal;
+        if (o->isXmm) emitValueToXmm(ctx, v, o->reg, v->type != null && v->type->width <= 32);
+        else emitValueToReg(ctx, v, o->reg);
+    }
+    for (u32 k = 0; k < nops; k++)
+    {
+        AsmOp* o = &ops2[k];
+        IrValue* v = inst->ops[k];
+        AsmConstraint c = cc[k];
+
+        if (o->wbKind == 9) continue; // already loaded above
+        if (o->mode == 4 && o->reg.len > 0)
+        {
+            /* memory operand through a register */
+            emitValueToReg(ctx, v, o->reg);
+        }
+        else if (o->wbKind == 2)
+        {
+            /* pinned pointer for write-back */
+            ctx->emit("    pushq %");
+            ctx->emitLine(o->wbPtr);
+            emitValueToReg(ctx, v, o->wbPtr);
+            if (c.isInOut)
+            {
+                /* preload pointee into the value register */
+                u32 pw = o->wbWidth;
+                if (o->wbXmm)
+                {
+                    emitIndLoad(ctx, o->wbPtr, pw, "rax", false);
+                    ctx->emit(pw <= 32 ? "    movd %eax, %" : "    movq %rax, %");
+                    ctx->emitLine(o->reg);
+                }
+                else
+                {
+                    emitIndLoad(ctx, o->wbPtr, pw, o->reg, false);
+                }
+            }
+        }
+        else if (o->mode == 1 || o->mode == 3)
+        {
+            if (o->isXmm) emitValueToXmm(ctx, v, o->reg, v->type != null && v->type->width <= 32);
+            else emitValueToReg(ctx, v, o->reg);
+        }
+    }
+
+    // ---- pass 4: template ---------------------------------------------
+    {
+        str ts = inst->asmString;
+        ctx->emit("    ");
+        usize i = 0;
+        while (i < ts.len)
+        {
+            u8 ch = ts.ptr[i];
+            if (ch == (u8)'%' && i + 1 < ts.len)
+            {
+                u8 nx = ts.ptr[i + 1];
+                if (nx == (u8)'%')
+                {
+                    ctx->out.pushChar((u8)'%');
+                    i += 2;
+                    continue;
+                }
+                if (nx >= (u8)'0' && nx <= (u8)'9')
+                {
+                    u32 d = (u32)(nx - (u8)'0');
+                    if (d < 24 && ops2[d].sub.len > 0)
+                        ctx->out.appendView(str::fromParts((const u8*)&ops2[d].sub.buf[0], (usize)ops2[d].sub.len));
+                    i += 2;
+                    continue;
+                }
+                ctx->out.pushChar((u8)'%');
+                i++;
+                continue;
+            }
+            if (ch == (u8)'\n')
+            {
+                ctx->out.pushChar((u8)'\n');
+                ctx->emit("    ");
+                i++;
+                continue;
+            }
+            ctx->out.pushChar(ch);
+            i++;
+        }
+        ctx->out.pushChar((u8)'\n');
+    }
+
+    // ---- pass 5: write-backs, result, pin restores --------------------
+    for (u32 k = 0; k < nops; k++)
+    {
+        AsmOp* o = &ops2[k];
+        if (o->wbKind == 1 && o->wbVal != null)
+        {
+            if (o->wbXmm) emitXmmToSlot(ctx, o->wbVal, o->reg, true);
+            else emitRegToSlot(ctx, o->wbVal, o->reg);
+        }
+        else if (o->wbKind == 2)
+        {
+            if (o->wbXmm)
+            {
+                ctx->emit(o->wbWidth <= 32 ? "    movd %" : "    movq %");
+                ctx->emit(o->reg);
+                ctx->emit(o->wbWidth <= 32 ? ", (%" : ", (%");
+                ctx->emit(o->wbPtr);
+                ctx->emitLine(")");
+            }
+            else
+            {
+                emitIndStore(ctx, o->wbPtr, o->wbWidth, o->reg);
+            }
+        }
+    }
+    if (inst->base.type != null && inst->base.type->kind != IrTypeKind::Void)
+    {
+        if (resReg.len > 0)
+        {
+            bool rf32 = inst->base.type != null && inst->base.type->width <= 32;
+            if (resXmm) emitXmmToSlot(ctx, &inst->base, resReg, rf32);
+            else emitRegToSlot(ctx, &inst->base, resReg);
+        }
+        else
+        {
+            emitRegToSlot(ctx, &inst->base, "rax");
+        }
+    }
+    for (u32 pi = npins; pi > 0; pi--)
+    {
+        ctx->emit("    popq %");
+        ctx->emitLine(pins[pi - 1]);
+    }
+}
+
+// byte size of a value's type (0 when unknown) — used to pick the
+// scalar (≤8B, one qword) vs. wide aggregate (rax:rdx pair, ≤16B)
+// return/call convention
+u64 valByteSize(IrContext* ictx, IrValue* v)
+{
+    if (v == null || v->type == null) return 8;
+    u64 s = (u64)ictx->irTypeSizeOf(v->type);
+    return s != 0 ? s : 8;
+}
+
+void emitWideRetOrStore(FastX86Context* ctx, IrValue* v, IrValue* dstSlot)
+{
+    /* 9..16 byte aggregate: low qword in rax, high in rdx (SysV
+     * rax:rdx pair convention, mirrored on the store side) */
+    emitVecLaneLoad(ctx, v, 0, 64, "rax", false);
+    emitVecLaneLoad(ctx, v, 8, 64, "rdx", false);
+    if (dstSlot != null)
+    {
+        i32 dOff = ctx->getSlot(dstSlot);
+        emitSlotStore(ctx, dOff, 64, "rax");
+        emitSlotStore(ctx, dOff + 8, 64, "rdx");
+    }
+}
+
 // Emits textual assembly for a single function
 pub str emitFastX86Func(IrFunc* func, IrContext* ictx, bool isWindows)
 {
@@ -305,8 +1547,20 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx, bool isWindows)
             }
             else if (inst->base.type != null && inst->base.type->kind != IrTypeKind::Void)
             {
-                curOffset -= 8;
-                ctx.addSlot(&inst->base, curOffset);
+                /* aggregate/vector values occupy a byte region, not a
+                 * single qword — vector ops address lanes at
+                 * slotOff + lane*elemSize. Scalars keep the 8-byte slot. */
+                u64 vsz = (u64)ictx->irTypeSizeOf(inst->base.type);
+                if (vsz > 8)
+                {
+                    curOffset -= (i32)(((vsz + 7) / 8) * 8);
+                    ctx.addSlot(&inst->base, curOffset);
+                }
+                else
+                {
+                    curOffset -= 8;
+                    ctx.addSlot(&inst->base, curOffset);
+                }
             }
         }
     }
@@ -459,7 +1713,24 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx, bool isWindows)
                 IrOpcode::Ret => {
                     if (inst->nops > 0 && inst->ops[0] != null)
                     {
-                        emitValueToReg(&ctx, inst->ops[0], "rax");
+                        IrValue* rv = inst->ops[0];
+                        u64 rsz = valByteSize(ictx, rv);
+                        if (rsz <= 8)
+                        {
+                            emitValueToReg(&ctx, rv, "rax");
+                        }
+                        else if (rsz <= 16 && vecLaneOk(rv))
+                        {
+                            emitVecLaneLoad(&ctx, rv, 0, 64, "rax", false);
+                            emitVecLaneLoad(&ctx, rv, 8, 64, "rdx", false);
+                        }
+                        else
+                        {
+                            ctx.emit("    # aggregate return of ");
+                            ctx.emitI64((i64)rsz);
+                            ctx.emitLine(" bytes unsupported");
+                            ctx.emitLine("    ud2");
+                        }
                     }
                     ctx.emit("    jmp .L");
                     ctx.emit(func->base.name);
@@ -670,7 +1941,25 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx, bool isWindows)
                     }
                     if (inst->base.type != null && inst->base.type->kind != IrTypeKind::Void)
                     {
-                        emitRegToSlot(&ctx, &inst->base, "rax");
+                        u64 rsz = valByteSize(ictx, &inst->base);
+                        if (rsz <= 8)
+                        {
+                            emitRegToSlot(&ctx, &inst->base, "rax");
+                        }
+                        else if (rsz <= 16)
+                        {
+                            /* callee returned the pair in rax:rdx —
+                             * spill both qwords into the result region */
+                            emitSlotStore(&ctx, ctx.getSlot(&inst->base), 64, "rax");
+                            emitSlotStore(&ctx, ctx.getSlot(&inst->base) + 8, 64, "rdx");
+                        }
+                        else
+                        {
+                            ctx.emit("    # call result of ");
+                            ctx.emitI64((i64)rsz);
+                            ctx.emitLine(" bytes unsupported");
+                            ctx.emitLine("    ud2");
+                        }
                     }
                 },
                 IrOpcode::Gep => {
@@ -1006,7 +2295,225 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx, bool isWindows)
                         emitRegToSlot(&ctx, &inst->base, "rax");
                     }
                 },
-                else => { }
+                IrOpcode::Phi => {
+                    /* copies were already emitted on the incoming edges
+                     * by emitPhiCopies — the phi itself is a no-op */
+                },
+                IrOpcode::InlineAsm => {
+                    emitInlineAsm(&ctx, inst, win64);
+                },
+                IrOpcode::Fma => {
+                    /* a*b+c through xmm — not a fused op, but correct */
+                    if (inst->nops >= 3)
+                    {
+                        bool isF32 = inst->base.type != null && inst->base.type->width == 32;
+                        emitValueToReg(&ctx, inst->ops[0], "rax");
+                        ctx.emitLine("    movq %rax, %xmm0");
+                        emitValueToReg(&ctx, inst->ops[1], "rcx");
+                        ctx.emitLine("    movq %rcx, %xmm1");
+                        ctx.emitLine(isF32 ? "    mulss %xmm1, %xmm0" : "    mulsd %xmm1, %xmm0");
+                        emitValueToReg(&ctx, inst->ops[2], "rdx");
+                        ctx.emitLine("    movq %rdx, %xmm1");
+                        ctx.emitLine(isF32 ? "    addss %xmm1, %xmm0" : "    addsd %xmm1, %xmm0");
+                        ctx.emitLine("    movq %xmm0, %rax");
+                        emitRegToSlot(&ctx, &inst->base, "rax");
+                    }
+                },
+                IrOpcode::FAbs => {
+                    if (inst->nops >= 1)
+                    {
+                        emitValueToReg(&ctx, inst->ops[0], "rax");
+                        u32 w = inst->base.type != null ? inst->base.type->width : 64;
+                        ctx.emitLine(w <= 32 ? "    btrl $31, %eax" : "    btrq $63, %rax");
+                        emitRegToSlot(&ctx, &inst->base, "rax");
+                    }
+                },
+                IrOpcode::FSqrt => {
+                    if (inst->nops >= 1)
+                    {
+                        bool isF32 = inst->ops[0]->type != null && inst->ops[0]->type->width == 32;
+                        emitValueToReg(&ctx, inst->ops[0], "rax");
+                        ctx.emitLine("    movq %rax, %xmm0");
+                        ctx.emitLine(isF32 ? "    sqrtss %xmm0, %xmm0" : "    sqrtsd %xmm0, %xmm0");
+                        ctx.emitLine("    movq %xmm0, %rax");
+                        emitRegToSlot(&ctx, &inst->base, "rax");
+                    }
+                },
+                IrOpcode::VecAdd => { emitVecIntBin(&ctx, ictx, inst, "add"); },
+                IrOpcode::VecSub => { emitVecIntBin(&ctx, ictx, inst, "sub"); },
+                IrOpcode::VecMul => { emitVecIntBin(&ctx, ictx, inst, "imul"); },
+                IrOpcode::VecDiv => { emitVecIntDiv(&ctx, ictx, inst); },
+                IrOpcode::VecFAdd => { emitVecFloatBin(&ctx, ictx, inst, "addss", "addsd"); },
+                IrOpcode::VecFSub => { emitVecFloatBin(&ctx, ictx, inst, "subss", "subsd"); },
+                IrOpcode::VecFMul => { emitVecFloatBin(&ctx, ictx, inst, "mulss", "mulsd"); },
+                IrOpcode::VecFDiv => { emitVecFloatBin(&ctx, ictx, inst, "divss", "divsd"); },
+                IrOpcode::VecMin => {
+                    IrType* et = vecValueTy(inst) != null ? vecValueTy(inst)->elem : null;
+                    if (et != null && et->kind == IrTypeKind::Float)
+                        emitVecFloatMinMax(&ctx, ictx, inst, true);
+                    else
+                        emitVecIntMinMax(&ctx, ictx, inst, true);
+                },
+                IrOpcode::VecMax => {
+                    IrType* et = vecValueTy(inst) != null ? vecValueTy(inst)->elem : null;
+                    if (et != null && et->kind == IrTypeKind::Float)
+                        emitVecFloatMinMax(&ctx, ictx, inst, false);
+                    else
+                        emitVecIntMinMax(&ctx, ictx, inst, false);
+                },
+                IrOpcode::VecBroadcast => { emitVecBroadcast(&ctx, ictx, inst); },
+                IrOpcode::ExtractElement => { emitVecExtract(&ctx, ictx, inst); },
+                IrOpcode::InsertElement => { emitVecInsert(&ctx, ictx, inst); },
+                IrOpcode::ShuffleVector => { emitVecShuffle(&ctx, ictx, inst); },
+                IrOpcode::AtomicLoad => {
+                    /* aligned scalar loads/stores are already atomic on
+                     * x86 — a plain mov is the correct lowering */
+                    if (inst->nops >= 1 && inst->ops[0] != null)
+                    {
+                        emitValueToReg(&ctx, inst->ops[0], "rax");
+                        u32 w = inst->base.type != null ? inst->base.type->width : 64;
+                        if (w == 8) ctx.emitLine("    movzbl (%rax), %ecx");
+                        else if (w == 16) ctx.emitLine("    movzwl (%rax), %ecx");
+                        else if (w == 32) ctx.emitLine("    movl (%rax), %ecx");
+                        else ctx.emitLine("    movq (%rax), %rcx");
+                        emitRegToSlot(&ctx, &inst->base, "rcx");
+                    }
+                },
+                IrOpcode::AtomicStore => {
+                    if (inst->nops >= 2 && inst->ops[0] != null && inst->ops[1] != null)
+                    {
+                        emitValueToReg(&ctx, inst->ops[0], "rax");
+                        emitValueToReg(&ctx, inst->ops[1], "rcx");
+                        u32 w = inst->ops[0]->type != null ? inst->ops[0]->type->width : 64;
+                        if (w == 8) ctx.emitLine("    movb %al, (%rcx)");
+                        else if (w == 16) ctx.emitLine("    movw %ax, (%rcx)");
+                        else if (w == 32) ctx.emitLine("    movl %eax, (%rcx)");
+                        else ctx.emitLine("    movq %rax, (%rcx)");
+                    }
+                },
+                IrOpcode::AtomicRmw => {
+                    IrAtomicRmwOp rw = (IrAtomicRmwOp)inst->icmpPred;
+                    if (rw == IrAtomicRmwOp::Nand || rw == IrAtomicRmwOp::Max ||
+                        rw == IrAtomicRmwOp::Min || rw == IrAtomicRmwOp::UMax ||
+                        rw == IrAtomicRmwOp::UMin)
+                    {
+                        ctx.emit("    # atomicrmw op not supported: ");
+                        ctx.emitLine(irOpcodeStr(inst->opcode));
+                        ctx.emitLine("    ud2");
+                    }
+                    else if (inst->nops >= 2 && inst->ops[0] != null && inst->ops[1] != null)
+                    {
+                        u32 w = inst->base.type != null ? inst->base.type->width : 64;
+                        emitValueToReg(&ctx, inst->ops[0], "rcx"); // ptr
+                        emitValueToReg(&ctx, inst->ops[1], "rdx"); // val
+                        str mn = "add";
+                        if (rw == IrAtomicRmwOp::Sub) mn = "sub";
+                        else if (rw == IrAtomicRmwOp::And) mn = "and";
+                        else if (rw == IrAtomicRmwOp::Or) mn = "or";
+                        else if (rw == IrAtomicRmwOp::Xor) mn = "xor";
+                        if (rw == IrAtomicRmwOp::Xchg)
+                        {
+                            ctx.emit(w <= 8 ? "    lock xchgb %dl, (%rcx)\n" :
+                                      w <= 16 ? "    lock xchgw %dx, (%rcx)\n" :
+                                      w <= 32 ? "    lock xchgl %edx, (%rcx)\n" :
+                                      "    lock xchgq %rdx, (%rcx)\n");
+                            ctx.emit(w <= 8 ? "    movzbl %dl, %eax\n" :
+                                      w <= 16 ? "    movzwl %dx, %eax\n" :
+                                      w <= 32 ? "    movl %edx, %eax\n" :
+                                      "    movq %rdx, %rax\n");
+                            emitRegToSlot(&ctx, &inst->base, "rax");
+                        }
+                        else
+                        {
+                            /* atomicrmw returns the OLD value; a plain
+                             * lock op + reload returns the new one, so
+                             * use a lock cmpxchg retry loop:
+                             *   rax = expected (old), r8 = new value,
+                             *   on mismatch rax <- *ptr and retry */
+                            str suf = w <= 8 ? "b" : w <= 16 ? "w" : w <= 32 ? "l" : "q";
+                            str vn = w <= 8 ? "dl" : w <= 16 ? "dx" : w <= 32 ? "edx" : "rdx";
+                            str nn = w <= 8 ? "r8b" : w <= 16 ? "r8w" : w <= 32 ? "r8d" : "r8";
+                            str en = w <= 8 ? "al" : w <= 16 ? "ax" : w <= 32 ? "eax" : "rax";
+                            /* expected = *ptr (zero-extended) */
+                            ctx.emit(w <= 8 ? "    movzbl (%rcx), %eax\n" :
+                                      w <= 16 ? "    movzwl (%rcx), %eax\n" :
+                                      w <= 32 ? "    movl (%rcx), %eax\n" :
+                                      "    movq (%rcx), %rax\n");
+                            ctx.emit(".L");
+                            ctx.emit(func->base.name);
+                            ctx.emit("_rmw");
+                            ctx.emitU64((u64)inst->base.id);
+                            ctx.emitLine(":");
+                            ctx.emit("    mov %");
+                            ctx.emit(en);
+                            ctx.emit(", %");
+                            ctx.emit(nn);
+                            ctx.emitLine("");
+                            ctx.emit("    ");
+                            ctx.emit(mn);
+                            ctx.emit(suf);
+                            ctx.emit(" %");
+                            ctx.emit(vn);
+                            ctx.emit(", %");
+                            ctx.emit(nn);
+                            ctx.emitLine("");
+                            ctx.emit("    lock cmpxchg");
+                            ctx.emit(suf);
+                            ctx.emit(" %");
+                            ctx.emit(nn);
+                            ctx.emitLine(", (%rcx)");
+                            ctx.emit("    jne .L");
+                            ctx.emit(func->base.name);
+                            ctx.emit("_rmw");
+                            ctx.emitU64((u64)inst->base.id);
+                            ctx.emitLine("");
+                            /* rax holds the old value on success */
+                            if (w <= 8) ctx.emitLine("    movzbl %al, %eax");
+                            else if (w <= 16) ctx.emitLine("    movzwl %ax, %eax");
+                            else if (w <= 32) ctx.emitLine("    movl %eax, %eax");
+                            emitRegToSlot(&ctx, &inst->base, "rax");
+                        }
+                    }
+                },
+                IrOpcode::AtomicCmpXchg => {
+                    /* ops: ptr, cmp, val — rax=cmp, src=val, lock cmpxchg */
+                    if (inst->nops >= 3 && inst->ops[0] != null && inst->ops[1] != null &&
+                        inst->ops[2] != null)
+                    {
+                        u32 w = inst->base.type != null ? inst->base.type->width : 64;
+                        emitValueToReg(&ctx, inst->ops[1], "rax"); // cmp
+                        emitValueToReg(&ctx, inst->ops[0], "rcx"); // ptr
+                        emitValueToReg(&ctx, inst->ops[2], "rdx"); // val
+                        ctx.emit(w <= 8 ? "    lock cmpxchgb %dl, (%rcx)\n" :
+                                  w <= 16 ? "    lock cmpxchgw %dx, (%rcx)\n" :
+                                  w <= 32 ? "    lock cmpxchgl %edx, (%rcx)\n" :
+                                  "    lock cmpxchgq %rdx, (%rcx)\n");
+                        if (w <= 8) ctx.emitLine("    movzbl %al, %eax");
+                        else if (w <= 16) ctx.emitLine("    movzwl %ax, %eax");
+                        else if (w <= 32) ctx.emitLine("    movl %eax, %eax");
+                        emitRegToSlot(&ctx, &inst->base, "rax");
+                    }
+                },
+                IrOpcode::Fence => {
+                    /* x86 TSO gives acquire/release for plain movs; only
+                     * seq_cst needs an actual fence */
+                    IrAtomicOrdering ord = (IrAtomicOrdering)inst->icmpPred;
+                    if (ord == IrAtomicOrdering::SeqCst) ctx.emitLine("    mfence");
+                },
+                IrOpcode::LandingPad | IrOpcode::ExtractValue | IrOpcode::InsertValue |
+                IrOpcode::GcRoot | IrOpcode::GcWriteBarrier | IrOpcode::GcSafepoint => {
+                    ctx.emit("    # unsupported opcode: ");
+                    ctx.emitLine(irOpcodeStr(inst->opcode));
+                    ctx.emitLine("    ud2");
+                },
+                else => {
+                    /* never silently drop an instruction — an
+                     * unimplemented op that survives to codegen is a
+                     * backend bug and must trap loudly, not corrupt */
+                    ctx.emit("    # unimplemented opcode: ");
+                    ctx.emitLine(irOpcodeStr(inst->opcode));
+                    ctx.emitLine("    ud2");
+                }
             }
         }
     }
