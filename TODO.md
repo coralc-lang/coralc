@@ -15,6 +15,7 @@
 - [ ] Check CODEGEN_GAPS.md for documented gaps, mark in the codegen gap doc and implement them in the muvm codegen for the compiler. you can skip implementation in the c backend.
 - [ ] Verify all error paths reach upper pipeline before codegen.
 - [ ] naked attribute should have constraints, the function can only have an inline asm block or a couple of them, no arguments, no local variables.
+
 ## Testing
 - [ ] Run extensive test suite to catch secretly failing cases
 - [ ] Fix 'should work' tests that are failing
