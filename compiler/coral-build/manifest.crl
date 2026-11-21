@@ -1,0 +1,318 @@
+#[[no_drop_all]]
+// module manifests: per-module `manifest.crlb` files declare
+// target-conditional source roots, a fallback root, and k=v flags.
+// `lib/manifest.crlb` doubles as the installed-library registry.
+//
+//   manifest "std" {
+//       version  = "0.1.0";
+//       fallback = "x86_64/linux";              // probed when no target matches
+//       flags    = ["feature=1"];               // merged into the flag table
+//       target "x86_64/linux"   { path = "x86_64/linux"; }
+//       target "arm64/macos"    { path = "arm64/macos"; }
+//   }
+//
+//   // lib/manifest.crlb — registry of installed libraries
+//   manifest "lib" {
+//       module "core" { path = "core"; }
+//       module "std"  { path = "std"; }
+//   }
+
+use arena { Arena };
+use ast { CrlbNode, CrlbNodeKind, Value, ValueArray };
+use common::slice { Slice };
+use parser { CrlbParser };
+import std::mman { alloc, dealloc, realloc };
+import std::fios { FileHandle, fileOpen, fileRead, fileClose };
+import std::fs { IoError };
+import std::result { Result };
+
+pub struct ManifestTarget
+{
+    Slice triple;   // "arch/os" label of the target block
+    Slice path;     // dir under the module dir (defaults to the triple)
+}
+
+pub struct ModuleManifest
+{
+    bool present;          // manifest.crlb exists and parsed
+    bool parseFailed;      // file existed but did not parse
+    Slice name;            // manifest label (module name)
+    Slice version;
+    Slice fallback;        // empty when undeclared
+    bool hasFallback;
+    Slice* flags;          // raw k=v strings
+    u32 flagsLen;
+    ManifestTarget* targets;
+    u32 targetsLen;
+    /* registry children (`module "name" { path = "..."; }`) — only
+     * populated for lib/manifest.crlb */
+    Slice* modNames;
+    Slice* modPaths;
+    u32 modsLen;
+}
+
+Slice mReadFile(Arena* a, str path, usize* outLen)
+{
+    *outLen = 0;
+    Result<FileHandle, IoError> fo = fileOpen(path, "rb");
+    if (fo.isErr()) return Slice { null, 0 };
+    FileHandle fh = fo.unwrap();
+    usize cap = 65536;
+    u8* buf = alloc<u8>(cap);
+    if (buf == null) { fileClose(fh); return Slice { null, 0 }; }
+    usize len = 0;
+    while (true)
+    {
+        if (len >= cap)
+        {
+            usize newCap = cap * 2;
+            u8* fresh = realloc<u8>(buf, newCap);
+            if (fresh == null) break;
+            buf = fresh;
+            cap = newCap;
+        }
+        Result<usize, IoError> rr = fileRead(fh, buf + len, cap - len);
+        if (rr.isErr()) break;
+        usize got = rr.unwrap();
+        if (got == 0) break;
+        len += got;
+    }
+    fileClose(fh);
+    u8* cp = (u8*)a->alloc(len + 1, 1);
+    if (cp == null) { dealloc<u8>(buf); return Slice { null, 0 }; }
+    u8* dst = cp;
+    u8* src = buf;
+    usize i = 0;
+    while (i < len) { dst[i] = src[i]; i++; }
+    cp[len] = 0;
+    dealloc<u8>(buf);
+    *outLen = len;
+    return Slice::from(cp, len);
+}
+
+CrlbField* mFindField(CrlbNode* n, Slice name)
+{
+    usize i = 0;
+    while (i < n->fields.len)
+    {
+        if (n->fields.data[i].name.len == name.len)
+        {
+            bool eq = true;
+            usize k = 0;
+            while (k < name.len) { if (n->fields.data[i].name.ptr[k] != name.ptr[k]) { eq = false; break; } k++; }
+            if (eq) return n->fields.data + i;
+        }
+        i++;
+    }
+    return null;
+}
+
+bool mFieldStr(CrlbNode* n, Slice name, Slice* out)
+{
+    CrlbField* f = mFindField(n, name);
+    if (f == null) return false;
+    if (f->value.tag != Value::String) return false;
+    *out = f->value.payload.String.value;
+    return true;
+}
+
+u32 mFieldList(CrlbNode* n, Slice name, Arena* a, Slice* out, u32 cap)
+{
+    CrlbField* f = mFindField(n, name);
+    if (f == null) return 0;
+    if (f->value.tag != Value::List) return 0;
+    ValueArray* va = f->value.payload.List.value;
+    if (va == null || va->len == 0 || va->len > (usize)cap) return 0;
+    u32 i = 0;
+    while (i < (u32)va->len)
+    {
+        if (va->data[i].tag != Value::String) return 0;
+        out[i] = va->data[i].payload.String.value;
+        i++;
+    }
+    return (u32)va->len;
+}
+
+/* parse <dir>/manifest.crlb. Returns null when the file does not exist;
+ * otherwise a manifest (present=false + parseFailed set on bad syntax).
+ * Everything is arena-owned; the caller keeps the arena alive. */
+pub ModuleManifest* bLoadManifest(Arena* a, Slice dirS)
+{
+    u8* path = alloc<u8>(4200);
+    if (path == null) return null;
+    usize n = 0;
+    usize i = 0;
+    while (i < dirS.len && n < 4190) { path[n] = dirS.ptr[i]; n++; i++; }
+    str suf = "/manifest.crlb";
+    i = 0;
+    while (i < suf.len && n < 4199) { path[n] = suf.ptr[i]; n++; i++; }
+    path[n] = 0;
+    str pathS = str { .ptr = path, .len = n };
+
+    usize len = 0;
+    Slice content = mReadFile(a, pathS, &len);
+    dealloc<u8>(path);
+    if (content.ptr == null) return null;
+
+    ModuleManifest* m = (ModuleManifest*)a->alloc(@sizeof(ModuleManifest), 8);
+    if (m == null) return null;
+    m->present = false;
+    m->parseFailed = false;
+    m->name = Slice { null, 0 };
+    m->version = Slice { null, 0 };
+    m->fallback = Slice { null, 0 };
+    m->hasFallback = false;
+    m->flags = null;
+    m->flagsLen = 0;
+    m->targets = null;
+    m->targetsLen = 0;
+    m->modNames = null;
+    m->modPaths = null;
+    m->modsLen = 0;
+
+    CrlbParser p;
+    p.init(a, content);
+    p.quiet = true;
+    CrlbNode* root = p.parseFile();
+    if (root == null || p.errors > 0) { m->parseFailed = true; return m; }
+
+    /* the manifest decl: `manifest "name" { ... }` — take the first
+     * Manifest child; a manifest file may also carry registry `module`
+     * children at top level for lib/manifest.crlb */
+    CrlbNode* body = null;
+    i = 0;
+    while (i < root->children.len)
+    {
+        CrlbNode* c = root->children.data + i;
+        if (c->kind == CrlbNodeKind::Manifest) { body = c; break; }
+        i++;
+    }
+    m->present = true;
+    if (body != null)
+    {
+        m->name = body->label;
+        Slice v;
+        if (mFieldStr(body, Slice::fromStr("version"), &v)) m->version = v;
+        if (mFieldStr(body, Slice::fromStr("fallback"), &v)) { m->fallback = v; m->hasFallback = true; }
+        m->flags = (Slice*)a->alloc(64 * @sizeof(Slice), 8);
+        if (m->flags != null) m->flagsLen = mFieldList(body, Slice::fromStr("flags"), a, m->flags, 64);
+
+        u32 tc = 0;
+        u32 tcCap = 0;
+        ManifestTarget* tbuf = null;
+        u32 mc = 0;
+        u32 mcCap = 0;
+        Slice* nbuf = null;
+        Slice* pbuf = null;
+        i = 0;
+        while (i < body->children.len)
+        {
+            CrlbNode* c = body->children.data + i;
+            if (c->kind == CrlbNodeKind::Target && c->hasLabel)
+            {
+                if (tc >= tcCap)
+                {
+                    tcCap = tcCap == 0 ? 8 : tcCap * 2;
+                    ManifestTarget* ng = (ManifestTarget*)a->alloc((usize)tcCap * @sizeof(ManifestTarget), 8);
+                    if (ng != null && tbuf != null)
+                    {
+                        u32 q = 0;
+                        while (q < tc) { ng[q] = tbuf[q]; q++; }
+                    }
+                    tbuf = ng;
+                }
+                if (tbuf != null && tc < tcCap)
+                {
+                    Slice tp = c->label;
+                    Slice pp;
+                    if (!mFieldStr(c, Slice::fromStr("path"), &pp)) pp = tp;
+                    tbuf[tc].triple = tp;
+                    tbuf[tc].path = pp;
+                    tc++;
+                }
+            }
+            else if (c->kind == CrlbNodeKind::Module && c->hasLabel)
+            {
+                if (mc >= mcCap)
+                {
+                    mcCap = mcCap == 0 ? 8 : mcCap * 2;
+                    Slice* nn = (Slice*)a->alloc((usize)mcCap * @sizeof(Slice), 8);
+                    Slice* pp2 = (Slice*)a->alloc((usize)mcCap * @sizeof(Slice), 8);
+                    if (nn != null && pp2 != null && nbuf != null && pbuf != null)
+                    {
+                        u32 q = 0;
+                        while (q < mc) { nn[q] = nbuf[q]; pp2[q] = pbuf[q]; q++; }
+                    }
+                    nbuf = nn;
+                    pbuf = pp2;
+                }
+                if (nbuf != null && pbuf != null && mc < mcCap)
+                {
+                    Slice mp = c->label;
+                    Slice pp;
+                    if (!mFieldStr(c, Slice::fromStr("path"), &pp)) pp = mp;
+                    nbuf[mc] = mp;
+                    pbuf[mc] = pp;
+                    mc++;
+                }
+            }
+            i++;
+        }
+        m->targets = tbuf;
+        m->targetsLen = tc;
+        m->modNames = nbuf;
+        m->modPaths = pbuf;
+        m->modsLen = mc;
+    }
+    /* registry shorthand: top-level `module "x" { }` decls (no
+     * manifest wrapper) also count as registry entries */
+    i = 0;
+    while (i < root->children.len)
+    {
+        CrlbNode* c = root->children.data + i;
+        if (c->kind == CrlbNodeKind::Module && c->hasLabel)
+        {
+            if (m->modsLen >= 256) break;
+            if (m->modNames == null)
+            {
+                m->modNames = (Slice*)a->alloc(256 * @sizeof(Slice), 8);
+                m->modPaths = (Slice*)a->alloc(256 * @sizeof(Slice), 8);
+            }
+            if (m->modNames != null && m->modPaths != null)
+            {
+                Slice mp = c->label;
+                Slice pp;
+                if (!mFieldStr(c, Slice::fromStr("path"), &pp)) pp = mp;
+                m->modNames[m->modsLen] = mp;
+                m->modPaths[m->modsLen] = pp;
+                m->modsLen++;
+            }
+        }
+        i++;
+    }
+    return m;
+}
+
+/* the platform root this module should probe for build target `triple`:
+ * the matching target block's path, else the fallback, else an empty
+ * slice (manifest present but nothing matches → base dir only).
+ * When no manifest exists the caller uses the global platform root. */
+pub Slice bManifestPlatRoot(ModuleManifest* m, Slice triple)
+{
+    if (m == null || !m->present) return Slice { null, 0 };
+    u32 i = 0;
+    while (i < m->targetsLen)
+    {
+        Slice t = m->targets[i].triple;
+        if (t.len == triple.len)
+        {
+            bool eq = true;
+            usize k = 0;
+            while (k < t.len) { if (t.ptr[k] != triple.ptr[k]) { eq = false; break; } k++; }
+            if (eq) return m->targets[i].path;
+        }
+        i++;
+    }
+    if (m->hasFallback) return m->fallback;
+    return Slice { C"", 0 };
+}

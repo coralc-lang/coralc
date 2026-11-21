@@ -25,16 +25,29 @@
 
 ## Optimizer (muvm)
 - [x] Inlining policy: hints-only at O0/O1/Debug, cost model at O2/O3; simplifycfg flattens post-inline CFG; parallel-edge phi bug fixed
-- [x] Ported: unroll, tco, sroa, select_to_branch, comm_canon, idempotent, involution, cast_elim, dse, macro_fusion, alias_analysis (points-to + escape marking, published to FunctionAnalysisCache)
+- [x] Ported: unroll, tco, sroa, select_to_branch, comm_canon, idempotent, involution, cast_elim, dse, macro_fusion, alias_analysis (points-to + escape marking, published to FunctionAnalysisCache), idiom (rotl/rotr/bswap/minmax/abs/fma), range (interval merge; branch-elim half of wallvm range was provably inert, skipped)
+- [x] Rotate width fixes: x86_64 rol/ror suffix by operand width, arm64 w-regs + 32-bit modulus for <=32-bit (both were 64-bit-only, corrupting narrow rotates); runtime-verified x86/arm64/wasm
 - [x] Test infra: muvm_tool --only <pass> single-pass isolation; run_aa.sh + run_pass.sh golden runners; cases_aa(17)/cases_dse(12)/cases_macro_fusion(8)/cases_fcmp_const(24) fixtures, runtime-verified on x86_64/arm64/wasm32
 - [x] fcmp backend fixes: x86_64 (fcmpPred+PF mask ported from wallvm), arm64 (verified NZCV: Olt->mi, Ole/One combos, Uge->hs), wasm32 (Ueq/One were miscompiled — also wrong in wallvm)
 - [ ] Audit CFG-mutating passes for duplicate-predecessor/parallel-edge hazards (jump_thread, branchprop, licm, loop_cse, sccp, gvn, mem2reg, ipa_cp) — verify-each over full corpus
-- [ ] Port remaining wallvm passes: idiom (rotl/bswap/select->smin/smax/abs), range (interval analysis), memory_ssa + machine_opt (store-to-load forwarding via AA), loop_distribute, loop_interchange
+- [ ] Port remaining wallvm passes: memory_ssa + machine_opt (store-to-load forwarding via AA), loop_distribute, loop_interchange
+- [x] range: 12 golden fixtures + 54 runtime checks; fixed 3 wallvm bugs in port — u64-wrap gap check, || vs && unbounded sentinels (unsound union merges), insert-before-reject infinite loop
 - [ ] Deliberately skipped as unsound: branch_inversion (CFG corruption), branch_factoring (incomplete CFG check), lex_canon (orphan chains; sort covered by comm_canon), borrowcheck (diagnostic-only, not an optimization)
 - [ ] Port wallvm passes (backend-adjacent, decide fit for fast backend): lower_phis, stack_layout, peephole (only unique patterns x+x->shl, x*-1->neg — already added to algebraic), simd_vec (deferred — vectors scalarized per earlier decision), validate
 
 ## Attributes
+- [x] Attribute args captured (align(N)/entry(addr)/deprecated("…") were silently dropped); entry requires address, once per program, chains with naked; naked = asm-only body contract; incompat pairs → T0068; bench/link/extern-attr/generate* removed; simd→muvm vector type; threadlocal/noalias/vectorise propagate or hard-error on muvm
 - [ ] Audit which attributes exist vs are honored; add missing attributes and honor them through sema/IR/backend
+
+## Parser / diagnostics
+- [x] `goto` + `ident:` labels → single P0030 unsupported-syntax error (was: parsed as decl, cascading errors)
+- [ ] Patterns in muvm IR: wildcard/lit/const/ident/or/range/guard lowered; variant/tuple/struct/type patterns hard-error by name — variant layout itself is still an opaque blob (Phase 3), implement layout then patterns + bindings
+
+## Build system / modules
+- [x] `.crlb` `target` field honoured: translated to platform=/arch= flag pairs (native-<arch> = host OS, arch/os passthrough, bare arch + host OS); explicit pairs win; `bytecode` errors E1013; unrecognized flags warn W2001
+- [ ] Module registry: lib-level .crlb manifest pointing to std modules, each std module with its own manifest + conditional platform config — replace truncated x86_64/linux probing and hardcoded std jumps
+- [ ] Per-module `override` opt/flags are fingerprinted but never applied (single-TU compile) — decide: apply globally, error, or document
+- [ ] `flags` honoured end-to-end audit: which crlb flags map to real compile options vs only the flag() table
 
 ## Prelude
 - [ ] Shift default prelude to only str.crl, result.crl, option.crl
