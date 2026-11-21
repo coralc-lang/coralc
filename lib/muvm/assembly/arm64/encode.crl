@@ -373,7 +373,7 @@ bool encAddSubReg(A64Ctx* c, Arm64Line* ln, u32 opc)
 
 // add/subtract with carry: sf op S 11010000 Rm 000000 Rn Rd
 // adc: op=0 S=0 ; sbc: op=1 S=0
-bool encAddSubCarry(A64Ctx* c, Arm64Line* ln, bool isSbc)
+bool encAddSubCarry(A64Ctx* c, Arm64Line* ln, bool isSbc, bool isS)
 {
     if (ln->nops != 3) return false;
     if (ln->ops[1].kind != Arm64OpKind::OpReg || ln->ops[2].kind != Arm64OpKind::OpReg) return false;
@@ -382,8 +382,8 @@ bool encAddSubCarry(A64Ctx* c, Arm64Line* ln, bool isSbc)
     u32 rm = a64RegNum(&ln->ops[2], false);
     u32 rn = a64RegNum(&ln->ops[1], false);
     u32 rd = a64RegNum(&ln->ops[0], false);
-    u32 w = (sf << 31) | ((isSbc ? 1u : 0u) << 30) | (0xD0u << 21) |
-            (rm << 16) | (rn << 5) | rd;
+    u32 w = (sf << 31) | ((isSbc ? 1u : 0u) << 30) | ((isS ? 1u : 0u) << 29) |
+            (0xD0u << 21) | (rm << 16) | (rn << 5) | rd;
     c->insnOff = c->base + (u64)c->out->len;
     return a64Ins(c, w);
 }
@@ -531,6 +531,67 @@ bool encMovWide(A64Ctx* c, Arm64Line* ln, u32 opc)
 }
 
 // symbolic mov wide: movz/movn/movk with symbol → MOVW_UABS_G{hw}
+// mov wd/wx,#imm alias: emit movz when the value is a single 16-bit
+// field at lsl#16k, else movn of the complement. Fails like GAS when
+// neither single instruction can produce the value.
+bool encMovAliasImm(A64Ctx* c, Arm64Line* ln)
+{
+    if (ln->nops != 2) return false;
+    Arm64Operand* a = &ln->ops[0];
+    Arm64Operand* im = &ln->ops[1];
+    if (a->kind != Arm64OpKind::OpReg || im->kind != Arm64OpKind::OpImm) return false;
+    bool is64 = a64Is64(a);
+    u32 sf = is64 ? 1 : 0;
+    u64 v = is64 ? (u64)im->imm : (u64)(u32)im->imm;
+    u64 mask = is64 ? ~(u64)0 : 0xFFFFFFFFu;
+    v &= mask;
+    // explicit lsl shift modifier narrows to that hw only
+    u32 onlyHw = 0xFF;
+    if (im->shiftAmt != 0 || im->shift == (u8)Arm64Shift::ShLSL)
+    {
+        if (im->shiftAmt % 16 != 0 || im->shiftAmt > 48) return false;
+        onlyHw = im->shiftAmt / 16;
+    }
+    u32 rd = a64RegNum(a, false);
+    // try movz (opc=2) then movn (opc=0) on v and ~v
+    for (u32 pass = 0; pass < 2; pass++)
+    {
+        u64 t = pass == 0 ? v : ((~v) & mask);
+        u32 opc = pass == 0 ? 2 : 0;
+        for (u32 h = 0; h < 4; h++)
+        {
+            if (!is64 && h > 1) break;
+            if (onlyHw != 0xFF && h != onlyHw) continue;
+            u64 sh = (u64)h * 16;
+            if ((t >> sh) > 0xFFFF) continue;
+            if ((t & (((u64)1 << sh) - 1)) != 0) continue;
+            if ((t >> (sh + 16)) != 0) continue;
+            u32 imm16 = (u32)((t >> sh) & 0xFFFF);
+            u32 w = (sf << 31) | (opc << 29) | (0b100101 << 23) | (h << 21) |
+                    (imm16 << 5) | rd;
+            c->insnOff = c->base + (u64)c->out->len;
+            return a64Ins(c, w);
+        }
+    }
+    if (onlyHw != 0xFF) return false;
+    // bitmask-immediate alias: mov rd, #v == orr rd, xzr, #v
+    {
+        u32 immN = 0;
+        u32 immr = 0;
+        u32 imms = 0;
+        if (a64BitmaskEncode(is64, v, &immN, &immr, &imms))
+        {
+            u32 base = (sf << 31) | (1u << 29) | (0b100100 << 23);
+            u32 w = base | (immN << 22) | (immr << 16) | (imms << 10) |
+                    (31u << 5) | rd;
+            c->insnOff = c->base + (u64)c->out->len;
+            return a64Ins(c, w);
+        }
+    }
+    // GNU mov alias is single-instruction only — no movz/movk expansion
+    return false;
+}
+
 bool encMovWideSym(A64Ctx* c, Arm64Line* ln, u32 opc)
 {
     if (ln->nops < 2) return false;
@@ -2098,6 +2159,8 @@ bool encFCmp(A64Ctx* c, Arm64Line* ln, bool withZero)
     if (ln->nops == 2)
     {
         if (ln->ops[1].kind == Arm64OpKind::OpReg) rm = a64RegNum(&ln->ops[1], false);
+        else if (ln->ops[1].kind == Arm64OpKind::OpImm && ln->ops[1].immIsFp &&
+                 ln->ops[1].imm == 0) rm = 31;
         else return false;
     }
     // fcmp = 0x1E202000 | ftype<<22 | rm<<16 | rn<<5 ; fcmpe sets bit4? 
@@ -2232,6 +2295,323 @@ bool encSimd3Same(A64Ctx* c, Arm64Line* ln, u32 opcode, bool isU, u32 szOverride
     return a64Ins(c, w);
 }
 
+// integer compare with zero: cmgt/cmge/cmeq/cmlt/cmle Vd.T, Vn.T, #0
+//   0 Q U 01110 size 1 0000 opc 0 Rn Rd
+//   opc(15:11): gt/ge=10001, eq/le=10011, lt=10101 ; U: ge/le=1
+bool encSimdCmpZero(A64Ctx* c, Arm64Line* ln, str mnem)
+{
+    if (ln->nops != 3) return false;
+    Arm64Operand* im = &ln->ops[2];
+    if (im->kind != Arm64OpKind::OpImm || im->imm != 0) return false;
+    Arm64Operand* a = &ln->ops[0];
+    if (a->kind != Arm64OpKind::OpReg || !a->arrPresent) return false;
+    u32 q;
+    u32 size;
+    u32 esz;
+    if (!a64ArrQS(a, &q, &size, &esz)) return false;
+    for (u32 i = 1; i < 2; i++)
+    {
+        if (ln->ops[i].kind != Arm64OpKind::OpReg) return false;
+        u32 q2;
+        u32 s2;
+        u32 e2;
+        if (!a64ArrQS(&ln->ops[i], &q2, &s2, &e2) || q2 != q || s2 != size) return false;
+    }
+    u32 opc;
+    bool isU = false;
+    if (mnem.equals("cmgt"))      { opc = 17; }
+    else if (mnem.equals("cmge")) { opc = 17; isU = true; }
+    else if (mnem.equals("cmeq")) { opc = 19; }
+    else if (mnem.equals("cmle")) { opc = 19; isU = true; }
+    else if (mnem.equals("cmlt")) { opc = 21; }
+    else return false;
+    u32 rn = a64RegNum(&ln->ops[1], false);
+    u32 rd = a64RegNum(a, false);
+    u32 w = (q << 30) | (isU ? (1u << 29) : 0) | (0x0E << 24) | (size << 22) |
+            (1u << 21) | (opc << 11) | (rn << 5) | rd;
+    c->insnOff = c->base + (u64)c->out->len;
+    return a64Ins(c, w);
+}
+
+// FP compares: fcmeq/fcmge/fcmgt/facge/facgt — vector or scalar,
+// register or #0.0 third operand. Verified against GNU as:
+//   vec s/d reg : 0 Q U 01110 {gt,esz64} 1 Rm 1110 ac 1 Rn Rd
+//   vec h   reg : 0 Q U 01110 {gt,1} 0 Rm 0010 ac 1 Rn Rd
+//   vec #0      : 0 Q U' 01110 1 {esz64/h} 1 rmext opc Rn Rd
+//                 (opc=27 eq else 25, U'=1 only for fcmge, rmext=24 for h)
+//   scalar s/d  : 01011110 U gt {esz64} 1 Rm {28|ac} 1 Rn Rd
+//   scalar h    : 01011110 U gt 1 0 Rm {4|ac} 1 Rn Rd
+//   scalar #0   : 01011110 U' 1 {esz64} 1 opc Rn Rd (s/d only)
+bool encFpSimdCmp(A64Ctx* c, Arm64Line* ln, str mnem)
+{
+    if (ln->nops != 3) return false;
+    Arm64Operand* a = &ln->ops[0];
+    Arm64Operand* b = &ln->ops[1];
+    Arm64Operand* d = &ln->ops[2];
+    if (a->kind != Arm64OpKind::OpReg || b->kind != Arm64OpKind::OpReg) return false;
+    if (a->hasLane || b->hasLane) return false;
+
+    bool isU = true;
+    bool isGt = true;
+    bool isAc = true;
+    if (mnem.equals("fcmeq"))      { isU = false; isGt = false; isAc = false; }
+    else if (mnem.equals("fcmge")) { isU = true;  isGt = false; isAc = false; }
+    else if (mnem.equals("fcmgt")) { isU = true;  isGt = true;  isAc = false; }
+    else if (mnem.equals("facge")) { isU = true;  isGt = false; isAc = true; }
+    else                           { isU = true;  isGt = true;  isAc = true; } // facgt
+
+    bool isZero = d->kind == Arm64OpKind::OpImm && d->immIsFp && d->imm == 0;
+    if (d->kind != Arm64OpKind::OpReg && !isZero) return false;
+    if (isZero && isAc) return false;
+    if (d->kind == Arm64OpKind::OpReg && d->hasLane) return false;
+
+    // eszKind: 0=s, 1=d, 2=h ; isVec for v-arrangement operands
+    u32 eszKind;
+    bool isVec;
+    u32 q = 0;
+    if (a->arrPresent && a->arrCount != 0 &&
+        a->reg.cls == (u8)Arm64RegCls::RcV)
+    {
+        isVec = true;
+        u64 bits = (u64)a->arrSize * 8 * (u64)a->arrCount;
+        if (bits != 64 && bits != 128) return false;
+        q = bits == 128 ? 1 : 0;
+        if (a->arrSize == 4) eszKind = 0;
+        else if (a->arrSize == 8) eszKind = 1;
+        else if (a->arrSize == 2) eszKind = 2;
+        else return false;
+        if (!b->arrPresent || b->arrCount != a->arrCount || b->arrSize != a->arrSize)
+            return false;
+        if (!isZero && (!d->arrPresent || d->arrCount != a->arrCount ||
+                        d->arrSize != a->arrSize)) return false;
+    }
+    else if (regIsFp(&a->reg))
+    {
+        isVec = false;
+        if (a->reg.cls == (u8)Arm64RegCls::RcS) eszKind = 0;
+        else if (a->reg.cls == (u8)Arm64RegCls::RcD) eszKind = 1;
+        else if (a->reg.cls == (u8)Arm64RegCls::RcH) eszKind = 2;
+        else return false;
+        if (b->reg.cls != a->reg.cls) return false;
+        if (!isZero && d->reg.cls != a->reg.cls) return false;
+    }
+    else return false;
+
+    u32 rm = isZero ? 0 : a64RegNum(d, false);
+    u32 rn = a64RegNum(b, false);
+    u32 rd = a64RegNum(a, false);
+    u32 uu = isU ? 1 : 0;
+    u32 gg = isGt ? 1 : 0;
+    u32 aa = isAc ? 1 : 0;
+    u32 w;
+    if (isZero)
+    {
+        u32 u0 = mnem.equals("fcmge") ? 1 : 0;
+        u32 opc = mnem.equals("fcmeq") ? 27 : 25;
+        u32 b22 = eszKind == 0 ? 0 : 1;
+        u32 rmext = eszKind == 2 ? 24 : 0;
+        if (isVec)
+            w = (q << 30) | (u0 << 29) | (0x0E << 24) | (1u << 23) | (b22 << 22) |
+                (1u << 21) | (rmext << 16) | (opc << 11) | (rn << 5) | rd;
+        else
+        {
+            if (eszKind == 2) return false;
+            w = (0x5E << 24) | (u0 << 29) | (1u << 23) | (b22 << 22) |
+                (1u << 21) | (opc << 11) | (rn << 5) | rd;
+        }
+    }
+    else if (isVec)
+    {
+        if (eszKind == 2)
+            w = (q << 30) | (uu << 29) | (0x0E << 24) | (gg << 23) | (1u << 22) |
+                (rm << 16) | (0x2 << 12) | (aa << 11) | (1u << 10) | (rn << 5) | rd;
+        else
+            w = (q << 30) | (uu << 29) | (0x0E << 24) | (gg << 23) |
+                ((eszKind == 1 ? 1u : 0u) << 22) | (1u << 21) | (rm << 16) |
+                (0xE << 12) | (aa << 11) | (1u << 10) | (rn << 5) | rd;
+    }
+    else if (eszKind == 2)
+        w = (0x5E << 24) | (uu << 29) | (gg << 23) | (1u << 22) |
+            (rm << 16) | ((isAc ? 5u : 4u) << 11) | (1u << 10) | (rn << 5) | rd;
+    else
+        w = (0x5E << 24) | (uu << 29) | (gg << 23) |
+            ((eszKind == 1 ? 1u : 0u) << 22) | (1u << 21) | (rm << 16) |
+            (0xE << 12) | (aa << 11) | (1u << 10) | (rn << 5) | rd;
+
+    c->insnOff = c->base + (u64)c->out->len;
+    return a64Ins(c, w);
+}
+
+// vector FP 3-same arithmetic: fmla/fmls/fmul/fdiv/fadd/fsub/fmax/
+// fmin/fmaxnm/fminnm. s/d: 0 Q U 01110 {g,esz64} 1 Rm opc5 1 Rn Rd
+// h(FP16): 0 Q U 01110 {g,1} 0 Rm opc5' 1 Rn Rd (opc5' differs)
+u32 a64SimdFpArithOp(str mnem, bool* isU, bool* isG, u32* opcSd, u32* opcH)
+{
+    *isU = false; *isG = false; *opcSd = 0xFFFFFFFF; *opcH = 0xFFFFFFFF;
+    if (mnem.equals("fmaxnm"))      { *opcSd = 24; *opcH = 0; }
+    else if (mnem.equals("fminnm")) { *opcSd = 24; *opcH = 0; *isG = true; }
+    else if (mnem.equals("fadd"))   { *opcSd = 26; *opcH = 2; }
+    else if (mnem.equals("fsub"))   { *opcSd = 26; *opcH = 2; *isG = true; }
+    else if (mnem.equals("fmla"))   { *opcSd = 25; *opcH = 1; }
+    else if (mnem.equals("fmls"))   { *opcSd = 25; *opcH = 1; *isG = true; }
+    else if (mnem.equals("fmax"))   { *opcSd = 30; *opcH = 6; }
+    else if (mnem.equals("fmin"))   { *opcSd = 30; *opcH = 6; *isG = true; }
+    else if (mnem.equals("fmul"))   { *isU = true; *opcSd = 27; *opcH = 3; }
+    else if (mnem.equals("fdiv"))   { *isU = true; *opcSd = 31; *opcH = 7; }
+    else return 0xFFFFFFFF;
+    return 1;
+}
+
+bool encSimdFpArith(A64Ctx* c, Arm64Line* ln, str mnem)
+{
+    if (ln->nops != 3) return false;
+    Arm64Operand* a = &ln->ops[0];
+    if (a->kind != Arm64OpKind::OpReg) return false;
+    bool isU;
+    bool isG;
+    u32 opcSd;
+    u32 opcH;
+    if (a64SimdFpArithOp(mnem, &isU, &isG, &opcSd, &opcH) == 0xFFFFFFFF) return false;
+    u32 q;
+    u32 size;
+    u32 esz;
+    if (!a64ArrQS(a, &q, &size, &esz)) return false;
+    for (u32 i = 1; i < 3; i++)
+    {
+        if (ln->ops[i].kind != Arm64OpKind::OpReg) return false;
+        u32 q2;
+        u32 s2;
+        u32 e2;
+        if (!a64ArrQS(&ln->ops[i], &q2, &s2, &e2) || q2 != q || s2 != size) return false;
+    }
+    // element bytes: esz is log2 — esz*8? a64ArrQS returns esizeLog.
+    // es==2 → esizeLog=1 (h); es==4 → 2 (s); es==8 → 3 (d)
+    u32 esBytes = 1u << esz;
+    u32 rm = a64RegNum(&ln->ops[2], false);
+    u32 rn = a64RegNum(&ln->ops[1], false);
+    u32 rd = a64RegNum(a, false);
+    u32 uu = isU ? 1 : 0;
+    u32 gg = isG ? 1 : 0;
+    u32 w;
+    if (esBytes == 2)
+        w = (q << 30) | (uu << 29) | (0x0E << 24) | (gg << 23) | (1u << 22) |
+            (rm << 16) | (opcH << 11) | (1u << 10) | (rn << 5) | rd;
+    else
+        w = (q << 30) | (uu << 29) | (0x0E << 24) | (gg << 23) |
+            ((esBytes == 8 ? 1u : 0u) << 22) | (1u << 21) | (rm << 16) |
+            (opcSd << 11) | (1u << 10) | (rn << 5) | rd;
+    c->insnOff = c->base + (u64)c->out->len;
+    return a64Ins(c, w);
+}
+
+// vector FP 2-reg misc: fabs/fneg/fsqrt/frint*/fcvtl/fcvtn(+2)
+// s/d: 0 Q U 01110 {g,esz64} 1 opc5 opc4 1 0 Rn Rd
+// h:   0 Q U 01110 {g,1} 1 opc5' opc4 1 0 Rn Rd  (opc5' = opc5+24)
+// fcvtl/fcvtn: U=0,g=0,opc5=1,opc4=7/6; b22 = dest esize != 2 bytes
+bool encSimdFp2Misc(A64Ctx* c, Arm64Line* ln, str mnem)
+{
+    if (ln->nops != 2) return false;
+    Arm64Operand* a = &ln->ops[0];
+    Arm64Operand* b = &ln->ops[1];
+    if (a->kind != Arm64OpKind::OpReg || b->kind != Arm64OpKind::OpReg) return false;
+    if (!a->arrPresent || a->arrCount == 0 || !b->arrPresent || b->arrCount == 0)
+        return false;
+
+    bool isL = mnem.equals("fcvtl") || mnem.equals("fcvtl2");
+    bool isN = mnem.equals("fcvtn") || mnem.equals("fcvtn2");
+    bool is2 = mnem.equals("fcvtl2") || mnem.equals("fcvtn2");
+    u32 U;
+    u32 G;
+    u32 opc4;
+    u32 opc5;
+    if (isL || isN)
+    {
+        U = 0; G = 0; opc5 = 1; opc4 = isL ? 7 : 6;
+    }
+    else
+    {
+        if (mnem.equals("fabs"))      { U = 0; G = 1; opc5 = 0; opc4 = 15; }
+        else if (mnem.equals("fneg")) { U = 1; G = 1; opc5 = 0; opc4 = 15; }
+        else if (mnem.equals("fsqrt")){ U = 1; G = 1; opc5 = 1; opc4 = 15; }
+        else if (mnem.equals("frintn")){ U = 0; G = 0; opc5 = 1; opc4 = 8; }
+        else if (mnem.equals("frintp")){ U = 0; G = 1; opc5 = 1; opc4 = 8; }
+        else if (mnem.equals("frintm")){ U = 0; G = 0; opc5 = 1; opc4 = 9; }
+        else if (mnem.equals("frintz")){ U = 0; G = 1; opc5 = 1; opc4 = 9; }
+        else if (mnem.equals("frinta")){ U = 1; G = 0; opc5 = 1; opc4 = 8; }
+        else if (mnem.equals("frintx")){ U = 1; G = 0; opc5 = 1; opc4 = 9; }
+        else if (mnem.equals("frinti")){ U = 1; G = 1; opc5 = 1; opc4 = 9; }
+        else return false;
+    }
+
+    u32 eszA = (u32)a->arrSize;
+    u32 eszB = (u32)b->arrSize;
+    u32 cntA = a->arrCount;
+    u32 cntB = b->arrCount;
+    u32 q;
+    u32 b22;
+    u32 opc5f;
+    if (isL)
+    {
+        // Vd esize = 2*Vn esize; counts equal (fcvtl) or vd=vn/2 (fcvtl2)
+        if (eszA != eszB * 2) return false;
+        if (is2 ? cntB != cntA * 2 : cntB != cntA) return false;
+        q = is2 ? 1 : 0;
+        // b22 = 1 iff no h element involved (s<->d conversions)
+        b22 = (eszA != 2 && eszB != 2) ? 1 : 0;
+        opc5f = 1;
+    }
+    else if (isN)
+    {
+        // Vd esize = Vn esize/2; counts equal (fcvtn) or vd=vn*2 (fcvtn2)
+        if (eszB != eszA * 2) return false;
+        if (is2 ? cntA != cntB * 2 : cntA != cntB) return false;
+        q = is2 ? 1 : 0;
+        b22 = (eszA != 2 && eszB != 2) ? 1 : 0;
+        opc5f = 1;
+    }
+    else
+    {
+        if (eszA != eszB || cntA != cntB) return false;
+        u64 bits = (u64)eszA * (u64)cntA;
+        if (bits != 8 && bits != 16) return false; // total bytes 8 or 16
+        q = bits == 16 ? 1 : 0;
+        // s→0, h/d→1
+        b22 = eszA != 4 ? 1 : 0;
+        opc5f = eszA == 2 ? opc5 + 24 : opc5;
+    }
+
+    u32 rn = a64RegNum(b, false);
+    u32 rd = a64RegNum(a, false);
+    u32 w = (q << 30) | (U << 29) | (0x0E << 24) | (G << 23) | (b22 << 22) |
+            (1u << 21) | (opc5f << 16) | (opc4 << 12) | (1u << 11) | (rn << 5) | rd;
+    c->insnOff = c->base + (u64)c->out->len;
+    return a64Ins(c, w);
+}
+
+// tbl/tbx: 0 Q 001110 00000 (len-1) tbx 00 Rn Rd  — Rm=indices at 20:16,
+// Rn=table base at 9:5. Register list length 1-4.
+bool encTblTbx(A64Ctx* c, Arm64Line* ln, bool isTbx)
+{
+    if (ln->nops != 3) return false;
+    Arm64Operand* a = &ln->ops[0];
+    Arm64Operand* lst = &ln->ops[1];
+    Arm64Operand* idx = &ln->ops[2];
+    if (a->kind != Arm64OpKind::OpReg || lst->kind != Arm64OpKind::OpRegList ||
+        idx->kind != Arm64OpKind::OpReg) return false;
+    u32 q;
+    u32 size;
+    u32 esz;
+    if (!a64ArrQS(a, &q, &size, &esz)) return false;
+    if (a->arrSize != 1) return false; // tbl/tbx are byte tables only
+    u32 rm = a64RegNum(idx, false);
+    u32 rn = (u32)lst->reg.num;
+    u32 rd = a64RegNum(a, false);
+    u32 w = (q << 30) | (0x0E << 24) | (rm << 16) |
+            ((lst->listLen - 1) << 13) | (isTbx ? (1u << 12) : 0) | (rn << 5) | rd;
+    c->insnOff = c->base + (u64)c->out->len;
+    return a64Ins(c, w);
+}
+
 // "2 reg misc": 0 Q U 01110 size 10000 opcode 10 Rn Rd
 // opcode at bits16:12 (5 bits). cnt=00101? measured cnt=5? earlier
 // cnt v.16b=0x4E205820: (>>12)&0x1F=5. abs=01011(11),neg=01011+U? neg
@@ -2258,29 +2638,75 @@ bool encSimd2Misc(A64Ctx* c, Arm64Line* ln, u32 opcode, bool isU)
     u32 rn = a64RegNum(b, false);
     u32 rd = a64RegNum(a, false);
     u32 w = (q << 30) | (isU ? (1u << 29) : 0) | (0x0E << 24) | (size << 22) |
-            (0x10 << 16) | (opcode << 12) | (0b10 << 10) | (rn << 5) | rd;
-    // 0x10<<16 = bits20:16=10000 ✓
+            (1u << 21) | (opcode << 12) | (0b10 << 10) | (rn << 5) | rd;
     c->insnOff = c->base + (u64)c->out->len;
     return a64Ins(c, w);
 }
 
 // across lanes: 0 Q U 01110 size 11000 opcode 10 Rn Rd
 // opcode bits16:12: addv=11011(27)? measured addv=(>>12)&0x1F=0x1B=27.
-bool encSimdAcross(A64Ctx* c, Arm64Line* ln, u32 opcode, bool isU)
+// across-lane reductions: 0 Q U 0/1 1110 sz opc(16:12) 10 Rn Rd
+// integer: 0x0E group, size=src element log2, opc: addv=27,u/saddlv=3,
+//   s/umaxv=10, s/uminv=26 ; U: unsigned=1
+// fp across (fmaxnmv/fminnmv/fmaxv/fminv): 0x0E group, U=1,
+//   sz=(isMin<<1)|isD, opc: nm=12, plain=15
+// fp pairwise (faddp/fmaxp/fminp/fmaxnmp/fminnmp): 0x1E group, U=1,
+//   sz=(isMin<<1)|isD, opc: faddp=13, max=15, nm=12 ; Q=1
+bool encSimdAcross(A64Ctx* c, Arm64Line* ln, str mnem)
 {
     if (ln->nops != 2) return false;
     Arm64Operand* a = &ln->ops[0];
     Arm64Operand* b = &ln->ops[1];
     if (a->kind != Arm64OpKind::OpReg || b->kind != Arm64OpKind::OpReg) return false;
-    // dest may be scalar (b/h/s/d) — use its esize for size field
+    if (!b->arrPresent || b->arrCount == 0) return false;
+    u32 rn = a64RegNum(b, false);
+    u32 rd = a64RegNum(a, false);
+
+    bool isFp = mnem.len >= 2 && mnem.ptr[0] == 'f';
+    u32 opc;
+    bool isU = false;
+    u32 sz;
+    u32 group; // 0x0E int/fp-across, 0x1E fp-pairwise
+
+    if (isFp)
+    {
+        u32 esize = (u32)b->arrSize;
+        if (esize != 4 && esize != 8) return false;
+        bool isD = esize == 8;
+        bool isMin = mnem.equals("fminv") || mnem.equals("fminnmv") ||
+                     mnem.equals("fminp") || mnem.equals("fminnmp");
+        bool isPair = mnem.equals("faddp") || mnem.equals("fmaxp") ||
+                      mnem.equals("fminp") || mnem.equals("fmaxnmp") ||
+                      mnem.equals("fminnmp");
+        if (mnem.equals("faddp"))      opc = 13;
+        else if (mnem.equals("fmaxp") || mnem.equals("fminp") ||
+                 mnem.equals("fmaxv") || mnem.equals("fminv")) opc = 15;
+        else if (mnem.equals("fmaxnmp") || mnem.equals("fminnmp") ||
+                 mnem.equals("fmaxnmv") || mnem.equals("fminnmv")) opc = 12;
+        else return false;
+        sz = ((isMin ? 1u : 0u) << 1) | (isD ? 1u : 0u);
+        group = isPair ? 0x1E : 0x0E;
+        isU = true;
+        u32 w = (1u << 30) | (1u << 29) | (group << 24) | (sz << 22) |
+                ((u32)0b11000 << 17) | (opc << 12) | (2u << 10) | (rn << 5) | rd;
+        c->insnOff = c->base + (u64)c->out->len;
+        return a64Ins(c, w);
+    }
+
     u32 q;
     u32 size;
     u32 esz;
     if (!a64ArrQS(b, &q, &size, &esz)) return false;
-    u32 rn = a64RegNum(b, false);
-    u32 rd = a64RegNum(a, false);
+    if (mnem.equals("addv"))      { opc = 27; }
+    else if (mnem.equals("uaddlv")) { opc = 3;  isU = true; }
+    else if (mnem.equals("saddlv")) { opc = 3; }
+    else if (mnem.equals("smaxv"))  { opc = 10; }
+    else if (mnem.equals("umaxv"))  { opc = 10; isU = true; }
+    else if (mnem.equals("sminv"))  { opc = 26; }
+    else if (mnem.equals("uminv"))  { opc = 26; isU = true; }
+    else return false;
     u32 w = (q << 30) | (isU ? (1u << 29) : 0) | (0x0E << 24) | (size << 22) |
-            (0x18 << 16) | (opcode << 12) | (0b10 << 10) | (rn << 5) | rd;
+            ((u32)0b11000 << 17) | (opc << 12) | (2u << 10) | (rn << 5) | rd;
     c->insnOff = c->base + (u64)c->out->len;
     return a64Ins(c, w);
 }
@@ -2319,34 +2745,116 @@ bool encSimdAcross(A64Ctx* c, Arm64Line* ln, u32 opcode, bool isU)
 //   immh:immb (7 bits) = shift + esize where esize = 8<<size? For B
 //   esize=8 → field=3+8=11 → immh=0001,immb=011.
 // I'll trust spec and verify by diff-test later.
-bool encSimdShiftImm(A64Ctx* c, Arm64Line* ln, u32 opcode, bool isU)
+// shift by immediate: 0 Q U 01111 immh immb opcode 1 Rn Rd
+// immh:immb is a 7-bit field; esize = 8 << msbpos(immh).
+// left shifts:  imm = esize + shift ; right shifts: imm = 2*esize - shift
+// verified against GNU as for sshr/ushr/ssra/usra/srshr/urshr/srsra/ursra/
+// shl/sli/sri/sqshl/uqshl/sqshlu + narrow (shrn family) + wide (sshll).
+bool encSimdShiftImm(A64Ctx* c, Arm64Line* ln, str mnem)
 {
+    // returns opc,U,class: class 0=same-width,1=narrow(dest=src/2),
+    // 2=wide(src=dest/2); left = shift added to esize
+    u32 opc = 0xFFFFFFFF;
+    bool isU = false;
+    u32 cls = 0;
+    bool left = false;
+    bool is2 = false;
+    str base = mnem;
+    if (mnem.len > 0 && mnem.ptr[mnem.len - 1] == '2')
+    {
+        is2 = true;
+        base = str { (const u8*)mnem.ptr, mnem.len - 1 };
+    }
+    if (base.equals("sshr"))        { opc = 0;  cls = 0; }
+    else if (base.equals("ushr"))   { opc = 0;  isU = true; cls = 0; }
+    else if (base.equals("ssra"))   { opc = 2;  cls = 0; }
+    else if (base.equals("usra"))   { opc = 2;  isU = true; cls = 0; }
+    else if (base.equals("srshr"))  { opc = 4;  cls = 0; }
+    else if (base.equals("urshr"))  { opc = 4;  isU = true; cls = 0; }
+    else if (base.equals("srsra"))  { opc = 6;  cls = 0; }
+    else if (base.equals("ursra"))  { opc = 6;  isU = true; cls = 0; }
+    else if (base.equals("sri"))    { opc = 8;  isU = true; cls = 0; }
+    else if (base.equals("shl"))    { opc = 10; cls = 0; left = true; }
+    else if (base.equals("sli"))    { opc = 10; isU = true; cls = 0; left = true; }
+    else if (base.equals("sqshlu")) { opc = 12; isU = true; cls = 0; left = true; }
+    else if (base.equals("sqshl"))  { opc = 14; cls = 0; left = true; }
+    else if (base.equals("uqshl"))  { opc = 14; isU = true; cls = 0; left = true; }
+    else if (base.equals("shrn"))   { opc = 16; cls = 1; }
+    else if (base.equals("sqshrun")){ opc = 16; isU = true; cls = 1; }
+    else if (base.equals("rshrn"))  { opc = 17; cls = 1; }
+    else if (base.equals("sqrshrun")){ opc = 17; isU = true; cls = 1; }
+    else if (base.equals("sqshrn")) { opc = 18; cls = 1; }
+    else if (base.equals("uqshrn")) { opc = 18; isU = true; cls = 1; }
+    else if (base.equals("sqrshrn")){ opc = 19; cls = 1; }
+    else if (base.equals("uqrshrn")){ opc = 19; isU = true; cls = 1; }
+    else if (base.equals("sshll"))  { opc = 20; cls = 2; left = true; }
+    else if (base.equals("ushll"))  { opc = 20; isU = true; cls = 2; left = true; }
+    else return false;
+    if (is2 && cls == 0) return false; // no "2" same-width forms
+
     if (ln->nops != 3) return false;
     Arm64Operand* a = &ln->ops[0];
     Arm64Operand* b = &ln->ops[1];
     Arm64Operand* im = &ln->ops[2];
     if (a->kind != Arm64OpKind::OpReg || b->kind != Arm64OpKind::OpReg ||
-        im->kind != Arm64OpKind::OpImm) return false;
+        im->kind != Arm64OpKind::OpImm || im->immIsFp) return false;
+    if (!a->arrPresent || a->arrCount == 0 || !b->arrPresent || b->arrCount == 0)
+        return false;
+
+    u32 eszA = (u32)a->arrSize;   // dest element bytes
+    u32 eszB = (u32)b->arrSize;   // src element bytes
+    u32 cntA = a->arrCount;
+    u32 cntB = b->arrCount;
     u32 q;
-    u32 size;
-    u32 esz;
-    if (!a64ArrQS(a, &q, &size, &esz)) return false;
-    u32 q2;
-    u32 s2;
-    u32 e2;
-    if (!a64ArrQS(b, &q2, &s2, &e2) || q2 != q || s2 != size) return false;
-    // element bits = esz; esize_field = log2(element bits): b=3,h=4,s=5,d=6
-    u32 esizeLog = esz + 3; // esz is bytes-log? esz=esize bytes→log2(bits)=log2(es*8)=es+3
-    i64 shift = im->imm;
-    u32 field = (u32)((i64)esizeLog + shift);
-    // field = immh:immb (7 bits): immh = field>>3 (4b), immb = field&7
-    u32 immh = (field >> 3) & 0xF;
-    u32 immb = field & 7;
-    if (immh == 0) return false; // reserved
+    u32 E; // esize in bits used by the imm field
+    if (cls == 0)
+    {
+        if (eszA != eszB || cntA != cntB) return false;
+        u64 bits = (u64)eszA * (u64)cntA;
+        if (bits != 8 && bits != 16) return false;
+        q = bits == 16 ? 1 : 0;
+        E = eszA * 8;
+    }
+    else if (cls == 1)
+    {
+        // narrow: dest = src/2 ; "2" variant has 128-bit dest
+        if (eszB != eszA * 2) return false;
+        if (is2 ? cntA != cntB * 2 : cntA != cntB) return false;
+        q = is2 ? 1 : 0;
+        E = eszA * 8; // dest element
+    }
+    else
+    {
+        // wide: src = dest/2 ; "2" reads upper src half
+        if (eszA != eszB * 2) return false;
+        if (is2 ? cntB != cntA * 2 : cntB != cntA) return false;
+        q = is2 ? 1 : 0;
+        E = eszB * 8; // src element
+    }
+    if (E != 8 && E != 16 && E != 32 && E != 64) return false;
+
+    i64 s = im->imm;
+    u64 V;
+    if (left)
+    {
+        if (s < 0 || s >= (i64)E) return false;
+        V = (u64)E + (u64)s;
+    }
+    else
+    {
+        if (s < 1 || s > (i64)E) return false;
+        V = 2 * (u64)E - (u64)s;
+    }
+    // V must lie in [E,2E) so its top bit is E's position
+    if (V < (u64)E || V >= 2 * (u64)E) return false;
+    u32 immh = (u32)(V >> 3);
+    u32 immb = (u32)(V & 7);
+    if (immh == 0 || immh > 15) return false;
+
     u32 rn = a64RegNum(b, false);
     u32 rd = a64RegNum(a, false);
-    u32 w = (q << 30) | (isU ? (1u << 29) : 0) | (0xF << 24) | (size << 22) |
-            (immh << 19) | (immb << 16) | (opcode << 11) | (1u << 10) | (rn << 5) | rd;
+    u32 w = (q << 30) | (isU ? (1u << 29) : 0) | (0x0F << 24) |
+            (immh << 19) | (immb << 16) | (opc << 11) | (1u << 10) | (rn << 5) | rd;
     c->insnOff = c->base + (u64)c->out->len;
     return a64Ins(c, w);
 }
@@ -2378,6 +2886,7 @@ u32 a64ModImm8(Arm64Operand* im, u32 esizeBytes, u32* cmode, bool isFmov,
         for (u32 i = 0; i < 8; i++) ((u8*)&v)[i] = b[i];
         *fpv = v;
         // fmov uses element-size-dependent expansion; caller picks ftype
+        *ok = true;
         return 0;
     }
     i64 v = im->imm;
@@ -2552,47 +3061,111 @@ bool encDup(A64Ctx* c, Arm64Line* ln)
     return a64Ins(c, w);
 }
 
-// ins/umov/smov: element moves
-// ins Vd.T[i], Rn = mov alias: 0 Q 001110 imm5 0 imm4 1 Rn Rd? 
-// measured ins v0.b[3],w1 = 0x4E071C20 (disasm "mov v0.b[3],w1")
-// umov w0,v1.b[2] = 0x0E053C20 ; smov x0,v1.h[1] = 0x4E062C20
-// ins general: 0 Q 001110 imm5 0 imm4 1 Rn Rd — imm4 = lane, imm5 = esize
-// umov: 0 Q 001110 imm5 0011 11 Rn Rd? umov = 0x0E053C20: Q=0,
-//   imm5=(>>16)&0x1F = 0x0E05&0x1F=5? bits20:16=00101 → imm5=5? for b lane
-//   umov w (32-bit) uses imm5=0101? smov x (64-bit) imm5=0110? 
-// These have subtle imm5 encodings (esize | direction bits). Implement:
-//   ins/mov lane: imm5 = esizeCode; lane in imm4? For ins v0.b[3]:
-//   0x4E071C20: imm5=(>>16)&0x1F=7? 0x4E07&0x1F=7 → imm5=7? b ins imm5=7?
-//   lane=(>>11)&0xF? 0x4E071C20>>11=0x9C0E3&0xF=3 → lane=3 ✓
-//   bits15:10 = (>>10)&0x3F = 0x4E071C20>>10&0x3F = 0x1381C7&0x3F=7?
-//   0x4E071C20>>10 = 0x1381C7.08 → &0x3F = 7 → bits15:10=000111.
-// umov w0,v1.b[2]=0x0E053C20: imm5=(>>16)&0x1F=5, lane=(>>11)&0xF=2? 
-//   0x0E053C20>>11=0x1C0A7&0xF=7? compute 0x0E053C20/2048=0x1C0A7.0→&0xF=7?
-//   hmm lane should be 2. (>>11)&0xF: 0x0E053C20>>11 = 0x1C0A7 → &0xF=7 ✗
-//   lane field is bits20:16 high bits? imm5 = bits20:16 = 00101 → lane
-//   is imm5<2:0>+? For umov: imm5 = esizeCode<<1 | ? — the lane index is
-//   split: imm5<2:0> and imm4? This needs the real spec:
-//   INS (general): 0 Q 001110 imm5 0 imm4 1 Rn Rd — imm4 at bits14:11,
-//   imm5 at 20:16, bit15=0? bit10=1? For ins v0.b[3]: imm5=7?? b esize
-//   code for INS = 0111? and lane=imm4=3: bits14:11 = (>>11)&0xF = 
-//   0x4E071C20>>11=0x9C0E3&0xF=3 ✓ and bits15:10: bit15=(>>15)&1=0,
-//   imm4=3 at 14:11, bit10=1? (>>10)&1=0x1381C7&1=1 ✓. So INS:
-//   imm5 at 20:16 = esize-specific (b=7? need table), imm4 lane at 14:11.
-//   For b: imm5=0111=7? s: ? d:? h:? — imm5 for INS = element size
-//   encoding: b=0111,h=0111? Actually INS imm5 = {esize}: b=0001? we got 7.
-//   Might be imm5 = esize*? Let me derive from smov/umov too — defer:
-//   implement INS/UMOV/SMOV with imm5 = esizeCode table {b:7?} — WRONG
-//   risk. Given budget, implement only INS (mov lane) + UMOV/SMOV with
-//   imm5 derived as: imm5 = esize_log2_code where for INS: b=7,h=6?,... 
-//   I'll encode imm5 = (esizeBytes==1?7:esizeBytes==2?6:esizeBytes==4?4:
-//   esizeBytes==8?3:0) guess and fix after test. Hmm too risky.
-//   ALTERNATIVE: parse "ins"/"umov"/"smov" via the DUP-like encoding
-//   won't work. I'll implement INS general with the spec formula:
-//   imm5 = esize encoding where B=0111,H=0111? — actually ARM: for INS
-//   (general) imm5<2:0> selects element size B/H/S/D = 1/2/4/8→codes
-//   and imm5<4:3> must be 01? For b: imm5=0001? but observed 7.
-//   Given uncertainty I'll SKIP ins/umov/smov lane moves except via
-//   ext/dup which are verified. Mark TODO.
+// element/lane moves — INS/UMOV/SMOV/mov aliases.
+// imm5 = esize*(2*lane+1) packs element size + lane index.
+//   ins/mov Vd.T[i], Rn(gpr)  : 0x4E001C00 | imm5<<16 | rn<<5 | rd
+//   umov/mov  Wd, Vn.T[i]     : 0x0E003C00 | imm5<<16 | rn<<5 | rd
+//   smov      Wd/Xd, Vn.T[i]  : Q<<30|0x0E002C00 | imm5<<16 | rn<<5 | rd
+//   mov       Vd.T[i], Vn.T[j]: 0x6E000400 | imm5<<16 | imm4<<11 | rn<<5 | rd
+//                               imm4 = esize*srcLane
+//   mov       Sd/Dd..., Vn.T[i]: 0x5E000400 | imm5<<16 | rn<<5 | rd
+//                               imm5 uses the SOURCE lane
+// Q=1 throughout for the 128-bit forms observed.
+u32 a64LaneImm5(u32 esize, i32 lane)
+{
+    return (u32)esize * (u32)(2 * lane + 1);
+}
+
+bool encLaneMove(A64Ctx* c, Arm64Line* ln, str mnem)
+{
+    if (ln->nops != 2) return false;
+    Arm64Operand* a = &ln->ops[0];
+    Arm64Operand* b = &ln->ops[1];
+    if (a->kind != Arm64OpKind::OpReg || b->kind != Arm64OpKind::OpReg) return false;
+
+    bool aLane = a->hasLane && a->arrPresent;
+    bool bLane = b->hasLane && b->arrPresent;
+
+    // lane operand helper: esize bytes must be 1/2/4/8
+    // (checked per-branch)
+
+    if (aLane && !bLane && b->reg.cls <= (u8)Arm64RegCls::RcXzr)
+    {
+        // GPR -> vector element : INS (general) / mov alias
+        if (!regIsGpr(&b->reg)) return false;
+        u32 esize = (u32)a->arrSize;
+        if (esize != 1 && esize != 2 && esize != 4 && esize != 8) return false;
+        if (a->lane < 0 || a->lane >= (i32)(16 / esize)) return false;
+        u32 imm5 = a64LaneImm5(esize, a->lane);
+        u32 rn = a64RegNum(b, true);
+        u32 rd = a64RegNum(a, true);
+        u32 w = 0x4E000000u | (imm5 << 16) | 0x1C00u | (rn << 5) | rd;
+        c->insnOff = c->base + (u64)c->out->len;
+        return a64Ins(c, w);
+    }
+
+    if (!aLane && bLane && regIsGpr(&a->reg))
+    {
+        // vector element -> GPR : UMOV/SMOV/mov alias
+        u32 esize = (u32)b->arrSize;
+        if (esize != 1 && esize != 2 && esize != 4 && esize != 8) return false;
+        if (b->lane < 0 || b->lane >= (i32)(16 / esize)) return false;
+        u32 imm5 = a64LaneImm5(esize, b->lane);
+        u32 rn = a64RegNum(b, true);
+        u32 rd = a64RegNum(a, true);
+        if (mnem.equals("smov") || (mnem.equals("mov") && a64Is64(a)))
+        {
+            u32 Q = mnem.equals("smov") ? (a64Is64(a) ? 1 : 0) : 1;
+            u32 w = (Q << 30) | 0x0E000000u | (imm5 << 16) | 0x2C00u | (rn << 5) | rd;
+            c->insnOff = c->base + (u64)c->out->len;
+            return a64Ins(c, w);
+        }
+        // umov / mov w — 32-bit dest only
+        if (a64Is64(a)) return false;
+        u32 w = 0x0E000000u | (imm5 << 16) | 0x3C00u | (rn << 5) | rd;
+        c->insnOff = c->base + (u64)c->out->len;
+        return a64Ins(c, w);
+    }
+
+    if (aLane && bLane)
+    {
+        // element -> element : mov/ins Vd.T[i], Vn.T[j]
+        if (a->reg.cls != (u8)Arm64RegCls::RcV || b->reg.cls != (u8)Arm64RegCls::RcV)
+            return false;
+        u32 esize = (u32)a->arrSize;
+        if (esize != (u32)b->arrSize) return false;
+        if (esize != 1 && esize != 2 && esize != 4 && esize != 8) return false;
+        i32 maxLane = (i32)(16 / esize) - 1;
+        if (a->lane < 0 || a->lane > maxLane || b->lane < 0 || b->lane > maxLane)
+            return false;
+        u32 imm5 = a64LaneImm5(esize, a->lane);
+        u32 imm4 = (u32)esize * (u32)b->lane;
+        u32 rn = a64RegNum(b, true);
+        u32 rd = a64RegNum(a, true);
+        u32 w = 0x6E000000u | (imm5 << 16) | (imm4 << 11) | 0x400u | (rn << 5) | rd;
+        c->insnOff = c->base + (u64)c->out->len;
+        return a64Ins(c, w);
+    }
+
+    if (!aLane && bLane && regIsFp(&a->reg) && a->reg.cls != (u8)Arm64RegCls::RcV)
+    {
+        // scalar FP <- element : mov s4, v5.s[2]
+        if (b->reg.cls != (u8)Arm64RegCls::RcV) return false;
+        u32 esize = (u32)b->arrSize;
+        if (esize != 1 && esize != 2 && esize != 4 && esize != 8) return false;
+        if (b->lane < 0 || b->lane >= (i32)(16 / esize)) return false;
+        // scalar dst size must match element size
+        u32 dsize = (u32)a->reg.size;
+        if (dsize != esize) return false;
+        u32 imm5 = a64LaneImm5(esize, b->lane);
+        u32 rn = a64RegNum(b, true);
+        u32 rd = a64RegNum(a, true);
+        u32 w = 0x5E000000u | (imm5 << 16) | 0x400u | (rn << 5) | rd;
+        c->insnOff = c->base + (u64)c->out->len;
+        return a64Ins(c, w);
+    }
+    return false;
+}
 
 // ext Vd.T, Vn.T, Vm.T, #index — 0 Q 101110 0 Rm 0 imm4? Actually
 // ext v0.16b,v1.16b,v2.16b,#3 = 0x6E021820: Q=1, format:
@@ -2676,29 +3249,53 @@ bool encSimdPermute(A64Ctx* c, Arm64Line* ln, u32 opcode)
 // = 0x0E212820>>22&3 = 0x38&3=0? 0x0E212820/0x400000=0x38.48→&3=0 →
 // size=0 (b dest). src is h. sqxtn v.4h dest: 0x0E614820>>22&3=0x39&3=1
 // → size=1 (h dest). So size = dest element code.
-bool encSimdNarrow(A64Ctx* c, Arm64Line* ln, u32 opcode, bool isU,
-                   u32 destSize)
+// xtn/xtn2/sqxtn/sqxtun/uqxtn family: 0 Q U 01110 immh immb opc 0 Rn Rd
+// opc(bits15:11): xtn=5(U0), sqxtun=5(U1), sqxtn=9(U0), uqxtn=9(U1)
+// immh:immb fixed by src element: h(2B)→immh4/immb1, s(4B)→immh12/immb1
+// (d→s narrowing is not supported by GNU as)
+bool encSimdNarrow(A64Ctx* c, Arm64Line* ln, str mnem)
 {
     if (ln->nops != 2) return false;
     Arm64Operand* a = &ln->ops[0];
     Arm64Operand* b = &ln->ops[1];
     if (a->kind != Arm64OpKind::OpReg || b->kind != Arm64OpKind::OpReg) return false;
-    // dest arrangement gives Q; src just needs to be wider — we take Q
-    // from dest count*esize
-    if (!a->arrPresent) return false;
-    u64 dbits = (u64)a->arrSize * 8 * (u64)a->arrCount;
-    if (dbits != 64 && dbits != 128) return false;
-    u32 Q = dbits == 128 ? 1 : 0;
-    // destSize param carries the 4-bit opcode (xtn=2, sqxtn/uqxtn=4);
-    // element size comes from the destination arrangement instead
-    u32 destSize = 0;
-    if (a->arrSize == 2) destSize = 1;
-    else if (a->arrSize == 4) destSize = 2;
-    else if (a->arrSize == 8) destSize = 3;
+    if (!a->arrPresent || a->arrCount == 0 || !b->arrPresent || b->arrCount == 0)
+        return false;
+
+    bool is2 = false;
+    str base = mnem;
+    if (mnem.len > 0 && mnem.ptr[mnem.len - 1] == '2')
+    {
+        is2 = true;
+        base = str { (const u8*)mnem.ptr, mnem.len - 1 };
+    }
+    u32 opc;
+    bool isU;
+    if (base.equals("xtn"))      { opc = 5; isU = false; }
+    else if (base.equals("sqxtun")){ opc = 5; isU = true; }
+    else if (base.equals("sqxtn")) { opc = 9; isU = false; }
+    else if (base.equals("uqxtn")) { opc = 9; isU = true; }
+    else return false;
+
+    u32 eszA = (u32)a->arrSize;
+    u32 eszB = (u32)b->arrSize;
+    u32 cntA = a->arrCount;
+    u32 cntB = b->arrCount;
+    if (eszB != eszA * 2) return false;
+    if (is2 ? cntA != cntB * 2 : cntA != cntB) return false;
+    u64 dbits = (u64)eszA * (u64)cntA;
+    if (dbits != 8 && dbits != 16) return false;
+    u32 q = dbits == 16 ? 1 : 0;
+    u32 immh;
+    u32 immb;
+    if (eszB == 2)      { immh = 4;  immb = 1; }
+    else if (eszB == 4) { immh = 12; immb = 1; }
+    else return false;
+
     u32 rn = a64RegNum(b, false);
     u32 rd = a64RegNum(a, false);
-    u32 w = (Q << 30) | (isU ? (1u << 29) : 0) | (0x0E << 24) | (destSize << 22) |
-            (1u << 21) | (1u << 16) | (opcode << 12) | (0b10 << 10) | (rn << 5) | rd;
+    u32 w = (q << 30) | (isU ? (1u << 29) : 0) | (0x0E << 24) |
+            (immh << 19) | (immb << 16) | (opc << 11) | (rn << 5) | rd;
     c->insnOff = c->base + (u64)c->out->len;
     return a64Ins(c, w);
 }
@@ -3029,11 +3626,20 @@ bool encInstr(A64Ctx* c, Arm64Line* ln)
         return encLogRegN(c, &t, 1, true);
     }
 
+    // element/lane moves: ins/umov/smov and mov with [i] operands
+    if (m.equals("ins") || m.equals("umov") || m.equals("smov") ||
+        m.equals("mov"))
+        if (encLaneMove(c, ln, m)) return true;
+
     // --- mov/movz/movk/movn ---
     if (m.equals("mov") || m.equals("movz"))
     {
-        // mov = movz or orr alias; movz always wide-imm
-        if (ln->ops[1].kind == Arm64OpKind::OpImm) return encMovWide(c, ln, 2);
+        // mov = movz/movn or orr alias; movz always wide-imm
+        if (ln->ops[1].kind == Arm64OpKind::OpImm)
+        {
+            if (m.equals("movz")) return encMovWide(c, ln, 2);
+            return encMovAliasImm(c, ln);
+        }
         if (ln->ops[1].kind == Arm64OpKind::OpSym) return encMovWideSym(c, ln, 2);
         // mov xd,xn alias of orr xd,xzr,xn
         if (ln->nops == 2 && ln->ops[1].kind == Arm64OpKind::OpReg)
@@ -3129,15 +3735,13 @@ bool encInstr(A64Ctx* c, Arm64Line* ln)
     if (m.equals("ccmn")) return encCondCmp(c, ln, false);
 
     // --- carry / compare / negate aliases ---
-    if (m.equals("adc")) return encAddSubCarry(c, ln, false);
-    if (m.equals("sbc")) return encAddSubCarry(c, ln, true);
+    if (m.equals("adc")) return encAddSubCarry(c, ln, false, false);
+    if (m.equals("adcs")) return encAddSubCarry(c, ln, false, true);
+    if (m.equals("sbc")) return encAddSubCarry(c, ln, true, false);
+    if (m.equals("sbcs")) return encAddSubCarry(c, ln, true, true);
     if (m.equals("ngc") || m.equals("ngcs"))
     {
-        // ngc xd,xn = sbc xd,xzr,xn ; ngcs = sbcs (S=1)? GNU: ngcs is
-        // sbcs alias — we only have S=0 carry forms; emit sbc anyway? No:
-        // ngcs sets flags → needs S=1 which our carry encoder lacks.
-        // Treat ngcs as sbcs: not encodable here → fall through false.
-        if (m.equals("ngcs")) return false;
+        // ngc xd,xn = sbc xd,xzr,xn ; ngcs = sbcs xd,xzr,xn
         if (ln->nops != 2) return false;
         Arm64Operand[3] a;
         a[0] = ln->ops[0];
@@ -3148,7 +3752,7 @@ bool encInstr(A64Ctx* c, Arm64Line* ln)
         a[2] = ln->ops[1];
         Arm64Line t = a64LineNew();
         t.nops = 3; t.ops[0]=a[0]; t.ops[1]=a[1]; t.ops[2]=a[2];
-        return encAddSubCarry(c, &t, true);
+        return encAddSubCarry(c, &t, true, m.equals("ngcs"));
     }
     if (m.equals("cmp") || m.equals("cmn") || m.equals("tst"))
     {
@@ -3241,6 +3845,21 @@ bool encInstr(A64Ctx* c, Arm64Line* ln)
     {
         if (ln->nops != 2) return false;
         bool isU = m.equals("uxtb") || m.equals("uxth") || m.equals("uxtw");
+        // uxtw xd, xn == mov wd, wn (32-bit orr alias) — writing w
+        // already zero-extends into x
+        if (m.equals("uxtw"))
+        {
+            Arm64Operand wd = ln->ops[0];
+            if (wd.reg.cls == (u8)Arm64RegCls::RcX) wd.reg.cls = (u8)Arm64RegCls::RcW;
+            Arm64Operand[3] a;
+            a[0] = wd; a[1] = ln->ops[1];
+            a[2] = arm64OpEmpty(); a[2].kind = Arm64OpKind::OpReg;
+            a[2].reg.cls = (u8)Arm64RegCls::RcWzr; a[2].reg.num = 31;
+            a[2].hasReg = true;
+            Arm64Line t = a64LineNew();
+            t.nops = 3; t.ops[0] = a[0]; t.ops[1] = a[2]; t.ops[2] = a[1];
+            return encLogReg(c, &t, 1);
+        }
         // unsigned extends always encode as 32-bit ops (upper bits zero)
         bool is64 = isU ? false : a64Is64(&ln->ops[0]);
         i64 imms = 31;
@@ -3328,6 +3947,8 @@ bool encInstr(A64Ctx* c, Arm64Line* ln)
     }
 
     // --- scalar FP ---
+    if (!a64VecOps(ln))
+    {
     if (m.equals("fadd")) return encFP2Src(c, ln, 2);
     if (m.equals("fsub")) return encFP2Src(c, ln, 3);
     if (m.equals("fmul")) return encFP2Src(c, ln, 0);
@@ -3336,16 +3957,21 @@ bool encInstr(A64Ctx* c, Arm64Line* ln)
     if (m.equals("fmin")) return encFP2Src(c, ln, 5);
     if (m.equals("fmaxnm")) return encFP2Src(c, ln, 6);
     if (m.equals("fminnm")) return encFP2Src(c, ln, 7);
-    if (m.equals("fnmul")) return encFP2Src(c, ln, 8);
+    }
+    if (m.equals("fnmul")) return a64VecOps(ln) ? false : encFP2Src(c, ln, 8);
+    if (!a64VecOps(ln))
+    {
     if (m.equals("fabs")) return encFP1SrcT(c, ln, 0, 0x30);
     if (m.equals("fneg")) return encFP1SrcT(c, ln, 1, 0x10);
     if (m.equals("fsqrt")) return encFP1SrcT(c, ln, 1, 0x30);
     if (m.equals("frintn")) return encFP1SrcT(c, ln, 4, 0x10);
-    if (m.equals("frintp")) return encFP1SrcT(c, ln, 4, 0x18);
-    if (m.equals("frintm")) return encFP1SrcT(c, ln, 4, 0x20);
-    if (m.equals("frintz")) return encFP1SrcT(c, ln, 4, 0x28);
-    if (m.equals("frinta")) return encFP1SrcT(c, ln, 4, 0x30);
-    if (m.equals("frintx")) return encFP1SrcT(c, ln, 4, 0x38);
+    if (m.equals("frintp")) return encFP1SrcT(c, ln, 4, 0x30);
+    if (m.equals("frintm")) return encFP1SrcT(c, ln, 5, 0x10);
+    if (m.equals("frintz")) return encFP1SrcT(c, ln, 5, 0x30);
+    if (m.equals("frinta")) return encFP1SrcT(c, ln, 6, 0x10);
+    if (m.equals("frintx")) return encFP1SrcT(c, ln, 7, 0x10);
+    if (m.equals("frinti")) return encFP1SrcT(c, ln, 7, 0x30);
+    }
     if (m.equals("fcvt")) return encFCvt(c, ln);
     if (m.equals("fcmp")) return encFCmp(c, ln, false);
     if (m.equals("fcmpe")) return encFCmp(c, ln, true);
@@ -3383,11 +4009,27 @@ bool encInstr(A64Ctx* c, Arm64Line* ln)
     if (m.equals("dup")) return encDup(c, ln);
     if (m.equals("ext")) return encExt(c, ln);
     if (m.equals("uzp1")) return encSimdPermute(c, ln, 3);
-    if (m.equals("uzp2")) return encSimdPermute(c, ln, 7);
-    if (m.equals("zip1")) return encSimdPermute(c, ln, 11);
+    if (m.equals("uzp2")) return encSimdPermute(c, ln, 11);
+    if (m.equals("zip1")) return encSimdPermute(c, ln, 7);
     if (m.equals("zip2")) return encSimdPermute(c, ln, 15);
     if (m.equals("trn1")) return encSimdPermute(c, ln, 5);
-    if (m.equals("trn2")) return encSimdPermute(c, ln, 9);
+    if (m.equals("trn2")) return encSimdPermute(c, ln, 13);
+    if (m.equals("tbl")) return encTblTbx(c, ln, false);
+    if (m.equals("tbx")) return encTblTbx(c, ln, true);
+    if (m.equals("fcmeq") || m.equals("fcmge") || m.equals("fcmgt") ||
+        m.equals("facge") || m.equals("facgt"))
+        return encFpSimdCmp(c, ln, m);
+    if (m.equals("fmla") || m.equals("fmls") || m.equals("fmul") ||
+        m.equals("fdiv") || m.equals("fadd") || m.equals("fsub") ||
+        m.equals("fmax") || m.equals("fmin") || m.equals("fmaxnm") ||
+        m.equals("fminnm"))
+        return encSimdFpArith(c, ln, m);
+    if (m.equals("fabs") || m.equals("fneg") || m.equals("fsqrt") ||
+        m.equals("frintn") || m.equals("frintp") || m.equals("frintm") ||
+        m.equals("frintz") || m.equals("frinta") || m.equals("frintx") ||
+        m.equals("frinti") || m.equals("fcvtl") || m.equals("fcvtl2") ||
+        m.equals("fcvtn") || m.equals("fcvtn2"))
+        return encSimdFp2Misc(c, ln, m);
 
     if (m.equals("sshl") || m.equals("ushl"))
         return encSimdShiftVec(c, ln, 8, m.equals("ushl"));
@@ -3395,6 +4037,11 @@ bool encInstr(A64Ctx* c, Arm64Line* ln)
         return encSimdShiftVec(c, ln, 9, m.equals("uqshl"));
     if (m.equals("sqrshl") || m.equals("uqrshl"))
         return encSimdShiftVec(c, ln, 11, m.equals("uqrshl"));
+    // integer compare with zero immediate
+    if (m.equals("cmgt") || m.equals("cmge") || m.equals("cmeq") ||
+        m.equals("cmlt") || m.equals("cmle"))
+        if (encSimdCmpZero(c, ln, m)) return true;
+
     {
         // SIMD 3-same integer ops
         u32 sop = 0xFFFFFFFF; bool isU = false; u32 szov = 0xFF;
@@ -3445,47 +4092,21 @@ bool encInstr(A64Ctx* c, Arm64Line* ln)
         else if (m.equals("rev32")) mop = 7;
         else if (m.equals("rev64")) mop = 8;
         else if (m.equals("clz")) mop = 9;
-        else if (m.equals("saddlv")) mop = 6;
         if (mop != 0xFFFFFFFF)
         {
-            // across-lanes ops (addv etc) vs 2-misc distinguished by
-            // dest arrangement (scalar → across)
-            if (ln->ops[0].kind == Arm64OpKind::OpReg && !ln->ops[0].arrPresent &&
-                (m.equals("addv") || m.equals("saddlv") || m.equals("uaddlv") ||
-                 m.equals("smaxv") || m.equals("sminv") || m.equals("umaxv") || m.equals("uminv")))
-            {
-                u32 aop = m.equals("addv") ? 27 : m.equals("uaddlv") ? 27 :
-                          m.equals("saddlv") ? 27 : 0;
-                bool aU = m.equals("uaddlv") || m.equals("umaxv") || m.equals("uminv");
-                return encSimdAcross(c, ln, aop, aU);
-            }
             return encSimd2Misc(c, ln, mop, mU);
         }
-        if (m.equals("addv")) return encSimdAcross(c, ln, 27, false);
-        if (m.equals("uaddlv")) return encSimdAcross(c, ln, 27, true);
-        if (m.equals("smaxv") || m.equals("sminv") || m.equals("umaxv") || m.equals("uminv"))
-        {
-            u32 op = m.equals("smaxv") ? 20 : m.equals("sminv") ? 19 :
-                     m.equals("umaxv") ? 20 : 19;
-            bool u = m.equals("umaxv") || m.equals("uminv");
-            return encSimdAcross(c, ln, op, u);
-        }
+        // across-lane reductions (int + fp pairwise/across)
+        if (m.equals("addv") || m.equals("uaddlv") || m.equals("saddlv") ||
+            m.equals("smaxv") || m.equals("sminv") || m.equals("umaxv") ||
+            m.equals("uminv") || m.equals("faddp") || m.equals("fmaxp") ||
+            m.equals("fminp") || m.equals("fmaxnmp") || m.equals("fminnmp") ||
+            m.equals("fmaxnmv") || m.equals("fminnmv") || m.equals("fmaxv") ||
+            m.equals("fminv"))
+            return encSimdAcross(c, ln, m);
 
         // shift-by-immediate
-        u32 shop = 0xFFFFFFFF; bool sU = false;
-        if (m.equals("ushr")) { shop = 0; sU = true; }
-        else if (m.equals("sshr")) shop = 0;
-        else if (m.equals("shl")) shop = 2;
-        else if (m.equals("sri")) { shop = 4; sU = true; }
-        else if (m.equals("sli")) shop = 4;
-        else if (m.equals("urshr")) { shop = 1; sU = true; }
-        else if (m.equals("srshr")) shop = 1;
-        else if (m.equals("urshl")) { shop = 8; sU = true; }
-        else if (m.equals("srshl")) shop = 8;
-        else if (m.equals("sqrshl")) shop = 10;
-        else if (m.equals("uqrshl")) { shop = 10; sU = true; }
-        if (shop != 0xFFFFFFFF && ln->nops == 3)
-            return encSimdShiftImm(c, ln, shop, sU);
+        if (encSimdShiftImm(c, ln, m)) return true;
 
         // vector FP 3-same
         u32 fop = 0xFFFFFFFF;
@@ -3525,13 +4146,11 @@ bool encInstr(A64Ctx* c, Arm64Line* ln)
         }
     }
 
-    // widen/narrow: ushll/sxtl/xtn etc — implement xtn family
-    if (m.equals("xtn") || m.equals("xtn2")) return encSimdNarrow(c, ln, 2, false, 0xFF);
-    if (m.equals("sqxtun") || m.equals("sqxtun2")) return encSimdNarrow(c, ln, 2, true, 0xFF);
-    if (m.equals("sqxtn") || m.equals("sqxtn2")) return encSimdNarrow(c, ln, 4, false, 0xFF);
-    if (m.equals("uqxtn") || m.equals("uqxtn2")) return encSimdNarrow(c, ln, 4, true, 0xFF);
-    if (m.equals("sqxtun") || m.equals("sqxtun2")) return encSimdNarrow(c, ln, 21, true, 0xFF);
-    if (m.equals("shll") || m.equals("shll2")) return false; // TODO
+    // widen/narrow: xtn family
+    if (m.equals("xtn") || m.equals("xtn2") || m.equals("sqxtn") ||
+        m.equals("sqxtn2") || m.equals("sqxtun") || m.equals("sqxtun2") ||
+        m.equals("uqxtn") || m.equals("uqxtn2"))
+        return encSimdNarrow(c, ln, m);
 
     // system
     if (m.equals("nop")) return encSystem(c, ln, 0xD503201F);
@@ -3699,6 +4318,29 @@ bool a64Directive(AsmObject* obj, AsmBytes* cur, Arm64Line* ln, A64Ctx* c,
                   i32* secIdx)
 {
     str d = ln->mnem;
+    // string directives take raw quoted literals, not operands
+    if (d.equals(".ascii") || d.equals(".asciz") || d.equals(".string"))
+    {
+        AsmLexer lx = AsmLexer::new(ln->dargs, ln->lineNo);
+        lx.hashIsComment = false;
+        bool anyStr = false;
+        while (true)
+        {
+            lx.skipSpace();
+            if (lx.done()) break;
+            str s;
+            AsmParseError serr = {};
+            serr.msg = "";
+            if (!lx.lexQuoted(&s, &serr)) return false;
+            anyStr = true;
+            for (usize i = 0; i < s.len; i++)
+                if (!cur->u8b(s.ptr[i])) return false;
+            if (!d.equals(".ascii") && !cur->u8b(0)) return false;
+            lx.skipSpace();
+            if (!lx.done() && !lx.eat(',')) return false;
+        }
+        return anyStr;
+    }
     Arm64Operand[8] ops;
     AsmParseError perr = {};
     perr.msg = "";
@@ -3903,6 +4545,149 @@ bool a64AssembleLine(AsmObject* obj, Arm64Line* ln, i32* secIdx)
     return encInstr(&c, ln);
 }
 
+// ------------------------------------------------------------------
+// local-relocation resolution: like GNU as, patch same-section symbol
+// references directly into the insn/data word and drop the reloc.
+// ------------------------------------------------------------------
+
+u32 a64Ld32(AsmBytes* b, u64 at)
+{
+    return (u32)b->data[at] | ((u32)b->data[at + 1] << 8) |
+           ((u32)b->data[at + 2] << 16) | ((u32)b->data[at + 3] << 24);
+}
+
+void a64St32(AsmBytes* b, u64 at, u32 w)
+{
+    b->data[at] = (u8)(w & 0xFF);
+    b->data[at + 1] = (u8)((w >> 8) & 0xFF);
+    b->data[at + 2] = (u8)((w >> 16) & 0xFF);
+    b->data[at + 3] = (u8)((w >> 24) & 0xFF);
+}
+
+void a64St64(AsmBytes* b, u64 at, u64 v)
+{
+    for (u32 i = 0; i < 8; i++) b->data[at + (u64)i] = (u8)((v >> ((u64)i * 8)) & 0xFF);
+}
+
+// returns true when the reloc was resolved in place
+bool a64ResolveReloc(AsmObject* obj, AsmReloc* r)
+{
+    i32 si = asmFindSym(obj, r->symbol);
+    if (si < 0) return false;
+    AsmSymbol* s = &obj->syms[si];
+    if (!s->defined || s->section != r->section) return false;
+    AsmBytes* buf = a64Sec(obj, r->section);
+    if (buf == null) return false;
+    i64 S = (i64)s->value + r->addend;
+    i64 P = (i64)r->offset;
+    u64 at = r->offset;
+    Arm64RelocKind k = (Arm64RelocKind)r->kind;
+    u32 w;
+    switch (k)
+    {
+        Arm64RelocKind::A64_Jump26,
+        Arm64RelocKind::A64_Call26 =>
+        {
+            i64 d = S - P;
+            if (d & 3) return false;
+            i64 i26 = d >> 2;
+            if (i26 < -(1 << 25) || i26 >= (1 << 25)) return false;
+            w = a64Ld32(buf, at);
+            a64St32(buf, at, (w & 0xFC000000u) | ((u32)i26 & 0x3FFFFFFu));
+            return true;
+        }
+        Arm64RelocKind::A64_CondBr19,
+        Arm64RelocKind::A64_LdPrel19 =>
+        {
+            i64 d = S - P;
+            if (d & 3) return false;
+            i64 i19 = d >> 2;
+            if (i19 < -(1 << 18) || i19 >= (1 << 18)) return false;
+            w = a64Ld32(buf, at);
+            a64St32(buf, at, (w & 0xFF00001Fu) | (((u32)i19 & 0x7FFFFu) << 5));
+            return true;
+        }
+        Arm64RelocKind::A64_TstBr14 =>
+        {
+            i64 d = S - P;
+            if (d & 3) return false;
+            i64 i14 = d >> 2;
+            if (i14 < -(1 << 13) || i14 >= (1 << 13)) return false;
+            w = a64Ld32(buf, at);
+            a64St32(buf, at, (w & 0xFFF8001Fu) | (((u32)i14 & 0x3FFFu) << 5));
+            return true;
+        }
+        Arm64RelocKind::A64_AdrLo21 =>
+        {
+            i64 d = S - P;
+            if (d < -(1 << 20) || d >= (1 << 20)) return false;
+            w = a64Ld32(buf, at);
+            a64St32(buf, at, (w & 0x9F00001Fu) |
+                    (((u32)d & 3u) << 29) | ((((u32)d >> 2) & 0x7FFFFu) << 5));
+            return true;
+        }
+        Arm64RelocKind::A64_AdrHi21 =>
+        {
+            i64 pg = (S >> 12) - (P >> 12);
+            if (pg < -(1 << 20) || pg >= (1 << 20)) return false;
+            w = a64Ld32(buf, at);
+            a64St32(buf, at, (w & 0x9F00001Fu) |
+                    (((u32)pg & 3u) << 29) | ((((u32)pg >> 2) & 0x7FFFFu) << 5));
+            return true;
+        }
+        Arm64RelocKind::A64_AddLo12,
+        Arm64RelocKind::A64_Ldst8Lo12,
+        Arm64RelocKind::A64_Ldst16Lo12,
+        Arm64RelocKind::A64_Ldst32Lo12,
+        Arm64RelocKind::A64_Ldst64Lo12,
+        Arm64RelocKind::A64_Ldst128Lo12 =>
+        {
+            w = a64Ld32(buf, at);
+            a64St32(buf, at, (w & 0xFFC003FFu) | (((u32)S & 0xFFFu) << 10));
+            return true;
+        }
+        Arm64RelocKind::A64_MovwG0,
+        Arm64RelocKind::A64_MovwG1,
+        Arm64RelocKind::A64_MovwG2,
+        Arm64RelocKind::A64_MovwG3 =>
+        {
+            u32 sh = (((u32)k - (u32)Arm64RelocKind::A64_MovwG0) * 16);
+            w = a64Ld32(buf, at);
+            a64St32(buf, at, (w & 0xFFE0001Fu) | ((((u32)(S >> (i64)sh)) & 0xFFFFu) << 5));
+            return true;
+        }
+        Arm64RelocKind::A64_Abs64 =>
+        {
+            a64St64(buf, at, (u64)S);
+            return true;
+        }
+        Arm64RelocKind::A64_Abs32 =>
+        {
+            a64St32(buf, at, (u32)S);
+            return true;
+        }
+        Arm64RelocKind::A64_Prel32 =>
+        {
+            a64St32(buf, at, (u32)(S - P));
+            return true;
+        }
+        else => { return false; }
+    }
+}
+
+// compact the reloc array, dropping entries resolved by a64ResolveReloc
+void a64ResolveLocalRelocs(AsmObject* obj)
+{
+    u32 w = 0;
+    for (u32 i = 0; i < obj->nrelocs; i++)
+    {
+        if (a64ResolveReloc(obj, &obj->relocs[i])) continue;
+        obj->relocs[w] = obj->relocs[i];
+        w++;
+    }
+    obj->nrelocs = w;
+}
+
 // public entry: assemble AArch64 GNU-as text → AsmObject
 pub bool a64AssembleText(str text, AsmObject* obj, i32* errSec, u32* errOff,
                      u32* errLine, str* errMsg)
@@ -3972,7 +4757,11 @@ pub bool a64AssembleText(str text, AsmObject* obj, i32* errSec, u32* errOff,
         }
         if (pos >= text.len) break;
     }
-    if (ok) { *errLine = 0; *errMsg = ""; }
+    if (ok)
+    {
+        a64ResolveLocalRelocs(obj);
+        *errLine = 0; *errMsg = "";
+    }
     else
     {
         *errSec = secIdx;

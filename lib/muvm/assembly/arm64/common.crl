@@ -185,14 +185,18 @@ pub enum Arm64OpKind
     OpReg,     // register (gpr/fp/v) possibly with arrangement
     OpImm,     // #imm — numeric or char literal or fp literal bits
     OpMem,     // [ ... ]
-    OpSym      // bare symbol — branch target or address
+    OpSym,     // bare symbol — branch target or address
+    OpRegList  // {v1.16b-v3.16b} — tbl/tbx register list
 }
 
 // extend option codes, same numbering as the ARM "option" field
 pub enum Arm64Ext
 {
     ExtNone = 0,
-    ExtUXTB = 0,
+    // ExtUXTB is 8, not 0: the low 3 bits still encode the ARM option
+    // value (UXTB=0) while keeping "has extend" distinguishable from
+    // ExtNone in != 0 tests
+    ExtUXTB = 8,
     ExtUXTH = 1,
     ExtUXTW = 2,
     ExtUXTX = 3,
@@ -273,6 +277,10 @@ pub struct Arm64Operand
     bool hasLane;
     i32 lane2;
     bool hasLane2;
+
+    // OpRegList payload: base register number + list length; arrangement
+    // stored in arrSize/arrCount like a normal vector operand
+    u32 listLen;
 }
 
 pub struct Arm64Line
@@ -325,7 +333,8 @@ pub Arm64Operand arm64OpEmpty()
         .lane = 0,
         .hasLane = false,
         .lane2 = 0,
-        .hasLane2 = false
+        .hasLane2 = false,
+        .listLen = 0
     };
 }
 
@@ -667,10 +676,10 @@ bool parseMemOperand(AsmLexer* lx, Arm64Operand* op, AsmParseError* err)
             if (!parseRegName(rname, &op->shiftReg)) { err->msg = "bad shift register"; err->lineNo = lx->lineNo; return false; }
             op->shiftIsReg = true;
         }
-        else if (!lx->lexNumber(&amt)) { err->msg = "bad shift amount"; err->lineNo = lx->lineNo; return false; }
+        else if (!lx->lexNumber(&amt) && ex == 0) { err->msg = "bad shift amount"; err->lineNo = lx->lineNo; return false; }
         else op->shiftAmt = (u32)amt;
         if (sh != 0) op->shift = sh;
-        if (ex != 0) op->ext = ex;
+        if (ex != 0) op->ext = ex | 0x80;
     }
 
     lx->skipSpace();
@@ -809,13 +818,20 @@ bool tryAttachModifier(AsmLexer* lx, Arm64Operand* op, AsmParseError* err)
     i64 amt = 0;
     bool isReg = false;
     Arm64Reg r;
+    bool haveNum = false;
     if (isAlpha(lx->peek()) || lx->peek() == '_' || lx->peek() == 'x' || lx->peek() == 'w')
     {
         str rname = lx->lexIdent();
-        if (!parseRegName(rname, &r)) { lx->pos = save; return true; }
-        isReg = true;
+        if (!parseRegName(rname, &r))
+        {
+            if (ex == 0) { lx->pos = save; return true; }
+        }
+        else { isReg = true; haveNum = true; }
     }
-    else if (!lx->lexNumber(&amt)) { lx->pos = save; return true; }
+    else if (lx->lexNumber(&amt)) haveNum = true;
+    // extend keywords may appear bare (", sxtw" means #0); shifts need
+    // an explicit amount or register
+    if (!haveNum && ex == 0) { lx->pos = save; return true; }
     if (sh != 0)
     {
         op->shift = sh;
@@ -825,7 +841,7 @@ bool tryAttachModifier(AsmLexer* lx, Arm64Operand* op, AsmParseError* err)
     }
     else
     {
-        op->ext = ex;
+        op->ext = ex | 0x80;
         op->extAmt = (u32)amt;
     }
     return true;
@@ -833,6 +849,100 @@ bool tryAttachModifier(AsmLexer* lx, Arm64Operand* op, AsmParseError* err)
 
 // one operand at the cursor: mem [...], #-imm/sym, register (with
 // optional .arr), or bare symbol/number (branch targets).
+// {v1.16b} / {v1.16b-v3.16b} / {v1.16b, v2.16b, ...} — tbl/tbx lists.
+// All entries must share one arrangement; we store base reg num, the
+// arrangement, and the entry count.
+bool parseRegListOperand(AsmLexer* lx, Arm64Operand* op, AsmParseError* err)
+{
+    lx->skipSpace();
+    if (!lx->eat('{')) { err->msg = "expected '{'"; err->lineNo = lx->lineNo; return false; }
+    u8 baseNum = 0;
+    u8 arrSize = 0;
+    u32 arrCount = 0;
+    u32 count = 0;
+    u8 firstNum = 0;
+    bool first = true;
+    while (true)
+    {
+        lx->skipSpace();
+        usize start = lx->pos;
+        while (lx->pos < lx->src.len)
+        {
+            u8 ch = lx->src.ptr[lx->pos];
+            if (isAlnum(ch) || ch == '_' || ch == '.' || ch == '$') lx->pos++;
+            else break;
+        }
+        str text = str { (const u8*)(lx->src.ptr + start), lx->pos - start };
+        if (text.isEmpty()) { err->msg = "expected register in list"; err->lineNo = lx->lineNo; return false; }
+        Arm64Operand tmp = arm64OpEmpty();
+        AsmParseError rerr = {};
+        rerr.msg = "";
+        if (!parseRegOperandText(text, &tmp, &rerr, lx->lineNo) ||
+            tmp.reg.cls != (u8)Arm64RegCls::RcV || !tmp.arrPresent || tmp.hasLane)
+        {
+            err->msg = "bad register in list"; err->lineNo = lx->lineNo; return false;
+        }
+        if (first)
+        {
+            firstNum = tmp.reg.num;
+            arrSize = tmp.arrSize;
+            arrCount = tmp.arrCount;
+            first = false;
+        }
+        else if (tmp.arrSize != arrSize || tmp.arrCount != arrCount)
+        {
+            err->msg = "mixed arrangements in register list"; err->lineNo = lx->lineNo; return false;
+        }
+        // range form: vA.T-vB.T — consume '-' and following reg
+        lx->skipSpace();
+        if (!lx->done() && lx->peek() == '-' && lx->pos + 1 < lx->src.len &&
+            lx->src.ptr[lx->pos + 1] != '>' )
+        {
+            lx->pos++;
+            lx->skipSpace();
+            usize s2 = lx->pos;
+            while (lx->pos < lx->src.len)
+            {
+                u8 ch = lx->src.ptr[lx->pos];
+                if (isAlnum(ch) || ch == '_' || ch == '.' || ch == '$') lx->pos++;
+                else break;
+            }
+            str t2 = str { (const u8*)(lx->src.ptr + s2), lx->pos - s2 };
+            Arm64Operand tmp2 = arm64OpEmpty();
+            AsmParseError rerr2 = {};
+            rerr2.msg = "";
+            if (!parseRegOperandText(t2, &tmp2, &rerr2, lx->lineNo) ||
+                tmp2.reg.cls != (u8)Arm64RegCls::RcV || tmp2.reg.num <= tmp.reg.num ||
+                tmp2.arrSize != arrSize || tmp2.arrCount != arrCount)
+            {
+                err->msg = "bad register range"; err->lineNo = lx->lineNo; return false;
+            }
+            count += (u32)(tmp2.reg.num - tmp.reg.num) + 1;
+            // a range must be the whole list content-wise for tbl? GNU
+            // allows {v1-v3, v5}: we just accumulate
+        }
+        else
+        {
+            count++;
+        }
+        lx->skipSpace();
+        if (!lx->done() && lx->peek() == ',') { lx->pos++; continue; }
+        break;
+    }
+    lx->skipSpace();
+    if (!lx->eat('}')) { err->msg = "expected '}'"; err->lineNo = lx->lineNo; return false; }
+    if (count == 0 || count > 4) { err->msg = "bad register list length"; err->lineNo = lx->lineNo; return false; }
+    op->kind = Arm64OpKind::OpRegList;
+    op->reg.cls = (u8)Arm64RegCls::RcV;
+    op->reg.num = firstNum;
+    op->arrSize = arrSize;
+    op->arrCount = arrCount;
+    op->arrPresent = true;
+    op->listLen = count;
+    op->hasReg = true;
+    return true;
+}
+
 pub bool parseArm64Operand(AsmLexer* lx, Arm64Operand* op, AsmParseError* err)
 {
     lx->skipSpace();
@@ -842,6 +952,11 @@ pub bool parseArm64Operand(AsmLexer* lx, Arm64Operand* op, AsmParseError* err)
     if (c == '[')
     {
         return parseMemOperand(lx, op, err);
+    }
+
+    if (c == '{')
+    {
+        return parseRegListOperand(lx, op, err);
     }
 
     if (c == '#')
@@ -875,13 +990,14 @@ pub bool parseArm64Operand(AsmLexer* lx, Arm64Operand* op, AsmParseError* err)
     // identifier: register (with optional .arr) or bare symbol
     if (isAlpha(c) || c == '_' || c == '.')
     {
-        // need the raw text incl. .arr — lexIdent stops at '.', so
-        // rescan manually
+        // need the raw text incl. .arr and [lane] — lexIdent stops at
+        // '.', so rescan manually
         usize start = lx->pos;
         while (lx->pos < lx->src.len)
         {
             u8 ch = lx->src.ptr[lx->pos];
-            if (isAlnum(ch) || ch == '_' || ch == '.' || ch == '$') lx->pos++;
+            if (isAlnum(ch) || ch == '_' || ch == '.' || ch == '$' ||
+                ch == '[' || ch == ']' || ch == ':') lx->pos++;
             else break;
         }
         str text = str { (const u8*)(lx->src.ptr + start), lx->pos - start };
