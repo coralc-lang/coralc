@@ -29,6 +29,7 @@
 - [x] Rotate width fixes: x86_64 rol/ror suffix by operand width, arm64 w-regs + 32-bit modulus for <=32-bit (both were 64-bit-only, corrupting narrow rotates); runtime-verified x86/arm64/wasm
 - [x] Test infra: muvm_tool --only <pass> single-pass isolation; run_aa.sh + run_pass.sh golden runners; cases_aa(17)/cases_dse(12)/cases_macro_fusion(8)/cases_fcmp_const(24) fixtures, runtime-verified on x86_64/arm64/wasm32
 - [x] fcmp backend fixes: x86_64 (fcmpPred+PF mask ported from wallvm), arm64 (verified NZCV: Olt->mi, Ole/One combos, Uge->hs), wasm32 (Ueq/One were miscompiled — also wrong in wallvm)
+- [x] Optimizer audit (physical, per-pass isolation vs --noopt baseline, diffs read): fixed fold same-arm select (check order), loop_cse was dead (reordered after licm + isSafeToSpeculate alloca/global-rooted pointers only + gVerbose gate), loop_detect now detects single-block (self-edge) loops — licm/loop_cse/unroll/loop_canon all benefit; new select_sidefx + involution fixtures (zero coverage before); verify-each 508 runs clean, run.sh 140/0
 - [ ] Audit CFG-mutating passes for duplicate-predecessor/parallel-edge hazards (jump_thread, branchprop, licm, loop_cse, sccp, gvn, mem2reg, ipa_cp) — verify-each over full corpus
 - [ ] Port remaining wallvm passes: memory_ssa + machine_opt (store-to-load forwarding via AA), loop_distribute, loop_interchange
 - [x] range: 12 golden fixtures + 54 runtime checks; fixed 3 wallvm bugs in port — u64-wrap gap check, || vs && unbounded sentinels (unsound union merges), insert-before-reject infinite loop
