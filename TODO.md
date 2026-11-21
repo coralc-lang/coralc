@@ -25,10 +25,13 @@
 
 ## Optimizer (muvm)
 - [x] Inlining policy: hints-only at O0/O1/Debug, cost model at O2/O3; simplifycfg flattens post-inline CFG; parallel-edge phi bug fixed
+- [x] Ported: unroll, tco, sroa, select_to_branch, comm_canon, idempotent, involution, cast_elim, dse, macro_fusion, alias_analysis (points-to + escape marking, published to FunctionAnalysisCache)
+- [x] Test infra: muvm_tool --only <pass> single-pass isolation; run_aa.sh + run_pass.sh golden runners; cases_aa(17)/cases_dse(12)/cases_macro_fusion(8)/cases_fcmp_const(24) fixtures, runtime-verified on x86_64/arm64/wasm32
+- [x] fcmp backend fixes: x86_64 (fcmpPred+PF mask ported from wallvm), arm64 (verified NZCV: Olt->mi, Ole/One combos, Uge->hs), wasm32 (Ueq/One were miscompiled — also wrong in wallvm)
 - [ ] Audit CFG-mutating passes for duplicate-predecessor/parallel-edge hazards (jump_thread, branchprop, licm, loop_cse, sccp, gvn, mem2reg, ipa_cp) — verify-each over full corpus
-- [ ] Port wallvm passes (self-contained first): unroll, tco, dse, sroa, idiom, range, macro_fusion, select_to_branch, branch_inversion, branch_factoring
-- [ ] Port wallvm passes (need infra): memory_ssa + alias_analysis (for dse/sroa), comm_canon/idempotent/involution/lex_canon/cast_elim/cse (check overlap with algebraic/gvn first)
-- [ ] Port wallvm passes (backend-adjacent, decide fit for fast backend): lower_phis, stack_layout, machine_opt, peephole, simd_vec, validate
+- [ ] Port remaining wallvm passes: idiom (rotl/bswap/select->smin/smax/abs), range (interval analysis), memory_ssa + machine_opt (store-to-load forwarding via AA), loop_distribute, loop_interchange
+- [ ] Deliberately skipped as unsound: branch_inversion (CFG corruption), branch_factoring (incomplete CFG check), lex_canon (orphan chains; sort covered by comm_canon), borrowcheck (diagnostic-only, not an optimization)
+- [ ] Port wallvm passes (backend-adjacent, decide fit for fast backend): lower_phis, stack_layout, peephole (only unique patterns x+x->shl, x*-1->neg — already added to algebraic), simd_vec (deferred — vectors scalarized per earlier decision), validate
 
 ## Attributes
 - [ ] Audit which attributes exist vs are honored; add missing attributes and honor them through sema/IR/backend
