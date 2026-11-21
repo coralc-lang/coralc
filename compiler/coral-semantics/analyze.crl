@@ -25,10 +25,11 @@ use mono {
     instantiate
 };
 use diag::engine { DiagnosticEngine, DiagList };
-use build::manifest { ModuleManifest, bLoadManifest, bManifestPlatRoot };
+use build::manifest { ModuleManifest, bLoadManifestFile, bManifestPlatRoot };
 use build::arena { Arena, ArenaBlock };
 import std::mman { alloc, dealloc, realloc };
-import platform::libc { write, getenv };
+import platform::libc { write, getenv, realpath, getcwd, _fullpath };
+import core::cchar { cchar };
 
 // stderr boundary for loader diagnostics: str in, no raw ptr+len at call sites
 void errWrite(str s) { write(2, (const cchar*)s.ptr, s.len); }
@@ -233,6 +234,65 @@ u8* libNormOwned(u8* p)
     return norm;
 }
 
+/* canonical spelling of a resolved module path: realpath collapses
+ * `.`/`..`, symlinks (compiler/lib -> ../lib) and makes every root
+ * spelling of the same file identical, so libHas dedup and the C-name
+ * mangle agree. Falls back to the lexical norm when realpath fails
+ * (file vanished between probe and resolve). Returned buffer is
+ * malloc'd; caller frees with dealloc<u8>. */
+u8* libCanonOwned(u8* p)
+{
+    if (p == null) return null;
+    u8* buf = alloc<u8>(4096);
+    u8* cbuf = alloc<u8>(4096);
+    if (buf == null || cbuf == null)
+    {
+        if (buf != null) dealloc<u8>(buf);
+        if (cbuf != null) dealloc<u8>(cbuf);
+        dealloc<u8>(p);
+        return null;
+    }
+    /* flag(host) selects at parse time: a Windows-built compiler calls
+     * _fullpath, everything else realpath — the unused arm never reaches
+     * codegen so only one CRT symbol is ever referenced */
+    cchar* r = flag(host) {
+        windows => _fullpath((cchar*)buf, (const cchar*)p, 4096),
+        else    => realpath((const cchar*)p, (cchar*)buf),
+    };
+    if (r == null)
+    {
+        dealloc<u8>(buf);
+        dealloc<u8>(cbuf);
+        return libNormOwned(p);
+    }
+    /* prefer a CWD-relative spelling when the canonical path lives under
+     * the working directory — keeps diagnostics and mangled names short */
+    u8* cwd = (u8*)getcwd((cchar*)cbuf, 4096);
+    usize cn = cwd != null ? libLen(cwd) : 0;
+    u8* rp = (u8*)r;
+    usize rn = libLen(rp);
+    usize skip = 0;
+    if (cwd != null && cn > 0 && rn > cn + 1 && rp[cn] == 47)
+    {
+        bool pre = true;
+        usize q = 0;
+        while (q < cn) { if (rp[q] != cwd[q]) { pre = false; break; } q++; }
+        if (pre) skip = cn + 1;
+    }
+    usize n = rn - skip;
+    u8* out = alloc<u8>(n + 1);
+    if (out != null)
+    {
+        usize i = 0;
+        while (i < n) { out[i] = rp[skip + i]; i++; }
+        out[n] = 0;
+    }
+    dealloc<u8>(buf);
+    dealloc<u8>(cbuf);
+    dealloc<u8>(p);
+    return out;
+}
+
 /* file-scope `#[[name]]` present? `noprelude` carries no attrBits bit:
  * it only disables the prelude, nothing else keys off it */
 bool libFileHasAttr(File* f, AstContext* ctx, str name)
@@ -363,19 +423,21 @@ bool libManArena(LibLoader* L)
     return true;
 }
 
-/* manifest for lib dir `dir` (cstr), cached; null when absent */
-ModuleManifest* libManForDir(LibLoader* L, u8* dir)
+/* manifest for an exact file path (cstr, NUL-terminated), cached; null
+ * when absent. Keys are the full "dir/file" strings so module manifests
+ * activated through different `extends` targets never collide. */
+ModuleManifest* libManForPath(LibLoader* L, u8* path)
 {
-    usize dl = libLen(dir);
+    usize dl = libLen(path);
     u32 i = 0;
     while (i < L->manLen)
     {
-        if (libBytesEq(L->manDirs[i], libLen(L->manDirs[i]), dir, dl))
+        if (libBytesEq(L->manDirs[i], libLen(L->manDirs[i]), path, dl))
             return L->manVals[i];
         i++;
     }
     if (!libManArena(L)) return null;
-    ModuleManifest* m = bLoadManifest(&L->manArena, Slice::from(dir, dl));
+    ModuleManifest* m = bLoadManifestFile(&L->manArena, Slice::from(path, dl));
     if (L->manLen >= L->manCap)
     {
         u32 newCap = L->manCap == 0 ? 16 : L->manCap * 2;
@@ -386,15 +448,33 @@ ModuleManifest* libManForDir(LibLoader* L, u8* dir)
         L->manVals = nv;
         L->manCap = newCap;
     }
-    /* arena-owned copy of the dir key so transient probe paths can go */
+    /* arena-owned copy of the path key so transient probe paths can go */
     u8* kd = (u8*)L->manArena.alloc(dl + 1, 1);
     if (kd == null) return m;
     usize k = 0;
-    while (k < dl) { kd[k] = dir[k]; k++; }
+    while (k < dl) { kd[k] = path[k]; k++; }
     kd[dl] = 0;
     L->manDirs[L->manLen] = kd;
     L->manVals[L->manLen] = m;
     L->manLen++;
+    return m;
+}
+
+/* manifest for lib dir `dir` (cstr), cached; null when absent */
+ModuleManifest* libManForDir(LibLoader* L, u8* dir)
+{
+    usize dl = libLen(dir);
+    u8* path = alloc<u8>(dl + 32);
+    if (path == null) return null;
+    usize n = 0;
+    usize i = 0;
+    while (i < dl) { path[n] = dir[i]; n++; i++; }
+    str suf = "/manifest.crlb";
+    i = 0;
+    while (i < suf.len) { path[n] = suf.ptr[i]; n++; i++; }
+    path[n] = 0;
+    ModuleManifest* m = libManForPath(L, path);
+    dealloc<u8>(path);
     return m;
 }
 
@@ -470,8 +550,25 @@ ModuleManifest* libModuleManifest(LibLoader* L, u8* libroot, usize librootLen,
             while (k < relLen) { if (mp.ptr[k] != rel[k]) { eq = false; break; } k++; }
             if (eq)
             {
-                if (!reg->modHasMan[i]) return null;
-                ModuleManifest* m = libManForDir(L, modDir);
+                /* activated only through the registry entry's `extends`
+                 * target — the file it names (default manifest.crlb)
+                 * is the module's manifest */
+                Slice ex = reg->modExtends[i];
+                if (ex.ptr == null) return null;
+                usize exLen = ex.len > 0 ? ex.len : 13;
+                u8* exBuf = ex.len > 0 ? ex.ptr : (u8*)C"manifest.crlb";
+                usize mpLen = mdLen + 1 + exLen;
+                u8* mp = alloc<u8>(mpLen + 1);
+                if (mp == null) return null;
+                usize w = 0;
+                usize q = 0;
+                while (q < mdLen) { mp[w] = modDir[q]; w++; q++; }
+                mp[w] = 47; w++;
+                q = 0;
+                while (q < exLen) { mp[w] = exBuf[q]; w++; q++; }
+                mp[w] = 0;
+                ModuleManifest* m = libManForPath(L, mp);
+                dealloc<u8>(mp);
                 if (m != null && m->present && !m->parseFailed && !m->flagsMerged)
                 {
                     m->flagsMerged = true;
@@ -665,7 +762,7 @@ u8* libResolve(LibLoader* L, u8* nsPtr, usize nsLen)
                 usize vi = 0;
                 while (vi < vl) { copy[vi] = L->modVals[mi].ptr[vi]; vi++; }
                 copy[vl] = 0;
-                return libNormOwned(copy);
+                return libCanonOwned(copy);
             }
             mi++;
         }
@@ -695,7 +792,7 @@ u8* libResolve(LibLoader* L, u8* nsPtr, usize nsLen)
                     usize vi = 0;
                     while (vi < mv.len) { copy[vi] = mv.ptr[vi]; vi++; }
                     copy[mv.len] = 0;
-                    return libNormOwned(copy);
+                    return libCanonOwned(copy);
                 }
                 mi++;
             }
@@ -809,7 +906,7 @@ u8* libResolve(LibLoader* L, u8* nsPtr, usize nsLen)
     dealloc<LibSeg>(segs);
     if (base != null) dealloc<u8>(base);
     if (gRoot != null) dealloc<u8>(gRoot);
-    return libNormOwned(result);
+    return libCanonOwned(result);
 }
 
 bool libHas(LibLoader* L, u8* path)
