@@ -1,8 +1,11 @@
 #[[no_drop_all]]
 import muvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrType, IrTypeKind, IrValueKind, FunctionAnalysisCache };
 import muvm::irOps { IrOpcode, IrICmpPred };
+import std::ios { eprintln };
 import muvm::passes::alias_analysis { AliasAnalysis };
 import muvm::passes::loop_detect { IrLoop, irLoopDetectNatural, irLoopDestroy };
+import muvm::irMetadata { hasFuncAttr, funcAttrInt, getInstMetadata, find,
+                          MetadataSet, MetadataEntry, MetadataValueKind };
 import std::mman { alloc, dealloc };
 
 // SIMD auto-vectorization pass, a constant-trip-count widening vectorizer.
@@ -107,6 +110,14 @@ pub struct AutoVectorizePass
     // aggressiveness feature — and a higher profitability bar so only
     // clearly-winning loops are touched.
     bool cheap;
+    // function carried #[[vectorise]]: bypasses the cheap tier (a user
+    // request outranks the cost model, same as hot/inline hints)
+    bool markedFunc;
+    // #[[vectorise]] on a specific loop stmt — same request semantics,
+    // scoped to one natural loop
+    bool curLoopMarked;
+    // #[[vectorise(N)]] preferred width in lanes, 0 = no preference
+    u32 widthCap;
 
     static AutoVectorizePass new(IrContext* ctx, bool cheap)
     {
@@ -116,7 +127,10 @@ pub struct AutoVectorizePass
             .ownAA = false,
             .vecOps = 0,
             .peepholes = 0,
-            .cheap = cheap
+            .cheap = cheap,
+            .markedFunc = false,
+            .curLoopMarked = false,
+            .widthCap = 0
         };
     }
 
@@ -124,6 +138,16 @@ pub struct AutoVectorizePass
     {
         self.vecOps = 0;
         self.peepholes = 0;
+
+        // #[[novector]] / vectorize.enable=false: hard opt-out at every
+        // tier, a user "do not touch" beats both cost models.
+        if (hasFuncAttr(func, "novector")) return false;
+
+        // #[[vectorise]]: a user request — runs the full transform even
+        // when this entry point is the cheap tier, and is what lets the
+        // O0/O1 marked-only entry point fire at all.
+        self.markedFunc = hasFuncAttr(func, "vectorize");
+        self.widthCap = (u32)funcAttrInt(func, "vectorize.width", 0);
 
         // Check for cached AA first. aaOwned must live at function scope: the
         // else-branch takes its address for the whole run(), and deinit() reads
@@ -145,13 +169,22 @@ pub struct AutoVectorizePass
         }
 
         bool changed = false;
+        eprintln("simd_vec run cheap={} marked={}", self.cheap, self.markedFunc);
 
         IrLoop** loops = irLoopDetectNatural(func);
+        u32 nloops = 0; if (loops != null) { while (loops[nloops] != null) nloops++; }
+        eprintln("  nloops={}", nloops);
         if (loops != null)
         {
             for (u32 li = 0; loops[li] != null; li++)
             {
                 IrLoop* lp = loops[li];
+
+                // loop-level #[[vectorise]] on the stmt: this natural
+                // loop gets the full transform even under the cheap tier
+                i32 loopMark = self.loopMark(lp);
+                if (loopMark == 2) continue; // #[[novector]] on this loop
+                self.curLoopMarked = (loopMark == 1);
 
                 LoopInfo info = self.analyzeLoop(lp);
                 if (!info.safe) continue;
@@ -166,6 +199,12 @@ pub struct AutoVectorizePass
                 if (result.ncandidates == 0) continue;
 
                 result.vectorWidth = self.chooseVectorWidth(&result);
+                // #[[vectorise(N)]]: prefer N lanes when the trip count
+                // splits evenly; an incompatible request falls back to
+                // the cost-model width rather than rejecting the loop
+                if (self.widthCap >= 2 && info.tripCount != 0xFFFFFFFF &&
+                    (info.tripCount % self.widthCap) == 0)
+                    result.vectorWidth = self.widthCap;
                 if (!self.verifyWidening(lp, &info, &result)) continue;
 
                 self.applyVectorization(lp, &result);
@@ -340,6 +379,49 @@ pub struct AutoVectorizePass
         }
 
         return li;
+    }
+
+    // effective tier: a #[[vectorise]]-marked function or loop always
+    // gets the full transform — the user's request outranks the cheap
+    // cost model
+    bool isCheap()
+    {
+        return self.cheap && !self.markedFunc && !self.curLoopMarked;
+    }
+
+    // loop-level #[[vectorise]]/#[[novector]] land as inst metadata on
+    // the loop header's exit branch (set by coral-ir stmt lowering);
+    // scan the header and latch terminators where they can appear.
+    // Returns 1 = explicit vectorise, 2 = explicit novector, 0 = none.
+    i32 loopMark(IrLoop* lp)
+    {
+        if (lp == null) return 0;
+        IrBlock*[2] bbs;
+        bbs[0] = lp->header;
+        bbs[1] = lp->latch;
+        i32 mark = 0;
+        for (u32 bi = 0; bi < 2; bi++)
+        {
+            IrBlock* bb = bbs[bi];
+            if (bb == null) continue;
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst->opcode != IrOpcode::CondBr && inst->opcode != IrOpcode::Br)
+                    continue;
+                MetadataSet* md = getInstMetadata(inst);
+                if (md == null) continue;
+                MetadataEntry* e = find(md, "novector.loop");
+                if (e != null && e->value.vkind == MetadataValueKind::Int &&
+                    e->value.intVal != 0)
+                    mark = 2;
+                e = find(md, "vectorize.loop");
+                if (e != null && e->value.vkind == MetadataValueKind::Int &&
+                    e->value.intVal != 0 && mark == 0)
+                    mark = 1;
+            }
+        }
+        return mark;
     }
 
     // Every load in the loop body, not just the header's, must be a
@@ -564,7 +646,7 @@ pub struct AutoVectorizePass
 
                     // cheap tier: reductions stay scalar — the horizontal
                     // combine in the exit block is -O3 aggressiveness
-                    if (self.cheap) continue;
+                    if (self.isCheap()) continue;
 
                     VecPattern rpat = VecPattern::ReductionSum;
                     if (user->opcode == IrOpcode::UMin) rpat = VecPattern::ReductionMin;
@@ -668,7 +750,7 @@ pub struct AutoVectorizePass
         // a horizontal combine in the exit block for reductions, so below
         // a couple of vectors of elements the scalar loop wins. The cheap
         // tier demands twice that margin — only clearly-winning loops.
-        u32 minIters = self.cheap ? vf * 4 : vf * 2;
+        u32 minIters = self.isCheap() ? vf * 4 : vf * 2;
         if (bound < minIters) return false;
 
         for (u32 ui = 0; ui < li->phi->base.nusers; ui++)
@@ -1146,4 +1228,42 @@ pub bool muvmPassSimdVecCheap(IrFunc* func, rawptr userdata)
     if (ctx == null || func == null) return false;
     AutoVectorizePass pass = AutoVectorizePass::new(ctx, true);
     return pass.run(func);
+}
+
+// O0/O1 tier: vectorization is off unless the user asked for it —
+// #[[vectorise]] on the function or on a loop stmt runs the full
+// transform even at the no-opt levels (explicit request beats the
+// tier, like an optimize attribute in GCC).
+pub bool muvmPassSimdVecMarked(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (ctx == null || func == null) return false;
+    if (!funcRequestsVectorize(func)) return false;
+    AutoVectorizePass pass = AutoVectorizePass::new(ctx, false);
+    return pass.run(func);
+}
+
+// does this function carry any vectorization request — fn-level
+// metadata or a loop-level mark on any branch inst?
+bool funcRequestsVectorize(IrFunc* func)
+{
+    if (hasFuncAttr(func, "vectorize")) return true;
+    for (u32 bi = 0; bi < func->nblocks; bi++)
+    {
+        IrBlock* bb = func->blocks[bi];
+        if (bb == null) continue;
+        for (u32 ii = 0; ii < bb->ninsts; ii++)
+        {
+            IrInst* inst = bb->insts[ii];
+            if (inst->opcode != IrOpcode::CondBr && inst->opcode != IrOpcode::Br)
+                continue;
+            MetadataSet* md = getInstMetadata(inst);
+            if (md == null) continue;
+            MetadataEntry* e = find(md, "vectorize.loop");
+            if (e != null && e->value.vkind == MetadataValueKind::Int &&
+                e->value.intVal != 0)
+                return true;
+        }
+    }
+    return false;
 }

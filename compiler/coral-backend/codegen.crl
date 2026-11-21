@@ -10,6 +10,7 @@
  */
 use context::context { AstContext, InternEntry };
 use build::arena { Arena };
+import std::intrinsics { memcpy };
 import core::error { __panic };
 use common::slice { Slice };
 use mono::mono { MonoContext, MonoSubstitution, MonoInstance, MonoInstanceKind };
@@ -209,6 +210,24 @@ pub struct Codegen
     Slice* extProtoNames;
     u32* extProtoFids;
     u32 extProtoLen;
+    /* name → decl map for tyStr's TypeAlias/fn-ptr-Constant lookup:
+     * same open-addressing scheme as extProto, built once per unit */
+    u32* aliasMapKeys;
+    u32* aliasMapVals;
+    u32 aliasMapCap;
+    /* name → decl chain for the O(decls) finders (cgFindDecl,
+     * cgFindDeclFrom, cgFindTypeDeclTy, cgMethodRecvKind): hash heads
+     * into dcNext links over decls positions, decl order preserved.
+     * Extend/ExtendTrait index under their self type's Named name. */
+    u32* dcHeads;
+    u32* dcNext;
+    u32 dcCap;
+    u32 dcLen;
+    /* method-owner memo: 256 direct-mapped slots (owner Slice, method
+     * Str, NodeId.index; 0xFFFFFFFF = empty) */
+    Slice* moOwner;
+    Str* moMeth;
+    u32* moVal;
     MonoSubstitution* subs;
     u32 subsLen;
     /* return type of the function being emitted: `return x` where both
@@ -930,20 +949,21 @@ NodeId cgFindDeclFrom(Codegen* cg, Str name, u32 tag, u32 refFile)
     if (refFile == 0 || cg->file == null || name == 0) return cgFindDecl(cg, name, tag);
     NodeId first;
     first.index = 0;
-    u32 i = 0;
-    while (i < cg->file->declsLen)
+    cgDeclChainEnsure(cg);
+    u32 di = cgDeclChainHead(cg, name);
+    while (di != 0xFFFFFFFFu)
     {
-        Node* d = cg->ctx->nodes + cg->file->decls[i].index;
+        Node* d = cg->ctx->nodes + cg->file->decls[di].index;
         if (d->kind.tag == NodeKind::Decl && (u32)d->kind.payload.Decl.value.kind.tag == tag)
         {
             Decl* dd = &d->kind.payload.Decl.value;
             if (cgDeclOwnName(dd) == name)
             {
-                if (locFile(d->loc) == refFile) return cg->file->decls[i];
-                if (first.index == 0) first = cg->file->decls[i];
+                if (locFile(d->loc) == refFile) return cg->file->decls[di];
+                if (first.index == 0) first = cg->file->decls[di];
             }
         }
-        i++;
+        di = cg->dcNext[di];
     }
     return first;
 }
@@ -981,10 +1001,11 @@ NodeId cgFindTypeDeclTy(Codegen* cg, Str name, u32 refFile)
     }
     NodeId first;
     first.index = 0;
-    u32 i = 0;
-    while (i < cg->file->declsLen)
+    cgDeclChainEnsure(cg);
+    u32 di = cgDeclChainHead(cg, name);
+    while (di != 0xFFFFFFFFu)
     {
-        Node* d = cg->ctx->nodes + cg->file->decls[i].index;
+        Node* d = cg->ctx->nodes + cg->file->decls[di].index;
         if (d->kind.tag == NodeKind::Decl)
         {
             Decl* dd = &d->kind.payload.Decl.value;
@@ -994,11 +1015,11 @@ NodeId cgFindTypeDeclTy(Codegen* cg, Str name, u32 refFile)
                         tag == DeclKind::TypeAlias || tag == DeclKind::Distinct;
             if (isTy && cgDeclOwnName(dd) == name)
             {
-                if (refFile != 0 && locFile(d->loc) == refFile) return cg->file->decls[i];
-                if (first.index == 0) first = cg->file->decls[i];
+                if (refFile != 0 && locFile(d->loc) == refFile) return cg->file->decls[di];
+                if (first.index == 0) first = cg->file->decls[di];
             }
         }
-        i++;
+        di = cg->dcNext[di];
     }
     return first;
 }
@@ -1277,7 +1298,7 @@ Slice cgOwnerSpelling(Codegen* cg, Slice owner)
     return owner;
 }
 
-NodeId cgFindMethodDeclOwner(Codegen* cg, Slice owner, Str methName)
+NodeId cgFindMethodDeclOwnerImpl(Codegen* cg, Slice owner, Str methName)
 {
     NodeId none;
     none.index = 0;
@@ -1380,6 +1401,45 @@ NodeId cgFindMethodDeclOwner(Codegen* cg, Slice owner, Str methName)
     return none;
 }
 
+/* memoized wrapper: method lookup repeats per call site with the same
+ * (owner, method) pair; 256-slot direct-mapped cache, owner slices are
+ * arena/intern-stable for the whole codegen */
+NodeId cgFindMethodDeclOwner(Codegen* cg, Slice owner, Str methName)
+{
+    NodeId none;
+    none.index = 0;
+    if (owner.len == 0 || methName == 0 || cg->file == null) return none;
+    if (cg->moVal == null)
+    {
+        cg->moOwner = (Slice*)cg->arena->alloc(256 * @sizeof(Slice), 8);
+        cg->moMeth = (Str*)cg->arena->alloc(256 * @sizeof(Str), 4);
+        cg->moVal = (u32*)cg->arena->alloc(256 * @sizeof(u32), 4);
+        if (cg->moVal != null)
+        {
+            u32 z = 0;
+            while (z < 256) { cg->moVal[z] = 0xFFFFFFFFu; z++; }
+        }
+    }
+    if (cg->moVal == null) return cgFindMethodDeclOwnerImpl(cg, owner, methName);
+    u64 h = 1469598103934665603;
+    usize hi = 0;
+    while (hi < owner.len) { h = (h ^ (u64)owner.ptr[hi]) * 1099511628211; hi++; }
+    h = (h ^ (u64)methName) * 1099511628211;
+    u32 slot = (u32)(h & 255);
+    if (cg->moVal[slot] != 0xFFFFFFFFu && cg->moMeth[slot] == methName &&
+        cg->moOwner[slot].len == owner.len && cg->moOwner[slot].ptr == owner.ptr)
+    {
+        NodeId hit;
+        hit.index = cg->moVal[slot];
+        return hit;
+    }
+    NodeId r = cgFindMethodDeclOwnerImpl(cg, owner, methName);
+    cg->moOwner[slot] = owner;
+    cg->moMeth[slot] = methName;
+    cg->moVal[slot] = r.index;
+    return r;
+}
+
 // the method's declaring node for a receiver type (unwraps ptr/const)
 NodeId cgFindMethodDecl(Codegen* cg, Ty recvTy, Str methName)
 {
@@ -1462,10 +1522,11 @@ NodeId cgFindDecl(Codegen* cg, Str name, u32 tag)
         }
         c++;
     }
-    u32 i = 0;
-    while (i < cg->file->declsLen)
+    cgDeclChainEnsure(cg);
+    u32 di = cgDeclChainHead(cg, name);
+    while (di != 0xFFFFFFFFu)
     {
-        Node* d = cg->ctx->nodes + cg->file->decls[i].index;
+        Node* d = cg->ctx->nodes + cg->file->decls[di].index;
         if (d->kind.tag == NodeKind::Decl && (u32)d->kind.payload.Decl.value.kind.tag == tag)
         {
             Decl* dd = &d->kind.payload.Decl.value;
@@ -1483,7 +1544,7 @@ NodeId cgFindDecl(Codegen* cg, Str name, u32 tag)
             }
             if (dn == name)
             {
-                NodeId found = cg->file->decls[i];
+                NodeId found = cg->file->decls[di];
                 if (cg->declCacheLen < 32)
                 {
                     cg->declCacheNames[cg->declCacheLen] = name;
@@ -1494,7 +1555,7 @@ NodeId cgFindDecl(Codegen* cg, Str name, u32 tag)
                 return found;
             }
         }
-        i++;
+        di = cg->dcNext[di];
     }
     return none;
 }
@@ -1905,6 +1966,138 @@ extern("C") Slice tyStr(Codegen* cg, Ty t);
 
 /* append text at [start, ...): tyStr arms all write into tybuf so nested
    composition never re-appends a slice of the same buffer */
+/* decl-name chain: hash name → head decls-position, dcNext links in
+ * ascending decl order (built back-to-front so the head is the first
+ * decl). Extend/ExtendTrait key on their self type's Named name so
+ * method lookup sees them under the type they extend. */
+void cgDeclChainEnsure(Codegen* cg)
+{
+    if (cg->dcHeads != null) return;
+    File* file = cg->file;
+    u32 n = file != null ? file->declsLen : 0;
+    u32 cap = 16;
+    while (cap < n * 2) cap *= 2;
+    u32* heads = (u32*)cg->arena->alloc((usize)cap * @sizeof(u32), 4);
+    u32* next = (u32*)cg->arena->alloc((usize)(n > 0 ? n : 1) * @sizeof(u32), 4);
+    if (heads == null || next == null) { cg->dcCap = 0; return; }
+    u32 i = 0;
+    while (i < cap) { heads[i] = 0xFFFFFFFFu; i++; }
+    i = 0;
+    while (i < n) { next[i] = 0xFFFFFFFFu; i++; }
+    /* back-to-front so chains read in decl order */
+    i = n;
+    while (i > 0)
+    {
+        i--;
+        Node* d = cg->ctx->nodes + file->decls[i].index;
+        if (d->kind.tag == NodeKind::Decl)
+        {
+            Decl* dd = &d->kind.payload.Decl.value;
+            Str nm = cgDeclOwnName(dd);
+            if (nm == 0 && (dd->kind.tag == DeclKind::Extend || dd->kind.tag == DeclKind::ExtendTrait))
+            {
+                Ty st = cgTyUnwrap(cg, dd->kind.tag == DeclKind::Extend ?
+                                   dd->kind.payload.Extend.selfType :
+                                   dd->kind.payload.ExtendTrait.selfType);
+                if (st != 0 && (cg->ctx->types + st)->kind.tag == TypeKind::Pointer)
+                    st = cgTyUnwrap(cg, (cg->ctx->types + st)->kind.payload.Pointer.base);
+                if (st != 0 && (cg->ctx->types + st)->kind.tag == TypeKind::Named)
+                    nm = (cg->ctx->types + st)->kind.payload.Named.name;
+            }
+            if (nm != 0)
+            {
+                u32 mask = cap - 1;
+                u32 h = (u32)(((u64)nm * 2654435761u) >> 32) & mask;
+                next[i] = heads[h];
+                heads[h] = i;
+            }
+        }
+    }
+    cg->dcHeads = heads;
+    cg->dcNext = next;
+    cg->dcCap = cap;
+    cg->dcLen = n;
+}
+
+/* first decls-position named `name`, or 0xFFFFFFFF; advance with
+ * cg->dcNext[pos] */
+u32 cgDeclChainHead(Codegen* cg, Str name)
+{
+    if (name == 0 || cg->dcHeads == null || cg->dcCap == 0) return 0xFFFFFFFFu;
+    u32 mask = cg->dcCap - 1;
+    u32 h = (u32)(((u64)name * 2654435761u) >> 32) & mask;
+    u32 di = cg->dcHeads[h];
+    while (di != 0xFFFFFFFFu)
+    {
+        Node* d = cg->ctx->nodes + cg->file->decls[di].index;
+        if (d->kind.tag == NodeKind::Decl && cgDeclOwnName(&d->kind.payload.Decl.value) == name)
+            return di;
+        /* Extend/ExtendTrait carry no own name: their chain key was the
+         * self type's — accept them when the resolved name matches */
+        if (d->kind.tag == NodeKind::Decl)
+        {
+            Decl* dd = &d->kind.payload.Decl.value;
+            if (dd->kind.tag == DeclKind::Extend || dd->kind.tag == DeclKind::ExtendTrait)
+            {
+                Ty st = cgTyUnwrap(cg, dd->kind.tag == DeclKind::Extend ?
+                                   dd->kind.payload.Extend.selfType :
+                                   dd->kind.payload.ExtendTrait.selfType);
+                if (st != 0 && (cg->ctx->types + st)->kind.tag == TypeKind::Pointer)
+                    st = cgTyUnwrap(cg, (cg->ctx->types + st)->kind.payload.Pointer.base);
+                if (st != 0 && (cg->ctx->types + st)->kind.tag == TypeKind::Named &&
+                    (cg->ctx->types + st)->kind.payload.Named.name == name)
+                    return di;
+            }
+        }
+        di = cg->dcNext[di];
+    }
+    return 0xFFFFFFFFu;
+}
+
+/* name → decl map over TypeAlias decls and fn-ptr Constants (the two
+ * "name doubles as a type" decls tyStr's Named arm resolves). First
+ * decl in unit order wins, matching the old linear scan. */
+void cgAliasMapEnsure(Codegen* cg)
+{
+    if (cg->aliasMapKeys != null) return;
+    File* file = cg->file;
+    u32 n = file != null ? file->declsLen : 0;
+    u32 cap = 16;
+    while (cap < n * 2) cap *= 2;
+    u32* keys = (u32*)cg->arena->alloc((usize)cap * @sizeof(u32), 4);
+    u32* vals = (u32*)cg->arena->alloc((usize)cap * @sizeof(u32), 4);
+    if (keys == null || vals == null) { cg->aliasMapCap = 0; return; }
+    u32 i = 0;
+    while (i < cap) { keys[i] = 0; vals[i] = 0; i++; }
+    i = 0;
+    while (i < n)
+    {
+        Node* d = cg->ctx->nodes + file->decls[i].index;
+        if (d->kind.tag == NodeKind::Decl)
+        {
+            Decl* dd = &d->kind.payload.Decl.value;
+            Str nm = 0;
+            bool take = false;
+            if (dd->kind.tag == DeclKind::TypeAlias) { nm = dd->kind.payload.TypeAlias.name; take = true; }
+            else if (dd->kind.tag == DeclKind::Constant &&
+                     dd->kind.payload.Constant.typeNode != 0 &&
+                     (cg->ctx->types + dd->kind.payload.Constant.typeNode)->kind.tag == TypeKind::FnPtr)
+            { nm = dd->kind.payload.Constant.name; take = true; }
+            if (take && nm != 0)
+            {
+                u32 mask = cap - 1;
+                u32 h = (u32)(((u64)nm * 2654435761u) >> 32) & mask;
+                while (keys[h] != 0 && keys[h] != nm) h = (h + 1) & mask;
+                if (keys[h] == 0) { keys[h] = nm; vals[h] = file->decls[i].index; }
+            }
+        }
+        i++;
+    }
+    cg->aliasMapKeys = keys;
+    cg->aliasMapVals = vals;
+    cg->aliasMapCap = cap;
+}
+
 Slice tyStrPut(Codegen* cg, Slice text, usize start)
 {
     stPS(&cg->tybuf, text);
@@ -1980,31 +2173,27 @@ Slice tyStr(Codegen* cg, Ty t)
                 return cgInstanceName(cg, name, k.payload.Named.genericArgs, k.payload.Named.genericArgsLen);
             }
             // alias? find `typedef` decl with this name and follow it
-            File* file = cg->file;
-            if (file != null) {
-                u32 i = 0;
-                while (i < file->declsLen)
+            if (cg->file != null)
+            {
+                cgAliasMapEnsure(cg);
+                if (cg->aliasMapKeys != null && cg->aliasMapCap != 0)
                 {
-                    Node* d = cg->ctx->nodes + file->decls[i].index;
-                    if (d->kind.tag == NodeKind::Decl)
+                    u32 mask = cg->aliasMapCap - 1;
+                    u32 h = (u32)(((u64)name * 2654435761u) >> 32) & mask;
+                    while (cg->aliasMapKeys[h] != 0)
                     {
-                        Decl* dd = &d->kind.payload.Decl.value;
-                        if (dd->kind.tag == DeclKind::TypeAlias)
+                        if (cg->aliasMapKeys[h] == name)
                         {
-                            if (dd->kind.payload.TypeAlias.name == name)
+                            Node* d = cg->ctx->nodes + cg->aliasMapVals[h];
+                            Decl* dd = &d->kind.payload.Decl.value;
+                            if (dd->kind.tag == DeclKind::TypeAlias)
                                 return tyStr(cg, dd->kind.payload.TypeAlias.target);
+                            if (dd->kind.tag == DeclKind::Constant)
+                                return tyStr(cg, dd->kind.payload.Constant.typeNode);
+                            break;
                         }
-                        else if (dd->kind.tag == DeclKind::Constant &&
-                                 dd->kind.payload.Constant.name == name &&
-                                 dd->kind.payload.Constant.typeNode != 0 &&
-                                 (cg->ctx->types + dd->kind.payload.Constant.typeNode)->kind.tag == TypeKind::FnPtr)
-                        {
-                            /* a fn-ptr global doubles as its own type name:
-                             * `void(u32) F;` then `F f;` — spell the typedef */
-                            return tyStr(cg, dd->kind.payload.Constant.typeNode);
-                        }
+                        h = (h + 1) & mask;
                     }
-                    i++;
                 }
             }
             /* mangle through the declaring decl: the type's own file
@@ -2668,10 +2857,11 @@ u8 cgMethodRecvKind(Codegen* cg, Ty recvTy, Str method, bool* found)
     }
     if (e->kind.tag != TypeKind::Named) return 1;
     Str typeName = e->kind.payload.Named.name;
-    u32 i = 0;
-    while (i < cg->file->declsLen)
+    cgDeclChainEnsure(cg);
+    u32 di = cgDeclChainHead(cg, typeName);
+    while (di != 0xFFFFFFFFu)
     {
-        Node* d = cg->ctx->nodes + cg->file->decls[i].index;
+        Node* d = cg->ctx->nodes + cg->file->decls[di].index;
         if (d->kind.tag == NodeKind::Decl)
         {
             Decl* dd = &d->kind.payload.Decl.value;
@@ -2743,7 +2933,7 @@ u8 cgMethodRecvKind(Codegen* cg, Ty recvTy, Str method, bool* found)
                 }
             }
         }
-        i++;
+        di = cg->dcNext[di];
     }
     return 1;
 }
@@ -7951,6 +8141,16 @@ pub CodegenResult generateC(AstContext* ctx, File* file, MonoContext* mono, Aren
     cg.extProtoNames = null;
     cg.extProtoFids = null;
     cg.extProtoLen = 0;
+    cg.aliasMapKeys = null;
+    cg.aliasMapVals = null;
+    cg.aliasMapCap = 0;
+    cg.dcHeads = null;
+    cg.dcNext = null;
+    cg.dcCap = 0;
+    cg.dcLen = 0;
+    cg.moOwner = null;
+    cg.moMeth = null;
+    cg.moVal = null;
     if (mono != null) cg.sema = mono->sema;
     cg.arena = arena;
     cg.out = stNew(arena, 4096);
