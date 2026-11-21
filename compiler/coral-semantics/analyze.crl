@@ -25,6 +25,8 @@ use mono {
     instantiate
 };
 use diag::engine { DiagnosticEngine, DiagList };
+use build::manifest { ModuleManifest, bLoadManifest, bManifestPlatRoot };
+use build::arena { Arena, ArenaBlock };
 import std::mman { alloc, dealloc, realloc };
 import platform::libc { write, getenv };
 
@@ -124,6 +126,14 @@ struct LibLoader
     u32 bufsCap;
     LibSeg* platformRootSegs;
     u32 platformRootSegsLen;
+    /* module-manifest state: arena for crlb parsing plus a small
+     * dir→manifest cache (lib/<module>/manifest.crlb) */
+    Arena manArena;
+    bool manArenaInit;
+    u8** manDirs;
+    ModuleManifest** manVals;
+    u32 manLen;
+    u32 manCap;
     /* in-memory module table from the builder (module/alias::name → path).
      * authoritative over lib-root probing: a hit here is the resolution. */
     Slice* modKeys;
@@ -341,6 +351,160 @@ u32 libSplit(u8* s, usize n, LibSeg* out, u32 max)
         i++;
     }
     return count;
+}
+
+/* ── module manifests (manifest.crlb) ──────────────────────────── */
+
+bool libManArena(LibLoader* L)
+{
+    if (L->manArenaInit) return true;
+    L->manArena.init(1 << 20);
+    L->manArenaInit = true;
+    return true;
+}
+
+/* manifest for lib dir `dir` (cstr), cached; null when absent */
+ModuleManifest* libManForDir(LibLoader* L, u8* dir)
+{
+    usize dl = libLen(dir);
+    u32 i = 0;
+    while (i < L->manLen)
+    {
+        if (libBytesEq(L->manDirs[i], libLen(L->manDirs[i]), dir, dl))
+            return L->manVals[i];
+        i++;
+    }
+    if (!libManArena(L)) return null;
+    ModuleManifest* m = bLoadManifest(&L->manArena, Slice::from(dir, dl));
+    if (L->manLen >= L->manCap)
+    {
+        u32 newCap = L->manCap == 0 ? 16 : L->manCap * 2;
+        u8** nd = (u8**)realloc<u8*>(L->manDirs, (usize)newCap * @sizeof(u8*));
+        ModuleManifest** nv = (ModuleManifest**)realloc<ModuleManifest*>(L->manVals, (usize)newCap * @sizeof(ModuleManifest*));
+        if (nd == null || nv == null) return m;
+        L->manDirs = nd;
+        L->manVals = nv;
+        L->manCap = newCap;
+    }
+    /* arena-owned copy of the dir key so transient probe paths can go */
+    u8* kd = (u8*)L->manArena.alloc(dl + 1, 1);
+    if (kd == null) return m;
+    usize k = 0;
+    while (k < dl) { kd[k] = dir[k]; k++; }
+    kd[dl] = 0;
+    L->manDirs[L->manLen] = kd;
+    L->manVals[L->manLen] = m;
+    L->manLen++;
+    return m;
+}
+
+/* split a manifest "arch/os" path into LibSegs for platform probing */
+LibSeg* libSegsFromStr(u8* s, usize n, u32* outLen)
+{
+    u32 segCount = 1;
+    usize i = 0;
+    while (i < n) { if (s[i] == 47) segCount++; i++; }
+    if (segCount > 8) segCount = 8;
+    LibSeg* segs = alloc<LibSeg>((usize)segCount);
+    if (segs == null) { *outLen = 0; return null; }
+    u32 k = 0;
+    usize start = 0;
+    i = 0;
+    while (i <= n && k < segCount)
+    {
+        if (i == n || s[i] == 47)
+        {
+            if (i > start)
+            {
+                segs[k].ptr = s + start;
+                segs[k].len = (u32)(i - start);
+                k++;
+            }
+            start = i + 1;
+        }
+        i++;
+    }
+    *outLen = k;
+    return segs;
+}
+
+/* join platformRootSegs into "arch/os" for manifest target matching */
+Slice libTripleSlice(LibLoader* L, u8* buf)
+{
+    usize n = 0;
+    u32 i = 0;
+    while (i < L->platformRootSegsLen)
+    {
+        usize k = 0;
+        while (k < (usize)L->platformRootSegs[i].len) { buf[n] = L->platformRootSegs[i].ptr[k]; n++; k++; }
+        if (i + 1 < L->platformRootSegsLen) { buf[n] = 47; n++; }
+        i++;
+    }
+    return Slice::from(buf, n);
+}
+
+/* the module's manifest, but only when the libroot registry opts in:
+ * <libroot>/manifest.crlb `module "name" { path = "..."; manifest =
+ * true; }` activates <libroot>/<path>/manifest.crlb. Without the
+ * registry entry (or without manifest = true) the module keeps the
+ * global platform root. Also merges the manifest's k=v flags into the
+ * context flag table once (flag() sees them for subsequently parsed
+ * files). */
+ModuleManifest* libModuleManifest(LibLoader* L, u8* libroot, usize librootLen,
+                                   u8* modDir)
+{
+    ModuleManifest* reg = libManForDir(L, libroot);
+    if (reg == null || !reg->present || reg->parseFailed) return null;
+    usize mdLen = libLen(modDir);
+    if (mdLen <= librootLen + 1) return null;
+    u8* rel = modDir + librootLen + 1;
+    usize relLen = mdLen - librootLen - 1;
+    u32 i = 0;
+    while (i < reg->modsLen)
+    {
+        Slice mp = reg->modPaths[i];
+        if (mp.len == relLen)
+        {
+            bool eq = true;
+            usize k = 0;
+            while (k < relLen) { if (mp.ptr[k] != rel[k]) { eq = false; break; } k++; }
+            if (eq)
+            {
+                if (!reg->modHasMan[i]) return null;
+                ModuleManifest* m = libManForDir(L, modDir);
+                if (m != null && m->present && !m->parseFailed && !m->flagsMerged)
+                {
+                    m->flagsMerged = true;
+                    AstContext* ctx = L->ctx;
+                    u32 fi = 0;
+                    while (fi < m->flagsLen)
+                    {
+                        Slice e = m->flags[fi];
+                        usize eq2 = 0;
+                        while (eq2 < e.len && e.ptr[eq2] != 61) eq2++;
+                        if (eq2 > 0 && eq2 < e.len)
+                        {
+                            u32 oldLen = ctx->flagsLen;
+                            Str* nn = (Str*)realloc<Str>(ctx->flagNames, (usize)(oldLen + 1) * @sizeof(Str));
+                            Str* nv = (Str*)realloc<Str>(ctx->flagValues, (usize)(oldLen + 1) * @sizeof(Str));
+                            if (nn != null && nv != null)
+                            {
+                                ctx->flagNames = nn;
+                                ctx->flagValues = nv;
+                                ctx->flagNames[oldLen] = ctx->intern(Slice::from(e.ptr, eq2).asStr());
+                                ctx->flagValues[oldLen] = ctx->intern(Slice::from(e.ptr + eq2 + 1, e.len - eq2 - 1).asStr());
+                                ctx->flagsLen = oldLen + 1;
+                            }
+                        }
+                        fi++;
+                    }
+                }
+                return m;
+            }
+        }
+        i++;
+    }
+    return null;
 }
 
 File* libParse(LibLoader* L, u8* buf, usize len, u8* cpath, DiagnosticEngine* diag, u32 fileId)
@@ -574,34 +738,73 @@ u8* libResolve(LibLoader* L, u8* nsPtr, usize nsLen)
     if (result == null && L->platformRootSegsLen > 0 && n > 1)
     {
         /* platform-first: <module>/<platform_root>/<rest>; neutral paths
-         * resolve under the platform root before the base tree
-         * (see coral-docs/builder_incomplete.md) */
-        LibSeg* psegs = alloc<LibSeg>((usize)n + (usize)L->platformRootSegsLen);
-        if (psegs != null)
+         * resolve under the platform root before the base tree. Each
+         * lib root's registry may activate a per-module manifest that
+         * selects a different root (or none) for this module. */
+        u8* tbuf = alloc<u8>(256);
+        Slice triple = tbuf != null ? libTripleSlice(L, tbuf) : Slice { null, 0 };
+        u32 ri = 0;
+        while (ri < 3 && result == null)
         {
-            psegs[0] = segs[0];
-            u32 k = 1;
-            u32 m = 0;
-            while (m < L->platformRootSegsLen)
+            u8* root;
+            usize rlen;
+            if (ri == 0) { root = (u8*)"lib".ptr; rlen = 3; }
+            else if (ri == 1) { if (base == null) { ri++; continue; } root = base; rlen = libLen(base); }
+            else { if (gRoot == null) break; root = gRoot; rlen = libLen(gRoot); }
+
+            LibSeg* useSegs = L->platformRootSegs;
+            u32 useLen = L->platformRootSegsLen;
+            LibSeg* mSegs = null;
+            u32 mLen = 0;
+            u8* modDir = libCandidate(root, rlen, segs[0].ptr, (usize)segs[0].len, "");
+            if (modDir != null)
             {
-                psegs[k] = L->platformRootSegs[m];
-                k++;
-                m++;
+                ModuleManifest* mm = libModuleManifest(L, root, rlen, modDir);
+                if (mm != null && mm->present && !mm->parseFailed)
+                {
+                    Slice sel = bManifestPlatRoot(mm, triple);
+                    if (sel.len > 0)
+                        mSegs = libSegsFromStr(sel.ptr, (usize)sel.len, &mLen);
+                    if (mSegs == null || mLen == 0)
+                    {
+                        /* manifest declares no root for this target:
+                         * base tree only — skip platform probing here */
+                        dealloc<u8>(modDir);
+                        ri++;
+                        continue;
+                    }
+                    useSegs = mSegs;
+                    useLen = mLen;
+                }
+                dealloc<u8>(modDir);
             }
-            m = 1;
-            while (m < n)
+
+            LibSeg* psegs = alloc<LibSeg>((usize)n + (usize)useLen);
+            if (psegs != null)
             {
-                psegs[k] = segs[m];
-                k++;
-                m++;
+                psegs[0] = segs[0];
+                u32 k = 1;
+                u32 m = 0;
+                while (m < useLen)
+                {
+                    psegs[k] = useSegs[m];
+                    k++;
+                    m++;
+                }
+                m = 1;
+                while (m < n)
+                {
+                    psegs[k] = segs[m];
+                    k++;
+                    m++;
+                }
+                result = libResolveSegs(L, psegs, k, root, rlen, 0);
+                dealloc<LibSeg>(psegs);
             }
-            result = libResolveSegs(L, psegs, k, (u8*)"lib".ptr, 3, 0);
-            if (result == null && base != null)
-                result = libResolveSegs(L, psegs, k, base, libLen(base), 0);
-            if (result == null && gRoot != null)
-                result = libResolveSegs(L, psegs, k, gRoot, libLen(gRoot), 0);
-            dealloc<LibSeg>(psegs);
+            if (mSegs != null) dealloc<LibSeg>(mSegs);
+            ri++;
         }
+        if (tbuf != null) dealloc<u8>(tbuf);
     }
     dealloc<LibSeg>(segs);
     if (base != null) dealloc<u8>(base);
@@ -1708,6 +1911,12 @@ pub CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, S
         .bufsCap = 0,
         .platformRootSegs = null,
         .platformRootSegsLen = 0,
+        .manArena = Arena { .head = null, .blockSize = 0 },
+        .manArenaInit = false,
+        .manDirs = null,
+        .manVals = null,
+        .manLen = 0,
+        .manCap = 0,
         .modKeys = modKeys,
         .modVals = modVals,
         .modLen = modLen,
@@ -1770,6 +1979,50 @@ pub CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, S
         }
         else
         {
+            /* lib registry default: <libroot>/manifest.crlb `default`
+             * selects the triple before the baked-in host fallback, so
+             * the toolchain builds for the registry's platform unless
+             * --platform/--flag/CORAL_PLATFORM says otherwise */
+            LibSeg* defSegs = null;
+            u32 defLen = 0;
+            {
+                u8*[2] heapCands;
+                u32 heapN = 0;
+                u8*[4] cands;
+                u32 nc = 0;
+                u8* base = libDir(loader.inputPath);
+                if (base != null)
+                {
+                    u8* up = libCandidate(base, libLen(base), (u8*)"..".ptr, 2, "/..");
+                    if (up != null)
+                    {
+                        u8* r1 = libCandidate(up, libLen(up), (u8*)"lib".ptr, 3, "");
+                        if (r1 != null) { cands[nc] = r1; heapCands[heapN] = r1; heapN++; nc++; }
+                        dealloc<u8>(up);
+                    }
+                    dealloc<u8>(base);
+                }
+                cands[nc] = (u8*)"lib".ptr; nc++;
+                u8* gr = libGlobalRoot();
+                if (gr != null) { cands[nc] = gr; heapCands[heapN] = gr; heapN++; nc++; }
+                u32 ci = 0;
+                while (ci < nc && defSegs == null)
+                {
+                    ModuleManifest* rm = libManForDir(&loader, cands[ci]);
+                    if (rm != null && rm->present && !rm->parseFailed && rm->hasDefaultTriple)
+                        defSegs = libSegsFromStr(rm->defaultTriple.ptr, (usize)rm->defaultTriple.len, &defLen);
+                    ci++;
+                }
+                u32 hi = 0;
+                while (hi < heapN) { dealloc<u8>(heapCands[hi]); hi++; }
+            }
+            if (defSegs != null && defLen > 0)
+            {
+                loader.platformRootSegs = defSegs;
+                loader.platformRootSegsLen = defLen;
+            }
+            else
+            {
             str hArch = hostArch();
             str hOs = hostOs();
             LibSeg* prSegs = alloc<LibSeg>(2);
@@ -1781,6 +2034,7 @@ pub CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, S
                 prSegs[1].len = (u32)hOs.len;
                 loader.platformRootSegs = prSegs;
                 loader.platformRootSegsLen = 2;
+            }
             }
         }
         }
@@ -1885,6 +2139,20 @@ pub CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, S
     unit->bufs = loader.bufs;
     unit->bufsLen = loader.bufsLen;
     if (loader.platformRootSegs != null) dealloc<LibSeg>(loader.platformRootSegs);
+    if (loader.manArenaInit)
+    {
+        ArenaBlock* ab = loader.manArena.head;
+        while (ab != null)
+        {
+            ArenaBlock* an = ab->next;
+            dealloc<u8>(ab->data);
+            dealloc<ArenaBlock>(ab);
+            ab = an;
+        }
+        loader.manArena.head = null;
+    }
+    if (loader.manDirs != null) dealloc<u8*>(loader.manDirs);
+    if (loader.manVals != null) dealloc<ModuleManifest*>(loader.manVals);
 
     idents.deinit();
 

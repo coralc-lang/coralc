@@ -18,7 +18,7 @@
 //   }
 
 use arena { Arena };
-use ast { CrlbNode, CrlbNodeKind, Value, ValueArray };
+use ast { CrlbNode, CrlbNodeKind, CrlbField, Value, ValueArray };
 use common::slice { Slice };
 use parser { CrlbParser };
 import std::mman { alloc, dealloc, realloc };
@@ -40,6 +40,8 @@ pub struct ModuleManifest
     Slice version;
     Slice fallback;        // empty when undeclared
     bool hasFallback;
+    Slice defaultTriple;   // registry-level default "arch/os" target
+    bool hasDefaultTriple;
     Slice* flags;          // raw k=v strings
     u32 flagsLen;
     ManifestTarget* targets;
@@ -48,7 +50,15 @@ pub struct ModuleManifest
      * populated for lib/manifest.crlb */
     Slice* modNames;
     Slice* modPaths;
+    /* per-module opt-in: the registry entry's `extends` relationship —
+     * `module "std" extends "manifest.crlb" { }` (or field
+     * `extends = "…"`) activates that file as the module's manifest.
+     * null ptr = not activated; the slice is the manifest file name
+     * relative to the module dir (empty → "manifest.crlb") */
+    Slice* modExtends;
     u32 modsLen;
+    u32 modsCap;
+    bool flagsMerged;   // loader-side: flags already merged into ctx
 }
 
 Slice mReadFile(Arena* a, str path, usize* outLen)
@@ -116,6 +126,15 @@ bool mFieldStr(CrlbNode* n, Slice name, Slice* out)
     return true;
 }
 
+bool mFieldBool(CrlbNode* n, Slice name, bool* out)
+{
+    CrlbField* f = mFindField(n, name);
+    if (f == null) return false;
+    if (f->value.tag != Value::Boolean) return false;
+    *out = f->value.payload.Boolean.value;
+    return true;
+}
+
 u32 mFieldList(CrlbNode* n, Slice name, Arena* a, Slice* out, u32 cap)
 {
     CrlbField* f = mFindField(n, name);
@@ -133,25 +152,26 @@ u32 mFieldList(CrlbNode* n, Slice name, Arena* a, Slice* out, u32 cap)
     return (u32)va->len;
 }
 
-/* parse <dir>/manifest.crlb. Returns null when the file does not exist;
- * otherwise a manifest (present=false + parseFailed set on bad syntax).
- * Everything is arena-owned; the caller keeps the arena alive. */
-pub ModuleManifest* bLoadManifest(Arena* a, Slice dirS)
+/* the `extends` target a module/override block declares: the parser's
+ * positional `extends "x"` wins, then an `extends = "x"` field. Empty
+ * (null ptr) when the block does not extend anything. */
+Slice mExtendsOf(CrlbNode* c, Arena* a)
 {
-    u8* path = alloc<u8>(4200);
-    if (path == null) return null;
-    usize n = 0;
-    usize i = 0;
-    while (i < dirS.len && n < 4190) { path[n] = dirS.ptr[i]; n++; i++; }
-    str suf = "/manifest.crlb";
-    i = 0;
-    while (i < suf.len && n < 4199) { path[n] = suf.ptr[i]; n++; i++; }
-    path[n] = 0;
-    str pathS = str { .ptr = path, .len = n };
+    if (c->hasExtends && c->extendsTarget.ptr != null)
+        return c->extendsTarget;
+    Slice ex;
+    if (mFieldStr(c, Slice::fromStr("extends"), &ex)) return ex;
+    return Slice { null, 0 };
+}
 
+/* parse <path> as a crlb manifest file. Returns null when the file does
+ * not exist; otherwise a manifest (present=false + parseFailed set on
+ * bad syntax). Everything is arena-owned; the caller keeps the arena
+ * alive. */
+pub ModuleManifest* bLoadManifestFile(Arena* a, Slice pathS)
+{
     usize len = 0;
-    Slice content = mReadFile(a, pathS, &len);
-    dealloc<u8>(path);
+    Slice content = mReadFile(a, pathS.asStr(), &len);
     if (content.ptr == null) return null;
 
     ModuleManifest* m = (ModuleManifest*)a->alloc(@sizeof(ModuleManifest), 8);
@@ -162,13 +182,18 @@ pub ModuleManifest* bLoadManifest(Arena* a, Slice dirS)
     m->version = Slice { null, 0 };
     m->fallback = Slice { null, 0 };
     m->hasFallback = false;
+    m->defaultTriple = Slice { null, 0 };
+    m->hasDefaultTriple = false;
     m->flags = null;
     m->flagsLen = 0;
     m->targets = null;
     m->targetsLen = 0;
     m->modNames = null;
     m->modPaths = null;
+    m->modExtends = null;
     m->modsLen = 0;
+    m->modsCap = 0;
+    m->flagsMerged = false;
 
     CrlbParser p;
     p.init(a, content);
@@ -180,7 +205,7 @@ pub ModuleManifest* bLoadManifest(Arena* a, Slice dirS)
      * Manifest child; a manifest file may also carry registry `module`
      * children at top level for lib/manifest.crlb */
     CrlbNode* body = null;
-    i = 0;
+    usize i = 0;
     while (i < root->children.len)
     {
         CrlbNode* c = root->children.data + i;
@@ -194,6 +219,7 @@ pub ModuleManifest* bLoadManifest(Arena* a, Slice dirS)
         Slice v;
         if (mFieldStr(body, Slice::fromStr("version"), &v)) m->version = v;
         if (mFieldStr(body, Slice::fromStr("fallback"), &v)) { m->fallback = v; m->hasFallback = true; }
+        if (mFieldStr(body, Slice::fromStr("default"), &v)) { m->defaultTriple = v; m->hasDefaultTriple = true; }
         m->flags = (Slice*)a->alloc(64 * @sizeof(Slice), 8);
         if (m->flags != null) m->flagsLen = mFieldList(body, Slice::fromStr("flags"), a, m->flags, 64);
 
@@ -204,31 +230,91 @@ pub ModuleManifest* bLoadManifest(Arena* a, Slice dirS)
         u32 mcCap = 0;
         Slice* nbuf = null;
         Slice* pbuf = null;
+        Slice* ebuf = null;
         i = 0;
         while (i < body->children.len)
         {
             CrlbNode* c = body->children.data + i;
             if (c->kind == CrlbNodeKind::Target && c->hasLabel)
             {
-                if (tc >= tcCap)
+                /* nested form: target "arch" { platform "os" { path=… } }
+                 * expands to "arch/os" triples — one arch can carry
+                 * several OS trees. A target with a direct `path` and no
+                 * platform children is the flat "arch/os" form. */
+                u32 sub = 0;
+                while (sub < c->children.len)
                 {
-                    tcCap = tcCap == 0 ? 8 : tcCap * 2;
-                    ManifestTarget* ng = (ManifestTarget*)a->alloc((usize)tcCap * @sizeof(ManifestTarget), 8);
-                    if (ng != null && tbuf != null)
+                    CrlbNode* pc = c->children.data + sub;
+                    if (pc->kind == CrlbNodeKind::Platform && pc->hasLabel)
                     {
-                        u32 q = 0;
-                        while (q < tc) { ng[q] = tbuf[q]; q++; }
+                        if (tc >= tcCap)
+                        {
+                            tcCap = tcCap == 0 ? 8 : tcCap * 2;
+                            ManifestTarget* ng = (ManifestTarget*)a->alloc((usize)tcCap * @sizeof(ManifestTarget), 8);
+                            if (ng != null && tbuf != null)
+                            {
+                                u32 q = 0;
+                                while (q < tc) { ng[q] = tbuf[q]; q++; }
+                            }
+                            tbuf = ng;
+                        }
+                        if (tbuf != null && tc < tcCap)
+                        {
+                            usize tl = c->label.len + 1 + pc->label.len;
+                            u8* ts = (u8*)a->alloc(tl + 1, 1);
+                            if (ts != null)
+                            {
+                                usize w = 0;
+                                usize q = 0;
+                                while (q < c->label.len) { ts[w] = c->label.ptr[q]; w++; q++; }
+                                ts[w] = 47; w++;
+                                q = 0;
+                                while (q < pc->label.len) { ts[w] = pc->label.ptr[q]; w++; q++; }
+                                ts[w] = 0;
+                                Slice triple = Slice::from(ts, tl);
+                                Slice pp;
+                                if (!mFieldStr(pc, Slice::fromStr("path"), &pp)) pp = triple;
+                                tbuf[tc].triple = triple;
+                                tbuf[tc].path = pp;
+                                tc++;
+                            }
+                        }
                     }
-                    tbuf = ng;
+                    sub++;
                 }
-                if (tbuf != null && tc < tcCap)
+                if (c->children.len == 0 || (tc > 0 && sub == c->children.len))
                 {
-                    Slice tp = c->label;
-                    Slice pp;
-                    if (!mFieldStr(c, Slice::fromStr("path"), &pp)) pp = tp;
-                    tbuf[tc].triple = tp;
-                    tbuf[tc].path = pp;
-                    tc++;
+                    /* fallthrough handled below for flat/direct-path targets */
+                }
+                bool hasPlatChild = false;
+                sub = 0;
+                while (sub < c->children.len)
+                {
+                    if (c->children.data[sub].kind == CrlbNodeKind::Platform) { hasPlatChild = true; break; }
+                    sub++;
+                }
+                if (!hasPlatChild)
+                {
+                    if (tc >= tcCap)
+                    {
+                        tcCap = tcCap == 0 ? 8 : tcCap * 2;
+                        ManifestTarget* ng = (ManifestTarget*)a->alloc((usize)tcCap * @sizeof(ManifestTarget), 8);
+                        if (ng != null && tbuf != null)
+                        {
+                            u32 q = 0;
+                            while (q < tc) { ng[q] = tbuf[q]; q++; }
+                        }
+                        tbuf = ng;
+                    }
+                    if (tbuf != null && tc < tcCap)
+                    {
+                        Slice tp = c->label;
+                        Slice pp;
+                        if (!mFieldStr(c, Slice::fromStr("path"), &pp)) pp = tp;
+                        tbuf[tc].triple = tp;
+                        tbuf[tc].path = pp;
+                        tc++;
+                    }
                 }
             }
             else if (c->kind == CrlbNodeKind::Module && c->hasLabel)
@@ -238,21 +324,24 @@ pub ModuleManifest* bLoadManifest(Arena* a, Slice dirS)
                     mcCap = mcCap == 0 ? 8 : mcCap * 2;
                     Slice* nn = (Slice*)a->alloc((usize)mcCap * @sizeof(Slice), 8);
                     Slice* pp2 = (Slice*)a->alloc((usize)mcCap * @sizeof(Slice), 8);
-                    if (nn != null && pp2 != null && nbuf != null && pbuf != null)
+                    Slice* ee = (Slice*)a->alloc((usize)mcCap * @sizeof(Slice), 8);
+                    if (nn != null && pp2 != null && ee != null && nbuf != null && pbuf != null && ebuf != null)
                     {
                         u32 q = 0;
-                        while (q < mc) { nn[q] = nbuf[q]; pp2[q] = pbuf[q]; q++; }
+                        while (q < mc) { nn[q] = nbuf[q]; pp2[q] = pbuf[q]; ee[q] = ebuf[q]; q++; }
                     }
                     nbuf = nn;
                     pbuf = pp2;
+                    ebuf = ee;
                 }
-                if (nbuf != null && pbuf != null && mc < mcCap)
+                if (nbuf != null && pbuf != null && ebuf != null && mc < mcCap)
                 {
                     Slice mp = c->label;
                     Slice pp;
                     if (!mFieldStr(c, Slice::fromStr("path"), &pp)) pp = mp;
                     nbuf[mc] = mp;
                     pbuf[mc] = pp;
+                    ebuf[mc] = mExtendsOf(c, a);
                     mc++;
                 }
             }
@@ -262,7 +351,9 @@ pub ModuleManifest* bLoadManifest(Arena* a, Slice dirS)
         m->targetsLen = tc;
         m->modNames = nbuf;
         m->modPaths = pbuf;
+        m->modExtends = ebuf;
         m->modsLen = mc;
+        m->modsCap = mcCap;
     }
     /* registry shorthand: top-level `module "x" { }` decls (no
      * manifest wrapper) also count as registry entries */
@@ -272,25 +363,61 @@ pub ModuleManifest* bLoadManifest(Arena* a, Slice dirS)
         CrlbNode* c = root->children.data + i;
         if (c->kind == CrlbNodeKind::Module && c->hasLabel)
         {
-            if (m->modsLen >= 256) break;
             if (m->modNames == null)
             {
                 m->modNames = (Slice*)a->alloc(256 * @sizeof(Slice), 8);
                 m->modPaths = (Slice*)a->alloc(256 * @sizeof(Slice), 8);
+                m->modExtends = (Slice*)a->alloc(256 * @sizeof(Slice), 8);
+                m->modsCap = 256;
             }
-            if (m->modNames != null && m->modPaths != null)
+            if (m->modsLen >= m->modsCap) break;
+            if (m->modNames != null && m->modPaths != null && m->modExtends != null)
             {
                 Slice mp = c->label;
                 Slice pp;
                 if (!mFieldStr(c, Slice::fromStr("path"), &pp)) pp = mp;
                 m->modNames[m->modsLen] = mp;
                 m->modPaths[m->modsLen] = pp;
+                m->modExtends[m->modsLen] = mExtendsOf(c, a);
                 m->modsLen++;
             }
         }
         i++;
     }
     return m;
+}
+
+/* <dir>/<file> as a NUL-terminated heap path (caller deallocs) */
+str mJoinPath(Arena* a, Slice dir, Slice file)
+{
+    u8* p = alloc<u8>(dir.len + file.len + 2);
+    if (p == null) return str { null, 0 };
+    usize n = 0;
+    usize i = 0;
+    while (i < dir.len) { p[n] = dir.ptr[i]; n++; i++; }
+    if (n > 0 && p[n - 1] != 47) { p[n] = 47; n++; }
+    i = 0;
+    while (i < file.len) { p[n] = file.ptr[i]; n++; i++; }
+    p[n] = 0;
+    return str { .ptr = p, .len = n };
+}
+
+/* parse <dir>/manifest.crlb — the default manifest file name */
+pub ModuleManifest* bLoadManifest(Arena* a, Slice dirS)
+{
+    str path = mJoinPath(a, dirS, Slice::fromStr("manifest.crlb"));
+    if (path.ptr == null) return null;
+    return bLoadManifestFile(a, Slice::from(path.ptr, path.len));
+}
+
+/* parse <dir>/<file> — `file` comes from a registry/override `extends`
+ * target; empty means the default manifest.crlb */
+pub ModuleManifest* bLoadManifestAs(Arena* a, Slice dirS, Slice file)
+{
+    if (file.ptr == null || file.len == 0) return bLoadManifest(a, dirS);
+    str path = mJoinPath(a, dirS, file);
+    if (path.ptr == null) return null;
+    return bLoadManifestFile(a, Slice::from(path.ptr, path.len));
 }
 
 /* the platform root this module should probe for build target `triple`:
