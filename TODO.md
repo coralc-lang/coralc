@@ -31,7 +31,8 @@
 - [x] fcmp backend fixes: x86_64 (fcmpPred+PF mask ported from wallvm), arm64 (verified NZCV: Olt->mi, Ole/One combos, Uge->hs), wasm32 (Ueq/One were miscompiled — also wrong in wallvm)
 - [x] Optimizer audit (physical, per-pass isolation vs --noopt baseline, diffs read): fixed fold same-arm select (check order), loop_cse was dead (reordered after licm + isSafeToSpeculate alloca/global-rooted pointers only + gVerbose gate), loop_detect now detects single-block (self-edge) loops — licm/loop_cse/unroll/loop_canon all benefit; new select_sidefx + involution fixtures (zero coverage before); verify-each 508 runs clean, run.sh 140/0
 - [ ] Audit CFG-mutating passes for duplicate-predecessor/parallel-edge hazards (jump_thread, branchprop, licm, loop_cse, sccp, gvn, mem2reg, ipa_cp) — verify-each over full corpus
-- [ ] Port remaining wallvm passes: memory_ssa + machine_opt (store-to-load forwarding via AA), loop_distribute, loop_interchange
+- [x] memory_ssa + machine_opt ported: store-to-load forwarding (must-alias + dominance + region scan) and AA-based dead-store elim at O2/O3 after dse; atomic loads excluded from forwarding (wallvm bug), 7 isolation fixtures + runtime verified, fires on dist_swap
+- [ ] Port remaining wallvm passes: loop_distribute, loop_interchange
 - [x] range: 12 golden fixtures + 54 runtime checks; fixed 3 wallvm bugs in port — u64-wrap gap check, || vs && unbounded sentinels (unsound union merges), insert-before-reject infinite loop
 - [ ] Deliberately skipped as unsound: branch_inversion (CFG corruption), branch_factoring (incomplete CFG check), lex_canon (orphan chains; sort covered by comm_canon), borrowcheck (diagnostic-only, not an optimization)
 - [ ] Port wallvm passes (backend-adjacent, decide fit for fast backend): lower_phis, stack_layout, peephole (only unique patterns x+x->shl, x*-1->neg — already added to algebraic), simd_vec (deferred — vectors scalarized per earlier decision), validate
