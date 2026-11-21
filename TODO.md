@@ -33,14 +33,21 @@
 - [ ] Audit CFG-mutating passes for duplicate-predecessor/parallel-edge hazards (jump_thread, branchprop, licm, loop_cse, sccp, gvn, mem2reg, ipa_cp) — verify-each over full corpus
 - [x] memory_ssa + machine_opt ported: store-to-load forwarding (must-alias + dominance + region scan) and AA-based dead-store elim at O2/O3 after dse; atomic loads excluded from forwarding (wallvm bug), 7 isolation fixtures + runtime verified, fires on dist_swap
 - [ ] Port remaining wallvm passes: loop_distribute, loop_interchange
+- [x] simd_vec ported: constant-trip-count vectorizer, O2 cheap tier (elementwise only, no reductions, vf*4 min iters) + O3 full (adds int sum/unsigned min/max reductions); unroll+tail_dup moved to O3-only so O3 is a strict superset of O2; fixed wallvm bugs — icmp-last-inst check rejected all real loops, reduction phi pair order assumed, unclaimed in-loop load/store now rejected (widening changes dynamic counts — was a miscompile); x86_64/arm64 emitters gained per-lane vector Load/Store (was single scalar access — runtime-caught); 15 fixtures in cases_simd, runtime-verified x86_64 O0/O2/O3
+- [ ] Vectorizer unlock roadmap (analysis-limited rejections, in order): signed min/max reductions (add VecSMin/VecSMax or per-lane select), constant-shift GEP a[i+k] (unit-stride + offset), runtime alias versioning (points-to fast path + runtime overlap check for UNKNOWN — biggest unlock), runtime trip-count + scalar epilogue, width-grouped vectorization for mixed elem widths
+- [ ] Vectorizer rejections that stay fundamental: atomics/fences, early exits/side branches (needs if-conversion+masking), float reductions without fast-math, calls in loop (needs loop_distribute first)
+- [ ] scalar_evolution pass (docs/scalar_evolution.md — LLVM IndVars/CR chains of recurrences): O3-only when ported; enables exit-value rewriting/loop deletion; watch overflow-widening rules
 - [x] range: 12 golden fixtures + 54 runtime checks; fixed 3 wallvm bugs in port — u64-wrap gap check, || vs && unbounded sentinels (unsound union merges), insert-before-reject infinite loop
 - [ ] Deliberately skipped as unsound: branch_inversion (CFG corruption), branch_factoring (incomplete CFG check), lex_canon (orphan chains; sort covered by comm_canon)
 - [ ] Rejected: borrowcheck (diagnostic-only alias-violation reporter, not an optimization — declined)
-- [ ] Port wallvm passes (backend-adjacent, decide fit for fast backend): lower_phis, stack_layout, peephole (only unique patterns x+x->shl, x*-1->neg — already added to algebraic), simd_vec (deferred — vectors scalarized per earlier decision), validate
+- [ ] Port wallvm passes (backend-adjacent, decide fit for fast backend): lower_phis, stack_layout, peephole (only unique patterns x+x->shl, x*-1->neg — already added to algebraic), validate
 
 ## Attributes
 - [x] Attribute args captured (align(N)/entry(addr)/deprecated("…") were silently dropped); entry requires address, once per program, chains with naked; naked = asm-only body contract; incompat pairs → T0068; bench/link/extern-attr/generate* removed; simd→muvm vector type; threadlocal/noalias/vectorise propagate or hard-error on muvm
 - [ ] Audit which attributes exist vs are honored; add missing attributes and honor them through sema/IR/backend
+- [ ] vectorise attributes (docs/vectorize-attributes.md): fn-level → IrFunc "vectorize.enable" metadata (request at O2/O3, enables at O0/O1); loop-level → per-natural-loop metadata; vectorise(N) → preferred width cap into chooseVectorWidth; novector opt-out attribute for the vectorizer
+- [ ] fastmath/reassoc attribute → unlocks float reductions in simd_vec (only legal with reassociation permission); attributes gate legality-relaxing transforms, never make illegal ones legal
+- [ ] simd struct attribute → fixed-vector IrType element-wise lowering (explicit-SIMD escape hatch)
 
 ## Parser / diagnostics
 - [x] `goto` + `ident:` labels → single P0030 unsupported-syntax error (was: parsed as decl, cascading errors)
