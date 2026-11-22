@@ -33,7 +33,8 @@
 - [ ] Audit CFG-mutating passes for duplicate-predecessor/parallel-edge hazards (jump_thread, branchprop, licm, loop_cse, sccp, gvn, mem2reg, ipa_cp) — verify-each over full corpus
 - [x] memory_ssa + machine_opt ported: store-to-load forwarding (must-alias + dominance + region scan) and AA-based dead-store elim at O2/O3 after dse; atomic loads excluded from forwarding (wallvm bug), 7 isolation fixtures + runtime verified, fires on dist_swap
 - [ ] Port remaining wallvm passes: loop_distribute, loop_interchange
-- [x] simd_vec ported: constant-trip-count vectorizer, O2 cheap tier (elementwise only, no reductions, vf*4 min iters) + O3 full (adds int sum/unsigned min/max reductions); unroll+tail_dup moved to O3-only so O3 is a strict superset of O2; fixed wallvm bugs — icmp-last-inst check rejected all real loops, reduction phi pair order assumed, unclaimed in-loop load/store now rejected (widening changes dynamic counts — was a miscompile); x86_64/arm64 emitters gained per-lane vector Load/Store (was single scalar access — runtime-caught); 15 fixtures in cases_simd, runtime-verified x86_64 O0/O2/O3
+- [x] simd_vec ported: constant-trip-count vectorizer, O2 cheap tier (elementwise only, no reductions, vf*4 min iters) + O3 full (adds int sum/unsigned min/max reductions); unroll+tail_dup run at BOTH O2 and O3 (only unported passes stay O3-only); fixed wallvm bugs — icmp-last-inst check rejected all real loops, reduction phi pair order assumed, unclaimed in-loop load/store now rejected (widening changes dynamic counts — was a miscompile); x86_64/arm64 emitters gained per-lane vector Load/Store (was single scalar access — runtime-caught); 15 fixtures in cases_simd, runtime-verified x86_64 O0/O2/O3
+- [x] slp_vec ported: SLP/straight-line vectorizer for unrolled scalar chains — packs consecutive-offset gep/load groups into vector loads, isomorphic ALU chains (operand lane-map or broadcast) into Vec* ops, and lane-aligned stores into vector stores; cheap tier (O2) skips broadcast-store packing; odd tails stay scalar; snapshot-based scanning (insertBefore mutates insts mid-scan), ADCE sweep after packing for orphaned geps, nextId bumped past numeric source names (printer %name/%id namespace collision → ambiguous reparse); extractelement inserted for surviving scalar uses; 3 fixtures in cases_slp + expected_slp_vec goldens; vec_add packs 16 elems → 8 vector groups at O2 AND O3, real coralc pipeline verified (vadd.crl exit 45)
 - [ ] Vectorizer unlock roadmap (analysis-limited rejections, in order): signed min/max reductions (add VecSMin/VecSMax or per-lane select), constant-shift GEP a[i+k] (unit-stride + offset), runtime alias versioning (points-to fast path + runtime overlap check for UNKNOWN — biggest unlock), runtime trip-count + scalar epilogue, width-grouped vectorization for mixed elem widths
 - [ ] Vectorizer rejections that stay fundamental: atomics/fences, early exits/side branches (needs if-conversion+masking), float reductions without fast-math, calls in loop (needs loop_distribute first)
 - [ ] scalar_evolution pass (docs/scalar_evolution.md — LLVM IndVars/CR chains of recurrences): O3-only when ported; enables exit-value rewriting/loop deletion; watch overflow-widening rules
@@ -45,7 +46,7 @@
 ## Attributes
 - [x] Attribute args captured (align(N)/entry(addr)/deprecated("…") were silently dropped); entry requires address, once per program, chains with naked; naked = asm-only body contract; incompat pairs → T0068; bench/link/extern-attr/generate* removed; simd→muvm vector type; threadlocal/noalias/vectorise propagate or hard-error on muvm
 - [ ] Audit which attributes exist vs are honored; add missing attributes and honor them through sema/IR/backend
-- [ ] vectorise attributes (docs/vectorize-attributes.md): fn-level → IrFunc "vectorize.enable" metadata (request at O2/O3, enables at O0/O1); loop-level → per-natural-loop metadata; vectorise(N) → preferred width cap into chooseVectorWidth; novector opt-out attribute for the vectorizer
+- [x] vectorise attributes (docs/vectorize-attributes.md): [[vectorise]]/[[vectorise(N)]]/[[novector]] at fn level → !vectorize/!vectorize.width/N/!novector metadata; loop-level attrs on for/while heads → !vectorise.loop/!novector.loop on header terminator; simd_vec honors marks (marked-only at O0/O1, width cap, novector opt-out incl. inside vectorised fns); test/coral/should work/vec_attr_{fn,loop,runtime}.crl verified O0/O2/O3
 - [ ] fastmath/reassoc attribute → unlocks float reductions in simd_vec (only legal with reassociation permission); attributes gate legality-relaxing transforms, never make illegal ones legal
 - [ ] simd struct attribute → fixed-vector IrType element-wise lowering (explicit-SIMD escape hatch)
 
@@ -80,6 +81,16 @@
 - [ ] Polish frontend and args passing
 - [ ] Run compiler under ASAN
 - [ ] Check docs/markdown files for reported failing cases
+
+## muvm backend bugs (verified 2026-11-22)
+- [ ] `std::string::String` segfaults under `--muvm`: `String s; s.pushChar('a'); s.appendView(...); s.asView()` crashes — heap-growth path (push/append realloc) broken; consequently `std::fmt::format` (String sink) cannot run under muvm. C backend fine.
+- [ ] muvm float/varargs bugs: `println("{}", 3.14159)` prints `9.53e-130` (garbage f64), `println("{}", 1.5f)` prints `0`, `{:f}` f64 prints `0.000000` (f32 works). f64 ABI/varargs lowering broken — unrelated to format impl.
+
+## Language features
+- [ ] `eq` trait design: types implementing it may use `==`/`!=` (and decide relational ops); replace the sema aggregate-comparison ban with trait-gated equality. Decide whether it subsumes the `(any toStr)` comptime arm in print/format — i.e. trait-based automatic conversion vs keeping comptime pattern matching. Needs design decision on scope first.
+- [ ] Union/variant IR representation: variant stored like a C tagged union (`{i32 tag; union payload}`, tag = case ordinal); union = byte blob + bitcast field access. Design doc written: `docs/union-variant-ir.md` — no new IrTypeKind needed, all lowering lives in coral-ir.
+- [ ] Per-module muvm codegen: compile projects as real modules, not one big translation unit.
+- [ ] wasm target: muvm assembler pipeline instead of gcc for muvm-generated assembly; stream assembler errors from the text buffer to the user; add wasm target.
 
 ## Language Cleanup
 - [x] Remove all compiler `cchar` hardcodes — `cchar` is a library `distinct` over `flag(arch)`; `C"..."` types as `const u8*` and binds to any integer pointer; bare module name in type position errors "is a module, not a type"; ~40 lib files now import `core::cchar { cchar }` explicitly

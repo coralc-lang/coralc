@@ -32,6 +32,7 @@ use mono { MonoContext, MonoSubstitution };
 use collect;
 
 import std::mman { alloc, dealloc, realloc, zero };
+import platform::libc { write, getenv };
 /* CtVal.kind tags: the bootstrap does not emit file-scope scalar consts
  * (only array consts) or forward-declare non-variant enums before extend
  * bodies, so the tags are inlined as numeric literals at use sites.
@@ -69,7 +70,6 @@ pub struct CtEval
     SourceLoc errLoc;
     u32 depth;
     SourceLoc loc;
-    Str variadicPackName;
     /* control-flow state for the evaluator: `returned` halts the current
      * function frame; `broken`/`continued` halt the current unrolled loop
      * body; `typeSwitchMissed` records a type switch with no matching arm
@@ -113,7 +113,6 @@ pub extend CtEval
         self.errLoc.data = 0;
         self.depth = 0;
         self.loc.data = 0;
-        self.variadicPackName = 0;
         self.returned = false;
         self.broken = false;
         self.continued = false;
@@ -393,6 +392,12 @@ pub extend CtEval
         self.failed = true;
         self.errMsg = msg;
         self.errLoc = self.loc;
+        if (getenv(C"CORAL_TRACE_CT") != null)
+        {
+            write(2, (const cchar*)"ctfail: ", 9);
+            write(2, (const cchar*)msg.ptr, msg.len);
+            write(2, (const cchar*)"\n", 1);
+        }
     }
 
     Node* nodeAt(NodeId n) { return self.mono->nodeAt(n); }
@@ -1097,8 +1102,11 @@ pub extend CtEval
                     CtVal pack;
                     if (spreadInner.index == 0)
                     {
-                        // bare `...`: forward the enclosing variadic pack
-                        pack = self.lookup(self.variadicPackName);
+                        /* bare `...` (the old anonymous forward-all hack)
+                         * is rejected by the parser; fail loudly if a
+                         * hand-built AST still carries one */
+                        self.fail("bare `...` is not supported; pass the pack by name (`args`) or spread it (`...args`)");
+                        pack = self.makeNone();
                     }
                     else
                     {
@@ -1121,7 +1129,24 @@ pub extend CtEval
                     continue;
                 }
                 NodeId aId = e->kind.payload.Call.args[i];
-                argv[argc] = self.evalExpr(aId);
+                CtVal av = self.evalExpr(aId);
+                if (av.kind == 6)
+                {
+                    /* a pack passed directly (`f(fmt, args)` where `args`
+                     * is the caller's own `... args` pack) splices into
+                     * the tail like `...args` — the callee's variadic
+                     * param receives the elements, not a nested pack */
+                    u32 k = 0;
+                    while (k < av.elemsLen && argc < rawArgs + 8)
+                    {
+                        argv[argc] = av.elems[k];
+                        argc++;
+                        k++;
+                    }
+                    i++;
+                    continue;
+                }
+                argv[argc] = av;
                 /* a comptime int/bool/str keeps its source node type so a
                  * callee's `@typeof(T)` inference does not fall back to a
                  * stale param type (`_fprintSpec(out, arg, spec)` inside
@@ -1146,6 +1171,13 @@ pub extend CtEval
         NodeId declId = self.findFunc(fname);
         Decl* decl = self.declAt(declId);
         bool hasComptime = false;
+        if (getenv(C"CORAL_TRACE_CT") != null && decl != null && fname != 0)
+        {
+            write(2, (const cchar*)"ctcall: ", 8);
+            write(2, (const cchar*)self.mono->ast->interns[fname].ptr,
+                  self.mono->ast->interns[fname].len);
+            write(2, (const cchar*)"\n", 1);
+        }
         if (decl != null && decl->kind.tag == DeclKind::Func)
         {
             // scan body for a top-level comptime stmt (shallow)
@@ -1169,11 +1201,16 @@ pub extend CtEval
             }
         }
 
+        if (getenv(C"CORAL_TRACE_CT") != null)
+        {
+            write(2, (const cchar*)"ctinline: ", 10);
+            if (hasComptime) write(2, (const cchar*)"yes\n", 4);
+            else write(2, (const cchar*)"no\n", 3);
+        }
         if (hasComptime && decl != null && decl->kind.tag == DeclKind::Func)
         {
             // inline: bind params to arg values, evaluate the body
             u32 savedLen = self.bindingsLen;
-            Str savedVariadic = self.variadicPackName;
             u32 p = 0;
             u32 pi = 0;
             while (p < decl->kind.payload.Func.paramsLen)
@@ -1184,18 +1221,18 @@ pub extend CtEval
                     Param* pp = &pn->kind.payload.Param.value;
                     if ((pp->flags & 16) != 0)
                     {
-                        /* variadic: bind the rest as a pack; when the
-                         * caller passed no trailing args (or forwarded an
-                         * empty pack through bare `...`) bind an EMPTY
-                         * pack so `for (x : args)` unrolls to zero
-                         * iterations instead of falling back to a
-                         * runtime loop over a pack codegen cannot lower */
-                        /* bare `...` params have no source name; bind the
-                         * pack under a private name so a bare `...` in the
-                         * body still forwards it (print's own `...`) */
+                        /* variadic: bind the rest as a pack under the
+                         * parameter's own name; when the caller passed no
+                         * trailing args bind an EMPTY pack so
+                         * `for (x : args)` unrolls to zero iterations
+                         * instead of falling back to a runtime loop over
+                         * a pack codegen cannot lower. Non-extern `...`
+                         * params are always named (parser-enforced);
+                         * extern C varargs never reach comptime eval. */
                         Str vpName = pp->name;
-                        if (vpName == 0) vpName = self.mono->ast->intern("\x01coral_varargs");
-                        if (pi < argc)
+                        if (vpName == 0)
+                            self.fail("comptime eval reached an unnamed variadic parameter");
+                        else if (pi < argc)
                         {
                             u32 rest = argc - pi;
                             CtVal* elems = alloc<CtVal>((usize)rest);
@@ -1205,14 +1242,12 @@ pub extend CtEval
                                 u32 k = 0;
                                 while (k < rest) { elems[k] = argv[pi + k]; k++; }
                                 self.bind(vpName, self.makePack(elems, rest));
-                                self.variadicPackName = vpName;
                             }
                             else dealloc<CtVal>(elems);
                         }
                         else
                         {
                             self.bind(vpName, self.makePack(null, 0));
-                            self.variadicPackName = vpName;
                         }
                         pi = argc;
                         break;
@@ -1293,7 +1328,6 @@ pub extend CtEval
             self.continued = savedContinued;
             // drop the inlined frame (keep outer bindings)
             self.bindingsLen = savedLen;
-            self.variadicPackName = savedVariadic;
             if (argv != null) dealloc<CtVal>(argv);
             /* inlined functions return nothing useful to the caller here:
              * print's callees are all void */
@@ -2304,6 +2338,18 @@ pub extend CtEval
     void evalSwitch(NodeId id, Stmt* s)
     {
         CtVal sc = self.evalExpr(s->kind.payload.Switch.expr);
+        if (getenv(C"CORAL_TRACE_CT") != null)
+        {
+            write(2, (const cchar*)"ctswitch kind=", 12);
+            write(2, (const cchar*)(48 + (sc.kind % 10)), 1);
+            write(2, (const cchar*)" ival=", 6);
+            u64 dv = sc.ival;
+            u8[20] db; u32 dn = 0;
+            if (dv == 0) { db[dn++] = 48; }
+            while (dv > 0) { db[dn++] = (u8)(48 + (dv % 10)); dv /= 10; }
+            while (dn > 0) { dn--; write(2, (const cchar*)(db + dn), 1); }
+            write(2, (const cchar*)"\n", 1);
+        }
         // type switch: scrutinee is a comptime type (T bound to concrete)
         if (sc.kind == 4)
         {
@@ -2349,6 +2395,15 @@ pub extend CtEval
                 }
                 i++;
             }
+            /* `else` arm (flags&4, no patterns): the catch-all — run it
+             * instead of reporting a missed type switch */
+            u32 ei = 0;
+            while (ei < s->kind.payload.Switch.casesLen)
+            {
+                SwitchCase* ec = s->kind.payload.Switch.cases + ei;
+                if ((ec->flags & 4) != 0) { self.evalArmBody(ec->body); return; }
+                ei++;
+            }
             /* no arm matched: record it so the end of the comptime block
              * can report it; an author's trailing @compileError still fires
              * first during fall-through and wins the message */
@@ -2383,6 +2438,14 @@ pub extend CtEval
                     return;
                 }
                 i++;
+            }
+            /* `else` arm (flags&4, no patterns): the catch-all */
+            u32 ei = 0;
+            while (ei < s->kind.payload.Switch.casesLen)
+            {
+                SwitchCase* ec = s->kind.payload.Switch.cases + ei;
+                if ((ec->flags & 4) != 0) { self.evalArmBody(ec->body); return; }
+                ei++;
             }
             /* no arm matched: emit the switch so the runtime fall-through
              * (C semantics) survives instead of vanishing silently */

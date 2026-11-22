@@ -1,0 +1,686 @@
+#[[no_drop_all]]
+// SLP (basic-block) vectorization for muvm.
+//
+// Loop unrolling leaves behind runs of isomorphic scalar instruction
+// chains — gep/load/add/store sequences repeated with consecutive
+// constant indices. This pass packs groups of vf isomorphic scalar ops
+// into their vector counterparts:
+//
+//   phase 1  strided loads:  vf loads at gep(base,k)..gep(base,k+vf-1)
+//            become one `load vector` at element k; each scalar result
+//            is tagged (vector, lane)
+//   phase 2  ALU fixpoint:   vf same-opcode insts whose operands are
+//            lane-consistent (operand j of member p is lane p of the
+//            same source vector) or splattable (identical scalar /
+//            constant across members) become one vector op; results
+//            tagged the same way. Iterates so packed results can feed
+//            higher-level packs.
+//   phase 3  strided stores: vf stores to consecutive elements with
+//            lane-consistent (or identical) values become one
+//            `store vector`.
+//   phase 4  materialize:    scalar results that still have users get
+//            an `extractelement` per lane; every packed scalar inst is
+//            then killed in reverse order so operand user lists stay
+//            exact.
+//
+// Only opcodes the scalarized backends lower are emitted: VecAdd,
+// VecSub, VecMul, VecMin/Max (unsigned contract), VecFAdd/FSub/FMul/
+// FDiv, vector Load/Store, VecBroadcast, ExtractElement.
+
+import muvm::passes::common { gVerbose };
+import muvm::passes::dce { muvmPassAdce };
+import muvm::irOps { IrOpcode };
+import muvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrType, IrTypeKind, IrValueKind };
+import std::mman { alloc, dealloc };
+import std::ios { eprintln };
+
+pub struct SlpPass
+{
+    IrContext* ctx;
+    bool cheap;
+    u64 packedOps;
+
+    // scalar result value -> (vector value, lane)
+    IrValue** mapSrc;
+    IrValue** mapVec;
+    u32* mapLane;
+    u32 mapLen;
+    u32 mapCap;
+
+    // scalar insts consumed by a pack
+    IrInst** packed;
+    u32 packedLen;
+    u32 packedCap;
+
+    // vbroadcast cache: scalar operand -> broadcast inst
+    IrValue** bcSrc;
+    IrInst** bcInst;
+    u32 bcLen;
+    u32 bcCap;
+
+    static SlpPass new(IrContext* ctx, bool cheap)
+    {
+        return SlpPass {
+            .ctx = ctx,
+            .cheap = cheap,
+            .packedOps = 0,
+            .mapSrc = null, .mapVec = null, .mapLane = null,
+            .mapLen = 0, .mapCap = 0,
+            .packed = null, .packedLen = 0, .packedCap = 0,
+            .bcSrc = null, .bcInst = null, .bcLen = 0, .bcCap = 0
+        };
+    }
+
+    void mapReset()
+    {
+        self.mapLen = 0;
+        self.packedLen = 0;
+        self.bcLen = 0;
+    }
+
+    i32 mapFind(IrValue* src)
+    {
+        for (u32 i = 0; i < self.mapLen; i++)
+            if (self.mapSrc[i] == src) return (i32)i;
+        return -1;
+    }
+
+    void mapAdd(IrValue* src, IrValue* vec, u32 lane)
+    {
+        if (self.mapLen >= self.mapCap)
+        {
+            u32 nc = self.mapCap ? self.mapCap * 2 : 32;
+            IrValue** ns = alloc<IrValue*>((usize)nc);
+            IrValue** nv = alloc<IrValue*>((usize)nc);
+            u32* nl = alloc<u32>((usize)nc);
+            if (self.mapSrc != null)
+            {
+                for (u32 i = 0; i < self.mapLen; i++)
+                { ns[i] = self.mapSrc[i]; nv[i] = self.mapVec[i]; nl[i] = self.mapLane[i]; }
+                dealloc<IrValue*>(self.mapSrc);
+                dealloc<IrValue*>(self.mapVec);
+                dealloc<u32>(self.mapLane);
+            }
+            self.mapSrc = ns; self.mapVec = nv; self.mapLane = nl;
+            self.mapCap = nc;
+        }
+        self.mapSrc[self.mapLen] = src;
+        self.mapVec[self.mapLen] = vec;
+        self.mapLane[self.mapLen] = lane;
+        self.mapLen++;
+    }
+
+    bool isPacked(IrInst* inst)
+    {
+        for (u32 i = 0; i < self.packedLen; i++)
+            if (self.packed[i] == inst) return true;
+        return false;
+    }
+
+    void markPacked(IrInst* inst)
+    {
+        if (self.packedLen >= self.packedCap)
+        {
+            u32 nc = self.packedCap ? self.packedCap * 2 : 32;
+            IrInst** np = alloc<IrInst*>((usize)nc);
+            if (self.packed != null)
+            {
+                for (u32 i = 0; i < self.packedLen; i++) np[i] = self.packed[i];
+                dealloc<IrInst*>(self.packed);
+            }
+            self.packed = np;
+            self.packedCap = nc;
+        }
+        self.packed[self.packedLen++] = inst;
+    }
+
+    IrInst* broadcastFor(IrBlock* bb, IrInst* anchor, IrValue* scalar, IrType* vecTy)
+    {
+        for (u32 i = 0; i < self.bcLen; i++)
+            if (self.bcSrc[i] == scalar) return self.bcInst[i];
+        IrValue*[1] ops = { scalar };
+        IrInst* bc = self.ctx->createInst(IrOpcode::VecBroadcast, vecTy, ops, 1, 0, 0);
+        scalar->addUser(bc);
+        bb->insertBefore(bc, anchor);
+        if (self.bcLen >= self.bcCap)
+        {
+            u32 nc = self.bcCap ? self.bcCap * 2 : 16;
+            IrValue** ns = alloc<IrValue*>((usize)nc);
+            IrInst** ni = alloc<IrInst*>((usize)nc);
+            if (self.bcSrc != null)
+            {
+                for (u32 i = 0; i < self.bcLen; i++) { ns[i] = self.bcSrc[i]; ni[i] = self.bcInst[i]; }
+                dealloc<IrValue*>(self.bcSrc);
+                dealloc<IrInst*>(self.bcInst);
+            }
+            self.bcSrc = ns; self.bcInst = ni; self.bcCap = nc;
+        }
+        self.bcSrc[self.bcLen] = scalar;
+        self.bcInst[self.bcLen] = bc;
+        self.bcLen++;
+        return bc;
+    }
+
+    // see through bitcast wrappers to the real producer value
+    IrValue* stripBitcasts(IrValue* v)
+    {
+        u32 depth = 0;
+        while (v != null && v->kind == IrValueKind::Inst && depth++ < 8)
+        {
+            IrInst* iv = (IrInst*)v;
+            if (iv->opcode != IrOpcode::Bitcast || iv->nops < 1) break;
+            v = iv->ops[0];
+        }
+        return v;
+    }
+
+    // decompose a memory operand into (base, element index). Accepts a
+    // bare base (index 0) or gep(base, constIdx). Returns false for
+    // anything else (variable index, multi-index gep, constants).
+    bool addrKey(IrValue* addr, IrValue** baseOut, u32* kOut)
+    {
+        IrValue* a = self.stripBitcasts(addr);
+        if (a == null) return false;
+        if (a->kind == IrValueKind::Inst)
+        {
+            IrInst* ai = (IrInst*)a;
+            if (ai->opcode == IrOpcode::Gep && ai->nops == 2 &&
+                ai->ops[1] != null && ai->ops[1]->kind == IrValueKind::ConstInt)
+            {
+                *baseOut = ai->ops[0];
+                *kOut = (u32)ai->ops[1]->valData;
+                return true;
+            }
+            // non-gep pointer producer: treat as base at index 0 only
+            // when it is not itself a computed address we cannot reason
+            // about — accept args/allocas/globals/phis? A phi base is
+            // still a valid base for grouping (same value = same base).
+            if (ai->opcode == IrOpcode::Alloca || ai->opcode == IrOpcode::Load)
+            {
+                *baseOut = a;
+                *kOut = 0;
+                return true;
+            }
+            return false;
+        }
+        if (a->kind == IrValueKind::Arg || a->kind == IrValueKind::Global)
+        {
+            *baseOut = a;
+            *kOut = 0;
+            return true;
+        }
+        return false;
+    }
+
+    u32 vecWidthFor(IrType* elemTy)
+    {
+        if (elemTy == null) return 0;
+        if (elemTy->kind == IrTypeKind::Vector ||
+            elemTy->kind == IrTypeKind::Ptr ||
+            elemTy->kind == IrTypeKind::Struct ||
+            elemTy->kind == IrTypeKind::Array ||
+            elemTy->kind == IrTypeKind::Void)
+            return 0;
+        u32 bits = elemTy->width;
+        if (bits == 0) return 0;
+        if (bits <= 8) return 16;
+        if (bits <= 16) return 8;
+        if (bits <= 32) return 4;
+        if (bits <= 64) return 2;
+        return 0;
+    }
+
+    // scalar opcode -> vector opcode, or VecAdd as sentinel for "no map"
+    // (VecAdd is a real op so use a separate bool out)
+    bool vecOpFor(IrOpcode op, bool isFloat, IrOpcode* out)
+    {
+        if (isFloat)
+        {
+            switch (op)
+            {
+                IrOpcode::FAdd => { *out = IrOpcode::VecFAdd; return true; },
+                IrOpcode::FSub => { *out = IrOpcode::VecFSub; return true; },
+                IrOpcode::FMul => { *out = IrOpcode::VecFMul; return true; },
+                IrOpcode::FDiv => { *out = IrOpcode::VecFDiv; return true; },
+                else => { return false; }
+            }
+        }
+        switch (op)
+        {
+            IrOpcode::Add => { *out = IrOpcode::VecAdd; return true; },
+            IrOpcode::Sub => { *out = IrOpcode::VecSub; return true; },
+            IrOpcode::Mul => { *out = IrOpcode::VecMul; return true; },
+            IrOpcode::UMin => { *out = IrOpcode::VecMin; return true; },
+            IrOpcode::UMax => { *out = IrOpcode::VecMax; return true; },
+            else => { return false; }
+        }
+    }
+
+    bool isFloatTy(IrType* t)
+    {
+        return t != null && t->kind == IrTypeKind::Float;
+    }
+
+    // can scalar value `v` serve as lane `lane` of vector `vec`?
+    // lane-mapped values must sit at exactly that lane; unmapped values
+    // must be identical across all members (broadcast) or equal consts.
+    bool operandLaneOk(IrValue* seedOp, IrValue* memberOp, u32 lane,
+                       IrValue** vecOut, bool* isBroadcast)
+    {
+        i32 si = self.mapFind(seedOp);
+        i32 mi = self.mapFind(memberOp);
+        if (si >= 0)
+        {
+            // seed operand is lane-mapped: member must be the same
+            // lane offset ahead in the SAME vector
+            if (mi < 0) return false;
+            if (self.mapVec[si] != self.mapVec[mi]) return false;
+            if (self.mapLane[mi] != self.mapLane[si] + lane) return false;
+            *vecOut = self.mapVec[si];
+            *isBroadcast = false;
+            return true;
+        }
+        // seed operand unmapped: broadcast — member must match the
+        // seed's own operand exactly; the caller guarantees all members
+        // compare against the seed, so identical-to-seed suffices
+        if (memberOp != seedOp) return false;
+        if (seedOp != null && seedOp->kind == IrValueKind::ConstInt)
+        {
+            // consts intern by value, pointer equality covers it
+        }
+        if (self.cheap && seedOp != null &&
+            seedOp->kind != IrValueKind::ConstInt &&
+            seedOp->kind != IrValueKind::ConstFloat)
+            return false;   // cheap tier: no scalar broadcasts
+        *vecOut = seedOp;
+        *isBroadcast = true;
+        return true;
+    }
+
+    // block index of inst, or ninsts when absent
+    u32 blockIndexOf(IrBlock* bb, IrInst* inst)
+    {
+        for (u32 i = 0; i < bb->ninsts; i++)
+            if (bb->insts[i] == inst) return i;
+        return bb->ninsts;
+    }
+
+    // snapshot of bb's inst pointers — insertBefore mutates bb->insts
+    // mid-scan, so all grouping must run off a stable snapshot
+    IrInst** snapshot(IrBlock* bb, u32* outN)
+    {
+        IrInst** snap = alloc<IrInst*>((usize)bb->ninsts);
+        u32 n = 0;
+        for (u32 i = 0; i < bb->ninsts; i++)
+            if (bb->insts[i] != null) snap[n++] = bb->insts[i];
+        *outN = n;
+        return snap;
+    }
+
+    // gather vf isomorphic partners for seed from snap; returns count
+    // (0/vf). members[] gets the group; anchorOut gets the member with
+    // the lowest live block index — insert the vector op before it.
+    u32 gatherGroup(IrInst* seed, IrInst** snap, u32 nsnap,
+                    IrInst** members, u32 vf, IrInst** anchorOut)
+    {
+        members[0] = seed;
+        u32 got = 1;
+        IrInst* anchor = seed;
+        u32 anchorIdx = self.blockIndexOf(seed->parent, seed);
+        for (u32 i = 0; i < nsnap && got < vf; i++)
+        {
+            IrInst* cand = snap[i];
+            if (cand == null || cand == seed) continue;
+            if (cand->opcode != seed->opcode) continue;
+            if (cand->nops != seed->nops) continue;
+            if (cand->base.type != seed->base.type) continue;
+            if (self.isPacked(cand)) continue;
+            bool ok = true;
+            for (u32 j = 0; j < seed->nops; j++)
+            {
+                IrValue* vec = null;
+                bool bcast = false;
+                if (!self.operandLaneOk(seed->ops[j], cand->ops[j], got,
+                                        &vec, &bcast)) { ok = false; break; }
+            }
+            if (!ok) continue;
+            u32 ci = self.blockIndexOf(seed->parent, cand);
+            if (ci < anchorIdx) { anchorIdx = ci; anchor = cand; }
+            members[got] = cand;
+            got++;
+        }
+        *anchorOut = anchor;
+        return got;
+    }
+
+    // phase 1: strided loads -> vector loads
+    void packLoads(IrBlock* bb)
+    {
+        u32 ns = 0;
+        IrInst** snap = self.snapshot(bb, &ns);
+        for (u32 i = 0; i < ns; i++)
+        {
+            IrInst* ld = snap[i];
+            if (ld == null || ld->opcode != IrOpcode::Load) continue;
+            if (ld->nops < 1 || ld->ops[0] == null) continue;
+            if (self.isPacked(ld)) continue;
+            IrType* elemTy = ld->base.type;
+            u32 vf = self.vecWidthFor(elemTy);
+            if (vf < 2) continue;
+
+            // find vf-1 partners: same base, consecutive k, same type
+            IrValue* base = null;
+            u32 k0 = 0;
+            if (!self.addrKey(ld->ops[0], &base, &k0)) continue;
+
+            IrInst*[16] members;
+            IrValue*[16] addrs;
+            members[0] = ld;
+            addrs[0] = ld->ops[0];
+            u32 got = 1;
+
+            for (u32 j = i + 1; j < ns && got < vf; j++)
+            {
+                IrInst* cand = snap[j];
+                if (cand == null || cand->opcode != IrOpcode::Load) continue;
+                if (cand->nops < 1 || cand->ops[0] == null) continue;
+                if (cand->base.type != elemTy) continue;
+                if (self.isPacked(cand)) continue;
+                IrValue* cb = null;
+                u32 ck = 0;
+                if (!self.addrKey(cand->ops[0], &cb, &ck)) continue;
+                if (cb != base) continue;
+                if (ck != k0 + got) continue;   // strictly consecutive
+                members[got] = cand;
+                addrs[got] = cand->ops[0];
+                got++;
+            }
+            if (got < vf) continue;
+
+            // vector load address: reuse the k0 member's stripped addr
+            IrValue* vaddr = self.stripBitcasts(addrs[0]);
+            IrType* vecTy = self.ctx->tyVector(elemTy, vf);
+            IrValue*[1] lops = { vaddr };
+            IrInst* vld = self.ctx->createInst(IrOpcode::Load, vecTy, lops, 1, 0, 0);
+            vaddr->addUser(vld);
+            bb->insertBefore(vld, members[0]);
+
+            for (u32 p = 0; p < vf; p++)
+            {
+                self.mapAdd(&members[p]->base, &vld->base, p);
+                self.markPacked(members[p]);
+            }
+            self.packedOps++;
+        }
+        dealloc<IrInst*>(snap);
+    }
+
+    // phase 2: isomorphic ALU chains -> vector ops (fixpoint)
+    void packAlu(IrBlock* bb)
+    {
+        for (u32 round = 0; round < 8; round++)
+        {
+            u32 ns = 0;
+            IrInst** snap = self.snapshot(bb, &ns);
+            bool progress = false;
+            for (u32 i = 0; i < ns; i++)
+            {
+                IrInst* seed = snap[i];
+                if (seed == null) continue;
+                if (self.isPacked(seed)) continue;
+                if (seed->nops != 2) continue;
+                IrOpcode vop;
+                if (!self.vecOpFor(seed->opcode, self.isFloatTy(seed->base.type), &vop))
+                    continue;
+                IrType* elemTy = seed->base.type;
+                u32 vf = self.vecWidthFor(elemTy);
+                if (vf < 2) continue;
+
+                IrInst*[16] members;
+                IrInst* anchor = null;
+                u32 got = self.gatherGroup(seed, snap, ns, members, vf, &anchor);
+                if (got < vf || anchor == null) continue;
+
+                // build vector operands: lane-mapped sources contribute
+                // their vector directly; everything else was proven
+                // identical-to-seed by operandLaneOk and splats
+                IrType* vecTy = self.ctx->tyVector(elemTy, vf);
+                IrValue*[2] vops;
+                for (u32 j = 0; j < 2; j++)
+                {
+                    i32 mi = self.mapFind(seed->ops[j]);
+                    if (mi >= 0)
+                    {
+                        vops[j] = self.mapVec[mi];
+                        continue;
+                    }
+                    IrInst* bc = self.broadcastFor(bb, anchor, seed->ops[j], vecTy);
+                    vops[j] = &bc->base;
+                }
+
+                IrValue*[2] ops2 = { vops[0], vops[1] };
+                IrInst* vinst = self.ctx->createInst(vop, vecTy, ops2, 2, 0, 0);
+                vops[0]->addUser(vinst);
+                vops[1]->addUser(vinst);
+                bb->insertBefore(vinst, anchor);
+
+                for (u32 p = 0; p < vf; p++)
+                {
+                    self.mapAdd(&members[p]->base, &vinst->base, p);
+                    self.markPacked(members[p]);
+                }
+                self.packedOps++;
+                progress = true;
+            }
+            dealloc<IrInst*>(snap);
+            if (!progress) break;
+        }
+    }
+
+    // phase 3: strided stores -> vector stores
+    void packStores(IrBlock* bb)
+    {
+        u32 ns = 0;
+        IrInst** snap = self.snapshot(bb, &ns);
+        for (u32 i = 0; i < ns; i++)
+        {
+            IrInst* st = snap[i];
+            if (st == null || st->opcode != IrOpcode::Store) continue;
+            if (st->nops < 2) continue;
+            if (self.isPacked(st)) continue;
+            IrValue* val = st->ops[0];
+            if (val == null) continue;
+            IrType* elemTy = val->type;
+            if (elemTy == null) continue;
+            u32 vf = self.vecWidthFor(elemTy);
+            if (vf < 2) continue;
+
+            IrValue* base = null;
+            u32 k0 = 0;
+            if (!self.addrKey(st->ops[1], &base, &k0)) continue;
+
+            // seed value must be lane-mapped at lane 0, or identical
+            // across members (broadcast store)
+            i32 si = self.mapFind(val);
+            bool bcastStore = si < 0;
+            if (bcastStore && self.cheap) continue;
+            if (!bcastStore && self.mapLane[si] != 0) continue;
+
+            IrInst*[16] members;
+            members[0] = st;
+            u32 got = 1;
+            for (u32 j = i + 1; j < ns && got < vf; j++)
+            {
+                IrInst* cand = snap[j];
+                if (cand == null || cand->opcode != IrOpcode::Store) continue;
+                if (cand->nops < 2) continue;
+                if (self.isPacked(cand)) continue;
+                if (cand->ops[0] == null || cand->ops[0]->type != elemTy) continue;
+                IrValue* cb = null;
+                u32 ck = 0;
+                if (!self.addrKey(cand->ops[1], &cb, &ck)) continue;
+                if (cb != base || ck != k0 + got) continue;
+                if (bcastStore)
+                {
+                    if (cand->ops[0] != val) continue;
+                }
+                else
+                {
+                    i32 ci = self.mapFind(cand->ops[0]);
+                    if (ci < 0) continue;
+                    if (self.mapVec[ci] != self.mapVec[si]) continue;
+                    if (self.mapLane[ci] != got) continue;
+                }
+                members[got] = cand;
+                got++;
+            }
+            if (got < vf) continue;
+
+            IrType* vecTy = self.ctx->tyVector(elemTy, vf);
+            IrValue* vval;
+            if (bcastStore)
+            {
+                IrInst* bc = self.broadcastFor(bb, st, val, vecTy);
+                vval = &bc->base;
+            }
+            else
+            {
+                vval = self.mapVec[si];
+            }
+            IrValue* vaddr = self.stripBitcasts(st->ops[1]);
+            IrValue*[2] sops = { vval, vaddr };
+            IrInst* vst = self.ctx->createInst(IrOpcode::Store, self.ctx->tyVoid(), sops, 2, 0, 0);
+            vval->addUser(vst);
+            vaddr->addUser(vst);
+            bb->insertBefore(vst, members[0]);
+
+            for (u32 p = 0; p < vf; p++) self.markPacked(members[p]);
+            self.packedOps++;
+        }
+        dealloc<IrInst*>(snap);
+    }
+
+    // phase 4: extracts for surviving uses, then kill packed scalars
+    // in reverse order so operand user lists drain correctly
+    void finalize(IrBlock* bb)
+    {
+        for (u32 pi = self.packedLen; pi-- > 0;)
+        {
+            IrInst* inst = self.packed[pi];
+            if (inst == null || inst->parent != bb) continue;
+            IrValue* res = &inst->base;
+            bool hasRes = inst->opcode != IrOpcode::Store &&
+                          res->type != null &&
+                          !(res->type->kind == IrTypeKind::Void);
+            if (hasRes && res->nusers > 0)
+            {
+                i32 mi = -1;
+                // the pending map entry for this result
+                for (u32 m = 0; m < self.mapLen; m++)
+                    if (self.mapSrc[m] == res) { mi = (i32)m; break; }
+                if (mi >= 0)
+                {
+                    IrValue* idx = self.ctx->constInt(self.ctx->tyInt(32),
+                                                    (u64)self.mapLane[mi]);
+                    IrValue*[2] eops = { self.mapVec[mi], idx };
+                    IrInst* ex = self.ctx->createInst(
+                        IrOpcode::ExtractElement, res->type, eops, 2, 0, 0);
+                    self.mapVec[mi]->addUser(ex);
+                    idx->addUser(ex);
+                    inst->parent->insertBefore(ex, inst);
+                    res->replaceAllUses(&ex->base);
+                }
+            }
+            inst->kill();
+        }
+    }
+
+    // the printer emits `%name` for named values and `%<id>` for fresh
+    // ones — both share the % namespace, so a fresh id that equals an
+    // existing numeric name prints ambiguously and reparses wrong.
+    // parsed names are arbitrary (unroll leaves sparse %70..%254), so
+    // push nextId past the largest numeric name before creating insts.
+    u64 numericName(str s)
+    {
+        if (s.len == 0 || s.ptr == null) return 0;
+        u64 v = 0;
+        for (u32 i = 0; i < (u32)s.len; i++)
+        {
+            u8 c = ((const u8*)s.ptr)[i];
+            if (c < '0' || c > '9') return 0;
+            v = v * 10 + (u64)(c - '0');
+        }
+        return v;
+    }
+
+    void bumpIdsPastNames(IrFunc* func)
+    {
+        u64 maxName = 0;
+        for (u32 ai = 0; ai < func->nargs; ai++)
+        {
+            u64 v = self.numericName(func->args[ai]->name);
+            if (v > maxName) maxName = v;
+        }
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            if (bb == null) continue;
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst == null) continue;
+                u64 v = self.numericName(inst->base.name);
+                if (v > maxName) maxName = v;
+            }
+        }
+        if (maxName + 1 > (u64)self.ctx->nextId)
+            self.ctx->nextId = (u32)(maxName + 1);
+    }
+
+    void runFunc(IrFunc* func)
+    {
+        if (func == null || func->isExtern) return;
+        self.bumpIdsPastNames(func);
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            if (bb == null) continue;
+            self.mapReset();
+            self.packLoads(bb);
+            self.packAlu(bb);
+            self.packStores(bb);
+            self.finalize(bb);
+        }
+    }
+}
+
+pub bool muvmPassSlpVec(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (func == null || ctx == null) return false;
+    SlpPass pass = SlpPass::new(ctx, false);
+    u64 before = pass.packedOps;
+    pass.runFunc(func);
+    if (pass.packedOps != before)
+    {
+        // packing orphans the scalar geps/bitcasts that fed the packed
+        // lanes — sweep them with the same ADCE the pipeline uses so
+        // the printed module is already at fixpoint
+        (void)muvmPassAdce(func, userdata);
+    }
+    return pass.packedOps != before;
+}
+
+pub bool muvmPassSlpVecCheap(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (func == null || ctx == null) return false;
+    SlpPass pass = SlpPass::new(ctx, true);
+    u64 before = pass.packedOps;
+    pass.runFunc(func);
+    if (pass.packedOps != before)
+    {
+        (void)muvmPassAdce(func, userdata);
+    }
+    return pass.packedOps != before;
+}

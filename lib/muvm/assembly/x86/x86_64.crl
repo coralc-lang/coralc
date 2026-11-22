@@ -7,9 +7,9 @@
 // go to the AVX table first (full-name match, no suffix splitting), then
 // the legacy table. Entry points: encodeLine (one line, no object) and
 // assembleText (whole unit into an AsmObject with symbols + relocs).
-import muvm::assembly::common { AsmLine, AsmOperand, AsmOpKind, AsmParseError, AsmLexer, parseAttLine, asmOperandEmpty };
+import muvm::assembly::common { AsmLine, AsmOperand, AsmOpKind, AsmParseError, AsmLexer, parseAttLine, asmOperandEmpty, asmLineEmpty };
 import muvm::assembly::x86::common { X86Reg, X86RegClass, lookupReg, isVectorReg, AsmBytes, X86Rex, X86Vex, encodeMem, encodeRegReg };
-import muvm::assembly::x86::obj { AsmObject, AsmSection, AsmSymbol, AsmRelocKind, asmAddReloc, asmFindOrAddSym, asmFindSym };
+import muvm::assembly::x86::obj { AsmObject, AsmSection, AsmSymbol, AsmRelocKind, asmAddReloc, asmFindOrAddSym, asmFindSym, asmSecData, asmSecSize, asmSecNobits, asmSecZero, asmSecBumpAlign, asmSecAlignPtr, asmSecExec, asmSecName, asmSecShf, asmFindXSection, asmAddXSection };
 import muvm::assembly::x86::x86_avx { EncodeCtx, ctxNew, tryVecTable };
 import muvm::assembly::x86::x86_sse { trySseTable };
 import core::char_util { isAlpha, isDigit, isSpace };
@@ -322,6 +322,7 @@ static FormRow[] _forms = {
     { "cbw",  0, 0, 0x66, 0x98, NOREG, 0, false, false, false, 0 },
     { "cwde", 0, 0, 0x98, 0, NOREG, 0, false, false, false, 0 },
     { "cdqe", 0, 0, 0x48, 0x98, NOREG, 0, false, false, false, 0 },
+    { "cltq", 0, 0, 0x48, 0x98, NOREG, 0, false, false, false, 0 },
     { "rdtsc", 0, 0, 0x0F, 0x31, NOREG, 0, false, false, false, 0 },
     { "iretq", 0, 0, 0x48, 0xCF, NOREG, 0, false, false, false, 0 },
     { "int", 0, 8, 0xCD, 0, NOREG, 1, false, false, false, 0 },
@@ -1019,6 +1020,47 @@ pub bool matchAndEncode(AsmLine* line, EncodeCtx* ctx, AsmParseError* err)
     i32 vr = tryVecTable(line, line->mnem, ctx, err);
     if (vr == 1) return true;
     if (vr == -1) return false;
+
+    // GAS cmp<cc><ps|pd|ss|sd> aliases → cmpps/cmppd/cmpss/cmpsd with
+    // the predicate immediate synthesized as the first (AT&T) operand
+    {
+        str cm = line->mnem;
+        if (cm.len >= 7 && cm.ptr[0] == (u8)'c' && cm.ptr[1] == (u8)'m' &&
+            cm.ptr[2] == (u8)'p')
+        {
+            str suf = str::fromParts(&cm.ptr[cm.len - 2], 2);
+            str cond = str::fromParts(&cm.ptr[3], cm.len - 5);
+            str base2 = "";
+            if (suf.equals("ps")) base2 = "cmpps";
+            else if (suf.equals("pd")) base2 = "cmppd";
+            else if (suf.equals("ss")) base2 = "cmpss";
+            else if (suf.equals("sd")) base2 = "cmpsd";
+            if (base2.len > 0 && cond.len > 0)
+            {
+                i64 imm = -1;
+                if (cond.equals("eq")) imm = 0;
+                else if (cond.equals("lt")) imm = 1;
+                else if (cond.equals("le")) imm = 2;
+                else if (cond.equals("unord")) imm = 3;
+                else if (cond.equals("neq")) imm = 4;
+                else if (cond.equals("nlt")) imm = 5;
+                else if (cond.equals("nle")) imm = 6;
+                else if (cond.equals("ord")) imm = 7;
+                if (imm >= 0 && line->nops <= 3)
+                {
+                    // shift operands right, drop the last slot overflow
+                    for (u32 i = line->nops; i > 0; i--)
+                        line->ops[i] = line->ops[i - 1];
+                    AsmOperand im = asmOperandEmpty();
+                    im.kind = AsmOpKind::Imm;
+                    im.imm = imm;
+                    line->ops[0] = im;
+                    line->nops++;
+                    line->mnem = base2;
+                }
+            }
+        }
+    }
 
     // legacy SSE/SSE2/SSE3/SSSE3/SSE4: also full mnemonics (paddb must
     // not split into padd + b), non-VEX forms only
@@ -1907,7 +1949,7 @@ pub bool matchAndEncode(AsmLine* line, EncodeCtx* ctx, AsmParseError* err)
 // Symbolic operands that need relocs are assembleText's job.
 pub bool encodeLine(str src, u32 lineNo, AsmBytes* out, AsmParseError* err)
 {
-    AsmLine line = AsmLine {};
+    AsmLine line = asmLineEmpty();
     if (!parseAttLine(src, lineNo, &line, err)) return false;
     if (line.isEmpty || line.isDirective) return true;
     EncodeCtx ctx = ctxNew(out, null, 1);
@@ -1942,29 +1984,65 @@ bool asmAppend(AsmBytes* dst, AsmBytes* src)
     return true;
 }
 
-// Output section for an assembler section index: 1 .text, 2 .data,
-// 3 .text.hot, 4 .text.cold.
+// Output section bytes for an assembler section index. Sections 1..4 are
+// the fixed fields; 5+ live in obj->xsecs. For NOBITS sections this still
+// returns the (empty) data buffer — callers must check asmSecNobits.
 AsmBytes* asmSectionData(AsmObject* obj, i32 sec)
 {
-    if (sec == 2) return &obj->data.data;
-    if (sec == 3) return &obj->hot.data;
-    if (sec == 4) return &obj->cold.data;
-    return &obj->text.data;
+    return asmSecData(obj, sec);
 }
 
 void asmSectionBumpAlign(AsmObject* obj, i32 sec, u64 align)
 {
-    AsmSection* s = &obj->text;
-    if (sec == 2) s = &obj->data;
-    else if (sec == 3) s = &obj->hot;
-    else if (sec == 4) s = &obj->cold;
-    if (align > s->align) s->align = align;
+    asmSecBumpAlign(obj, sec, align);
 }
 
 // executable sections get NOP padding; data gets zeros
-bool asmSectionIsText(i32 sec)
+bool asmSectionIsText(AsmObject* obj, i32 sec)
 {
-    return sec != 2;
+    return asmSecExec(obj, sec);
+}
+
+// SHF flags + SHT_NOBITS for an assembler-named section, derived from the
+// name family (matches what GCC/binutils emit for the same names).
+void asmSectionAttrs(str name, u32* shf, bool* nobits)
+{
+    *shf = 3;      // default: ALLOC|WRITE
+    *nobits = false;
+    if (name.isEmpty()) return;
+    if (secNameStarts(name, ".text") || name.equals(".init") ||
+        name.equals(".fini") || secNameStarts(name, ".init.") ||
+        secNameStarts(name, ".fini."))
+    {
+        *shf = 6;  // ALLOC|EXECINSTR
+        return;
+    }
+    if (name.equals(".bss") || name.equals(".sbss") || name.equals(".tbss") ||
+        secNameStarts(name, ".bss.") || secNameStarts(name, ".sbss."))
+    {
+        *shf = 3;
+        *nobits = true;
+        return;
+    }
+    if (secNameStarts(name, ".debug") || name.equals(".comment") ||
+        name.equals(".line"))
+    {
+        *shf = 0;  // non-alloc metadata
+        return;
+    }
+    if (secNameStarts(name, ".note"))
+    {
+        *shf = 2;  // ALLOC
+        return;
+    }
+    if (secNameStarts(name, ".rodata") || name.equals(".eh_frame") ||
+        secNameStarts(name, ".eh_frame.") || name.equals(".gcc_except_table"))
+    {
+        *shf = 2;  // ALLOC, read-only
+        return;
+    }
+    // .data/.got/.init_array/.fini_array/.dynamic/.tdata and friends keep
+    // the ALLOC|WRITE default
 }
 
 // .byte/.word/.long/.quad payload: comma-separated numbers, symbols, or
@@ -1979,6 +2057,12 @@ bool emitDataLitValue(AsmBytes* out, u32 width, u64 v)
 
 bool emitDataLits(AsmLine* line, AsmObject* obj, i32 sec, u32 width, AsmParseError* err)
 {
+    if (asmSecNobits(obj, sec))
+    {
+        err->msg = "data literal in nobits section";
+        err->lineNo = line->lineNo;
+        return false;
+    }
     AsmBytes* out = asmSectionData(obj, sec);
     AsmLexer lx = AsmLexer::new(line->dargs, line->lineNo);
     while (true)
@@ -2114,13 +2198,110 @@ static DirEnt[] _dirs = {
     { ".cfi_startproc", 90, 0 }, { ".cfi_endproc", 90, 0 },
     { ".cfi_def_cfa_offset", 90, 0 }, { ".cfi_def_cfa_register", 90, 0 },
     { ".cfi_offset", 90, 0 }, { ".cfi_def_cfa", 90, 0 },
-    { ".ident", 90, 0 }, { ".file", 90, 0 }, { ".loc", 90, 0 }
+    { ".ident", 90, 0 }, { ".file", 90, 0 }, { ".loc", 90, 0 },
+    { ".uleb128", 23, 0 }, { ".uleb", 23, 0 },
+    { ".sleb128", 24, 0 }, { ".sleb", 24, 0 },
+    { ".value", 5, 0 }, { ".short", 5, 0 }
 };
+
+// .uleb128/.sleb128 payload: comma-separated constants or same-section
+// symbol differences (the DWARF forms GCC emits). Relocations cannot
+// patch a LEB field, so external symbols are rejected.
+bool emitLebU(AsmBytes* out, u64 v)
+{
+    while (v >= 0x80)
+    {
+        if (!out->u8b((u8)(v | 0x80))) return false;
+        v >>= 7;
+    }
+    return out->u8b((u8)v);
+}
+
+bool emitLebS(AsmBytes* out, i64 v)
+{
+    bool more = true;
+    while (more)
+    {
+        u8 b = (u8)(v & 0x7F);
+        v >>= 7;
+        if ((v == 0 && (b & 0x40) == 0) || (v == -1 && (b & 0x40) != 0)) more = false;
+        else b |= 0x80;
+        if (!out->u8b(b)) return false;
+    }
+    return true;
+}
+
+bool emitLebLits(AsmLine* line, AsmObject* obj, i32 sec, bool isSigned, AsmParseError* err)
+{
+    if (asmSecNobits(obj, sec))
+    {
+        err->msg = "leb literal in nobits section";
+        err->lineNo = line->lineNo;
+        return false;
+    }
+    AsmBytes* out = asmSectionData(obj, sec);
+    AsmLexer lx = AsmLexer::new(line->dargs, line->lineNo);
+    while (true)
+    {
+        lx.skipSpace();
+        if (lx.done()) break;
+        i64 v = 0;
+        if (isAlpha(lx.peek()) || lx.peek() == (u8)'_' || lx.peek() == (u8)'.')
+        {
+            str name = lx.lexIdent();
+            if (name.isEmpty()) { err->msg = "bad leb operand"; err->lineNo = line->lineNo; return false; }
+            lx.skipSpace();
+            if (!lx.done() && lx.peek() == (u8)'-')
+            {
+                lx.pos++;
+                lx.skipSpace();
+                str base = lx.lexIdent();
+                i32 bi = asmFindSym(obj, base);
+                i32 ni = asmFindSym(obj, name);
+                if (bi < 0 || ni < 0 || !obj->syms[bi].defined || !obj->syms[ni].defined ||
+                    obj->syms[bi].section != sec || obj->syms[ni].section != sec)
+                {
+                    err->msg = "leb symbol difference needs same-section definitions";
+                    err->lineNo = line->lineNo;
+                    return false;
+                }
+                v = (i64)(obj->syms[ni].value - obj->syms[bi].value);
+            }
+            else
+            {
+                err->msg = "leb operand must be a constant or same-section difference";
+                err->lineNo = line->lineNo;
+                return false;
+            }
+        }
+        else
+        {
+            if (!lx.lexNumber(&v)) { err->msg = "bad leb operand"; err->lineNo = line->lineNo; return false; }
+        }
+        bool ok = isSigned ? emitLebS(out, v) : emitLebU(out, (u64)v);
+        if (!ok) { err->msg = "out of memory"; return false; }
+        lx.skipSpace();
+        if (lx.done()) break;
+        if (!lx.eat((u8)','))
+        {
+            err->msg = "expected ',' in leb literal";
+            err->lineNo = line->lineNo;
+            return false;
+        }
+    }
+    return true;
+}
 
 // .ascii/.asciz payload: comma-separated string literals, decoded by the
 // lexer; the NUL-terminated form appends a 0 after each literal
 bool emitStringLits(AsmLine* line, AsmObject* obj, i32 sec, bool nulTerm, AsmParseError* err)
 {
+    if (asmSecNobits(obj, sec))
+    {
+        err->msg = "string literal in nobits section";
+        err->lineNo = line->lineNo;
+        return false;
+    }
     AsmBytes* out = asmSectionData(obj, sec);
     AsmLexer lx = AsmLexer::new(line->dargs, line->lineNo);
     while (true)
@@ -2164,7 +2345,7 @@ bool handleDirective(AsmLine* line, AsmObject* obj, i32* sec, bool* discard, Asm
     err->lineNo = line->lineNo;
     u8 kind = 0;
     u8 darg = 0;
-    u32 nd = 35;
+    u32 nd = 45;
     for (u32 i = 0; i < nd; i++)
     {
         if (_dirs[i].name.equals(line->mnem)) { kind = _dirs[i].kind; darg = _dirs[i].arg; break; }
@@ -2199,29 +2380,40 @@ bool handleDirective(AsmLine* line, AsmObject* obj, i32* sec, bool* discard, Asm
             AsmLexer lx = AsmLexer::new(line->dargs, line->lineNo);
             i64 n = 0;
             if (!lx.lexNumber(&n) || n < 0) { err->msg = "bad .zero count"; return false; }
-            AsmBytes* out = asmSectionData(obj, *sec);
-            for (i64 k = 0; k < n; k++)
-            {
-                if (!out->u8b(0)) { err->msg = "out of memory"; return false; }
-            }
+            if (!asmSecZero(obj, *sec, (u64)n)) { err->msg = "out of memory"; return false; }
             return true;
         },
         9 => {
             AsmLexer lx = AsmLexer::new(line->dargs, line->lineNo);
             i64 a = 0;
             if (!lx.lexNumber(&a)) { err->msg = "bad alignment"; return false; }
-            AsmBytes* out = asmSectionData(obj, *sec);
             if (a > 0) asmSectionBumpAlign(obj, *sec, (u64)a);
-            return alignSec(out, a, asmSectionIsText(*sec), err, line->lineNo);
+            if (asmSecNobits(obj, *sec))
+            {
+                // NOBITS: pad the virtual size, no bytes in the file
+                u64 cur = asmSecSize(obj, *sec);
+                u64 al = (u64)a > 0 ? (u64)a : 1;
+                u64 pad = (al - (cur % al)) % al;
+                return asmSecZero(obj, *sec, pad);
+            }
+            AsmBytes* out = asmSectionData(obj, *sec);
+            return alignSec(out, a, asmSectionIsText(obj, *sec), err, line->lineNo);
         },
         10 => {
             AsmLexer lx = AsmLexer::new(line->dargs, line->lineNo);
             i64 a = 0;
             if (!lx.lexNumber(&a) || a < 0 || a > 8) { err->msg = "bad p2align"; return false; }
             i64 bytes = (i64)1 << a;
-            AsmBytes* out = asmSectionData(obj, *sec);
             if (bytes > 0) asmSectionBumpAlign(obj, *sec, (u64)bytes);
-            return alignSec(out, bytes, asmSectionIsText(*sec), err, line->lineNo);
+            if (asmSecNobits(obj, *sec))
+            {
+                u64 cur = asmSecSize(obj, *sec);
+                u64 al = (u64)bytes > 0 ? (u64)bytes : 1;
+                u64 pad = (al - (cur % al)) % al;
+                return asmSecZero(obj, *sec, pad);
+            }
+            AsmBytes* out = asmSectionData(obj, *sec);
+            return alignSec(out, bytes, asmSectionIsText(obj, *sec), err, line->lineNo);
         },
         11 => {
             // .type name, @function / @object — mark the symbol for the writers
@@ -2272,7 +2464,7 @@ bool handleDirective(AsmLine* line, AsmObject* obj, i32* sec, bool* discard, Asm
                     err->lineNo = line->lineNo;
                     return false;
                 }
-                size = (i64)asmSectionData(obj, *sec)->len - (i64)obj->syms[bi].value;
+                size = (i64)asmSecSize(obj, *sec) - (i64)obj->syms[bi].value;
             }
             else if (!lx.lexNumber(&size))
             {
@@ -2289,24 +2481,46 @@ bool handleDirective(AsmLine* line, AsmObject* obj, i32* sec, bool* discard, Asm
         13 => {
             AsmLexer lx = AsmLexer::new(line->dargs, line->lineNo);
             str name = lx.lexIdent();
-            if (secNameStarts(name, ".debug") || name.equals(".drectve") ||
-                name.equals(".llvm_addrsig")) { *discard = true; return true; }
+            if (name.isEmpty()) { err->msg = ".section needs a name"; return false; }
+            // COFF/LLVM metadata sections carry no bytes we can use
+            if (name.equals(".drectve") || name.equals(".llvm_addrsig"))
+            {
+                *discard = true;
+                return true;
+            }
             *discard = false;
             if (name.equals(".text.hot") || name.equals(".hot") ||
                 name.equals(".text$hot")) { *sec = 3; return true; }
             if (name.equals(".text.cold") || name.equals(".cold") ||
-                name.equals(".text$cold") || name.equals(".text.unlikely")) { *sec = 4; return true; }
+                name.equals(".text$cold")) { *sec = 4; return true; }
             if (name.equals(".text")) { *sec = 1; return true; }
-            if (name.equals(".data") || name.equals(".rodata") ||
-                name.equals(".rdata") || name.equals(".bss") ||
-                name.equals(".sbss")) { *sec = 2; return true; }
-            if (secNameStarts(name, ".text.") || secNameStarts(name, ".text$")) { *sec = 1; return true; }
-            if (secNameStarts(name, ".rodata.") || secNameStarts(name, ".rdata.") ||
-                secNameStarts(name, ".data.") || secNameStarts(name, ".bss.")) { *sec = 2; return true; }
-            // linker metadata with no assembler-visible bytes in our output
-            if (secNameStarts(name, ".note") || name.equals(".comment")) return true;
-            err->msg = "unsupported section";
-            return false;
+            if (name.equals(".data")) { *sec = 2; return true; }
+            if (name.equals(".bss") || name.equals(".sbss"))
+            {
+                u32 shf = 0; bool nb = false;
+                asmSectionAttrs(name, &shf, &nb);
+                *sec = asmAddXSection(obj, name, shf, nb);
+                return true;
+            }
+            if (name.equals(".text.unlikely"))
+            {
+                // GNU keeps .text.unlikely as its own section
+                u32 shf = 0; bool nb = false;
+                asmSectionAttrs(name, &shf, &nb);
+                *sec = asmAddXSection(obj, name, shf, nb);
+                return true;
+            }
+            // every other name gets a real section with flags derived
+            // from the name family
+            i32 xs = asmFindXSection(obj, name);
+            if (xs < 0)
+            {
+                u32 shf = 0; bool nb = false;
+                asmSectionAttrs(name, &shf, &nb);
+                xs = asmAddXSection(obj, name, shf, nb);
+            }
+            *sec = xs;
+            return true;
         },
         14 => { return emitStringLits(line, obj, *sec, darg != 0, err); },
         15 => {
@@ -2343,7 +2557,20 @@ bool handleDirective(AsmLine* line, AsmObject* obj, i32* sec, bool* discard, Asm
             obj->syms[si].vis = darg;
             return true;
         },
-        20 => { *sec = 2; *discard = false; return true; },
+        20 => {
+            // .bss/.sbss directives select the matching NOBITS section
+            str nm = line->mnem;
+            i32 xs = asmFindXSection(obj, nm);
+            if (xs < 0)
+            {
+                u32 shf = 0; bool nb = false;
+                asmSectionAttrs(nm, &shf, &nb);
+                xs = asmAddXSection(obj, nm, shf, nb);
+            }
+            *sec = xs;
+            *discard = false;
+            return true;
+        },
         21 => {
             // .local name — keep the symbol local even if .comm defines it
             AsmLexer lx = AsmLexer::new(line->dargs, line->lineNo);
@@ -2377,23 +2604,29 @@ bool handleDirective(AsmLine* line, AsmObject* obj, i32* sec, bool* discard, Asm
                 lx.skipSpace();
                 if (!lx.lexNumber(&al) || al < 0) { err->msg = "bad .comm alignment"; return false; }
             }
-            AsmBytes* out = asmSectionData(obj, 2);
-            if (al > 1)
+            // commons live in .bss (NOBITS): align the virtual size, bump
+            // it by the object size, and bind the symbol there
+            i32 bs = asmFindXSection(obj, ".bss");
+            if (bs < 0)
             {
-                asmSectionBumpAlign(obj, 2, (u64)al);
-                if (!alignSec(out, al, false, err, line->lineNo)) return false;
+                u32 shf = 0; bool nb = false;
+                asmSectionAttrs(".bss", &shf, &nb);
+                bs = asmAddXSection(obj, ".bss", shf, nb);
             }
+            u64 bcur = asmSecSize(obj, bs);
+            u64 bal = al > 0 ? (u64)al : 1;
+            u64 pad = (bal - (bcur % bal)) % bal;
+            if (!asmSecZero(obj, bs, pad + (u64)size)) { err->msg = "out of memory"; return false; }
+            asmSecBumpAlign(obj, bs, bal);
             i32 si = asmFindOrAddSym(obj, name);
             if (si < 0) { err->msg = "too many symbols"; return false; }
             obj->syms[si].defined = true;
-            obj->syms[si].section = 2;
-            obj->syms[si].value = (u64)out->len;
-            for (i64 k = 0; k < size; k++)
-            {
-                if (!out->u8b(0)) return false;
-            }
+            obj->syms[si].section = bs;
+            obj->syms[si].value = bcur + pad;
             return true;
         },
+        23 => { return emitLebLits(line, obj, *sec, false, err); },
+        24 => { return emitLebLits(line, obj, *sec, true, err); },
         90 => { return true; },
         else => { return true; },
     }
@@ -2426,7 +2659,7 @@ pub bool assembleText(str text, AsmObject* obj, AsmParseError* err)
         lineNo++;
         if (atAssignmentLine(ln)) continue;
 
-        AsmLine line = AsmLine {};
+        AsmLine line = asmLineEmpty();
         if (!parseAttLine(ln, lineNo, &line, err)) return false;
         err->lineNo = lineNo;
         if (line.hasLabel && !discard)
@@ -2434,7 +2667,7 @@ pub bool assembleText(str text, AsmObject* obj, AsmParseError* err)
             i32 si = asmFindOrAddSym(obj, line.label);
             if (si < 0) { err->msg = "too many symbols"; err->lineNo = lineNo; return false; }
             obj->syms[si].defined = true;
-            obj->syms[si].value = (u64)asmSectionData(obj, sec)->len;
+            obj->syms[si].value = asmSecSize(obj, sec);
             obj->syms[si].section = sec;
         }
         if (line->isEmpty) continue;
@@ -2444,6 +2677,12 @@ pub bool assembleText(str text, AsmObject* obj, AsmParseError* err)
             continue;
         }
         if (discard) continue;
+        if (asmSecNobits(obj, sec))
+        {
+            err->msg = "instruction in nobits section";
+            err->lineNo = lineNo;
+            return false;
+        }
         AsmBytes tmp = AsmBytes::new();
         AsmBytes* dst = asmSectionData(obj, sec);
         EncodeCtx ctx = ctxNew(&tmp, obj, sec);
