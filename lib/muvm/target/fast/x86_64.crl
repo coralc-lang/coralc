@@ -30,10 +30,11 @@ pub struct FastX86Context
     u32 nslots;
     u32 capSlots;
     i32 frameSize;
+    i32 sretOff;
     str funcName;
     bool isWindows;
 
-    static FastX86Context new(bool isWindows)
+    FastX86Context new(bool isWindows)
     {
         return FastX86Context {
             .out = String::new(),
@@ -41,6 +42,7 @@ pub struct FastX86Context
             .nslots = 0,
             .capSlots = 0,
             .frameSize = 0,
+            .sretOff = -1,
             .funcName = str::empty(),
             .isWindows = isWindows
         };
@@ -104,10 +106,24 @@ pub struct FastX86Context
 }
 
 // SystemV ABI (Linux / macOS / BSD)
-static str[] SYSV_ARG_REGS_64 = { "rdi", "rsi", "rdx", "rcx", "r8", "r9" };
+str[] SYSV_ARG_REGS_64 = { "rdi", "rsi", "rdx", "rcx", "r8", "r9" };
 
 // Win64 ABI (Windows)
-static str[] WIN64_ARG_REGS_64 = { "rcx", "rdx", "r8", "r9" };
+str[] WIN64_ARG_REGS_64 = { "rcx", "rdx", "r8", "r9" };
+
+bool isAggKind(IrTypeKind k)
+{
+    return k == IrTypeKind::Struct || k == IrTypeKind::Array || k == IrTypeKind::Union;
+}
+
+/* >16B aggregate returns use sret: the caller passes a hidden destination
+ * pointer in the first argument register and the callee memcpy's the
+ * object there. ≤16B aggregates keep the rax:rdx convention. */
+bool retNeedsSret(IrFunc* f, IrContext* ictx)
+{
+    if (f == null || f->retType == null || !isAggKind(f->retType->kind)) return false;
+    return (u64)ictx->irTypeSizeOf(f->retType) > 16;
+}
 
 bool funcUsesWin64(IrFunc* func, bool targetIsWindows)
 {
@@ -1659,6 +1675,14 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx, bool isWindows)
         curOffset -= 32;
     }
 
+    /* sret: reserve a slot for the hidden return-destination pointer the
+     * caller passed in the first arg register */
+    if (retNeedsSret(func, ictx))
+    {
+        curOffset -= 8;
+        ctx.sretOff = curOffset;
+    }
+
     // Align stack frame to 16 bytes
     i32 rawFrame = -curOffset;
     ctx.frameSize = (rawFrame + 15) & ~15;
@@ -1744,21 +1768,30 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx, bool isWindows)
         ctx.emitLine(", %rsp");
     }
 
-    // Spill incoming arguments into their assigned slots
+    // Spill incoming arguments into their assigned slots. With sret the
+    // hidden destination pointer takes the first arg register, so real
+    // params shift one register to the right.
+    u32 argRegShift = ctx.sretOff != -1 ? 1 : 0;
+    if (ctx.sretOff != -1)
+    {
+        ctx.emit("    movq %");
+        ctx.emit(win64 ? "rcx" : "rdi");
+        ctx.emit(", ");
+        ctx.emitI64((i64)ctx.sretOff);
+        ctx.emitLine("(%rbp)");
+    }
     if (win64)
     {
-        u32 maxWinArgs = 4;
-        for (u32 ai = 0; ai < func->nargs && ai < maxWinArgs; ai++)
+        for (u32 ai = 0; ai < func->nargs && ai + argRegShift < 4; ai++)
         {
-            emitRegToSlot(&ctx, func->args[ai], WIN64_ARG_REGS_64[ai]);
+            emitRegToSlot(&ctx, func->args[ai], WIN64_ARG_REGS_64[ai + argRegShift]);
         }
     }
     else
     {
-        u32 maxSysVArgs = 6;
-        for (u32 ai = 0; ai < func->nargs && ai < maxSysVArgs; ai++)
+        for (u32 ai = 0; ai < func->nargs && ai + argRegShift < 6; ai++)
         {
-            emitRegToSlot(&ctx, func->args[ai], SYSV_ARG_REGS_64[ai]);
+            emitRegToSlot(&ctx, func->args[ai], SYSV_ARG_REGS_64[ai + argRegShift]);
         }
     }
 
@@ -1808,13 +1841,34 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx, bool isWindows)
                         {
                             /* aggregate return: the value's header is
                              * the object address — ship the bytes in
-                             * rax[:rdx] (internal ≤16B convention) */
+                             * rax[:rdx] (internal ≤16B convention), or
+                             * memcpy to the hidden sret destination */
                             if (rsz > 16)
                             {
-                                ctx.emit("    # aggregate return of ");
-                                ctx.emitI64((i64)rsz);
-                                ctx.emitLine(" bytes unsupported");
-                                ctx.emitLine("    ud2");
+                                if (ctx.sretOff == -1)
+                                {
+                                    ctx.emit("    # aggregate return of ");
+                                    ctx.emitI64((i64)rsz);
+                                    ctx.emitLine(" bytes unsupported");
+                                    ctx.emitLine("    ud2");
+                                }
+                                else
+                                {
+                                    emitValueToReg(&ctx, rv, "rax"); // src object
+                                    ctx.emit("    movq ");
+                                    ctx.emitI64((i64)ctx.sretOff);
+                                    ctx.emitLine("(%rbp), %rcx");    // dest
+                                    u64 nq = (rsz + 7) / 8;
+                                    for (u64 q = 0; q < nq; q++)
+                                    {
+                                        i64 o = (i64)(q * 8);
+                                        ctx.emit("    movq ");
+                                        ctx.emitI64(o);
+                                        ctx.emit("(%rax), %rdx\n    movq %rdx, ");
+                                        ctx.emitI64(o);
+                                        ctx.emitLine("(%rcx)");
+                                    }
+                                }
                             }
                             else
                             {
@@ -2064,19 +2118,46 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx, bool isWindows)
                 },
                 IrOpcode::Call => {
                     u32 nArgs = inst->nops > 1 ? inst->nops - 1 : 0;
+                    /* >16B aggregate result → sret: hidden destination
+                     * pointer in the first arg register, real args shift */
+                    bool callSret = false;
+                    i32 sretSlot = 0;
+                    if (inst->base.type != null && isAggKind(inst->base.type->kind) &&
+                        (u64)ictx->irTypeSizeOf(inst->base.type) > 16)
+                    {
+                        callSret = true;
+                        sretSlot = ctx.getSlot(&inst->base);
+                    }
+                    u32 cregShift = callSret ? 1 : 0;
                     if (win64)
                     {
-                        for (u32 ai = 0; ai < nArgs && ai < 4; ai++)
+                        for (u32 ai = 0; ai < nArgs && ai + cregShift < 4; ai++)
                         {
-                            emitValueToReg(&ctx, inst->ops[ai + 1], WIN64_ARG_REGS_64[ai]);
+                            emitValueToReg(&ctx, inst->ops[ai + 1], WIN64_ARG_REGS_64[ai + cregShift]);
                         }
                     }
                     else
                     {
-                        for (u32 ai = 0; ai < nArgs && ai < 6; ai++)
+                        for (u32 ai = 0; ai < nArgs && ai + cregShift < 6; ai++)
                         {
-                            emitValueToReg(&ctx, inst->ops[ai + 1], SYSV_ARG_REGS_64[ai]);
+                            emitValueToReg(&ctx, inst->ops[ai + 1], SYSV_ARG_REGS_64[ai + cregShift]);
                         }
+                    }
+                    if (callSret)
+                    {
+                        /* dest object region sits at slotOff+8; its
+                         * address is both the hidden arg and the value
+                         * header consumers read */
+                        str hreg = win64 ? "rcx" : "rdi";
+                        ctx.emit("    leaq ");
+                        ctx.emitI64((i64)sretSlot + 8);
+                        ctx.emit("(%rbp), %");
+                        ctx.emitLine(hreg);
+                        ctx.emit("    movq %");
+                        ctx.emit(hreg);
+                        ctx.emit(", ");
+                        ctx.emitI64((i64)sretSlot);
+                        ctx.emitLine("(%rbp)");
                     }
 
                     if (inst->ops[0] != null)
@@ -2103,15 +2184,16 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx, bool isWindows)
                         {
                             /* aggregate result: rax[:rdx] carry the
                              * bytes; store them into the object region
-                             * and point the header at it */
-                            if (rsz > 16)
+                             * and point the header at it. sret results
+                             * were already staged before the call. */
+                            if (rsz > 16 && !callSret)
                             {
                                 ctx.emit("    # aggregate return of ");
                                 ctx.emitI64((i64)rsz);
                                 ctx.emitLine(" bytes unsupported");
                                 ctx.emitLine("    ud2");
                             }
-                            else
+                            else if (rsz <= 16)
                             {
                                 i32 d = ctx.getSlot(&inst->base);
                                 ctx.emit("    leaq ");
@@ -2165,10 +2247,16 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx, bool isWindows)
                             IrValue* ix = inst->ops[gi];
                             if (ix == null) continue;
                             bool isConst = ix->kind == IrValueKind::ConstInt;
-                            if (cur != null && cur->kind == IrTypeKind::Struct)
+                            if (cur != null &&
+                                (cur->kind == IrTypeKind::Struct ||
+                                 cur->kind == IrTypeKind::Union))
                             {
                                 u32 fi = isConst ? (u32)(ix->valData & 0xFFFFFFFF) : 0;
-                                cOff += (i64)emitStructFieldOff(ictx, cur, fi);
+                                /* union fields all overlap at offset 0 —
+                                 * only struct field indices move the
+                                 * address */
+                                if (cur->kind == IrTypeKind::Struct)
+                                    cOff += (i64)emitStructFieldOff(ictx, cur, fi);
                                 cur = fi < cur->nparams ? cur->params[fi] : null;
                             }
                             else

@@ -1,0 +1,757 @@
+#[[no_drop_all]]
+// merge N wasm modules into one: concatenate index spaces, remap
+// indices inside code bodies / init exprs / elem / data / exports,
+// resolve imports against sibling exports where possible.
+import std::vec { Vec };
+import std::mman { alloc, dealloc };
+import std::string { String };
+import muvm::linker::wasm::parse { WasmModule, WFuncType, WImport, WTable, WMem, WGlobal, WExport, WElem, WData, WCode };
+
+pub struct ModMap
+{
+    u32 typeBase;
+    u32 funcDefBase;   // merged index of this module's first DEFINED func
+    u32 tabDefBase;
+    u32 memDefBase;
+    u32 globDefBase;
+    u32 elemBase;
+    u32 dataBase;
+    u32 nImpFunc, nTabImp, nMemImp, nGlobImp;
+    i32* funcImp;      // local import idx -> merged index
+    i32* tabImp;
+    i32* memImp;
+    i32* globImp;
+}
+
+struct WCtx { u8* p; u32 pos; u32 cap; }
+void wrU(WCtx* w, u64 v)
+{
+    while (v >= 0x80) { w->p[w->pos++] = (u8)(v | 0x80); v >>= 7; }
+    w->p[w->pos++] = (u8)v;
+}
+void wrBytes(WCtx* w, u8* d, u32 n) { for (u32 i = 0; i < n; i++) w->p[w->pos++] = d[i]; }
+void wrU32(WCtx* w, u32 v) { wrU(w, (u64)v); }
+void wrName(WCtx* w, str s) { wrU(w, (u64)s.len); wrBytes(w, (u8*)s.ptr, (u32)s.len); }
+
+struct Rd { u8* p; u32 len; u32 pos; }
+u8 rdU8(Rd* r) { return r->p[r->pos++]; }
+u64 rdU64(Rd* r)
+{
+    u64 v = 0; u64 sh = 0;
+    while (r->pos < r->len)
+    {
+        u8 b = r->p[r->pos++];
+        v |= (u64)(b & 0x7F) << sh;
+        if ((b & 0x80) == 0) break;
+        sh += 7;
+    }
+    return v;
+}
+i64 rdS64(Rd* r)
+{
+    i64 v = 0; i64 sh = 0; u8 b = 0;
+    while (r->pos < r->len)
+    {
+        b = r->p[r->pos++];
+        v |= (i64)(b & 0x7F) << sh;
+        sh += 7;
+        if ((b & 0x80) == 0) break;
+    }
+    if (sh < 64 && (b & 0x40) != 0) v |= -((i64)1 << sh);
+    return v;
+}
+u32 rdLebTo(Rd* r, u8* dst)
+{
+    u32 n = 0;
+    while (r->pos < r->len)
+    {
+        u8 b = r->p[r->pos++];
+        if (dst != null) dst[n] = b;
+        n++;
+        if ((b & 0x80) == 0) break;
+    }
+    return n;
+}
+void cpLeb(Rd* r, WCtx* w) { u8[16] t; u32 n = rdLebTo(r, t); wrBytes(w, t, n); }
+void cpN(Rd* r, WCtx* w, u32 n) { for (u32 i = 0; i < n; i++) w->p[w->pos++] = rdU8(r); }
+
+u32 mapFunc(ModMap* mp, u64 v)
+{
+    if (v < (u64)mp->nImpFunc) return (u32)mp->funcImp[v];
+    return mp->funcDefBase + ((u32)v - mp->nImpFunc);
+}
+u32 mapTab(ModMap* mp, u64 v)
+{
+    if (v < (u64)mp->nTabImp) return (u32)mp->tabImp[v];
+    return mp->tabDefBase + ((u32)v - mp->nTabImp);
+}
+u32 mapGlob(ModMap* mp, u64 v)
+{
+    if (v < (u64)mp->nGlobImp) return (u32)mp->globImp[v];
+    return mp->globDefBase + ((u32)v - mp->nGlobImp);
+}
+
+// rewrite a const init expr (global.get / ref.func indices remapped)
+bool rewriteInitExpr(Vec<u8>* in, Vec<u8>* out, ModMap* mp, str* err)
+{
+    Rd r = { in->data, (u32)in->len, 0 };
+    u32 cap = (u32)(in->len * 2 + 16);
+    u8* buf = alloc<u8>((usize)cap);
+    if (buf == null) { *err = "oom"; return false; }
+    WCtx w = { buf, 0, cap };
+    while (r.pos < r.len)
+    {
+        u8 op = rdU8(&r);
+        w.p[w.pos++] = op;
+        if (op == 0x0B) break;
+        if (op == 0x41 || op == 0x42) { i64 v = rdS64(&r); 
+            bool more = true;
+            while (more) { u8 b = (u8)(v & 0x7F); v >>= 7;
+                if ((v == 0 && (b & 0x40) == 0) || (v == -1 && (b & 0x40) != 0)) more = false; else b |= 0x80;
+                w.p[w.pos++] = b; } }
+        else if (op == 0x43) { cpN(&r, &w, 4); }
+        else if (op == 0x44) { cpN(&r, &w, 8); }
+        else if (op == 0x23) { u64 v = rdU64(&r); wrU32(&w, mapGlob(mp, v)); }
+        else if (op == 0xD0) { i64 v = rdS64(&r);
+            bool more = true;
+            while (more) { u8 b = (u8)(v & 0x7F); v >>= 7;
+                if ((v == 0 && (b & 0x40) == 0) || (v == -1 && (b & 0x40) != 0)) more = false; else b |= 0x80;
+                w.p[w.pos++] = b; } }
+        else if (op == 0xD2) { u64 v = rdU64(&r); wrU32(&w, mapFunc(mp, v)); }
+        else { *err = "bad init expr opcode"; dealloc<u8>(buf); return false; }
+    }
+    for (u32 i = 0; i < w.pos; i++) out->push(buf[i]);
+    dealloc<u8>(buf);
+    return true;
+}
+
+// skip/copy one instruction's immediates; index immediates remapped.
+// rd cursor is positioned just after the opcode byte; w receives the
+// (possibly rewritten) immediate bytes.
+bool skipImmediates(u8 op, u32 sub, Rd* rd, WCtx* w, ModMap* mp, str* err)
+{
+    switch (op)
+    {
+        0x02, 0x03, 0x04 => { cpLeb(rd, w); },              // block/loop/if
+        0x0C, 0x0D => { cpLeb(rd, w); },                    // br/br_if
+        0x0E => {                                           // br_table
+            u64 n = rdU64(rd);
+            wrU(w,(u64)n);
+            for (u64 i = 0; i <= n; i++) cpLeb(rd, w);
+        },
+        0x10 => { wrU32(w, mapFunc(mp, rdU64(rd))); },        // call
+        0x11 => {                                           // call_indirect
+            u64 t = rdU64(rd);
+            wrU32(w, mp->typeBase + (u32)t);
+            wrU32(w, mapTab(mp, rdU64(rd)));
+        },
+        0x1C => { u64 n = rdU64(rd); wrU(w,(u64)n); cpN(rd, w, (u32)n); },
+        0x20, 0x21, 0x22 => { cpLeb(rd, w); },              // local.*
+        0x23 => { wrU32(w, mapGlob(mp, rdU64(rd))); },        // global.get
+        0x24 => { wrU32(w, mapGlob(mp, rdU64(rd))); },        // global.set
+        0x25, 0x26 => { wrU32(w, mapTab(mp, rdU64(rd))); },   // table.get/set
+        0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F,
+        0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,
+        0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E => { cpLeb(rd, w); cpLeb(rd, w); },
+        0x3F, 0x40 => { cpN(rd, w, 1); },                   // memory.size/grow
+        0x41, 0x42 => { cpLeb(rd, w); },                    // i32/i64.const
+        0x43 => { cpN(rd, w, 4); },
+        0x44 => { cpN(rd, w, 8); },
+        0xD0 => { cpLeb(rd, w); },                          // ref.null
+        0xD2 => { wrU32(w, mapFunc(mp, rdU64(rd))); },         // ref.func
+        0xFC => {
+            switch (sub)
+            {
+                0, 1, 2, 3, 4, 5, 6, 7 => { },               // trunc_sat
+                8 => { wrU32(w, mp->dataBase + (u32)rdU64(rd)); cpN(rd, w, 1); },
+                9 => { wrU32(w, mp->dataBase + (u32)rdU64(rd)); },
+                10 => { cpN(rd, w, 2); },
+                11 => { cpN(rd, w, 1); },
+                12 => { wrU32(w, mp->elemBase + (u32)rdU64(rd)); wrU32(w, mapTab(mp, rdU64(rd))); },
+                13 => { wrU32(w, mp->elemBase + (u32)rdU64(rd)); },
+                14 => { u64 a = rdU64(rd); u64 b = rdU64(rd); wrU32(w, mapTab(mp, a)); wrU32(w, mapTab(mp, b)); },
+                15, 16, 17 => { wrU32(w, mapTab(mp, rdU64(rd))); },
+                else => { *err = "unsupported 0xFC subop"; return false; },
+            }
+        },
+        0xFD => {
+            switch (sub)
+            {
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 => { cpLeb(rd, w); cpLeb(rd, w); },
+                84, 85, 86, 87, 88, 89, 90, 91 => { cpN(rd, w, 1); },
+                92 => { cpN(rd, w, 16); },
+                12, 13, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47 => { },
+                else => { *err = "unsupported 0xFD subop"; return false; },
+            }
+        },
+        0xFE => {
+            switch (sub)
+            {
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30 => { cpLeb(rd, w); cpLeb(rd, w); },
+                11, 12, 13, 14, 15, 16, 17, 18, 19, 31, 32, 33, 34 => { },
+                else => { *err = "unsupported 0xFE subop"; return false; },
+            }
+        },
+        else => {
+            if ((op >= 0x45 && op <= 0xC4) || op == 0x00 || op == 0x01 ||
+                op == 0x05 || op == 0x0B || op == 0x0F || op == 0x1A ||
+                op == 0x1B || op == 0xD1)
+                return true;
+            *err = "unsupported opcode"; return false;
+        },
+    }
+    return true;
+}
+
+// rewrite a whole function body (locals decls + expr)
+bool rewriteCode(Vec<u8>* body, Vec<u8>* out, ModMap* mp, str* err)
+{
+    Rd r = { body->data, (u32)body->len, 0 };
+    u32 cap = (u32)(body->len * 3 + 64);
+    u8* buf = alloc<u8>((usize)cap);
+    if (buf == null) { *err = "oom"; return false; }
+    WCtx w = { buf, 0, cap };
+    u64 nl = rdU64(&r);
+    wrU(&w,(u64)nl);
+    for (u64 i = 0; i < nl; i++)
+    {
+        u64 cnt = rdU64(&r);
+        u8 lt = rdU8(&r);
+        wrU(&w,(u64)cnt);
+        w.p[w.pos++] = lt;
+    }
+    while (r.pos < r.len)
+    {
+        u8 op = rdU8(&r);
+        w.p[w.pos++] = op;
+        u32 sub = 0;
+        if (op == 0xFC || op == 0xFD || op == 0xFE)
+        {
+            sub = (u32)rdU64(&r);
+            u64 sv = (u64)sub;
+            while (sv >= 0x80) { w.p[w.pos++] = (u8)(sv | 0x80); sv >>= 7; }
+            w.p[w.pos++] = (u8)sv;
+        }
+        if (!skipImmediates(op, sub, &r, &w, mp, err)) { dealloc<u8>(buf); return false; }
+    }
+    for (u32 i = 0; i < w.pos; i++) out->push(buf[i]);
+    dealloc<u8>(buf);
+    return true;
+}
+
+// ---- section emit helpers ----
+void secBegin(WCtx* w, u8 id) { w->p[w->pos++] = id; }
+// size placeholder patched later: we emit size as u32 LEB — sizes can
+// exceed 127 so reserve 5 bytes and patch? Simpler: build each section
+// into a temp buffer then copy with real size. We use a two-buffer
+// approach: sections built into Vec<u8> then flushed.
+
+struct SecBuf { Vec<u8> v; }
+void sbU(SecBuf* s, u64 v)
+{
+    while (v >= 0x80) { s->v.push((u8)(v | 0x80)); v >>= 7; }
+    s->v.push((u8)v);
+}
+void sbBytes(SecBuf* s, u8* d, u32 n) { for (u32 i = 0; i < n; i++) s->v.push(d[i]); }
+void sbName(SecBuf* s, str t) { sbU(s, (u64)t.len); sbBytes(s, (u8*)t.ptr, (u32)t.len); }
+void sbRaw(SecBuf* s, Vec<u8>* b) { for (usize i = 0; i < b->len; i++) s->v.push(b->data[i]); }
+
+void emitSection(WCtx* w, u8 id, SecBuf* s)
+{
+    w->p[w->pos++] = id;
+    // size LEB
+    u64 sz = (u64)s->v.len;
+    while (sz >= 0x80) { w->p[w->pos++] = (u8)(sz | 0x80); sz >>= 7; }
+    w->p[w->pos++] = (u8)sz;
+    wrBytes(w, s->v.data, (u32)s->v.len);
+}
+
+void wrLimitsSec(SecBuf* s, u64 fl, u64 min, i64 max)
+{
+    sbU(s,(u64)fl);
+    sbU(s,(u64)min);
+    if (fl & 1) sbU(s, (u64)max);
+}
+
+// find export (kind,index) across all modules -> merged index or -1.
+// only resolves to DEFINED entities (index >= that module's import count
+// for the kind). kind: 0 func,1 table,2 mem,3 global.
+// On match returns the target module and the index within that module's
+// DEFINED entities of the kind (export index minus its import count).
+bool resolveExportRaw(WasmModule** mods, u32 nmods, u32* nImpCounts,
+                      str name, u8 kind, u32* outMod, u32* outLocal)
+{
+    for (u32 mi = 0; mi < nmods; mi++)
+    {
+        WasmModule* m = mods[mi];
+        for (usize ei = 0; ei < m->exports.count(); ei++)
+        {
+            WExport* e = &m->exports.data[ei];
+            if ((u32)e->kind != (u32)kind) continue;
+            if (!e->name.equals(name)) continue;
+            u32 local = e->index;
+            u32 nImp = nImpCounts[mi * 4 + (u32)kind];
+            if (local < nImp) continue; // export of an import — not resolvable here
+            *outMod = mi;
+            *outLocal = local - nImp;
+            return true;
+        }
+    }
+    return false;
+}
+
+// count imports of a kind in module
+u32 countImp(WasmModule* m, u8 kind)
+{
+    u32 n = 0;
+    for (usize i = 0; i < m->imports.count(); i++) if (m->imports.data[i].kind == kind) n++;
+    return n;
+}
+
+pub bool wasmMerge(WasmModule** mods, u32 nmods, Vec<u8>* out, str* err)
+{
+    if (nmods == 0) { *err = "no input modules"; return false; }
+
+    // per-module import counts by kind: [mi*4+kind]
+    u32* nImp = alloc<u32>((usize)(nmods * 4));
+    ModMap* maps = alloc<ModMap>((usize)nmods);
+    if (nImp == null || maps == null) { *err = "oom"; return false; }
+    for (u32 i = 0; i < nmods * 4; i++) nImp[i] = 0;
+    for (u32 mi = 0; mi < nmods; mi++)
+        for (u32 k = 0; k < 4; k++)
+            nImp[mi * 4 + k] = countImp(mods[mi], (u8)k);
+
+    // totals for merged index spaces
+    u32 totTypes = 0;
+    u32 totFuncImp = 0; u32 totDefFunc = 0;
+    u32 totTabImp = 0; u32 totDefTab = 0;
+    u32 totMemImp = 0; u32 totDefMem = 0;
+    u32 totGlobImp = 0; u32 totDefGlob = 0;
+    u32 totElem = 0; u32 totData = 0;
+    for (u32 mi = 0; mi < nmods; mi++)
+    {
+        WasmModule* m = mods[mi];
+        totTypes += (u32)m->types.count();
+        totDefFunc += (u32)m->funcs.count();
+        totDefTab += (u32)m->tables.count();
+        totDefMem += (u32)m->mems.count();
+        totDefGlob += (u32)m->globals.count();
+        totElem += (u32)m->elems.count();
+        totData += (u32)m->datas.count();
+        // only imports that do NOT resolve to another module's export
+        // occupy slots in the merged import index spaces
+        for (usize ii = 0; ii < m->imports.count(); ii++)
+        {
+            WImport* im = &m->imports.data[ii];
+            if (im->kind > 3) continue;
+            u32 tm = 0; u32 tl = 0;
+            if (!resolveExportRaw(mods, nmods, nImp, im->name, im->kind, &tm, &tl))
+            {
+                if (im->kind == 0) totFuncImp++;
+                else if (im->kind == 1) totTabImp++;
+                else if (im->kind == 2) totMemImp++;
+                else totGlobImp++;
+            }
+        }
+    }
+
+    // assign bases
+    u32 typeBase = 0; u32 funcDef = totFuncImp; u32 tabDef = totTabImp;
+    u32 memDef = totMemImp; u32 globDef = totGlobImp;
+    u32 elemBase = 0; u32 dataBase = 0;
+    for (u32 mi = 0; mi < nmods; mi++)
+    {
+        WasmModule* m = mods[mi];
+        ModMap* mp = &maps[mi];
+        mp->typeBase = typeBase;
+        mp->funcDefBase = funcDef;
+        mp->tabDefBase = tabDef;
+        mp->memDefBase = memDef;
+        mp->globDefBase = globDef;
+        mp->elemBase = elemBase;
+        mp->dataBase = dataBase;
+        mp->nImpFunc = nImp[mi * 4 + 0];
+        mp->nTabImp = nImp[mi * 4 + 1];
+        mp->nMemImp = nImp[mi * 4 + 2];
+        mp->nGlobImp = nImp[mi * 4 + 3];
+        mp->funcImp = alloc<i32>((usize)(mp->nImpFunc > 0 ? mp->nImpFunc : 1));
+        mp->tabImp = alloc<i32>((usize)(mp->nTabImp > 0 ? mp->nTabImp : 1));
+        mp->memImp = alloc<i32>((usize)(mp->nMemImp > 0 ? mp->nMemImp : 1));
+        mp->globImp = alloc<i32>((usize)(mp->nGlobImp > 0 ? mp->nGlobImp : 1));
+        if (mp->funcImp == null || mp->tabImp == null || mp->memImp == null || mp->globImp == null)
+        { *err = "oom"; return false; }
+        for (u32 i = 0; i < mp->nImpFunc; i++) mp->funcImp[i] = -1;
+        for (u32 i = 0; i < mp->nTabImp; i++) mp->tabImp[i] = -1;
+        for (u32 i = 0; i < mp->nMemImp; i++) mp->memImp[i] = -1;
+        for (u32 i = 0; i < mp->nGlobImp; i++) mp->globImp[i] = -1;
+        typeBase += (u32)m->types.count();
+        funcDef += (u32)m->funcs.count();
+        tabDef += (u32)m->tables.count();
+        memDef += (u32)m->mems.count();
+        globDef += (u32)m->globals.count();
+        elemBase += (u32)m->elems.count();
+        dataBase += (u32)m->datas.count();
+    }
+
+    // resolve / assign merged import indices, in module order.
+    // merged import index spaces: funcs then tables then mems then globals —
+    // actually each kind has its OWN index space within imports? No:
+    // wasm index spaces are per-kind: funcidx counts imported+defined
+    // FUNCS only; tableidx counts imported+defined TABLES only. So merged
+    // import func indices are 0..totFuncImp-1 etc.
+    u32 nextFImp = 0; u32 nextTImp = 0;
+    u32 nextMImp = 0; u32 nextGImp = 0;
+    // keep list of unresolved imports to emit: (modIdx, importIdx)
+    // store as parallel arrays
+    u32* impList = alloc<u32>((usize)((totFuncImp + totTabImp + totMemImp + totGlobImp) * 2 + 1));
+    if (impList == null) { *err = "oom"; return false; }
+    u32 nImpList = 0;
+    for (u32 mi = 0; mi < nmods; mi++)
+    {
+        WasmModule* m = mods[mi];
+        ModMap* mp = &maps[mi];
+        u32 lf = 0; u32 lt = 0; u32 lm = 0; u32 lg = 0;
+        for (usize ii = 0; ii < m->imports.count(); ii++)
+        {
+            WImport* im = &m->imports.data[ii];
+            i32 resolved = -1;
+            if (im->kind <= 3)
+            {
+                u32 tm = 0; u32 tl = 0;
+                if (resolveExportRaw(mods, nmods, nImp, im->name, im->kind, &tm, &tl))
+                {
+                    ModMap* tp = &maps[tm];
+                    u32 tb = im->kind == 0 ? tp->funcDefBase :
+                             im->kind == 1 ? tp->tabDefBase :
+                             im->kind == 2 ? tp->memDefBase : tp->globDefBase;
+                    resolved = (i32)(tb + tl);
+                }
+            }
+            if (im->kind == 0)
+            {
+                if (resolved >= 0) mp->funcImp[lf] = resolved;
+                else { mp->funcImp[lf] = (i32)nextFImp; impList[nImpList*2] = mi; impList[nImpList*2+1] = (u32)ii; nImpList++; nextFImp++; }
+                lf++;
+            }
+            else if (im->kind == 1)
+            {
+                if (resolved >= 0) mp->tabImp[lt] = resolved;
+                else { mp->tabImp[lt] = (i32)nextTImp; impList[nImpList*2] = mi; impList[nImpList*2+1] = (u32)ii; nImpList++; nextTImp++; }
+                lt++;
+            }
+            else if (im->kind == 2)
+            {
+                if (resolved >= 0) mp->memImp[lm] = resolved;
+                else { mp->memImp[lm] = (i32)nextMImp; impList[nImpList*2] = mi; impList[nImpList*2+1] = (u32)ii; nImpList++; nextMImp++; }
+                lm++;
+            }
+            else if (im->kind == 3)
+            {
+                if (resolved >= 0) mp->globImp[lg] = resolved;
+                else { mp->globImp[lg] = (i32)nextGImp; impList[nImpList*2] = mi; impList[nImpList*2+1] = (u32)ii; nImpList++; nextGImp++; }
+                lg++;
+            }
+        }
+    }
+
+    // ---- encode merged module ----
+    // capacity estimate: sum of all input sizes * 2 + slack
+    u64 cap = 64;
+    for (u32 mi = 0; mi < nmods; mi++)
+    {
+        WasmModule* m = mods[mi];
+        for (usize i = 0; i < m->codes.count(); i++) cap += m->codes.data[i].body.len * 3 + 16;
+        for (usize i = 0; i < m->datas.count(); i++) cap += (u64)m->datas.data[i].bytes.count() + 64;
+        cap += 4096;
+    }
+    u8* buf = alloc<u8>((usize)cap);
+    if (buf == null) { *err = "oom"; return false; }
+    WCtx w = { buf, 0, (u32)cap };
+    // magic + version
+    w.p[w.pos++] = 0; w.p[w.pos++] = 0x61; w.p[w.pos++] = 0x73; w.p[w.pos++] = 0x6D;
+    w.p[w.pos++] = 1; w.p[w.pos++] = 0; w.p[w.pos++] = 0; w.p[w.pos++] = 0;
+
+    // type section
+    if (totTypes > 0)
+    {
+        SecBuf s = { Vec<u8>::new() };
+        sbU(&s,(u64)totTypes);
+        for (u32 mi = 0; mi < nmods; mi++)
+            for (usize i = 0; i < mods[mi]->types.count(); i++)
+            {
+                WFuncType* t = &mods[mi]->types.data[i];
+                s.v.push(0x60);
+                sbU(&s,(u64)(t->params.count()));
+                for (usize j = 0; j < t->params.count(); j++) s.v.push(t->params.data[j]);
+                sbU(&s,(u64)(t->results.count()));
+                for (usize j = 0; j < t->results.count(); j++) s.v.push(t->results.data[j]);
+            }
+        emitSection(&w, 1, &s);
+        s.v.dispose();
+    }
+
+    // import section (unresolved only)
+    if (nImpList > 0)
+    {
+        SecBuf s = { Vec<u8>::new() };
+        sbU(&s,(u64)nImpList);
+        for (u32 i = 0; i < nImpList; i++)
+        {
+            WasmModule* m = mods[impList[i*2]];
+            WImport* im = &m->imports.data[impList[i*2+1]];
+            sbName(&s, im->module);
+            sbName(&s, im->name);
+            s.v.push(im->kind);
+            if (im->kind == 0)
+            {
+                // func: typeidx — need this import's local type index;
+                // WImport.desc holds it
+                sbU(&s,(u64)(maps[impList[i*2]].typeBase + im->desc));
+            }
+            else
+            {
+                sbRaw(&s, &im->descRaw);
+            }
+        }
+        emitSection(&w, 2, &s);
+        s.v.dispose();
+    }
+
+    // function section: type indices of defined funcs
+    if (totDefFunc > 0)
+    {
+        SecBuf s = { Vec<u8>::new() };
+        sbU(&s,(u64)totDefFunc);
+        for (u32 mi = 0; mi < nmods; mi++)
+            for (usize i = 0; i < mods[mi]->funcs.count(); i++)
+                sbU(&s,(u64)(maps[mi].typeBase + mods[mi]->funcs.data[i]));
+        emitSection(&w, 3, &s);
+        s.v.dispose();
+    }
+
+    // table section
+    if (totDefTab > 0)
+    {
+        SecBuf s = { Vec<u8>::new() };
+        sbU(&s,(u64)totDefTab);
+        for (u32 mi = 0; mi < nmods; mi++)
+            for (usize i = 0; i < mods[mi]->tables.count(); i++)
+            {
+                WTable* t = &mods[mi]->tables.data[i];
+                s.v.push(t->et);
+                u64 fl = t->hasMax ? 1 : 0;
+                wrLimitsSec(&s, fl, t->min, t->max);
+            }
+        emitSection(&w, 4, &s);
+        s.v.dispose();
+    }
+
+    // memory section
+    if (totDefMem > 0)
+    {
+        SecBuf s = { Vec<u8>::new() };
+        sbU(&s,(u64)totDefMem);
+        for (u32 mi = 0; mi < nmods; mi++)
+            for (usize i = 0; i < mods[mi]->mems.count(); i++)
+            {
+                WMem* mm = &mods[mi]->mems.data[i];
+                u64 fl = (mm->hasMax ? 1 : 0) | (mm->shared ? 2 : 0);
+                wrLimitsSec(&s, fl, mm->min, mm->max);
+            }
+        emitSection(&w, 5, &s);
+        s.v.dispose();
+    }
+
+    // global section
+    if (totDefGlob > 0)
+    {
+        SecBuf s = { Vec<u8>::new() };
+        sbU(&s,(u64)totDefGlob);
+        for (u32 mi = 0; mi < nmods; mi++)
+            for (usize i = 0; i < mods[mi]->globals.count(); i++)
+            {
+                WGlobal* g = &mods[mi]->globals.data[i];
+                s.v.push(g->vt);
+                s.v.push(g->mut ? 1 : 0);
+                Vec<u8> rw = Vec<u8>::new();
+                if (!rewriteInitExpr(&g->init, &rw, &maps[mi], err)) return false;
+                sbRaw(&s, &rw);
+                rw.dispose();
+            }
+        emitSection(&w, 6, &s);
+        s.v.dispose();
+    }
+
+    // export section
+    {
+        u64 nex = 0;
+        for (u32 mi = 0; mi < nmods; mi++) nex += (u64)mods[mi]->exports.count();
+        if (nex > 0)
+        {
+            SecBuf s = { Vec<u8>::new() };
+            Vec<String> keep = Vec<String>::new();
+            Vec<str> used = Vec<str>::new();
+            sbU(&s,(u64)nex);
+            for (u32 mi = 0; mi < nmods; mi++)
+                for (usize i = 0; i < mods[mi]->exports.count(); i++)
+                {
+                    WExport* e = &mods[mi]->exports.data[i];
+                    str nm = e->name;
+                    bool dup = false;
+                    for (usize u = 0; u < used.count(); u++)
+                        if (used.data[u].equals(nm)) { dup = true; break; }
+                    if (dup)
+                    {
+                        u32 suf = 2;
+                        while (true)
+                        {
+                            String cand = String::from(nm);
+                            cand.appendView("_");
+                            char[16] db;
+                            u32 nd = 0; u32 tv = suf;
+                            while (true) { db[nd] = (char)('0' + (tv % 10)); nd++; tv /= 10; if (tv == 0) break; }
+                            for (u32 z = nd; z > 0; z--)
+                                cand.appendView(str::fromParts((const u8*)&db[z - 1], 1));
+                            bool again = false;
+                            for (usize u = 0; u < used.count(); u++)
+                                if (used.data[u].equals(cand.asView())) { again = true; break; }
+                            if (!again)
+                            {
+                                keep.push(cand);
+                                nm = keep.data[keep.count() - 1].asView();
+                                break;
+                            }
+                            suf++;
+                        }
+                    }
+                    used.push(nm);
+                    sbName(&s, nm);
+                    s.v.push(e->kind);
+                    u32 nImpCnt = nImp[mi * 4 + (u32)e->kind];
+                    u32 local = e->index;
+                    if (local < nImpCnt)
+                    {
+                        // export of an import: map through imp tables
+                        ModMap* mp = &maps[mi];
+                        u32 mv = 0;
+                        if (e->kind == 0) mv = (u32)mp->funcImp[local];
+                        else if (e->kind == 1) mv = (u32)mp->tabImp[local];
+                        else if (e->kind == 2) mv = (u32)mp->memImp[local];
+                        else mv = (u32)mp->globImp[local];
+                        sbU(&s,(u64)mv);
+                    }
+                    else
+                    {
+                        ModMap* mp = &maps[mi];
+                        u32 base = e->kind == 0 ? mp->funcDefBase :
+                                   e->kind == 1 ? mp->tabDefBase :
+                                   e->kind == 2 ? mp->memDefBase : mp->globDefBase;
+                        sbU(&s,(u64)(base + (local - nImpCnt)));
+                    }
+                }
+            emitSection(&w, 7, &s);
+            s.v.dispose();
+        }
+    }
+
+    // start section
+    {
+        u32 startIdx = 0;
+        bool has = false;
+        for (u32 mi = 0; mi < nmods; mi++)
+            if (mods[mi]->hasStart)
+            {
+                if (has) { *err = "multiple start functions"; return false; }
+                has = true;
+                startIdx = mapFunc(&maps[mi], (u64)mods[mi]->start);
+            }
+        if (has)
+        {
+            SecBuf s = { Vec<u8>::new() };
+            sbU(&s,(u64)startIdx);
+            emitSection(&w, 8, &s);
+            s.v.dispose();
+        }
+    }
+
+    // elem section
+    if (totElem > 0)
+    {
+        SecBuf s = { Vec<u8>::new() };
+        sbU(&s,(u64)totElem);
+        for (u32 mi = 0; mi < nmods; mi++)
+            for (usize i = 0; i < mods[mi]->elems.count(); i++)
+            {
+                WElem* e = &mods[mi]->elems.data[i];
+                s.v.push(e->flag);
+                if (e->flag == 2) sbU(&s,(u64)(maps[mi].tabDefBase + e->table));
+                if (e->flag <= 2)
+                {
+                    Vec<u8> rw = Vec<u8>::new();
+                    if (!rewriteInitExpr(&e->offset, &rw, &maps[mi], err)) return false;
+                    sbRaw(&s, &rw);
+                    rw.dispose();
+                }
+                if (e->flag == 1 || e->flag == 3) sbRaw(&s, &e->elemkind);
+                sbU(&s,(u64)(e->funcidx.count()));
+                for (usize j = 0; j < e->funcidx.count(); j++)
+                    sbU(&s,(u64)(mapFunc(&maps[mi], (u64)e->funcidx.data[j])));
+            }
+        emitSection(&w, 9, &s);
+        s.v.dispose();
+    }
+
+    // code section
+    if (totDefFunc > 0)
+    {
+        SecBuf s = { Vec<u8>::new() };
+        sbU(&s,(u64)totDefFunc);
+        for (u32 mi = 0; mi < nmods; mi++)
+            for (usize i = 0; i < mods[mi]->codes.count(); i++)
+            {
+                Vec<u8> rw = Vec<u8>::new();
+                if (!rewriteCode(&mods[mi]->codes.data[i].body, &rw, &maps[mi], err)) return false;
+                sbU(&s, (u64)rw.len);
+                sbRaw(&s, &rw);
+                rw.dispose();
+            }
+        emitSection(&w, 10, &s);
+        s.v.dispose();
+    }
+
+    // data section
+    if (totData > 0)
+    {
+        SecBuf s = { Vec<u8>::new() };
+        sbU(&s,(u64)totData);
+        for (u32 mi = 0; mi < nmods; mi++)
+            for (usize i = 0; i < mods[mi]->datas.count(); i++)
+            {
+                WData* d = &mods[mi]->datas.data[i];
+                s.v.push(d->flag);
+                if (d->flag == 2) sbU(&s,(u64)(maps[mi].memDefBase + d->memidx));
+                Vec<u8> rw = Vec<u8>::new();
+                if (!rewriteInitExpr(&d->offset, &rw, &maps[mi], err)) return false;
+                sbRaw(&s, &rw);
+                rw.dispose();
+                sbU(&s,(u64)(d->bytes.count()));
+                sbRaw(&s, &d->bytes);
+            }
+        emitSection(&w, 11, &s);
+        s.v.dispose();
+    }
+
+    for (u32 i = 0; i < w.pos; i++) out->push(buf[i]);
+    dealloc<u8>(buf);
+    dealloc<u32>(nImp);
+    dealloc<u32>(impList);
+    for (u32 mi = 0; mi < nmods; mi++)
+    {
+        dealloc<i32>(maps[mi].funcImp);
+        dealloc<i32>(maps[mi].tabImp);
+        dealloc<i32>(maps[mi].memImp);
+        dealloc<i32>(maps[mi].globImp);
+    }
+    dealloc<ModMap>(maps);
+    return true;
+}

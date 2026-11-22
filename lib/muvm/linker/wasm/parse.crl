@@ -1,0 +1,312 @@
+#[[no_drop_all]]
+// wasm binary parser: sections -> WasmModule. Only the fields the
+// linker needs; unknown/custom sections are skipped.
+import std::vec { Vec };
+import std::mman { alloc, dealloc };
+import std::string { String };
+
+pub struct WFuncType { Vec<u8> params; Vec<u8> results; }
+pub struct WImport { str module; str name; u8 kind; u32 desc; Vec<u8> descRaw; }
+pub struct WTable { u8 et; bool mut; u64 min; i64 max; bool hasMax; }
+pub struct WMem { u64 min; i64 max; bool hasMax; bool shared; }
+pub struct WGlobal { u8 vt; bool mut; Vec<u8> init; }
+pub struct WExport { str name; u8 kind; u32 index; }
+pub struct WElem { u8 flag; u32 table; Vec<u8> offset; Vec<u8> elemkind; Vec<u32> funcidx; }
+pub struct WData { u8 flag; u32 memidx; Vec<u8> offset; Vec<u8> bytes; }
+pub struct WCode { Vec<u8> body; }   // locals decls + expr, raw
+
+pub struct WasmModule
+{
+    Vec<WFuncType> types;
+    Vec<WImport> imports;    // kind: 0 func,1 table,2 mem,3 global
+    Vec<u32> funcs;          // type indices of defined functions
+    Vec<WTable> tables;
+    Vec<WMem> mems;
+    Vec<WGlobal> globals;
+    Vec<WExport> exports;
+    Vec<WElem> elems;
+    Vec<WCode> codes;
+    Vec<WData> datas;
+    bool hasStart;
+    u32 start;
+}
+
+pub WasmModule wasmModuleNew() { return WasmModule {
+    .types = Vec<WFuncType>::new(), .imports = Vec<WImport>::new(),
+    .funcs = Vec<u32>::new(), .tables = Vec<WTable>::new(),
+    .mems = Vec<WMem>::new(), .globals = Vec<WGlobal>::new(),
+    .exports = Vec<WExport>::new(), .elems = Vec<WElem>::new(),
+    .codes = Vec<WCode>::new(), .datas = Vec<WData>::new(),
+    .hasStart = false, .start = 0 }; }
+
+pub void wasmModuleDeinit(WasmModule* m)
+{
+    if (m == null) return;
+    for (usize i = 0; i < m->types.count(); i++) { m->types.data[i].params.dispose(); m->types.data[i].results.dispose(); }
+    m->types.dispose();
+    m->imports.dispose(); m->funcs.dispose(); m->tables.dispose(); m->mems.dispose();
+    for (usize i = 0; i < m->globals.count(); i++) m->globals.data[i].init.dispose();
+    m->globals.dispose(); m->exports.dispose();
+    for (usize i = 0; i < m->elems.count(); i++) { m->elems.data[i].offset.dispose(); m->elems.data[i].elemkind.dispose(); m->elems.data[i].funcidx.dispose(); }
+    m->elems.dispose();
+    for (usize i = 0; i < m->codes.count(); i++) m->codes.data[i].body.dispose();
+    m->codes.dispose();
+    for (usize i = 0; i < m->datas.count(); i++) { m->datas.data[i].offset.dispose(); m->datas.data[i].bytes.dispose(); }
+    m->datas.dispose();
+    dealloc<WasmModule>(m);
+}
+
+struct Rd { u8* p; u32 len; u32 pos; }
+
+u8 rdU8(Rd* r) { return r->p[r->pos++]; }
+bool rdOk(Rd* r, u32 n) { return r->pos + n <= r->len; }
+
+u64 rdU64(Rd* r)
+{
+    u64 v = 0; u64 sh = 0;
+    while (r->pos < r->len)
+    {
+        u8 b = r->p[r->pos++];
+        v |= (u64)(b & 0x7F) << sh;
+        if ((b & 0x80) == 0) break;
+        sh += 7;
+    }
+    return v;
+}
+
+i64 rdS64(Rd* r)
+{
+    i64 v = 0; i64 sh = 0; u8 b = 0;
+    while (r->pos < r->len)
+    {
+        b = r->p[r->pos++];
+        v |= (i64)(b & 0x7F) << sh;
+        sh += 7;
+        if ((b & 0x80) == 0) break;
+    }
+    if (sh < 64 && (b & 0x40) != 0) v |= -((i64)1 << sh);
+    return v;
+}
+
+str rdName(Rd* r)
+{
+    u64 n = rdU64(r);
+    if (!rdOk(r, (u32)n)) return "";
+    str s = str::fromParts(r->p + r->pos, (usize)n);
+    r->pos += (u32)n;
+    return s;
+}
+
+// const init expr: opcodes + immediates until 0x0B; returns raw bytes
+// including the terminating 0x0B.
+bool rdInitExpr(Rd* r, Vec<u8>* out)
+{
+    u32 start = r->pos;
+    while (r->pos < r->len)
+    {
+        u8 op = r->p[r->pos++];
+        if (op == 0x0B) break;
+        if (op == 0x41 || op == 0x42) { rdS64(r); }
+        else if (op == 0x43) { if (!rdOk(r, 4)) return false; r->pos += 4; }
+        else if (op == 0x44) { if (!rdOk(r, 8)) return false; r->pos += 8; }
+        else if (op == 0x23) { rdU64(r); }
+        else if (op == 0xD0) { rdS64(r); }   // ref.null heaptype (s33)
+        else if (op == 0xD2) { rdU64(r); }   // ref.func funcidx
+        else { return false; }
+    }
+    for (u32 i = start; i < r->pos; i++) out->push(r->p[i]);
+    return true;
+}
+
+// read limits: flags, min, [max]
+void rdLimits(Rd* r, u64* min, i64* max, bool* hasMax, bool* shared)
+{
+    u64 fl = rdU64(r);
+    *hasMax = (fl & 1) != 0;
+    *shared = (fl & 2) != 0;
+    *min = (u64)rdU64(r);
+    if (*hasMax) *max = (i64)rdU64(r);
+}
+
+pub bool wasmParse(u8* data, u32 len, WasmModule* m, str* err)
+{
+    *m = wasmModuleNew();
+    if (len < 8 || data[0] != 0 || data[1] != 0x61 || data[2] != 0x73 || data[3] != 0x6D)
+    { *err = "bad wasm magic"; return false; }
+    if (data[4] != 1) { *err = "bad wasm version"; return false; }
+    u32 pos = 8;
+    while (pos < len)
+    {
+        u8 sid = data[pos++];
+        u64 sz = 0; u64 sh = 0;
+        while (pos < len)
+        {
+            u8 b = data[pos++];
+            sz |= (u64)(b & 0x7F) << sh; sh += 7;
+            if ((b & 0x80) == 0) break;
+        }
+        if ((u64)pos + sz > (u64)len) { *err = "truncated section"; return false; }
+        Rd r = { data + pos, (u32)sz, 0 };
+        switch (sid)
+        {
+            0 => { },
+            1 => {
+                u64 nt = rdU64(&r);
+                for (u64 i = 0; i < nt; i++)
+                {
+                    if (rdU8(&r) != 0x60) { *err = "bad functype"; return false; }
+                    u64 np = rdU64(&r);
+                    Vec<u8> ps = Vec<u8>::new();
+                    for (u64 j = 0; j < np; j++) ps.push(rdU8(&r));
+                    u64 nr = rdU64(&r);
+                    Vec<u8> rs = Vec<u8>::new();
+                    for (u64 j = 0; j < nr; j++) rs.push(rdU8(&r));
+                    m->types.push(WFuncType { .params = ps, .results = rs });
+                }
+            },
+            2 => {
+                u64 ni = rdU64(&r);
+                for (u64 i = 0; i < ni; i++)
+                {
+                    str modn = rdName(&r);
+                    str nm = rdName(&r);
+                    u8 kind = rdU8(&r);
+                    u32 desc = 0;
+                    Vec<u8> draw = Vec<u8>::new();
+                    u32 dstart = r.pos;
+                    if (kind == 0) desc = (u32)rdU64(&r);
+                    else if (kind == 1)
+                    {
+                        rdU8(&r);
+                        u64 mn = 0; i64 mx = 0; bool hm = false; bool sh = false;
+                        rdLimits(&r, &mn, &mx, &hm, &sh);
+                    }
+                    else if (kind == 2)
+                    {
+                        u64 mn = 0; i64 mx = 0; bool hm = false; bool sh = false;
+                        rdLimits(&r, &mn, &mx, &hm, &sh);
+                    }
+                    else if (kind == 3)
+                    {
+                        rdU8(&r); rdU8(&r);
+                    }
+                    else { *err = "bad import kind"; return false; }
+                    for (u32 k = dstart; k < r.pos; k++) draw.push(data[k]);
+                    m->imports.push(WImport { .module = modn, .name = nm, .kind = kind, .desc = desc, .descRaw = draw });
+                }
+            },
+            3 => {
+                u64 nf = rdU64(&r);
+                for (u64 i = 0; i < nf; i++) m->funcs.push((u32)rdU64(&r));
+            },
+            4 => {
+                u64 nt = rdU64(&r);
+                for (u64 i = 0; i < nt; i++)
+                {
+                    u8 et = rdU8(&r);
+                    u64 mn = 0; i64 mx = 0; bool hm = false; bool sh = false;
+                    rdLimits(&r, &mn, &mx, &hm, &sh);
+                    m->tables.push(WTable { .et = et, .mut = hm, .min = mn, .max = mx, .hasMax = hm });
+                }
+            },
+            5 => {
+                u64 nm = rdU64(&r);
+                for (u64 i = 0; i < nm; i++)
+                {
+                    u64 mn = 0; i64 mx = 0; bool hm = false; bool sh = false;
+                    rdLimits(&r, &mn, &mx, &hm, &sh);
+                    m->mems.push(WMem { .min = mn, .max = mx, .hasMax = hm, .shared = sh });
+                }
+            },
+            6 => {
+                u64 ng = rdU64(&r);
+                for (u64 i = 0; i < ng; i++)
+                {
+                    u8 vt = rdU8(&r);
+                    u8 mut_ = rdU8(&r);
+                    Vec<u8> init = Vec<u8>::new();
+                    if (!rdInitExpr(&r, &init)) { *err = "bad global init"; return false; }
+                    m->globals.push(WGlobal { .vt = vt, .mut = mut_ != 0, .init = init });
+                }
+            },
+            7 => {
+                u64 ne = rdU64(&r);
+                for (u64 i = 0; i < ne; i++)
+                {
+                    str nm = rdName(&r);
+                    u8 kind = rdU8(&r);
+                    u32 idx = (u32)rdU64(&r);
+                    m->exports.push(WExport { .name = nm, .kind = kind, .index = idx });
+                }
+            },
+            8 => {
+                m->start = (u32)rdU64(&r);
+                m->hasStart = true;
+            },
+            9 => {
+                u64 ne = rdU64(&r);
+                for (u64 i = 0; i < ne; i++)
+                {
+                    u8 flg = rdU8(&r);
+                    if (flg > 3) { *err = "unsupported elem flag"; return false; }
+                    WElem e = {};
+                    e.flag = flg;
+                    e.table = 0;
+                    e.offset = Vec<u8>::new();
+                    e.elemkind = Vec<u8>::new();
+                    e.funcidx = Vec<u32>::new();
+                    if (flg == 0 || flg == 2)
+                    {
+                        if (flg == 2) e.table = (u32)rdU64(&r);
+                        if (!rdInitExpr(&r, &e.offset)) { *err = "bad elem offset"; return false; }
+                    }
+                    else if (flg == 1)
+                    {
+                        e.elemkind.push(rdU8(&r));
+                    }
+                    else if (flg == 3)
+                    {
+                        e.elemkind.push(rdU8(&r));
+                    }
+                    u64 nf = rdU64(&r);
+                    for (u64 j = 0; j < nf; j++) e.funcidx.push((u32)rdU64(&r));
+                    m->elems.push(e);
+                }
+            },
+            10 => {
+                u64 nc = rdU64(&r);
+                if (nc != m->funcs.count()) { *err = "code/func count mismatch"; return false; }
+                for (u64 i = 0; i < nc; i++)
+                {
+                    u64 bsz = rdU64(&r);
+                    if (!rdOk(&r, (u32)bsz)) { *err = "truncated code"; return false; }
+                    Vec<u8> body = Vec<u8>::new();
+                    for (u64 j = 0; j < bsz; j++) body.push(r.p[r.pos + (u32)j]);
+                    r.pos += (u32)bsz;
+                    m->codes.push(WCode { .body = body });
+                }
+            },
+            11 => {
+                u64 nd = rdU64(&r);
+                for (u64 i = 0; i < nd; i++)
+                {
+                    u8 flg = rdU8(&r);
+                    if (flg > 2) { *err = "unsupported data flag"; return false; }
+                    WData d = {};
+                    d.flag = flg;
+                    d.memidx = 0;
+                    d.offset = Vec<u8>::new();
+                    d.bytes = Vec<u8>::new();
+                    if (flg == 2) d.memidx = (u32)rdU64(&r);
+                    if (!rdInitExpr(&r, &d.offset)) { *err = "bad data offset"; return false; }
+                    u64 nb = rdU64(&r);
+                    for (u64 j = 0; j < nb; j++) d.bytes.push(rdU8(&r));
+                    m->datas.push(d);
+                }
+            },
+            else => { },
+        }
+        pos += (u32)sz;
+    }
+    return true;
+}
