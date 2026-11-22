@@ -10,12 +10,15 @@
 use lower { Muv, MuvDrop, muvNode, muvErr, muvStr, muvResolved, muvFindLocal, muvPushLocal,
                muvBlock, muvSetBlock, muvTerm, muvPos, muvArr, muvSlotTy, muvSubstTy };
 use types { muvTy, muvFindTypeDecl, muvVariantDeclOf, muvVariantCaseIdx,
-               muvVariantCaseStructTy, muvVariantCaseFieldIdx, muvIsIndirect, muvIndirectBase };
+               muvVariantCaseStructTyFor, muvVariantCaseFieldIdx, muvIsIndirect, muvIndirectBase,
+               muvPushTySubs };
 use expr { muvExpr, muvAddrOf, muvCond, muvAssignCommon, muvIsAgg, muvCopyAgg, muvAggSlot,
                muvDecodeLit, muvCompareVals, muvResolveConst, muvMakeGlobal, muvValBody,
                muvMethodFnFor, muvCast, muvUnwrapTy, muvTyUnsigned, muvIndexAddr,
-               muvGepField, muvFieldIdx, muvConstU64 };
+               muvGepField, muvFieldIdx, muvConstU64, muvStoreVal, muvArmStore,
+               muvCoerceToIr };
 use decl { muvMethodSelfKind };
+use mono::mono { MonoSubstitution };
 use context::context { AstContext };
 use sem { scope { Symbol, ScopeStack } };
 use ast {
@@ -432,7 +435,7 @@ bool muvSwitchFast(Muv* w, IrValue* scrut, SwitchCase* cases, u32 n,
         if (slot != null)
         {
             IrValue* v = muvValBody(w, cases[i].body, vt);
-            if (v != null) w->b.store(v, slot);
+            if (v != null) muvArmStore(w, v, slot, vt);
         }
         else muvStmt(w, cases[i].body);
         if (!w->term) w->b.br(joinBb);
@@ -545,7 +548,7 @@ bool muvSwitchHybrid(Muv* w, IrValue* scrut, Ty scrutTy,
         if (slot != null)
         {
             IrValue* v = muvValBody(w, cases[i].body, vt);
-            if (v != null) w->b.store(v, slot);
+            if (v != null) muvArmStore(w, v, slot, vt);
         }
         else muvStmt(w, cases[i].body);
         if (!w->term) w->b.br(joinBb);
@@ -585,6 +588,12 @@ pub void muvVariantBinds(Muv* w, SwitchCase* c, IrValue* scrut, Ty scrutTy,
     u32 mark = w->locLen;
     Decl* vd = muvVariantDeclOf(w, scrutTy);
     if (vd == null || scrut == null) return;
+    /* generic scrutinee (`Option<f64>`): case field types carry `T` —
+     * activate the instance substitutions so pushed bind types are
+     * concrete (the loads already use the substituted case struct) */
+    MonoSubstitution* os = null;
+    u32 osl = 0;
+    bool pushed = muvPushTySubs(w, scrutTy, &os, &osl);
     u32 p = 0;
     while (p < c->patternsLen)
     {
@@ -598,7 +607,7 @@ pub void muvVariantBinds(Muv* w, SwitchCase* c, IrValue* scrut, Ty scrutTy,
                 i32 ci = muvVariantCaseIdx(w, vd, pv->kind.payload.Variant.variantName);
                 if (ci >= 0)
                 {
-                    IrStructType* cst = muvVariantCaseStructTy(w, vd, (u32)ci, 0);
+                    IrStructType* cst = muvVariantCaseStructTyFor(w, scrutTy, (u32)ci, 0);
                     IrValue* payA = cst != null ? muvGepField(w, scrut, 1) : null;
                     IrValue* caseA = payA != null
                         ? muvV(w->b.bitcast(payA, w->ir->tyPtr(cst->irType))) : null;
@@ -649,6 +658,7 @@ pub void muvVariantBinds(Muv* w, SwitchCase* c, IrValue* scrut, Ty scrutTy,
         }
         p++;
     }
+    if (pushed) { w->subs = os; w->subsLen = osl; }
 }
 
 /* everything after the scrutinee is evaluated: fast switch, hybrid
@@ -750,7 +760,7 @@ pub void muvSwitchCoreVal(Muv* w, IrValue* scrut, Ty scrutTy,
         if (slot != null)
         {
             IrValue* v = muvValBody(w, c->body, vt);
-            if (v != null) w->b.store(v, slot);
+            if (v != null) muvArmStore(w, v, slot, vt);
         }
         else muvStmt(w, c->body);
         w->locLen = bindMark;
@@ -764,7 +774,7 @@ pub void muvSwitchCoreVal(Muv* w, IrValue* scrut, Ty scrutTy,
         if (slot != null)
         {
             IrValue* v = muvValBody(w, cases[elseIdx].body, vt);
-            if (v != null) w->b.store(v, slot);
+            if (v != null) muvArmStore(w, v, slot, vt);
         }
         else muvStmt(w, cases[elseIdx].body);
         if (!w->term) w->b.br(joinBb);
@@ -966,11 +976,19 @@ pub void muvVarDecl(Muv* w, Stmt* s, NodeId id)
             Ty pvt = muvUnwrapTy(w, vt);
             TypeEntry* vte = pvt != 0 ? w->ctx->types + pvt : null;
             IrValue* init;
+            Ty ity = 0;
             if (vte != null && vte->kind.tag == TypeKind::Reference)
                 init = muvAddrOf(w, initId);
             else
+            {
                 init = muvExpr(w, initId);
-            if (init != null) w->b.store(init, slot);
+                Node* inn = muvNode(w, initId);
+                if (inn != null && inn->kind.tag == NodeKind::Expr)
+                    ity = inn->kind.payload.Expr.value.resolvedType;
+                if (init != null)
+                    init = muvCoerceToIr(w, init, ity, irt, initId);
+            }
+            if (init != null) muvStoreVal(w, init, slot, irt);
         }
     }
     /* RAII move: `T x = y;` transfers y's ownership, so y must not
@@ -1464,7 +1482,18 @@ pub void muvStmt(Muv* w, NodeId id)
                 if (frte != null && frte->kind.tag == TypeKind::Reference)
                     v = muvAddrOf(w, vId);
                 else
+                {
                     v = muvExpr(w, vId);
+                    /* `return 1` in an f64 function: the C backend gets
+                     * the conversion free — emit it explicitly here */
+                    if (v != null && w->retTy != 0)
+                    {
+                        IrType* rtI = muvTy(w, muvResolved(w, w->retTy), 0);
+                        Ty vty = rn->kind.tag == NodeKind::Expr
+                            ? rn->kind.payload.Expr.value.resolvedType : 0;
+                        v = muvCoerceToIr(w, v, vty, rtI, vId);
+                    }
+                }
                 if (v != null) {
                     muvDefersBranch(w, w->fnDeferMark);
                     muvDropsBranch(w, w->fnDropMark, skip);
@@ -1488,7 +1517,12 @@ pub void muvStmt(Muv* w, NodeId id)
             u32 i = 0;
             while (i < s->kind.payload.Block.stmtsLen && !w->term)
             {
-                muvStmt(w, s->kind.payload.Block.stmts[i]);
+                NodeId bi = s->kind.payload.Block.stmts[i];
+                Node* bn = muvNode(w, bi);
+                /* block lists can hold a bare expr (`{ f(); }` inside
+                 * value-position blocks): evaluate and discard it */
+                if (bn != null && bn->kind.tag == NodeKind::Expr) muvExpr(w, bi);
+                else muvStmt(w, bi);
                 i++;
             }
             /* a terminated block already unwound through return/break */

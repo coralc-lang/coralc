@@ -13,8 +13,8 @@ use lower { Muv, muvNode, muvErr, muvStr, muvResolved, muvSubstTy, muvFindLocal,
                muvSetBlock, muvTerm, muvPos, muvArr, muvMbCh, muvMbStr,
                MuvNameEnt, muvNamesFind, muvTypeInstanceName };
 use types { muvTy, muvFindTypeDecl, muvTyHasParam, muvVariantDeclOf, muvVariantCaseIdx,
-               muvVariantCaseStructTy, muvVariantCaseFieldIdx, muvUnionDeclOf, muvUnionFieldTy,
-               muvIsIndirect, muvIndirectBase };
+               muvVariantCaseStructTy, muvVariantCaseStructTyFor, muvVariantCaseFieldIdx, muvUnionDeclOf, muvUnionFieldTy,
+               muvIsIndirect, muvIndirectBase, muvDeclTy };
 use decl { muvMangle, muvDeclareFunc, muvDeclareMethod, muvMethodSelfKind,
                muvOwnerStr, muvMethodMangle, muvMethodMangleEx };
 use stmt;
@@ -32,10 +32,10 @@ use ast {
            BUILTIN_ASSERTGE, BUILTIN_ASSERTRANGE, BUILTIN_ASSERTNONNULL,
            BUILTIN_ASSERTALIGNED, BUILTIN_BACKTRACETO },
     stmt { Stmt, StmtKind, SwitchCase },
-    decl { Decl, DeclKind, Field, Param, File, VariantVariant, ATTR_THREADLOCAL }
+    decl { Decl, DeclKind, Field, Param, File, VariantVariant, EnumVariant, ATTR_THREADLOCAL }
 };
 use common::slice { Slice };
-import muvm::irtypes { IrContext, IrModule, IrFunc, IrBlock, IrValue, IrValueKind, IrType, IrTypeKind, IrInst, IrStringConst, IrGlobal, IrStructType };
+import muvm::irtypes { IrContext, IrModule, IrFunc, IrBlock, IrValue, IrValueKind, IrType, IrTypeKind, IrInst, IrStringConst, IrGlobal, IrStructType, irTypeEqual };
 import muvm::irOps { IrICmpPred, IrFCmpPred };
 import muvm::irBuilder { IrBuilder };
 import std::mman { alloc, dealloc, copy, zero };
@@ -413,6 +413,56 @@ pub bool muvSelfTyMatches(Muv* w, Ty selfTy, Str instName, Ty* args, u32 argsLen
  * an owner type, then the bare name as a last resort (the order the C
  * backend resolves in). Null only after the last form also fails to
  * name a function — that failure is reported by the bare resolver. */
+/* resolves a `mod::…::member` callee path to the member's Func decl
+ * node, walking module symbols exactly like mono's collect pass does.
+ * Returns NodeId 0 for type-headed paths (`Foo::new`) and non-module
+ * roots — those stay on the method-owner path below. */
+NodeId muvModuleFuncDecl(Muv* w, NodeId pathId)
+{
+    NodeId none;
+    none.index = 0;
+    if (w->sema == null || w->sema->scopes == null) return none;
+    Node* pn = muvNode(w, pathId);
+    if (pn->kind.tag != NodeKind::Expr) return none;
+    Expr* pe = &pn->kind.payload.Expr.value;
+    if (pe->kind.tag != ExprKind::Path) return none;
+    NodeId* segs = pe->kind.payload.Path.segments;
+    u32 n = pe->kind.payload.Path.segmentsLen;
+    if (segs == null || n < 2) return none;
+    Node* s0 = muvNode(w, segs[0]);
+    if (s0->kind.tag != NodeKind::Expr ||
+        s0->kind.payload.Expr.value.kind.tag != ExprKind::Ident) return none;
+    Str rootName = s0->kind.payload.Expr.value.kind.payload.Ident.name;
+    u32 refFile = 0;
+    Node* rn = muvNode(w, pathId);
+    if (rn != null) refFile = locFile(rn->loc);
+    Symbol* sym = w->sema->scopes->lookupFrom(rootName, refFile);
+    if (sym == null || sym->kind != 5 || sym->declaration.index == 0) return none;
+    Node* curMod = muvNode(w, sym->declaration);
+    u32 i = 1;
+    while (i < n)
+    {
+        Node* sn = muvNode(w, segs[i]);
+        if (sn->kind.tag != NodeKind::Expr ||
+            sn->kind.payload.Expr.value.kind.tag != ExprKind::Ident) return none;
+        Str mname = sn->kind.payload.Expr.value.kind.payload.Ident.name;
+        Symbol* ms = w->sema->lookupModuleMember(curMod, mname);
+        if (ms == null || ms->declaration.index == 0) return none;
+        if (i + 1 == n)
+        {
+            Node* mn = muvNode(w, ms->declaration);
+            if (mn->kind.tag == NodeKind::Decl &&
+                mn->kind.payload.Decl.value.kind.tag == DeclKind::Func)
+                return ms->declaration;
+            return none;
+        }
+        if (ms->kind != 5) return none;
+        curMod = muvNode(w, ms->declaration);
+        i++;
+    }
+    return none;
+}
+
 IrFunc* muvResolveCalleePath(Muv* w, NodeId calleeId, NodeId refSite, NodeId* args, u32 argsLen)
 {
     Node* cn = muvNode(w, calleeId);
@@ -421,6 +471,26 @@ IrFunc* muvResolveCalleePath(Muv* w, NodeId calleeId, NodeId refSite, NodeId* ar
     NodeId* segs = ce->kind.payload.Path.segments;
     u32 sn = ce->kind.payload.Path.segmentsLen;
     if (sn == 0) return null;
+    /* module-qualified function: `ios::println(...)`. Resolved through
+     * the same module walk collect uses, so generic instances picked
+     * here are the ones collect enqueued for this call site. */
+    NodeId mdecl = muvModuleFuncDecl(w, calleeId);
+    if (mdecl.index != 0)
+    {
+        if (w->mono != null && w->mono->genericCount(mdecl) != 0)
+            return muvPickInstanceForDecl(w, mdecl, args, argsLen, refSite);
+        IrFunc* mf = muvFnMapGet(w, mdecl.index);
+        if (mf != null) return mf;
+        Node* mdn = muvNode(w, mdecl);
+        if (mdn->kind.tag != NodeKind::Decl) return null;
+        Decl* mdd = &mdn->kind.payload.Decl.value;
+        if (mdd->kind.tag != DeclKind::Func) return null;
+        mf = muvDeclareFunc(w, mdecl, mdd);
+        if (mf == null) return null;
+        w->module->addFunc(mf);
+        muvFnMapPut(w, mdecl.index, mf);
+        return mf;
+    }
     if (sn >= 2)
     {
         Node* s0 = muvNode(w, segs[0]);
@@ -818,6 +888,39 @@ bool muvConstF64(Muv* w, NodeId id, IrType* dt, f64* out)
     return true;
 }
 
+/* enum member constant: auto-increment ordinal with explicit `= N`
+ * resetting the counter (same computation the pattern-side switch
+ * lowering and the C backend's enum emission use). false when the
+ * member is absent or its value is not constant. */
+pub bool muvEnumMemberConst(Muv* w, Decl* edd, Str member, IrType* bt, u64* out)
+{
+    u64 running = 0;
+    u32 v = 0;
+    while (v < edd->kind.payload.Enum.variantsLen)
+    {
+        Node* vn = muvNode(w, edd->kind.payload.Enum.variants[v]);
+        if (vn->kind.tag == NodeKind::EnumVariant)
+        {
+            EnumVariant* ev = &vn->kind.payload.EnumVariant.value;
+            if (ev->name == member)
+            {
+                if ((ev->flags & 1) != 0)
+                    return muvConstU64(w, ev->value, bt, out);
+                *out = running;
+                return true;
+            }
+            if ((ev->flags & 1) != 0)
+            {
+                u64 evv = 0;
+                running = muvConstU64(w, ev->value, bt, &evv) ? evv + 1 : running + 1;
+            }
+            else running++;
+        }
+        v++;
+    }
+    return false;
+}
+
 /* compile-time initializer for static storage: literals, their negation
  * and a cast over either fold into an IrValue of the storage's own type;
  * anything else would need code at load time (Phase 3). */
@@ -1163,12 +1266,49 @@ pub IrValue* muvPromoteVararg(Muv* w, IrValue* v, Ty coralTy)
 }
 
 
+/* lvalue shape for `T&` argument binding — mirrors sema's
+ * isLvalueExpr without depending on the analyzer being reachable:
+ * locals, field/index/deref chains, lvalue ternaries, and calls that
+ * return references. */
+bool muvLvalueExpr(Muv* w, NodeId id)
+{
+    if (id.index == 0) return false;
+    Node* n = muvNode(w, id);
+    if (n->kind.tag != NodeKind::Expr) return false;
+    Expr* e = &n->kind.payload.Expr.value;
+    switch (e->kind.tag)
+    {
+        ExprKind::Ident => {
+            return muvFindLocal(w, e->kind.payload.Ident.name) != null;
+        },
+        ExprKind::Field | ExprKind::DerefField | ExprKind::TupleField |
+        ExprKind::Index | ExprKind::Deref => { return true; },
+        ExprKind::Ternary => {
+            return muvLvalueExpr(w, e->kind.payload.Ternary.thenExpr) &&
+                   muvLvalueExpr(w, e->kind.payload.Ternary.elseExpr);
+        },
+        ExprKind::Call | ExprKind::MethodCall | ExprKind::StaticCall => {
+            Ty ct = muvResolved(w, e->resolvedType);
+            while (ct != 0)
+            {
+                TypeEntry* te = w->ctx->types + ct;
+                if (te->kind.tag == TypeKind::Const) ct = te->kind.payload.Const.base;
+                else if (te->kind.tag == TypeKind::Comptime) ct = te->kind.payload.Comptime.base;
+                else break;
+            }
+            return ct != 0 && (w->ctx->types + ct)->kind.tag == TypeKind::Reference;
+        },
+        else => { return false; }
+    }
+}
+
 /* evaluate a call's argument list: an optional receiver first, then
  * every listed argument (with vararg promotion past the fixed prefix).
  * Shared by bare calls and method calls. On failure *fail is set and
  * the array (if any) is already freed. */
 pub IrValue** muvBuildCallArgs(Muv* w, IrFunc* f, NodeId* argv, u32 argvLen,
-                              IrValue* recv, bool passRecv, u32* outN, bool* fail)
+                              IrValue* recv, bool passRecv, u32* outN, bool* fail,
+                              IrType** paramTypes, u32 paramCount)
 {
     *fail = false;
     *outN = 0;
@@ -1192,6 +1332,46 @@ pub IrValue** muvBuildCallArgs(Muv* w, IrFunc* f, NodeId* argv, u32 argvLen,
             *fail = true;
             if (args != null) dealloc<IrValue*>(args);
             return null;
+        }
+        /* `T&` parameters take the referent ADDRESS: an argument that
+         * is itself a reference passes its raw pointer, any other
+         * lvalue binds by address (the C backend's cgRefArgText). The
+         * IR cannot tell `T*` from `T&`, so this only fires when the
+         * value form's type disagrees with the declared param type —
+         * which sema only allows for reference bindings. */
+        u32 pi = i + (passRecv ? 1 : 0);
+        if (paramTypes != null && pi < paramCount && paramTypes[pi] != null &&
+            av->type != null && !irTypeEqual(av->type, paramTypes[pi]))
+        {
+            Node* an = muvNode(w, argv[i]);
+            Ty at = an->kind.tag == NodeKind::Expr
+                ? an->kind.payload.Expr.value.resolvedType : 0;
+            Ty bt = at;
+            while (bt != 0)
+            {
+                TypeEntry* te = w->ctx->types + bt;
+                if (te->kind.tag == TypeKind::Const) bt = te->kind.payload.Const.base;
+                else if (te->kind.tag == TypeKind::Comptime) bt = te->kind.payload.Comptime.base;
+                else break;
+            }
+            IrValue* cand = null;
+            if (bt != 0 && (w->ctx->types + bt)->kind.tag == TypeKind::Reference)
+                cand = muvExprRaw(w, argv[i]);
+            else if (muvLvalueExpr(w, argv[i]))
+                cand = muvAddrOf(w, argv[i]);
+            if (cand != null && cand->type != null &&
+                irTypeEqual(cand->type, paramTypes[pi]))
+                av = cand;
+        }
+        /* implicit numeric conversion: `f(1)` into an f64 param must
+         * emit si_to_fp — the C backend gets this free from C */
+        if (paramTypes != null && pi < paramCount && paramTypes[pi] != null &&
+            !(vararg && pi >= fixed))
+        {
+            Node* an2 = muvNode(w, argv[i]);
+            Ty at2 = an2->kind.tag == NodeKind::Expr
+                ? an2->kind.payload.Expr.value.resolvedType : 0;
+            av = muvCoerceToIr(w, av, at2, paramTypes[pi], argv[i]);
         }
         if (vararg && (i + (passRecv ? 1 : 0)) >= fixed)
         {
@@ -1337,7 +1517,8 @@ pub IrValue* muvCall(Muv* w, Expr* e, NodeId id)
             bool pfail = false;
             IrValue** pargs = muvBuildCallArgs(w, null, e->kind.payload.Call.args,
                                               e->kind.payload.Call.argsLen,
-                                              null, false, &pnargs, &pfail);
+                                              null, false, &pnargs, &pfail,
+                                              cfty->params, cfty->nparams);
             if (pfail) return null;
             IrValue* pres = muvV(w->b.call(fval, pargs, pnargs));
             if (pargs != null) dealloc<IrValue*>(pargs);
@@ -1379,7 +1560,8 @@ pub IrValue* muvCall(Muv* w, Expr* e, NodeId id)
         bool fail = false;
         IrValue** args = muvBuildCallArgs(w, null, e->kind.payload.Call.args,
                                          e->kind.payload.Call.argsLen,
-                                         null, false, &nargs, &fail);
+                                         null, false, &nargs, &fail,
+                                         fty->params, fty->nparams);
         if (fail) return null;
         IrInst* callInst = w->b.call(fval, args, nargs);
         muvSetDebugLoc(w, callInst, id);
@@ -1400,7 +1582,8 @@ pub IrValue* muvCall(Muv* w, Expr* e, NodeId id)
     bool fail = false;
     IrValue** args = muvBuildCallArgs(w, f, e->kind.payload.Call.args,
                                      e->kind.payload.Call.argsLen,
-                                     null, false, &nargs, &fail);
+                                     null, false, &nargs, &fail,
+                                     f->paramTypes, f->nparams);
     if (fail) return null;
     IrInst* callInst = w->b.call(&f->base, args, nargs);
     muvSetDebugLoc(w, callInst, id);
@@ -1443,7 +1626,8 @@ pub IrValue* muvMethodCall(Muv* w, Expr* e, NodeId id)
         u32 nargs = 0;
         bool fail = false;
         IrValue** args = muvBuildCallArgs(w, f, argv, argvLen, recvVal, passRecv,
-                                         &nargs, &fail);
+                                         &nargs, &fail,
+                                         f->paramTypes, f->nparams);
         if (fail) return null;
         IrValue* res = muvV(w->b.call(&f->base, args, nargs));
         if (args != null) dealloc<IrValue*>(args);
@@ -1465,7 +1649,8 @@ pub IrValue* muvMethodCall(Muv* w, Expr* e, NodeId id)
         u32 nargs = 0;
         bool fail = false;
         IrValue** args = muvBuildCallArgs(w, null, argv, argvLen, null, false,
-                                         &nargs, &fail);
+                                         &nargs, &fail,
+                                         fty->params, fty->nparams);
         if (fail) return null;
         IrValue* res = muvV(w->b.call(fval, args, nargs));
         if (args != null) dealloc<IrValue*>(args);
@@ -1571,9 +1756,126 @@ pub IrValue* muvCompareVals(Muv* w, ExprKind k, IrValue* l, IrValue* r, NodeId i
 
 pub IrValue* muvCompare(Muv* w, ExprKind k, NodeId lid, NodeId rid, NodeId id, Ty ct)
 {
+    /* `x.tag == V::Case` / `V::Case == x.tag`: the path's value form is
+     * the whole {tag,payload} aggregate — compare the tag load against
+     * the case ordinal instead (mirrors cgAssignValue's `.tag` rule) */
+    if (k.tag == ExprKind::Eq || k.tag == ExprKind::Ne)
+    {
+        Decl* cvd = null;
+        i32 lci = muvVariantCasePath(w, lid, &cvd);
+        i32 rci = muvVariantCasePath(w, rid, &cvd);
+        if (lci >= 0 && rci < 0 && muvIsTagAccess(w, rid))
+        {
+            IrValue* r = muvExpr(w, rid);
+            if (r == null) return null;
+            IrValue* lc = w->ir->constInt(w->ir->tyInt(32), (u64)(u32)lci);
+            return muvCompareVals(w, k, lc, r, id, ct);
+        }
+        if (rci >= 0 && lci < 0 && muvIsTagAccess(w, lid))
+        {
+            IrValue* l = muvExpr(w, lid);
+            if (l == null) return null;
+            IrValue* rc = w->ir->constInt(w->ir->tyInt(32), (u64)(u32)rci);
+            return muvCompareVals(w, k, l, rc, id, ct);
+        }
+    }
     IrValue* l = muvExpr(w, lid);
     IrValue* r = muvExpr(w, rid);
     return muvCompareVals(w, k, l, r, id, ct);
+}
+
+/* `V::Case` path detection shared by the Path arm and the `.tag`
+ * consumers: returns the case ordinal and the variant decl, or -1
+ * when `id` isn't a two-segment variant-case path. The head segment
+ * may be a plain Ident (`Option::None`) or a TypeRef
+ * (`Option<f64>::None`). */
+pub i32 muvVariantCasePath(Muv* w, NodeId id, Decl** outVd)
+{
+    if (id.index == 0) return -1;
+    Node* n = muvNode(w, id);
+    if (n->kind.tag != NodeKind::Expr) return -1;
+    Expr* e = &n->kind.payload.Expr.value;
+    if (e->kind.tag != ExprKind::Path) return -1;
+    if (e->kind.payload.Path.segmentsLen != 2) return -1;
+    Node* s0 = muvNode(w, e->kind.payload.Path.segments[0]);
+    Node* s1 = muvNode(w, e->kind.payload.Path.segments[1]);
+    if (s0->kind.tag != NodeKind::Expr || s1->kind.tag != NodeKind::Expr) return -1;
+    Expr* s0e = &s0->kind.payload.Expr.value;
+    Expr* s1e = &s1->kind.payload.Expr.value;
+    if (s1e->kind.tag != ExprKind::Ident) return -1;
+    Decl* vd = null;
+    if (s0e->kind.tag == ExprKind::TypeRef)
+    {
+        Ty ht = muvResolved(w, s0e->kind.payload.TypeRef.typeNode);
+        vd = muvVariantDeclOf(w, muvUnwrapTy(w, ht));
+    }
+    else if (s0e->kind.tag == ExprKind::Ident)
+    {
+        NodeId td = muvFindTypeDecl(w, s0e->kind.payload.Ident.name);
+        if (td.index != 0)
+        {
+            Node* dn = muvNode(w, td);
+            if (dn->kind.tag == NodeKind::Decl &&
+                dn->kind.payload.Decl.value.kind.tag == DeclKind::Variant)
+                vd = &dn->kind.payload.Decl.value;
+        }
+    }
+    if (vd == null) return -1;
+    i32 ci = muvVariantCaseIdx(w, vd, s1e->kind.payload.Ident.name);
+    if (ci < 0) return -1;
+    if (outVd != null) *outVd = vd;
+    return ci;
+}
+
+/* `x.tag` / `x->tag` where x's type is a variant — the field holding
+ * the case ordinal */
+pub bool muvIsTagAccess(Muv* w, NodeId id)
+{
+    if (id.index == 0) return false;
+    Node* n = muvNode(w, id);
+    if (n->kind.tag != NodeKind::Expr) return false;
+    Expr* e = &n->kind.payload.Expr.value;
+    Str fname = 0;
+    NodeId obj;
+    obj.index = 0;
+    if (e->kind.tag == ExprKind::Field)
+        { fname = e->kind.payload.Field.field; obj = e->kind.payload.Field.obj; }
+    else if (e->kind.tag == ExprKind::DerefField)
+        { fname = e->kind.payload.DerefField.field; obj = e->kind.payload.DerefField.obj; }
+    else return false;
+    if (fname != w->ctx->intern("tag") || obj.index == 0) return false;
+    Node* on = muvNode(w, obj);
+    if (on->kind.tag != NodeKind::Expr) return false;
+    Ty ot = muvResolved(w, on->kind.payload.Expr.value.resolvedType);
+    return muvVariantDeclOf(w, muvUnwrapTy(w, ot)) != null;
+}
+
+/* zero `size` bytes at `addr` — i64 chunks then an i8 tail. Used to
+ * clear variant payload storage for `V::Case` values (C's `{ .tag = v }`
+ * zero-initialises the rest). */
+pub void muvZeroMem(Muv* w, IrValue* addr, u32 size)
+{
+    if (addr == null || size == 0) return;
+    IrValue* p64 = muvV(w->b.bitcast(addr, w->ir->tyPtr(w->ir->tyInt(64))));
+    IrValue* p8 = muvV(w->b.bitcast(addr, w->ir->tyPtr(w->ir->tyInt(8))));
+    if (p64 == null || p8 == null) return;
+    u32 off = 0;
+    while (off + 8 <= size)
+    {
+        IrValue* idx = w->ir->constInt(w->ir->tyInt(32), (u64)(off / 8));
+        IrValue* slot = muvV(w->b.gep(p64, &idx, 1));
+        if (slot == null) return;
+        w->b.store(w->ir->constInt(w->ir->tyInt(64), 0), slot);
+        off += 8;
+    }
+    while (off < size)
+    {
+        IrValue* idx = w->ir->constInt(w->ir->tyInt(32), (u64)off);
+        IrValue* slot = muvV(w->b.gep(p8, &idx, 1));
+        if (slot == null) return;
+        w->b.store(w->ir->constInt(w->ir->tyInt(8), 0), slot);
+        off += 1;
+    }
 }
 
 /* short-circuit And/Or via result alloca + condBr (no phis) */
@@ -1637,6 +1939,39 @@ pub IrValue* muvCast(Muv* w, IrValue* v, IrType* st, IrType* dt, bool srcUnsigne
 }
 
 
+/* implicit numeric conversion at store/return/argument boundaries:
+ * the C backend leans on C's implicit conversions, but muvm IR is
+ * typed — `f64 x = 1` must emit si_to_fp, not `store i32` into an
+ * f64 slot. sit comes from the VALUE's own IR type (ground truth);
+ * srcTy only supplies signedness for int→float / int→int widening.
+ * i1 (bool) always zero-extends — sext would turn `true` into -1. */
+pub IrValue* muvCoerceToIr(Muv* w, IrValue* v, Ty srcTy, IrType* dit, NodeId id)
+{
+    if (v == null || dit == null || v->type == null) return v;
+    IrType* sit = v->type;
+    if (sit == dit) return v;
+    if (muvIsAgg(sit) || muvIsAgg(dit)) return v;
+    if (sit->kind == IrTypeKind::Ptr || dit->kind == IrTypeKind::Ptr) return v;
+    bool numeric = (sit->kind == IrTypeKind::Int || sit->kind == IrTypeKind::Float) &&
+                   (dit->kind == IrTypeKind::Int || dit->kind == IrTypeKind::Float);
+    if (!numeric) return v;
+    Ty st = muvResolved(w, srcTy);
+    bool su = st != 0 ? muvTyUnsigned(w, st) : false;
+    /* dst sign only matters for float→int; assume signed — sema
+     * rejects most narrowing conversions before this point anyway */
+    bool du = false;
+    IrValue* cv;
+    if (sit->kind == IrTypeKind::Int && sit->width == 1 &&
+        dit->kind == IrTypeKind::Int && dit->width > 1)
+        cv = muvV(w->b.zext(v, dit));
+    else
+        cv = muvCast(w, v, sit, dit, su, du);
+    if (cv != null && cv != v && cv->kind == IrValueKind::Inst)
+        muvSetDebugLoc(w, (IrInst*)cv, id);
+    return cv;
+}
+
+
 /* coerce any expression value to an i1 condition: i1 passes through,
  * other ints and pointers compare against 0 (C truthiness: `if (2)` and
  * `if (ptr)` are true, `if (0)`/`if (null)` false), floats against 0.0.
@@ -1675,6 +2010,46 @@ pub bool muvIsAgg(IrType* t)
                          t->kind == IrTypeKind::Array ||
                          t->kind == IrTypeKind::Union ||
                          t->kind == IrTypeKind::Vector);
+}
+
+/* store `v` into `addr`, where the destination's value type is `dt`.
+ * An aggregate-typed value IS its address; storing one into a
+ * pointer/scalar slot is array->pointer decay and must store the
+ * 8-byte address, not memcpy the whole object (a `u8[1024]` stored
+ * into a `u8*` field used to overwrite 1 KiB of stack). Relabel the
+ * value with a bitcast so the backend picks the pointer-store path. */
+pub IrInst* muvStoreVal(Muv* w, IrValue* v, IrValue* addr, IrType* dt)
+{
+    if (v == null || addr == null) return null;
+    if (dt != null && v->type != null && muvIsAgg(v->type) &&
+        !muvIsAgg(dt) && dt->kind != IrTypeKind::Void)
+        v = muvV(w->b.bitcast(v, dt));
+    return w->b.store(v, addr);
+}
+
+/* result-slot store for branch arms (ternary/if/switch expressions):
+ * scalar arms store their value, aggregate arms are already
+ * address-valued so the bytes copy element-wise. */
+pub void muvArmStore(Muv* w, IrValue* v, IrValue* slot, IrType* vt)
+{
+    if (v == null || slot == null) return;
+    if (vt != null && muvIsAgg(vt)) { muvCopyAgg(w, slot, v, vt, 0); return; }
+    muvStoreVal(w, v, slot, vt);
+}
+
+/* literal field/element store: evaluate the value expr, coerce its
+ * numeric type to the slot's (C's implicit conversions), store.
+ * Returns the stored value, null on error. */
+pub IrValue* muvLitStore(Muv* w, NodeId valId, IrValue* dst, IrType* dt)
+{
+    IrValue* v = muvExpr(w, valId);
+    if (v == null) return null;
+    Node* vn = muvNode(w, valId);
+    Ty vty = vn != null && vn->kind.tag == NodeKind::Expr
+        ? vn->kind.payload.Expr.value.resolvedType : 0;
+    v = muvCoerceToIr(w, v, vty, dt, valId);
+    muvStoreVal(w, v, dst, dt);
+    return v;
 }
 
 /* IR field index of `name` in struct type `t` — the position the field
@@ -1733,7 +2108,7 @@ pub IrValue* muvFieldAddr(Muv* w, NodeId obj, Str fname, NodeId errId)
                          * (obj was `x.payload`) — bitcast it directly;
                          * a field gep here would step past the union */
                         IrValue* payA = base;
-                        IrStructType* cst = muvVariantCaseStructTy(w, vd, (u32)ci, 0);
+                        IrStructType* cst = muvVariantCaseStructTyFor(w, ity, (u32)ci, 0);
                         if (cst == null) { muvErr(w, errId, "unknown variant case"); return null; }
                         return muvV(w->b.bitcast(payA, w->ir->tyPtr(cst->irType)));
                     }
@@ -2197,31 +2572,87 @@ pub IrValue* muvStringLit(Muv* w, NodeId id)
 /* the address of an lvalue expression: local slot, deref pointee, or a
  * gep chain (field / tuple field / index). Used by plain assignment,
  * compound assignment and aggregate copies alike. */
+/* `T&` lvalue's referent address: addr points at the stored pointer,
+ * so the referent address is one load through it (the C backend's
+ * lvalue-on-reference rule). Non-reference types pass through. */
+IrValue* muvAddrOfRef(Muv* w, IrValue* addr, Ty rt, NodeId id)
+{
+    if (addr == null || rt == 0) return addr;
+    Ty bt = rt;
+    while (bt != 0)
+    {
+        TypeEntry* te = w->ctx->types + bt;
+        if (te->kind.tag == TypeKind::Const) bt = te->kind.payload.Const.base;
+        else if (te->kind.tag == TypeKind::Comptime) bt = te->kind.payload.Comptime.base;
+        else break;
+    }
+    if (bt == 0 || (w->ctx->types + bt)->kind.tag != TypeKind::Reference) return addr;
+    IrType* pt = muvTy(w, rt, 0);   // ptr T — the stored pointer type
+    if (pt == null) return addr;
+    IrInst* li = w->b.load(pt, addr);
+    muvSetDebugLoc(w, li, id);
+    return muvV(li);
+}
+
 pub IrValue* muvAddrOf(Muv* w, NodeId id)
 {
     if (id.index == 0) return null;
     Node* n = muvNode(w, id);
     if (n->kind.tag != NodeKind::Expr) { muvErr(w, id, "not an lvalue"); return null; }
     Expr* e = &n->kind.payload.Expr.value;
+    Ty rt = muvResolved(w, e->resolvedType);
     switch (e->kind.tag)
     {
         ExprKind::Ident => {
             Str name = e->kind.payload.Ident.name;
             IrValue* slot = muvFindLocal(w, name);
-            if (slot != null) return slot;
+            if (slot != null) return muvAddrOfRef(w, slot, rt, id);
             IrValue* gv = muvResolveGlobal(w, name, id);
-            if (gv != null) return gv;
+            if (gv != null) return muvAddrOfRef(w, gv, rt, id);
             muvErr(w, id, "cannot assign to a non-local name");
             return null;
         },
-        ExprKind::Deref => { return muvExpr(w, e->kind.payload.Deref.expr); },
+        ExprKind::Deref => {
+            IrValue* dv = muvExpr(w, e->kind.payload.Deref.expr);
+            return dv != null ? muvAddrOfRef(w, dv, rt, id) : null;
+        },
+        ExprKind::Call | ExprKind::MethodCall | ExprKind::StaticCall => {
+            /* a call returning `T&` IS the referent address already —
+             * the result pointer needs no further load */
+            Ty bt = rt;
+            while (bt != 0)
+            {
+                TypeEntry* te = w->ctx->types + bt;
+                if (te->kind.tag == TypeKind::Const) bt = te->kind.payload.Const.base;
+                else if (te->kind.tag == TypeKind::Comptime) bt = te->kind.payload.Comptime.base;
+                else break;
+            }
+            if (bt != 0 && (w->ctx->types + bt)->kind.tag == TypeKind::Reference)
+                return muvExprRaw(w, id);
+            /* an aggregate call result is already address-valued (the
+             * same convention as every aggregate) — `T x = f()` where
+             * f returns a struct/tuple needs exactly that address for
+             * the element-wise copy, not an error */
+            IrType* it = rt != 0 ? muvTy(w, rt, 0) : null;
+            if (it != null && muvIsAgg(it)) return muvExprRaw(w, id);
+            muvErr(w, id, "cannot assign to a call result");
+            return null;
+        },
+        ExprKind::Path => {
+            /* `V::Case` as an aggregate source (`x = Option::None`,
+             * `T v = V::Case`): the path's value form is already the
+             * storage address — same convention as aggregate calls */
+            if (muvVariantCasePath(w, id, null) >= 0) return muvExprRaw(w, id);
+            muvErr(w, id, "path is not an lvalue");
+            return null;
+        },
         ExprKind::Field | ExprKind::DerefField => {
             NodeId obj; Str fname;
             if (e->kind.tag == ExprKind::Field)
                 { obj = e->kind.payload.Field.obj; fname = e->kind.payload.Field.field; }
             else
                 { obj = e->kind.payload.DerefField.obj; fname = e->kind.payload.DerefField.field; }
-            return muvFieldAddr(w, obj, fname, id);
+            return muvAddrOfRef(w, muvFieldAddr(w, obj, fname, id), rt, id);
         },
         ExprKind::TupleField => {
             NodeId obj = e->kind.payload.TupleField.obj;
@@ -2241,7 +2672,7 @@ pub IrValue* muvAddrOf(Muv* w, NodeId id)
                 base = muvExpr(w, obj);
             else
                 base = muvAddrOf(w, obj);
-            return muvGepField(w, base, ti - 1);
+            return muvAddrOfRef(w, muvGepField(w, base, ti - 1), rt, id);
         },
         ExprKind::Index => {
             NodeId obj = e->kind.payload.Index.obj;
@@ -2307,7 +2738,7 @@ pub IrValue* muvAddrOf(Muv* w, NodeId id)
                 { muvErr(w, id, "unsupported index base"); return null; }
             IrValue* idx = muvExpr(w, ixId);
             if (idx == null) return null;
-            return muvIndexAddr(w, base, pointee, idx, byElement, id);
+            return muvAddrOfRef(w, muvIndexAddr(w, base, pointee, idx, byElement, id), rt, id);
         },
         ExprKind::StructLiteral => {
             Ty st = muvResolved(w, e->kind.payload.StructLiteral.typeNode);
@@ -2333,7 +2764,7 @@ pub IrValue* muvAddrOf(Muv* w, NodeId id)
                 w->b.store(w->ir->constInt(w->ir->tyInt(32), (u64)(u32)ci), tagA);
                 IrValue* payA = muvGepField(w, slot, 1);
                 if (payA == null) return null;
-                IrStructType* cst = muvVariantCaseStructTy(w, vd, (u32)ci, 0);
+                IrStructType* cst = muvVariantCaseStructTyFor(w, st, (u32)ci, 0);
                 if (cst == null) return null;
                 IrValue* caseA = muvV(w->b.bitcast(payA, w->ir->tyPtr(cst->irType)));
                 if (caseA == null) return null;
@@ -2363,9 +2794,7 @@ pub IrValue* muvAddrOf(Muv* w, NodeId id)
                     }
                     else
                     {
-                        IrValue* v = muvExpr(w, fvals[i]);
-                        if (v == null) return null;
-                        w->b.store(v, fa);
+                        if (muvLitStore(w, fvals[i], fa, ft) == null) return null;
                     }
                     i++;
                 }
@@ -2399,9 +2828,7 @@ pub IrValue* muvAddrOf(Muv* w, NodeId id)
                 }
                 else
                 {
-                    IrValue* v = muvExpr(w, fvals[i]);
-                    if (v == null) return null;
-                    w->b.store(v, fa);
+                    if (muvLitStore(w, fvals[i], fa, ft) == null) return null;
                 }
                 i++;
             }
@@ -2438,35 +2865,13 @@ pub IrValue* muvAddrOf(Muv* w, NodeId id)
                 }
                 else
                 {
-                    IrValue* v = muvExpr(w, elems[i]);
-                    if (v == null) return null;
-                    w->b.store(v, ea);
+                    if (muvLitStore(w, elems[i], ea, et) == null) return null;
                 }
                 i++;
             }
             return slot;
         },
         ExprKind::StringLit => { return muvStringLit(w, id); },
-        ExprKind::Call | ExprKind::MethodCall => {
-            /* an aggregate result is address-valued like every aggregate:
-             * the call result's struct-typed value is the address ABI
-             * materialises into caller storage (see muvAggSlot) */
-            IrValue* res = e->kind.tag == ExprKind::Call
-                ? muvCall(w, e, id) : muvMethodCall(w, e, id);
-            if (res == null) return null;
-            if (res->type != null &&
-                (res->type->kind == IrTypeKind::Struct ||
-                 res->type->kind == IrTypeKind::Array ||
-                 res->type->kind == IrTypeKind::Union ||
-                 res->type->kind == IrTypeKind::Vector))
-                return res;
-            if (res->type == null || res->type->kind == IrTypeKind::Void)
-                { muvErr(w, id, "cannot take the address of a void call"); return null; }
-            IrValue* slot = muvV(w->b.alloca(res->type));
-            if (slot == null) return null;
-            w->b.store(res, slot);
-            return slot;
-        },
         else => { muvErr(w, id, "unsupported assignment target"); return null; },
     }
 }
@@ -2560,12 +2965,34 @@ pub IrValue* muvAssignCommon(Muv* w, NodeId target, NodeId value, str op, NodeId
     Node* tn = muvNode(w, target);
     Ty tgtTy = tn->kind.tag == NodeKind::Expr
         ? muvResolved(w, tn->kind.payload.Expr.value.resolvedType) : 0;
-    IrType* vt = tgtTy != 0 ? muvTy(w, tgtTy, 0) : muvSlotTy(addr->type);
+    /* assigning through `T&` stores/loads the REFERENT — addr already
+     * is the referent address, so type the access by the base type */
+    Ty at = tgtTy;
+    while (at != 0)
+    {
+        TypeEntry* ae = w->ctx->types + at;
+        if (ae->kind.tag == TypeKind::Const) at = ae->kind.payload.Const.base;
+        else if (ae->kind.tag == TypeKind::Comptime) at = ae->kind.payload.Comptime.base;
+        else if (ae->kind.tag == TypeKind::Reference) at = ae->kind.payload.Reference.base;
+        else break;
+    }
+    IrType* vt = at != 0 ? muvTy(w, at, 0) : muvSlotTy(addr->type);
     if (vt == null || vt->kind == IrTypeKind::Void)
         { muvErr(w, id, "cannot type assignment target"); return null; }
 
     if (op.equals("="))
     {
+        /* `x.tag = V::Case` writes the case ordinal — the path's value
+         * form is the whole {tag,payload} aggregate (C backend's
+         * cgAssignValue does the same for `.tag` targets) */
+        Decl* cvd = null;
+        i32 vci = muvVariantCasePath(w, value, &cvd);
+        if (vci >= 0 && muvIsTagAccess(w, target) && !muvIsAgg(vt))
+        {
+            IrInst* ti = w->b.store(w->ir->constInt(vt, (u64)(u32)vci), addr);
+            if (ti != null) muvSetDebugLoc(w, ti, id);
+            return null;
+        }
         if (muvIsAgg(vt))
         {
             IrValue* src = muvAddrOf(w, value);
@@ -2575,8 +3002,12 @@ pub IrValue* muvAssignCommon(Muv* w, NodeId target, NodeId value, str op, NodeId
         }
         IrValue* val = muvExpr(w, value);
         if (val == null) return null;
-        IrInst* storeInst = w->b.store(val, addr);
-        muvSetDebugLoc(w, storeInst, id);
+        Node* vn = muvNode(w, value);
+        Ty vty = vn != null && vn->kind.tag == NodeKind::Expr
+            ? vn->kind.payload.Expr.value.resolvedType : 0;
+        val = muvCoerceToIr(w, val, vty, vt, id);
+        IrInst* storeInst = muvStoreVal(w, val, addr, vt);
+        if (storeInst != null) muvSetDebugLoc(w, storeInst, id);
         return val;
     }
     if (muvIsAgg(vt)) { muvErr(w, id, "compound assign on aggregate (Phase 2)"); return null; }
@@ -2584,6 +3015,10 @@ pub IrValue* muvAssignCommon(Muv* w, NodeId target, NodeId value, str op, NodeId
     muvSetDebugLoc(w, loadInst, id);
     IrValue* cur = muvV(loadInst);
     IrValue* rhs = muvExpr(w, value);
+    Node* vn2 = muvNode(w, value);
+    Ty vty2 = vn2 != null && vn2->kind.tag == NodeKind::Expr
+        ? vn2->kind.payload.Expr.value.resolvedType : 0;
+    rhs = muvCoerceToIr(w, rhs, vty2, vt, id);
     IrValue* res = muvCompoundOp(w, op, cur, rhs, tgtTy, id);
     if (res == null) return null;
     IrInst* storeInst = w->b.store(res, addr);
@@ -2610,14 +3045,25 @@ pub IrValue* muvValBody(Muv* w, NodeId id, IrType* vt)
         u32 scopeMark = w->locLen;
         u32 cnt = s->kind.payload.Block.stmtsLen;
         u32 i = 0;
-        while (i + 1 < cnt && !w->term) { stmt::muvStmt(w, s->kind.payload.Block.stmts[i]); i++; }
+        while (i + 1 < cnt && !w->term)
+        {
+            NodeId si = s->kind.payload.Block.stmts[i];
+            Node* sn = muvNode(w, si);
+            /* block lists can hold a bare expr where a stmt is expected
+             * (`=> { 1 }` arms): evaluate and discard it */
+            if (sn != null && sn->kind.tag == NodeKind::Expr) muvExpr(w, si);
+            else stmt::muvStmt(w, si);
+            i++;
+        }
         IrValue* res = null;
         if (cnt == 0 || w->term) res = vt != null ? w->ir->constInt(vt, 0) : null;
         else
         {
             NodeId last = s->kind.payload.Block.stmts[cnt - 1];
             Node* ln = muvNode(w, last);
-            if (ln->kind.tag == NodeKind::Stmt &&
+            if (ln != null && ln->kind.tag == NodeKind::Expr)
+                res = muvExpr(w, last);
+            else if (ln->kind.tag == NodeKind::Stmt &&
                 ln->kind.payload.Stmt.value.kind.tag == StmtKind::ExprStmt)
                 res = muvExpr(w, ln->kind.payload.Stmt.value.kind.payload.ExprStmt.expr);
             else
@@ -2653,7 +3099,38 @@ IrFunc* muvExternFn0(Muv* w, str name)
 }
 
 
+/* `T&` in operand position reads through the reference (the C backend's
+ * cgExpr `(*v)` wrap): the raw lowering of a reference-typed expression
+ * already yields the referent ADDRESS (slot load, call result, field
+ * load — all ptr T), so the value form loads the referent for scalars
+ * and keeps the address for aggregates. Anything whose raw result is
+ * not a pointer (e.g. an assign expression's stored value) passes
+ * through untouched. */
 pub IrValue* muvExpr(Muv* w, NodeId id)
+{
+    IrValue* v = muvExprRaw(w, id);
+    if (v == null || id.index == 0) return v;
+    Node* n = muvNode(w, id);
+    if (n->kind.tag != NodeKind::Expr) return v;
+    Ty rt = muvResolved(w, n->kind.payload.Expr.value.resolvedType);
+    while (rt != 0)
+    {
+        TypeEntry* te = w->ctx->types + rt;
+        if (te->kind.tag == TypeKind::Const) rt = te->kind.payload.Const.base;
+        else if (te->kind.tag == TypeKind::Comptime) rt = te->kind.payload.Comptime.base;
+        else break;
+    }
+    if (rt == 0 || (w->ctx->types + rt)->kind.tag != TypeKind::Reference) return v;
+    if (v->type == null || v->type->kind != IrTypeKind::Ptr) return v;
+    Ty base = (w->ctx->types + rt)->kind.payload.Reference.base;
+    IrType* tt = base != 0 ? muvTy(w, base, 0) : null;
+    if (tt == null || muvIsAgg(tt)) return v;
+    IrInst* li = w->b.load(tt, v);
+    muvSetDebugLoc(w, li, id);
+    return muvV(li);
+}
+
+pub IrValue* muvExprRaw(Muv* w, NodeId id)
 {
     if (id.index == 0) return null;
     Node* n = muvNode(w, id);
@@ -2839,8 +3316,10 @@ pub IrValue* muvExpr(Muv* w, NodeId id)
                 muvSetBlock(w, jBb);
                 return null;
             }
-            if (muvIsAgg(vt)) { muvErr(w, id, "aggregate ternary (Phase 2)"); return null; }
-            IrValue* slot = muvV(w->b.alloca(vt));
+            /* aggregate ternary: arms are address-valued — copy each
+             * into the result slot and yield the slot's address */
+            bool agg = muvIsAgg(vt);
+            IrValue* slot = agg ? muvAggSlot(w, vt) : muvV(w->b.alloca(vt));
             if (slot == null) return null;
             IrBlock* tBb = muvBlock(w, "sel.then");
             IrBlock* fBb = muvBlock(w, "sel.else");
@@ -2848,14 +3327,14 @@ pub IrValue* muvExpr(Muv* w, NodeId id)
             w->b.condBr(c, tBb, fBb);
             muvSetBlock(w, tBb);
             IrValue* tv = muvExpr(w, e->kind.payload.Ternary.thenExpr);
-            if (tv != null) w->b.store(tv, slot);
+            if (tv != null) muvArmStore(w, tv, slot, vt);
             w->b.br(jBb);
             muvSetBlock(w, fBb);
             IrValue* fv = muvExpr(w, e->kind.payload.Ternary.elseExpr);
-            if (fv != null) w->b.store(fv, slot);
+            if (fv != null) muvArmStore(w, fv, slot, vt);
             w->b.br(jBb);
             muvSetBlock(w, jBb);
-            return muvV(w->b.load(vt, slot));
+            return agg ? slot : muvV(w->b.load(vt, slot));
         },
         
         ExprKind::Call => { return muvCall(w, e, id); },
@@ -2865,11 +3344,32 @@ pub IrValue* muvExpr(Muv* w, NodeId id)
             NodeId* segs = e->kind.payload.Path.segments;
             u32 sn = e->kind.payload.Path.segmentsLen;
             if (sn == 0) { muvErr(w, id, "empty path expression"); return null; }
-            /* V::Case path in value position is the case's ordinal
-             * constant — writes x.tag = V::Case and comparisons
-             * against the tag; full construction is V::Case { … } */
+            /* `V::Case` path in value position is the case's aggregate
+             * value — { i32 tag = ordinal; zeroed payload } — the same
+             * shape `V::Case { … }` literals produce. `.tag` reads and
+             * writes intercept the ordinal form before reaching here
+             * (muvCompare / muvAssignCommon). Enum members stay scalar
+             * constants. */
             if (sn == 2)
             {
+                Decl* cvd = null;
+                i32 vci = muvVariantCasePath(w, id, &cvd);
+                if (vci >= 0)
+                {
+                    Ty hty = muvResolved(w, e->resolvedType);
+                    IrType* irt = hty != 0 ? muvTy(w, hty, 0) : muvDeclTy(w, cvd, 0);
+                    if (irt == null || irt->kind != IrTypeKind::Struct)
+                        { muvErr(w, id, "variant case value needs a variant type"); return null; }
+                    IrValue* slot = muvAggSlot(w, irt);
+                    if (slot == null) return null;
+                    IrValue* tagA = muvGepField(w, slot, 0);
+                    if (tagA == null) return null;
+                    w->b.store(w->ir->constInt(w->ir->tyInt(32), (u64)(u32)vci), tagA);
+                    IrValue* payA = muvGepField(w, slot, 1);
+                    if (payA == null) return null;
+                    muvZeroMem(w, payA, w->ir->irTypeSizeOf(irt->params[1]));
+                    return slot;
+                }
                 Node* s0 = muvNode(w, segs[0]);
                 Node* s1 = muvNode(w, segs[1]);
                 if (s0->kind.tag == NodeKind::Expr && s1->kind.tag == NodeKind::Expr &&
@@ -2881,13 +3381,25 @@ pub IrValue* muvExpr(Muv* w, NodeId id)
                     if (td.index != 0)
                     {
                         Node* dn = muvNode(w, td);
-                        if (dn->kind.tag == NodeKind::Decl &&
-                            dn->kind.payload.Decl.value.kind.tag == DeclKind::Variant)
+                        if (dn->kind.tag == NodeKind::Decl)
                         {
-                            i32 ci = muvVariantCaseIdx(w, &dn->kind.payload.Decl.value,
-                                s1->kind.payload.Expr.value.kind.payload.Ident.name);
-                            if (ci >= 0)
-                                return w->ir->constInt(w->ir->tyInt(32), (u64)(u32)ci);
+                            Decl* dd = &dn->kind.payload.Decl.value;
+                            if (dd->kind.tag == DeclKind::Enum)
+                            {
+                                /* `Color::Blue` in value position is the
+                                 * member's constant (ordinal or explicit
+                                 * `= N`) at the enum's lowered type */
+                                IrType* bt = dd->kind.payload.Enum.backingType != 0
+                                    ? muvTy(w, dd->kind.payload.Enum.backingType, 0)
+                                    : w->ir->tyInt(32);
+                                if (bt == null || bt->kind != IrTypeKind::Int)
+                                    bt = w->ir->tyInt(32);
+                                u64 eval = 0;
+                                if (muvEnumMemberConst(w, dd,
+                                        s1->kind.payload.Expr.value.kind.payload.Ident.name,
+                                        bt, &eval))
+                                    return w->ir->constInt(bt, eval);
+                            }
                         }
                     }
                 }
@@ -2961,10 +3473,68 @@ pub IrValue* muvExpr(Muv* w, NodeId id)
         },
         
         ExprKind::Cast => {
-            IrValue* v = muvExpr(w, e->kind.payload.Cast.expr);
+            NodeId cin = e->kind.payload.Cast.expr;
+            /* `(u64)V::Case` is the case's ordinal, not its aggregate
+             * form — the C backend's cgVariantCaseIdx rule */
+            {
+                Decl* vcd = null;
+                i32 vci = muvVariantCasePath(w, cin, &vcd);
+                if (vci >= 0)
+                {
+                    Ty tgt0 = muvResolved(w, e->kind.payload.Cast.targetType);
+                    IrType* dt0 = muvTy(w, tgt0, 0);
+                    if (dt0 != null && dt0->kind == IrTypeKind::Int)
+                        return w->ir->constInt(dt0, (u64)(u32)vci);
+                }
+            }
+            IrValue* v = muvExpr(w, cin);
             if (v == null) return null;
             Ty tgt = muvResolved(w, e->kind.payload.Cast.targetType);
             IrType* dt = muvTy(w, tgt, 0);
+            /* str/slice → pointer: the fat value's FIRST field is the
+             * data address; bitcasting the {ptr,len} aggregate would
+             * hand back the struct itself (C backend emits s.ptr). */
+            {
+                Node* cn = muvNode(w, cin);
+                Ty sct = 0;
+                if (cn != null && cn->kind.tag == NodeKind::Expr)
+                    sct = muvResolved(w, cn->kind.payload.Expr.value.resolvedType);
+                Ty sbt = sct;
+                u32 sguard = 0;
+                while (sbt != 0 && sguard < 8)
+                {
+                    TypeEntry* ste = w->ctx->types + sbt;
+                    if (ste->kind.tag == TypeKind::Const) sbt = ste->kind.payload.Const.base;
+                    else if (ste->kind.tag == TypeKind::Comptime) sbt = ste->kind.payload.Comptime.base;
+                    else break;
+                    sguard++;
+                }
+                Ty twt = tgt;
+                u32 tguard = 0;
+                while (twt != 0 && tguard < 8)
+                {
+                    TypeEntry* tte = w->ctx->types + twt;
+                    if (tte->kind.tag == TypeKind::Const) twt = tte->kind.payload.Const.base;
+                    else if (tte->kind.tag == TypeKind::Comptime) twt = tte->kind.payload.Comptime.base;
+                    else break;
+                    tguard++;
+                }
+                bool fat = sbt != 0 &&
+                    ((w->ctx->types + sbt)->kind.tag == TypeKind::Str ||
+                     (w->ctx->types + sbt)->kind.tag == TypeKind::Slice);
+                bool toPtr = twt != 0 &&
+                    ((w->ctx->types + twt)->kind.tag == TypeKind::Pointer ||
+                     (w->ctx->types + twt)->kind.tag == TypeKind::Rawptr);
+                if (fat && toPtr && v->type != null &&
+                    v->type->kind == IrTypeKind::Struct && v->type->nparams > 0)
+                {
+                    IrValue* f0 = muvGepField(w, v, 0);
+                    if (f0 == null) return null;
+                    IrInst* li = w->b.load(v->type->params[0], f0);
+                    muvSetDebugLoc(w, li, id);
+                    return muvV(li);
+                }
+            }
             Expr* se = &muvNode(w, e->kind.payload.Cast.expr)->kind.payload.Expr.value;
             bool su = muvTyUnsigned(w, se->resolvedType);
             bool du = muvTyUnsigned(w, e->kind.payload.Cast.targetType);
@@ -3015,7 +3585,8 @@ pub IrValue* muvExpr(Muv* w, NodeId id)
             bool fail = false;
             IrValue** args = muvBuildCallArgs(w, f, e->kind.payload.StaticCall.args,
                                              e->kind.payload.StaticCall.argsLen,
-                                             null, false, &nargs, &fail);
+                                             null, false, &nargs, &fail,
+                                             f->paramTypes, f->nparams);
             if (fail) return null;
             IrValue* res = muvV(w->b.call(&f->base, args, nargs));
             if (args != null) dealloc<IrValue*>(args);
@@ -3055,7 +3626,8 @@ pub IrValue* muvExpr(Muv* w, NodeId id)
             bool fail = false;
             IrValue** callArgs = muvBuildCallArgs(w, impl,
                 e->kind.payload.BuiltinCall.args,
-                e->kind.payload.BuiltinCall.argsLen, null, false, &nargs, &fail);
+                e->kind.payload.BuiltinCall.argsLen, null, false, &nargs, &fail,
+                impl->paramTypes, impl->nparams);
             if (fail) return null;
             IrValue* res = muvV(w->b.call(&impl->base, callArgs, nargs));
             if (callArgs != null) dealloc<IrValue*>(callArgs);
@@ -3068,13 +3640,37 @@ pub IrValue* muvExpr(Muv* w, NodeId id)
             u32 scopeMark = w->locLen;
             NodeId* bstmts = e->kind.payload.BlockExpr.stmts;
             u32 bn = e->kind.payload.BlockExpr.stmtsLen;
+            /* stmts mixes stmt nodes and bare expr nodes; `result`
+             * aliases the LAST item, so evaluate [0,bn-1) for effect
+             * and let the last item produce the value — evaluating
+             * `result` again would run it twice. */
             u32 i = 0;
-            while (i < bn && !w->term) { stmt::muvStmt(w, bstmts[i]); i++; }
-            if (w->term) { w->locLen = scopeMark; return null; }
+            while (i + 1 < bn && !w->term)
+            {
+                NodeId bi = bstmts[i];
+                Node* bn2 = muvNode(w, bi);
+                if (bn2 != null && bn2->kind.tag == NodeKind::Expr) muvExpr(w, bi);
+                else stmt::muvStmt(w, bi);
+                i++;
+            }
             IrValue* res = null;
-            NodeId resId = e->kind.payload.BlockExpr.result;
-            if (resId.index != 0) res = muvExpr(w, resId);
+            if (bn == 0 || w->term) res = null;
             else
+            {
+                NodeId last = bstmts[bn - 1];
+                Node* ln = muvNode(w, last);
+                if (ln != null && ln->kind.tag == NodeKind::Expr)
+                    res = muvExpr(w, last);
+                else if (ln != null && ln->kind.tag == NodeKind::Stmt &&
+                         ln->kind.payload.Stmt.value.kind.tag == StmtKind::ExprStmt)
+                    res = muvExpr(w, ln->kind.payload.Stmt.value.kind.payload.ExprStmt.expr);
+                else
+                {
+                    stmt::muvStmt(w, last);
+                    res = null;
+                }
+            }
+            if (res == null && !w->term)
             {
                 IrType* vt = rt != 0 ? muvTy(w, rt, 0) : null;
                 if (vt != null && vt->kind != IrTypeKind::Void &&
@@ -3089,9 +3685,9 @@ pub IrValue* muvExpr(Muv* w, NodeId id)
             if (c == null) return null;
             IrType* vt = rt != 0 ? muvTy(w, rt, 0) : null;
             bool hasVal = vt != null && vt->kind != IrTypeKind::Void;
-            if (hasVal && muvIsAgg(vt))
-                { muvErr(w, id, "aggregate if-expression (Phase 2)"); return null; }
-            IrValue* slot = hasVal ? muvV(w->b.alloca(vt)) : null;
+            bool agg = hasVal && muvIsAgg(vt);
+            IrValue* slot = !hasVal ? null :
+                (agg ? muvAggSlot(w, vt) : muvV(w->b.alloca(vt)));
             if (hasVal && slot == null) return null;
             IrBlock* thenBb = muvBlock(w, "if.then");
             IrBlock* elseBb = muvBlock(w, "if.else");
@@ -3099,29 +3695,28 @@ pub IrValue* muvExpr(Muv* w, NodeId id)
             w->b.condBr(c, thenBb, elseBb);
             muvSetBlock(w, thenBb);
             IrValue* tv = muvValBody(w, e->kind.payload.IfExpr.thenBody, vt);
-            if (tv != null && slot != null) w->b.store(tv, slot);
+            if (tv != null && slot != null) muvArmStore(w, tv, slot, vt);
             if (!w->term) w->b.br(endBb);
             muvSetBlock(w, elseBb);
             IrValue* fv = muvValBody(w, e->kind.payload.IfExpr.elseBody, vt);
-            if (fv != null && slot != null) w->b.store(fv, slot);
+            if (fv != null && slot != null) muvArmStore(w, fv, slot, vt);
             if (!w->term) w->b.br(endBb);
             muvSetBlock(w, endBb);
             if (!hasVal) return null;
-            return muvV(w->b.load(vt, slot));
+            return agg ? slot : muvV(w->b.load(vt, slot));
         },
         
         ExprKind::SwitchExpr => {
             IrType* vt = rt != 0 ? muvTy(w, rt, 0) : null;
             if (vt == null || vt->kind == IrTypeKind::Void)
                 { muvErr(w, id, "switch expression without a result type"); return null; }
-            if (muvIsAgg(vt))
-                { muvErr(w, id, "aggregate switch-expression (Phase 2)"); return null; }
-            IrValue* slot = muvV(w->b.alloca(vt));
+            bool agg = muvIsAgg(vt);
+            IrValue* slot = agg ? muvAggSlot(w, vt) : muvV(w->b.alloca(vt));
             if (slot == null) return null;
             stmt::muvSwitchCore(w, e->kind.payload.SwitchExpr.expr,
                          e->kind.payload.SwitchExpr.cases,
                          e->kind.payload.SwitchExpr.casesLen, id, slot, vt);
-            return muvV(w->b.load(vt, slot));
+            return agg ? slot : muvV(w->b.load(vt, slot));
         },
         
         else => {
