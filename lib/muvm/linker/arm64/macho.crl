@@ -1,0 +1,372 @@
+#[[no_drop_all]]
+/* macho.crl — Mach-O arm64 object parsing + output constants.
+ * Parses MH_OBJECT (64-bit, CPU_TYPE_ARM64) into the shared ObjFile
+ * view: LC_SEGMENT_64 sections become Section entries (a dummy
+ * section is prepended so 1-based n_sect indexes align with shndx),
+ * LC_SYMTAB nlist_64 entries become Sym entries, and per-section
+ * relocation_info records become Reloc entries with fmt = 2.
+ *
+ * Relocation notes (arm64 Mach-O):
+ *  - r_extern=1: r_symbolnum is a symtab index; r_extern=0: it is a
+ *    1-based section ordinal (we synthesize STT_SECTION syms).
+ *  - ARM64_RELOC_ADDEND (10) is a paired record: its r_symbolnum is a
+ *    signed 24-bit addend applied to the FOLLOWING relocation. The
+ *    parser folds it into that reloc's addend and drops the record.
+ *  - UNSIGNED/SUBTRACTOR carry their addend in the target field; the
+ *    apply stage reads it back out of the image.
+ *  - Scattered relocations (r_address bit 31) are rejected.
+ */
+
+import std::vec { Vec };
+import std::string { String };
+import std::result { Result };
+use elf {
+    SHT_PROGBITS, SHT_NOBITS, SHN_UNDEF, SHN_ABS, SHN_COMMON,
+    STB_LOCAL, STB_GLOBAL, STB_WEAK, STT_SECTION, STT_FUNC, STT_NOTYPE,
+    ELFCLASS64, fits, leU16, leU32, leU64, leU8, strFromTable
+};
+use object { ObjFile, Section, Sym, Reloc, _objErr, _fail };
+
+pub const u32 MH_MAGIC_64 = 0xFEEDFACF;
+pub const u32 MH_OBJECT = 0x1;
+pub const u32 MH_EXECUTE = 0x2;
+pub const u32 MH_DYLIB = 0x6;
+pub const u32 CPU_TYPE_ARM64 = 0x0100000C;
+pub const u32 CPU_SUBTYPE_ARM64_ALL = 0;
+pub const u32 LC_SEGMENT_64 = 0x19;
+pub const u32 LC_SYMTAB = 0x2;
+pub const u32 LC_DYSYMTAB = 0xb;
+pub const u32 LC_UUID = 0x1b;
+pub const u32 LC_VERSION_MIN_MACOSX = 0x24;
+pub const u32 LC_MAIN = 0x28 | 0x80000000; /* LC_REQ_DYLD | 0x28 */
+
+pub const u32 SEG_TEXT = 0;
+pub const u32 SEG_DATA = 1;
+pub const u32 SEG_DWARF = 2;
+
+/* section_64 flags */
+pub const u32 S_REGULAR = 0x0;
+pub const u32 S_ZEROFILL = 0x1;
+pub const u32 S_GB_ZEROFILL = 0xC;
+pub const u32 S_THREAD_LOCAL_ZEROFILL = 0x12;
+pub const u32 S_ATTR_PURE_INSTRUCTIONS = 0x80000000;
+pub const u32 S_ATTR_SOME_INSTRUCTIONS = 0x00000400;
+pub const u32 S_ATTR_DEBUG = 0x02000000;
+
+/* arm64 Mach-O relocation types */
+pub const u8 ARM64_RELOC_UNSIGNED = 0;
+pub const u8 ARM64_RELOC_SUBTRACTOR = 1;
+pub const u8 ARM64_RELOC_BRANCH26 = 2;
+pub const u8 ARM64_RELOC_PAGE21 = 3;
+pub const u8 ARM64_RELOC_PAGEOFF12 = 4;
+pub const u8 ARM64_RELOC_GOT_LOAD_PAGE21 = 5;
+pub const u8 ARM64_RELOC_GOT_LOAD_PAGEOFF12 = 6;
+pub const u8 ARM64_RELOC_POINTER_TO_GOT = 7;
+pub const u8 ARM64_RELOC_TLVP_LOAD_PAGE21 = 8;
+pub const u8 ARM64_RELOC_TLVP_LOAD_PAGEOFF12 = 9;
+pub const u8 ARM64_RELOC_ADDEND = 10;
+pub const u32 R_SCATTERED = 0x80000000;
+
+pub bool isMachO(str data)
+{
+    return data.len >= 4 && leU32(data.ptr) == MH_MAGIC_64;
+}
+
+pub bool isMachOArm64(str data)
+{
+    return isMachO(data) && data.len >= 8 && leU32(data.ptr + 4) == CPU_TYPE_ARM64;
+}
+
+/* Map a Mach-O (segname, sectname) pair to a canonical linker section
+ * name. Returns "" to keep the original name (debug sections keep
+ * their __debug_* spelling for the __DWARF output segment). */
+str _machoCanon(str seg, str sn, u64 flags, u32 ty)
+{
+    if ((flags & 2) == 0) return ""; /* non-alloc: keep name */
+    if ((flags & 4) != 0 ||
+        sn.equals("__stubs") || sn.equals("__stub_helper") ||
+        sn.equals("__picsymbol_stub1") || sn.equals("__symbol_stub1"))
+        return ".text";
+    if (sn.equals("__eh_frame")) return ".eh_frame";
+    if (sn.equals("__mod_init_func")) return ".init_array";
+    if (sn.equals("__mod_term_func")) return ".fini_array";
+    if (sn.startsWith("__thread"))
+    {
+        if (sn.equals("__thread_bss")) return ".tbss";
+        return ".tdata";
+    }
+    if ((flags & 1) != 0)
+    {
+        if (ty == S_ZEROFILL || ty == S_GB_ZEROFILL || ty == S_THREAD_LOCAL_ZEROFILL)
+            return ".bss";
+        if (sn.equals("__bss") || sn.equals("__common")) return ".bss";
+        return ".data";
+    }
+    if (sn.equals("__const") || sn.equals("__cstring") ||
+        sn.equals("__ustring") || sn.equals("__gcc_except_tab") ||
+        sn.equals("__literal"))
+        return ".rodata";
+    return ".rodata";
+}
+
+pub Result<ObjFile, String> parseObjectMachO(str name, str data)
+{
+    ObjFile f = ObjFile::empty(name, data);
+    if (data.len < 32) return _fail(&f, _objErr(name, "truncated Mach-O header"));
+    if (leU32(data.ptr) != MH_MAGIC_64)
+        return _fail(&f, _objErr(name, "bad Mach-O magic"));
+    if (leU32(data.ptr + 4) != CPU_TYPE_ARM64)
+        return _fail(&f, _objErr(name, "not CPU_TYPE_ARM64"));
+    u32 filetype = leU32(data.ptr + 12);
+    if (filetype != MH_OBJECT)
+        return _fail(&f, _objErr(name, "not MH_OBJECT"));
+    u32 ncmds = leU32(data.ptr + 16);
+    u32 sizeofcmds = leU32(data.ptr + 20);
+    f.cls = ELFCLASS64;
+    f.machine = 183; /* EM_AARCH64 */
+
+    /* dummy section at index 0 so n_sect (1-based) == secs index */
+    Section dummy = Section::empty();
+    f.secs.push(dummy);
+    Vec<Reloc> dbucket = Vec<Reloc>::new();
+    f.rels.push(dbucket);
+
+    u64 symoff = 0; u32 nsyms = 0; u64 stroff = 0; u64 strsize = 0;
+    bool haveSymtab = false;
+
+    u64 pos = 32;
+    u64 cmdEnd = 32 + (u64)sizeofcmds;
+    if (cmdEnd > (u64)data.len) return _fail(&f, _objErr(name, "load commands out of bounds"));
+    for (u32 c = 0; c < ncmds; c++)
+    {
+        if (pos + 8 > cmdEnd) return _fail(&f, _objErr(name, "truncated load command"));
+        str cp = data.slice((usize)pos, (usize)pos + 8);
+        u32 cmd = leU32(cp.ptr);
+        u32 cmdsize = leU32(cp.ptr + 4);
+        if (cmdsize < 8 || pos + (u64)cmdsize > cmdEnd)
+            return _fail(&f, _objErr(name, "bad load command size"));
+        if (cmd == LC_SEGMENT_64)
+        {
+            if (cmdsize < 72) return _fail(&f, _objErr(name, "short LC_SEGMENT_64"));
+            str sp = data.slice((usize)pos, (usize)pos + (usize)cmdsize);
+            u32 nsects = leU32(sp.ptr + 64);
+            if ((u64)72 + (u64)nsects * 80 > (u64)cmdsize)
+                return _fail(&f, _objErr(name, "section table out of bounds"));
+            for (u32 si = 0; si < nsects; si++)
+            {
+                usize so = 72 + (usize)si * 80;
+                str sec = sp.slice(so, so + 80);
+                Section s = Section::empty();
+                /* sectname[16] at 0, segname[16] at 16 — both are
+                 * views into the load-command bytes inside `data`,
+                 * which outlives the ObjFile */
+                u32 nl = 0;
+                while (nl < 16 && sec.ptr[nl] != 0) nl++;
+                s.name = str::fromParts(sec.ptr, (usize)nl);
+                u64 addr = leU64(sec.ptr + 32);
+                u64 size = leU64(sec.ptr + 40);
+                u64 offset = (u64)leU32(sec.ptr + 48);
+                u32 align = leU32(sec.ptr + 52);
+                u64 reloff = (u64)leU32(sec.ptr + 56);
+                u64 nreloc = (u64)leU32(sec.ptr + 60);
+                u32 sflags = leU32(sec.ptr + 64);
+                u32 gl = 0;
+                while (gl < 16 && sec.ptr[16 + gl] != 0) gl++;
+                str segname = str::fromParts(sec.ptr + 16, (usize)gl);
+
+                u32 ty = sflags & 0xFF;
+                if (ty == S_ZEROFILL || ty == S_GB_ZEROFILL || ty == S_THREAD_LOCAL_ZEROFILL)
+                {
+                    s.type = SHT_NOBITS;
+                }
+                else
+                {
+                    s.type = SHT_PROGBITS;
+                    if (size > 0 && !fits((usize)offset, (usize)size, data.len))
+                        return _fail(&f, _objErr(name, "section contents out of bounds"));
+                }
+                /* SHF mapping: alloc unless debug; write for __DATA seg;
+                 * exec for instruction-attributed sections */
+                u64 fl = 2; /* SHF_ALLOC */
+                if ((sflags & S_ATTR_DEBUG) != 0 || segname.equals("__DWARF")) fl = 0;
+                if (segname.startsWith("__DATA")) fl |= 1; /* SHF_WRITE */
+                if ((sflags & (S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS)) != 0) fl |= 4;
+                s.flags = fl;
+                /* normalize Mach-O section names to the canonical
+                 * names the layout buckets understand */
+                str cn = _machoCanon(segname, s.name, fl, ty);
+                if (cn.len > 0) s.name = cn;
+                s.addr = addr;
+                s.offset = offset;
+                s.size = size;
+                s.addralign = align < 16 ? (1ULL << (u64)align) : 0x10000ULL;
+                /* stash Mach-O reloff/nreloc in entsize/link — the
+                 * ELF-only fields are unused on this parse path */
+                s.entsize = reloff;
+                s.link = (u32)nreloc;
+                f.secs.push(s);
+                Vec<Reloc> bucket = Vec<Reloc>::new();
+                f.rels.push(bucket);
+            }
+        }
+        else if (cmd == LC_SYMTAB)
+        {
+            if (cmdsize < 24) return _fail(&f, _objErr(name, "short LC_SYMTAB"));
+            str sp = data.slice((usize)pos, (usize)pos + 24);
+            symoff = (u64)leU32(sp.ptr + 8);
+            nsyms = leU32(sp.ptr + 12);
+            stroff = (u64)leU32(sp.ptr + 16);
+            strsize = (u64)leU32(sp.ptr + 20);
+            haveSymtab = true;
+        }
+        pos += (u64)cmdsize;
+    }
+    if (!haveSymtab) return _fail(&f, _objErr(name, "no LC_SYMTAB"));
+    if (!fits((usize)symoff, (usize)nsyms * 16, data.len))
+        return _fail(&f, _objErr(name, "symtab out of bounds"));
+    if (!fits((usize)stroff, (usize)strsize, data.len))
+        return _fail(&f, _objErr(name, "string table out of bounds"));
+
+    /* section symbols: one STT_SECTION sym per real section, appended
+     * after all real symbols below (indices recorded per section) */
+    /* parse nlist_64 entries */
+    for (u32 i = 0; i < nsyms; i++)
+    {
+        usize p = (usize)symoff + (usize)i * 16;
+        str np = data.slice(p, p + 16);
+        Sym sym;
+        sym.name = "";
+        sym.value = 0;
+        sym.size = 0;
+        sym.bind = STB_LOCAL;
+        sym.type = STT_NOTYPE;
+        sym.shndx = SHN_UNDEF;
+        u32 strx = leU32(np.ptr);
+        u8 ntype = np.ptr[4];
+        u8 nsect = np.ptr[5];
+        u16 ndesc = leU16(np.ptr + 6);
+        u64 nvalue = leU64(np.ptr + 8);
+        u8 nType = ntype & 0x0E;
+        bool nExt = (ntype & 0x01) != 0;
+        bool nWeakDef = (ndesc & 0x80) != 0;
+        if (strx != 0)
+        {
+            if (!strFromTable(data, (usize)stroff, (usize)strsize, (usize)strx, &sym.name))
+                return _fail(&f, _objErr(name, "bad symbol name"));
+        }
+        if (nType == 0xE) /* N_SECT */
+        {
+            if (nsect == 0 || (usize)nsect >= f.secs.count())
+                return _fail(&f, _objErr(name, "symbol has bad section"));
+            sym.shndx = (u16)nsect;
+            sym.value = nvalue;
+            Section* sec = f.secs.atPtr((usize)nsect);
+            if ((sec->flags & 4) != 0 && nType != 0) sym.type = STT_FUNC;
+            if (nExt) sym.bind = nWeakDef ? STB_WEAK : STB_GLOBAL;
+        }
+        else if (nType == 0x2) /* N_ABS */
+        {
+            sym.shndx = SHN_ABS;
+            sym.value = nvalue;
+            if (nExt) sym.bind = nWeakDef ? STB_WEAK : STB_GLOBAL;
+        }
+        else if (nType == 0xC) /* N_PBUD */
+        {
+            sym.shndx = SHN_COMMON;
+            sym.value = nvalue;
+            if (nExt) sym.bind = nWeakDef ? STB_WEAK : STB_GLOBAL;
+        }
+        else /* N_UNDF, N_INDR, others */
+        {
+            sym.shndx = SHN_UNDEF;
+            if (nExt) sym.bind = nWeakDef ? STB_WEAK : STB_GLOBAL;
+        }
+        f.syms.push(sym);
+    }
+    f.firstGlobal = 0;
+    for (usize i = 0; i < f.syms.count(); i++)
+        if (f.syms.at(i).bind != STB_LOCAL) { f.firstGlobal = i; break; }
+
+    /* append one STT_SECTION symbol per real section for r_extern=0
+     * relocations; record base index in a parallel array */
+    usize secSymBase = f.syms.count();
+    for (usize i = 1; i < f.secs.count(); i++)
+    {
+        Sym ss;
+        ss.name = "";
+        ss.value = 0;
+        ss.size = 0;
+        ss.bind = STB_LOCAL;
+        ss.type = STT_SECTION;
+        ss.shndx = (u16)i;
+        f.syms.push(ss);
+    }
+
+    /* relocations per section */
+    for (usize si = 1; si < f.secs.count(); si++)
+    {
+        Section* sec = f.secs.atPtr(si);
+        u64 reloff = sec->entsize;
+        u32 nreloc = sec->link;
+        if (nreloc == 0 || reloff == 0) continue;
+        if (!fits((usize)reloff, (usize)nreloc * 8, data.len))
+            return _fail(&f, _objErr(name, "relocation entries out of bounds"));
+        Vec<Reloc>* bucket = f.rels.atPtr(si);
+        i64 pendingAddend = 0;
+        bool havePending = false;
+        for (u32 ri = 0; ri < nreloc; ri++)
+        {
+            usize p = (usize)reloff + (usize)ri * 8;
+            str rp = data.slice(p, p + 8);
+            u32 raddr = leU32(rp.ptr);
+            u32 rinfo = leU32(rp.ptr + 4);
+            if ((raddr & 0x80000000u) != 0)
+                return _fail(&f, _objErr(name, "scattered relocation unsupported"));
+            u8 rtype = (u8)((rinfo >> 28) & 0xF);
+            u8 rlen = (u8)((rinfo >> 25) & 0x3);
+            bool prl = ((rinfo >> 24) & 1) != 0;
+            bool rex = ((rinfo >> 27) & 1) != 0;
+            u32 rsym = rinfo & 0xFFFFFF;
+            if (rtype == ARM64_RELOC_ADDEND)
+            {
+                /* signed 24-bit addend for the NEXT reloc */
+                i32 a = (i32)(rsym & 0xFFFFFF);
+                if (a & 0x800000) a -= 0x1000000;
+                pendingAddend = (i64)a;
+                havePending = true;
+                continue;
+            }
+            Reloc r;
+            r.offset = (u64)(u32)raddr;
+            r.sym = 0;
+            r.type = 0;
+            r.addend = havePending ? pendingAddend : 0;
+            r.rela = true;
+            r.fmt = 2;
+            havePending = false; pendingAddend = 0;
+            /* symbol resolution: extern → symtab index; local →
+             * section ordinal → synthesized STT_SECTION sym */
+            if (rex)
+            {
+                if ((usize)rsym >= f.syms.count())
+                    return _fail(&f, _objErr(name, "reloc symbol out of range"));
+                r.sym = rsym;
+            }
+            else
+            {
+                if (rsym == 0 || (usize)rsym >= f.secs.count())
+                    return _fail(&f, _objErr(name, "reloc section ordinal out of range"));
+                r.sym = (u32)(secSymBase + (usize)rsym - 1);
+            }
+            /* pack (ARM64_RELOC type, pcrel, r_length) into r.type:
+             * type = 1000 + rtype*16 + pcrel*8 + rlen */
+            u32 code = 1000 + (u32)rtype * 16 + (prl ? 8u : 0u) + (u32)rlen;
+            r.type = code;
+            bucket->push(r);
+        }
+    }
+
+    /* record macho parse metadata: map section name __text→.text etc.
+     * already done via s.name; output naming handled by emitter. */
+    return Result<ObjFile, String>::Ok { .value = f };
+}

@@ -1,0 +1,360 @@
+#[[no_drop_all]]
+/* machoemit.crl — Mach-O arm64 executable/dylib output.
+ * Emits MH_EXECUTE / MH_DYLIB (64-bit, CPU_TYPE_ARM64) from the
+ * format-neutral Layout: __PAGEZERO, __TEXT, __DATA (when needed),
+ * __LINKEDIT and __DWARF segments built from the canonical output
+ * sections, plus LC_SYMTAB, LC_DYSYMTAB, LC_MAIN, LC_UUID and
+ * LC_VERSION_MIN_MACOSX. The header size must agree exactly with
+ * machoHeaderSize() in layout.crl.
+ */
+
+import std::vec { Vec };
+import std::string { String };
+import std::mman { alloc, dealloc, copy };
+use macho {
+    MH_MAGIC_64, MH_EXECUTE, MH_DYLIB, CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL,
+    LC_SEGMENT_64, LC_SYMTAB, LC_DYSYMTAB, LC_MAIN, LC_UUID,
+    LC_VERSION_MIN_MACOSX, S_REGULAR, S_ZEROFILL, S_ATTR_PURE_INSTRUCTIONS,
+    S_ATTR_SOME_INSTRUCTIONS, S_ATTR_DEBUG
+};
+use elf {
+    SHT_NOBITS, SHF_EXECINSTR, SHN_UNDEF, SHN_ABS,
+    STB_WEAK, EM_AARCH64, fits, putU16, putU32, putU64, alignUp
+};
+use object { ObjFile, Section };
+use resolve { GlobalDef };
+use layout {
+    Layout, OutSec, Piece, defAddress, machoHeaderSize,
+    SEC_BSS, SEC_ALLOC_COUNT
+};
+
+void _mName(u8* p, str name)
+{
+    /* sectname/segname: 16 bytes NUL-padded. Canonical linker names
+     * start with '.', Mach-O convention is '__' + name. */
+    for (usize i = 0; i < 16; i++) p[i] = 0;
+    bool prefixed = name.len >= 2 && name.ptr[0] == '_' && name.ptr[1] == '_';
+    usize dst = 0;
+    if (!prefixed)
+    {
+        p[0] = '_'; p[1] = '_';
+        dst = 2;
+    }
+    usize i0 = (name.len > 0 && name.ptr[0] == '.') ? 1 : 0;
+    usize i = 0;
+    while (i0 + i < name.len && dst < 16)
+    {
+        p[dst] = name.ptr[i0 + i];
+        dst++;
+        i++;
+    }
+}
+
+u32 _mLog2Align(u64 a)
+{
+    u32 r = 0;
+    while (a > 1 && r < 15) { a >>= 1; r++; }
+    return r;
+}
+
+u32 _mSecFlags(OutSec* s, bool dwarf)
+{
+    u32 f = S_REGULAR;
+    if (s->type == SHT_NOBITS) f = S_ZEROFILL;
+    if (dwarf) f |= S_ATTR_DEBUG;
+    else if ((s->flags & SHF_EXECINSTR) != 0)
+        f |= S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS;
+    return f;
+}
+
+/* OutSec indices of emitted sections, in load-command order, tagged
+ * by segment: 0=__TEXT, 1=__DATA, 2=__DWARF */
+void _mSections(Layout* L, Vec<usize>* ord, Vec<u8>* segs)
+{
+    for (usize i = 0; i < L->secs.count(); i++)
+    {
+        OutSec* s = L->secs.atPtr(i);
+        if (s->size == 0) continue;
+        u8 sg;
+        if (i < 6) sg = 0;          /* SEC_HOT..SEC_NOTE */
+        else if (i <= 9) sg = 1;    /* SEC_INIT..SEC_BSS */
+        else sg = 2;                /* debug passthrough */
+        ord->push(i);
+        segs->push(sg);
+    }
+}
+
+usize _segCount(Vec<u8>* segs, u8 want)
+{
+    usize n = 0;
+    for (usize i = 0; i < segs->count(); i++)
+        if (segs->at(i) == want) n++;
+    return n;
+}
+
+void _wSeg64(u8* p, str segname, u64 vmaddr, u64 vmsize, u64 fileoff,
+             u64 filesize, u32 maxprot, u32 initprot, u32 nsects)
+{
+    putU32(p, LC_SEGMENT_64);
+    putU32(p + 4, (u32)(72 + 80 * (usize)nsects));
+    _mName(p + 8, segname);
+    putU64(p + 24, vmaddr);
+    putU64(p + 32, vmsize);
+    putU64(p + 40, fileoff);
+    putU64(p + 48, filesize);
+    putU32(p + 56, maxprot);
+    putU32(p + 60, initprot);
+    putU32(p + 64, nsects);
+    putU32(p + 68, 0);
+}
+
+/* writes the section_64 records belonging to segment `want`, returns
+ * the position past them */
+usize _wSections(u8* img, usize pos, Layout* L, Vec<usize>* ord,
+                 Vec<u8>* segs, str segName, u8 want)
+{
+    for (usize i = 0; i < ord->count(); i++)
+    {
+        if (segs->at(i) != want) continue;
+        OutSec* s = L->secs.atPtr(ord->at(i));
+        bool dwarf = want == 2;
+        u8* p = img + pos;
+        _mName(p, s->name);
+        _mName(p + 16, segName);
+        putU64(p + 32, s->addr);
+        putU64(p + 40, s->size);
+        if (s->type == SHT_NOBITS)
+            putU32(p + 48, 0);
+        else
+            putU32(p + 48, (u32)s->offset);
+        putU32(p + 52, _mLog2Align(s->align));
+        putU32(p + 56, 0);
+        putU32(p + 60, 0);
+        putU32(p + 64, _mSecFlags(s, dwarf));
+        putU32(p + 68, 0);
+        putU32(p + 72, 0);
+        putU32(p + 76, 0);
+        pos += 80;
+    }
+    return pos;
+}
+
+pub bool emitMachOImage(bool isDll, Vec<ObjFile>* objs, Vec<GlobalDef>* defs,
+                        Layout* L, u8** outImg, usize* outLen, String* err)
+{
+    u64 base = L->imageBase;
+    bool needRW = L->hasRW;
+
+    Vec<usize> ord = Vec<usize>::new();
+    Vec<u8> segs = Vec<u8>::new();
+    _mSections(L, &ord, &segs);
+
+    u64 dbgStart = 0;
+    u64 dbgEnd = 0;
+    for (usize i = 0; i < L->secs.count(); i++)
+    {
+        if (i >= SEC_ALLOC_COUNT && L->secs.at(i).size > 0)
+        {
+            if (dbgStart == 0) dbgStart = L->secs.at(i).offset;
+            dbgEnd = L->secs.at(i).offset + L->secs.at(i).size;
+        }
+    }
+    u64 contentEnd = dbgEnd > 0 ? dbgEnd : L->fileEnd;
+    u64 linkOff = alignUp(contentEnd, 8);
+
+    usize nDef = 0;
+    usize nUndef = 0;
+    for (usize d = 0; d < defs->count(); d++)
+    {
+        GlobalDef* def = defs->atPtr(d);
+        if (def->isImport || def->shndx == SHN_UNDEF) nUndef++;
+        else nDef++;
+    }
+    usize nSyms = 1 + nDef + nUndef;
+    u64 strSize = 1;
+    /* strtab holds names in symtab order: defined first, then undef */
+    for (i32 pass = 0; pass < 2; pass++)
+        for (usize d = 0; d < defs->count(); d++)
+        {
+            GlobalDef* def = defs->atPtr(d);
+            bool undef = def->isImport || def->shndx == SHN_UNDEF;
+            if ((i32)(undef ? 1 : 0) == pass) strSize += (u64)def->name.len + 1;
+        }
+
+    u64 symOff = linkOff;
+    u64 strOff = symOff + (u64)nSyms * 16;
+    u64 linkSize = (u64)nSyms * 16 + strSize;
+    u64 fileSize = linkOff + linkSize;
+    if (fileSize > 0xffffffffu)
+    {
+        err->pushView("linker: Mach-O output exceeds 4 GiB");
+        return false;
+    }
+
+    u64 hdrSize = machoHeaderSize(L, needRW);
+    if (isDll) hdrSize -= 24; /* no LC_MAIN in dylibs */
+
+    u8* img = alloc<u8>((usize)fileSize);
+    if (img == null) { err->pushView("linker: out of memory"); return false; }
+    for (usize i = 0; i < (usize)fileSize; i++) img[i] = 0;
+
+    putU32(img, MH_MAGIC_64);
+    putU32(img + 4, CPU_TYPE_ARM64);
+    putU32(img + 8, CPU_SUBTYPE_ARM64_ALL);
+    putU32(img + 12, isDll ? MH_DYLIB : MH_EXECUTE);
+    u32 ncmds = 8 + (needRW ? 1 : 0) + (dbgEnd > 0 ? 1 : 0) - (isDll ? 1 : 0);
+    putU32(img + 16, ncmds);
+    putU32(img + 20, (u32)(hdrSize - 32));
+    putU32(img + 24, isDll ? 0u : 0x200000u); /* MH_PIE */
+    putU32(img + 28, 0);
+
+    usize cmdPos = 32;
+    _wSeg64(img + cmdPos, "__PAGEZERO", 0, 0x100000000ULL, 0, 0, 0, 0, 0);
+    cmdPos += 72;
+    {
+        u64 vmsz = alignUp(L->rxEnd, 0x4000);
+        if (vmsz < 0x4000) vmsz = 0x4000;
+        _wSeg64(img + cmdPos, "__TEXT", base, vmsz, 0, L->rxEnd, 5, 5,
+                (u32)_segCount(&segs, 0));
+        cmdPos += 72;
+        cmdPos = _wSections(img, cmdPos, L, &ord, &segs, "__TEXT", 0);
+    }
+    if (needRW)
+    {
+        _wSeg64(img + cmdPos, "__DATA", base + L->rwOff, L->rwMemsz,
+                L->rwOff, L->rwFilesz, 3, 3, (u32)_segCount(&segs, 1));
+        cmdPos += 72;
+        cmdPos = _wSections(img, cmdPos, L, &ord, &segs, "__DATA", 1);
+    }
+    _wSeg64(img + cmdPos, "__LINKEDIT", base + linkOff, linkSize,
+            linkOff, linkSize, 1, 1, 0);
+    cmdPos += 72;
+    if (dbgEnd > 0)
+    {
+        _wSeg64(img + cmdPos, "__DWARF", base + dbgStart, dbgEnd - dbgStart,
+                dbgStart, dbgEnd - dbgStart, 1, 1, (u32)_segCount(&segs, 2));
+        cmdPos += 72;
+        cmdPos = _wSections(img, cmdPos, L, &ord, &segs, "__DWARF", 2);
+    }
+
+    /* LC_SYMTAB */
+    putU32(img + cmdPos, LC_SYMTAB);
+    putU32(img + cmdPos + 4, 24);
+    putU32(img + cmdPos + 8, (u32)symOff);
+    putU32(img + cmdPos + 12, (u32)nSyms);
+    putU32(img + cmdPos + 16, (u32)strOff);
+    putU32(img + cmdPos + 20, (u32)strSize);
+    cmdPos += 24;
+
+    /* LC_DYSYMTAB: null sym, then defined, then undefined */
+    putU32(img + cmdPos, LC_DYSYMTAB);
+    putU32(img + cmdPos + 4, 80);
+    putU32(img + cmdPos + 8, 0);            /* ilocalsym */
+    putU32(img + cmdPos + 12, 0);           /* nlocalsym */
+    putU32(img + cmdPos + 16, 1);           /* iextdefsym */
+    putU32(img + cmdPos + 20, (u32)nDef);   /* nextdefsym */
+    putU32(img + cmdPos + 24, (u32)(1 + nDef)); /* iundefsym */
+    putU32(img + cmdPos + 28, (u32)nUndef); /* nundefsym */
+    cmdPos += 80;
+
+    if (!isDll)
+    {
+        putU32(img + cmdPos, LC_MAIN);
+        putU32(img + cmdPos + 4, 24);
+        putU64(img + cmdPos + 8, L->entry >= base ? L->entry - base : 0);
+        putU64(img + cmdPos + 16, 0);
+        cmdPos += 24;
+    }
+    putU32(img + cmdPos, LC_UUID);
+    putU32(img + cmdPos + 4, 24);
+    {
+        u8[16] uu;
+        uu[0] = 0x6D; uu[1] = 0x75; uu[2] = 0x76; uu[3] = 0x6D;
+        uu[4] = 0x2D; uu[5] = 0x61; uu[6] = 0x72; uu[7] = 0x6D;
+        uu[8] = 0x36; uu[9] = 0x34;
+        for (usize i = 10; i < 16; i++) uu[i] = 0;
+        for (usize i = 0; i < 16; i++) img[cmdPos + 8 + i] = uu[i];
+    }
+    cmdPos += 24;
+    putU32(img + cmdPos, LC_VERSION_MIN_MACOSX);
+    putU32(img + cmdPos + 4, 16);
+    putU32(img + cmdPos + 8, 0x000B0000u);
+    putU32(img + cmdPos + 12, 0x000C0000u);
+    cmdPos += 16;
+
+    /* copy section contents */
+    for (usize i = 0; i < L->secs.count(); i++)
+    {
+        OutSec* out = L->secs.atPtr(i);
+        if (out->type == SHT_NOBITS || out->size == 0) continue;
+        for (usize j = 0; j < out->pieces.count(); j++)
+        {
+            Piece* p = out->pieces.atPtr(j);
+            ObjFile* obj = objs->atPtr(p->objIdx);
+            Section* in = obj->secs.atPtr(p->secIdx);
+            copy<u8>(img + (usize)out->offset + (usize)p->offset,
+                     (u8*)obj->data.ptr + (usize)in->offset, (usize)p->size);
+        }
+    }
+
+    /* symtab: OutSec index -> 1-based Mach-O section ordinal */
+    Vec<u32> sectNo = Vec<u32>::new();
+    for (usize i = 0; i < L->secs.count(); i++) sectNo.push(0);
+    {
+        u32 no = 1;
+        for (usize i = 0; i < ord.count(); i++)
+        {
+            *sectNo.atPtr(ord.at(i)) = no;
+            no++;
+        }
+    }
+
+    usize idx = 1;
+    u64 stroff = 1;
+    for (i32 pass = 0; pass < 2; pass++)
+    {
+        for (usize d = 0; d < defs->count(); d++)
+        {
+            GlobalDef* def = defs->atPtr(d);
+            bool undef = def->isImport || def->shndx == SHN_UNDEF;
+            if ((i32)(undef ? 1 : 0) != pass) continue;
+            u64 value = 0;
+            u8 ntype = 0x01; /* N_UNDF | N_EXT */
+            u8 nsect = 0;
+            u16 ndesc = 0;
+            if (!undef)
+            {
+                if (!defAddress(objs, L, def, &value, err))
+                {
+                    dealloc<u8>(img);
+                    return false;
+                }
+                if (def->shndx == SHN_ABS)
+                {
+                    ntype = 0x03; /* N_ABS | N_EXT */
+                }
+                else
+                {
+                    ntype = 0x0F; /* N_SECT | N_EXT */
+                    usize oi = def->common ? (usize)SEC_BSS
+                        : (usize)objs->atPtr(def->objIdx)->secs.atPtr((usize)def->shndx)->outIdx;
+                    if (oi < sectNo.count() && sectNo.at(oi) != 0)
+                        nsect = (u8)sectNo.at(oi);
+                }
+                if (def->bind == STB_WEAK) ndesc = 0x80;
+            }
+            putU32(img + (usize)symOff + idx * 16, (u32)stroff);
+            img[(usize)symOff + idx * 16 + 4] = ntype;
+            img[(usize)symOff + idx * 16 + 5] = nsect;
+            putU16(img + (usize)symOff + idx * 16 + 6, ndesc);
+            putU64(img + (usize)symOff + idx * 16 + 8, value);
+            copy<u8>(img + (usize)strOff + (usize)stroff, (u8*)def->name.ptr, def->name.len);
+            stroff += (u64)def->name.len + 1;
+            idx++;
+        }
+    }
+
+    *outImg = img;
+    *outLen = (usize)fileSize;
+    return true;
+}

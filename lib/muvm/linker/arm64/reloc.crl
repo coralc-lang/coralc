@@ -303,6 +303,8 @@ pub bool applyRels(u16 machine, u8 outFmt, Vec<ObjFile>* objs, Vec<GlobalDef>* d
              * consumers expect; they never get base fixups either. */
             bool allocd = (out->flags & SHF_ALLOC) != 0;
             Vec<u32>* rec = allocd ? fixups : null;
+            u64 mSub = 0;
+            bool mHasSub = false;
             for (usize k = 0; k < bucket->count(); k++)
             {
                 Reloc* r = bucket->atPtr(k);
@@ -317,6 +319,16 @@ pub bool applyRels(u16 machine, u8 outFmt, Vec<ObjFile>* objs, Vec<GlobalDef>* d
                 {
                     if (t == IMAGE_REL_ARM64_ADDR64) w = 8;
                     else if (t == IMAGE_REL_ARM64_SECTION) w = 2;
+                }
+                else if (r->fmt == 2)
+                {
+                    /* Mach-O: r.type = 1000 + ARM64_RELOC*16 + pcrel*8 + rlen;
+                     * rlen is log2(access size) for UNSIGNED data relocs */
+                    u32 mt = t - 1000;
+                    u32 mrt = mt >> 4;
+                    u32 mrlen = mt & 7;
+                    if (mrt == 0)
+                        w = mrlen == 3 ? 8 : mrlen == 2 ? 4 : mrlen == 1 ? 2 : 1;
                 }
                 else
                 {
@@ -342,6 +354,113 @@ pub bool applyRels(u16 machine, u8 outFmt, Vec<ObjFile>* objs, Vec<GlobalDef>* d
                     A = (i64)leU64(img + fileOff);
                 }
                 u8* patch = img + fileOff;
+
+                if (r->fmt == 2)
+                {
+                    /* Mach-O arm64 relocation.
+                     * r.type packs: 1000 + ARM64_RELOC_*16 + pcrel*8 + rlen.
+                     * Formulas follow LLVM lld MachO/Arch/ARM64.cpp. */
+                    u32 mt = t - 1000;
+                    u32 mrt = mt >> 4;
+                    u32 mrlen = mt & 7;
+                    if (mrt == 1)
+                    {
+                        /* SUBTRACTOR: pairs with the following UNSIGNED;
+                         * remember the subtrahend symbol address */
+                        mSub = S;
+                        mHasSub = true;
+                        continue;
+                    }
+                    if (mrt == 0)
+                    {
+                        /* UNSIGNED: absolute value S - K + A, addend is
+                         * the in-field contents plus any paired ADDEND */
+                        u64 fv = 0;
+                        if (w == 8) fv = leU64(patch);
+                        else if (w == 4) fv = (u64)leU32(patch);
+                        else if (w == 2) fv = (u64)leU16(patch);
+                        else fv = (u64)patch[0];
+                        i64 mA = A + (i64)fv;
+                        u64 Sv = S;
+                        if (mHasSub) { Sv = S - mSub; mHasSub = false; mSub = 0; }
+                        u64 v = Sv + (u64)mA;
+                        if (w == 8) putU64(patch, v);
+                        else if (w == 4)
+                        {
+                            if (v > 0xffffffffu)
+                            {
+                                dealloc<u64>(addrs);
+                                return _rangeErr(err, obj->name, t, P);
+                            }
+                            putU32(patch, (u32)v);
+                        }
+                        else if (w == 2)
+                        {
+                            if (v > 0xffffu)
+                            {
+                                dealloc<u64>(addrs);
+                                return _rangeErr(err, obj->name, t, P);
+                            }
+                            putU16(patch, (u16)v);
+                        }
+                        else patch[0] = (u8)(v & 0xFFu);
+                        continue;
+                    }
+                    if (mHasSub) { mHasSub = false; mSub = 0; }
+                    if (mrt == 2)
+                    {
+                        /* BRANCH26: b/bl, imm26 = (S+A-P)>>2 */
+                        i64 v = (i64)S + A - (i64)P;
+                        if (v & 3)
+                        {
+                            dealloc<u64>(addrs);
+                            _relErrBase(err, obj->name);
+                            err->pushView(": misaligned branch26 target at ");
+                            pushHex(err, P);
+                            return false;
+                        }
+                        if (!_a64ChkI(err, obj->name, t, P, v, 28)) { dealloc<u64>(addrs); return false; }
+                        _a64W32Masked(patch, (u32)(((u64)v & 0x0FFFFFFCu) >> 2), 0x03FFFFFFu);
+                    }
+                    else if (mrt == 3)
+                    {
+                        /* PAGE21: adrp, imm = (page(S+A)-page(P))>>12 */
+                        i64 v = (i64)(_a64Page(S + (u64)A) - _a64Page(P));
+                        if (!_a64ChkI(err, obj->name, t, P, v, 33)) { dealloc<u64>(addrs); return false; }
+                        _a64WAddr(patch, (u64)(v >> 12));
+                    }
+                    else if (mrt == 4)
+                    {
+                        /* PAGEOFF12: low 12 bits of S+A; unsigned-offset
+                         * load/store forms scale imm12 by access size */
+                        u64 v = S + (u64)A;
+                        u32 iw = leU32(patch);
+                        if (((iw >> 24) & 0x3Fu) == 0x39u)
+                        {
+                            u32 sz = (iw >> 30) & 3;
+                            u64 scale = (u64)1 << (u64)sz;
+                            if (v & (scale - 1))
+                            {
+                                dealloc<u64>(addrs);
+                                _relErrBase(err, obj->name);
+                                err->pushView(": misaligned pageoff12 target at ");
+                                pushHex(err, P);
+                                return false;
+                            }
+                            _a64WImm12(patch, (v >> (u64)sz) & 0xFFFu);
+                        }
+                        else
+                        {
+                            _a64WImm12(patch, v & 0xFFFu);
+                        }
+                    }
+                    else
+                    {
+                        dealloc<u64>(addrs);
+                        return _supErr(err, obj->name, t);
+                    }
+                    continue;
+                }
 
                 if (r->fmt == 1)
                 {
