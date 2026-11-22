@@ -12,7 +12,8 @@ use lower { Muv, muvNode, muvErr, muvStr, muvResolved, muvSubstTy, muvFindLocal,
                muvPushLocal, muvFnMapGet, muvFnMapPut, muvGMapGet, muvGMapPut, muvBlock,
                muvSetBlock, muvTerm, muvPos, muvArr, muvMbCh, muvMbStr,
                MuvNameEnt, muvNamesFind, muvTypeInstanceName };
-use types { muvTy, muvFindTypeDecl, muvTyHasParam };
+use types { muvTy, muvFindTypeDecl, muvTyHasParam, muvVariantDeclOf, muvVariantCaseIdx,
+               muvVariantCaseStructTy, muvVariantCaseFieldIdx, muvUnionDeclOf, muvUnionFieldTy };
 use decl { muvMangle, muvDeclareFunc, muvDeclareMethod, muvMethodSelfKind,
                muvOwnerStr, muvMethodMangle, muvMethodMangleEx };
 use stmt;
@@ -30,7 +31,7 @@ use ast {
            BUILTIN_ASSERTGE, BUILTIN_ASSERTRANGE, BUILTIN_ASSERTNONNULL,
            BUILTIN_ASSERTALIGNED, BUILTIN_BACKTRACETO },
     stmt { Stmt, StmtKind, SwitchCase },
-    decl { Decl, DeclKind, Field, Param, File, ATTR_THREADLOCAL }
+    decl { Decl, DeclKind, Field, Param, File, VariantVariant, ATTR_THREADLOCAL }
 };
 use common::slice { Slice };
 import muvm::irtypes { IrContext, IrModule, IrFunc, IrBlock, IrValue, IrValueKind, IrType, IrTypeKind, IrInst, IrStringConst, IrGlobal, IrStructType };
@@ -800,7 +801,7 @@ f64 muvConstFloatBits(IrValue* v)
 /* fold an initializer and read it back as an integer / an f64. Both
  * answer false without touching `out` when the node does not fold that
  * way — the caller then reports. */
-bool muvConstU64(Muv* w, NodeId id, IrType* dt, u64* out)
+pub bool muvConstU64(Muv* w, NodeId id, IrType* dt, u64* out)
 {
     IrValue* v = muvConstInit(w, id, dt);
     if (v == null || v->kind != IrValueKind::ConstInt) return false;
@@ -1703,9 +1704,83 @@ pub IrValue* muvFieldAddr(Muv* w, NodeId obj, Str fname, NodeId errId)
         base = muvAddrOf(w, obj); // address of the struct value
     }
     if (base == null) return null;
+    /* x.payload.Case: bitcast the payload blob to the selected case's
+     * struct type — the address is then an ordinary struct lvalue */
+    if (on->kind.payload.Expr.value.kind.tag == ExprKind::Field)
+    {
+        Str pf = on->kind.payload.Expr.value.kind.payload.Field.field;
+        NodeId pobj = on->kind.payload.Expr.value.kind.payload.Field.obj;
+        if (pf == w->ctx->intern("payload") && pobj.index != 0)
+        {
+            Node* inn = muvNode(w, pobj);
+            if (inn->kind.tag == NodeKind::Expr)
+            {
+                Expr* ie = &inn->kind.payload.Expr.value;
+                Ty ity = muvResolved(w, ie->resolvedType);
+                if (ity == 0 && ie->kind.tag == ExprKind::Ident)
+                    ity = muvResolved(w, muvLocalTy(w, ie->kind.payload.Ident.name));
+                Decl* vd = muvVariantDeclOf(w, muvUnwrapTy(w, ity));
+                if (vd != null)
+                {
+                    i32 ci = muvVariantCaseIdx(w, vd, fname);
+                    if (ci >= 0)
+                    {
+                        IrValue* payA = muvGepField(w, base, 1);
+                        IrStructType* cst = muvVariantCaseStructTy(w, vd, (u32)ci, 0);
+                        if (cst == null) { muvErr(w, errId, "unknown variant case"); return null; }
+                        return muvV(w->b.bitcast(payA, w->ir->tyPtr(cst->irType)));
+                    }
+                }
+            }
+        }
+    }
+    /* union field: every field overlaps at offset 0 — bitcast the
+     * storage to the field's pointer type instead of indexing */
+    Decl* ud = muvUnionDeclOf(w, sty);
+    if (ud != null)
+    {
+        IrType* fty = muvUnionFieldTy(w, ud, fname, 0);
+        if (fty == null) { muvErr(w, errId, "unknown union field"); return null; }
+        return muvV(w->b.bitcast(base, w->ir->tyPtr(fty)));
+    }
     u32 fi = muvFieldIdx(w, sty, fname);
-    if (fi == 0xFFFFFFFF) { muvErr(w, errId, "unknown struct field"); return null; }
+    if (fi == 0xFFFFFFFF)
+    {
+        /* bitcast-derived struct lvalue (variant case payload): the
+         * pointee IrStructType carries the field names */
+        IrType* bt = muvSlotTy(base->type);
+        if (bt != null && bt->kind == IrTypeKind::Struct)
+        {
+            str want = muvStr(w, fname);
+            fi = muvStructFieldIdxOf(w, bt, want);
+        }
+        if (fi == 0xFFFFFFFF) { muvErr(w, errId, "unknown struct field"); return null; }
+    }
     return muvGepField(w, base, fi);
+}
+
+/* field index of `fname` in the tracked IrStructType `st` whose
+ * irType is `ir` — used for case-struct lvalues reached through
+ * bitcasts where no Coral Ty exists to index through */
+pub u32 muvStructFieldIdxOf(Muv* w, IrType* ir, str fname)
+{
+    u32 i = 0;
+    while (i < w->structTysLen)
+    {
+        IrStructType* st = w->structTys[i];
+        if (st->irType == ir)
+        {
+            u32 f = 0;
+            while (f < st->nfields)
+            {
+                if (st->fieldNames[f].equals(fname)) return f;
+                f++;
+            }
+            return 0xFFFFFFFF;
+        }
+        i++;
+    }
+    return 0xFFFFFFFF;
 }
 
 /* the declaring node of a method on a receiver type — the same walk
@@ -2228,9 +2303,61 @@ pub IrValue* muvAddrOf(Muv* w, NodeId id)
         },
         ExprKind::StructLiteral => {
             Ty st = muvResolved(w, e->kind.payload.StructLiteral.typeNode);
-            if (e->kind.payload.StructLiteral.variantName != 0)
-                { muvErr(w, id, "variant construction (Phase 3)"); return null; }
+            Str vname = e->kind.payload.StructLiteral.variantName;
             IrType* irt = st != 0 ? muvTy(w, st, 0) : null;
+            if (vname != 0)
+            {
+                /* V::Case { f = v, … } — store the case ordinal in the
+                 * tag field, then fill the payload through the case's
+                 * struct-typed bitcast (union-variant-ir.md) */
+                Decl* vd = muvVariantDeclOf(w, st);
+                if (vd == null)
+                    { muvErr(w, id, "variant construction needs a variant type"); return null; }
+                i32 ci = muvVariantCaseIdx(w, vd, vname);
+                if (ci < 0)
+                    { muvErr(w, id, "unknown variant case"); return null; }
+                if (irt == null || irt->kind != IrTypeKind::Struct)
+                    { muvErr(w, id, "variant type lowered to a non-struct"); return null; }
+                IrValue* slot = muvAggSlot(w, irt);
+                if (slot == null) return null;
+                IrValue* tagA = muvGepField(w, slot, 0);
+                if (tagA == null) return null;
+                w->b.store(w->ir->constInt(w->ir->tyInt(32), (u64)(u32)ci), tagA);
+                IrValue* payA = muvGepField(w, slot, 1);
+                if (payA == null) return null;
+                IrStructType* cst = muvVariantCaseStructTy(w, vd, (u32)ci, 0);
+                if (cst == null) return null;
+                IrValue* caseA = muvV(w->b.bitcast(payA, w->ir->tyPtr(cst->irType)));
+                if (caseA == null) return null;
+                u32 i = 0;
+                u32 n = e->kind.payload.StructLiteral.fieldValuesLen;
+                Str* fnames = e->kind.payload.StructLiteral.fieldNames;
+                NodeId* fvals = e->kind.payload.StructLiteral.fieldValues;
+                while (i < n)
+                {
+                    if (fnames == null || fvals == null || fvals[i].index == 0) { i++; continue; }
+                    i32 fi = muvVariantCaseFieldIdx(w, vd, (u32)ci, fnames[i]);
+                    if (fi < 0 || (u32)fi >= cst->nfields)
+                        { muvErr(w, id, "unknown variant field"); return null; }
+                    IrValue* fa = muvGepField(w, caseA, (u32)fi);
+                    if (fa == null) return null;
+                    IrType* ft = cst->irType->params[(u32)fi];
+                    if (muvIsAgg(ft))
+                    {
+                        IrValue* sv = muvAddrOf(w, fvals[i]);
+                        if (sv == null) return null;
+                        if (!muvCopyAgg(w, fa, sv, ft, 0)) return null;
+                    }
+                    else
+                    {
+                        IrValue* v = muvExpr(w, fvals[i]);
+                        if (v == null) return null;
+                        w->b.store(v, fa);
+                    }
+                    i++;
+                }
+                return slot;
+            }
             if (irt == null || irt->kind != IrTypeKind::Struct)
                 { muvErr(w, id, "struct literal needs a struct type"); return null; }
             IrValue* slot = muvAggSlot(w, irt);
@@ -2711,6 +2838,33 @@ pub IrValue* muvExpr(Muv* w, NodeId id)
             NodeId* segs = e->kind.payload.Path.segments;
             u32 sn = e->kind.payload.Path.segmentsLen;
             if (sn == 0) { muvErr(w, id, "empty path expression"); return null; }
+            /* V::Case path in value position is the case's ordinal
+             * constant — writes x.tag = V::Case and comparisons
+             * against the tag; full construction is V::Case { … } */
+            if (sn == 2)
+            {
+                Node* s0 = muvNode(w, segs[0]);
+                Node* s1 = muvNode(w, segs[1]);
+                if (s0->kind.tag == NodeKind::Expr && s1->kind.tag == NodeKind::Expr &&
+                    s0->kind.payload.Expr.value.kind.tag == ExprKind::Ident &&
+                    s1->kind.payload.Expr.value.kind.tag == ExprKind::Ident)
+                {
+                    NodeId td = muvFindTypeDecl(w,
+                        s0->kind.payload.Expr.value.kind.payload.Ident.name);
+                    if (td.index != 0)
+                    {
+                        Node* dn = muvNode(w, td);
+                        if (dn->kind.tag == NodeKind::Decl &&
+                            dn->kind.payload.Decl.value.kind.tag == DeclKind::Variant)
+                        {
+                            i32 ci = muvVariantCaseIdx(w, &dn->kind.payload.Decl.value,
+                                s1->kind.payload.Expr.value.kind.payload.Ident.name);
+                            if (ci >= 0)
+                                return w->ir->constInt(w->ir->tyInt(32), (u64)(u32)ci);
+                        }
+                    }
+                }
+            }
             /* a value reference through a namespace resolves to its
              * final segment (a function becomes its address, a constant
              * folds, an enum/variant name reports and gets fixed when

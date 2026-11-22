@@ -1177,6 +1177,15 @@ pub extend Sema
         // an untyped side (null) borrows the other side's type
         if (leftType == 0) leftType = rightType;
         if (rightType == 0) rightType = leftType;
+        /* `a + b` on an `add`-trait type desugars to a.add(b) before any
+         * scalar rule sees it (aggregates would otherwise fall through
+         * to the generic compatible() tail and reach the backend) */
+        {
+            Node* bn = self.ctx->nodes + id.index;
+            if (bn->kind.payload.Expr.value.kind.tag == ExprKind::Add &&
+                self.rewriteTraitBinOp(id, self.ctx->intern("add"), self.ctx->intern("add"), left, right))
+                return true;
+        }
         /* `v.tag == V::Case`: a variant value compared against its tag
          * int; the backend lowers the case side to the ordinal.
          * isVariantNamedTy strips pointers, so guard against pointer
@@ -1301,6 +1310,23 @@ pub extend Sema
             { self.setExprType(id, leftType); return true; }
             self.semaErrorNode(ErrorCode::DiagT0033, id,
                 self.binaryOperandMsg(leftType, rightType));
+        }
+        /* aggregates reaching here have no operator semantics — without
+         * this they'd sail through compatible() and die in the C backend
+         * as a gcc error. `+` specifically can be fixed with `extend T :
+         * add`; the rest have no trait yet. Comparisons are excluded:
+         * checkBinaryBool reports them (or rewrote them to .eq()/.ne()). */
+        {
+            Expr* be = &self.ctx->nodes[id.index].kind.payload.Expr.value;
+            if (be->kind.tag != ExprKind::Eq && be->kind.tag != ExprKind::Ne &&
+                be->kind.tag != ExprKind::Lt && be->kind.tag != ExprKind::Le &&
+                be->kind.tag != ExprKind::Gt && be->kind.tag != ExprKind::Ge &&
+                self.isCmpBannedTy(leftType) && self.isCmpBannedTy(rightType) &&
+                (self.sameType(leftType, rightType) || self.compatible(leftType, rightType)))
+            {
+                self.semaErrorNode(ErrorCode::DiagT0033, id,
+                    self.gotTypeMsg("operator on this type has no defined semantics — implement the matching builtin trait (`extend T : add` for +) or compare fields explicitly", leftType));
+            }
         }
         self.setExprType(id, leftType);
         return true;
@@ -1503,9 +1529,84 @@ pub extend Sema
         return 0;
     }
 
+    /* `a == b` / `a != b` / `a + b` on a type implementing the matching
+     * builtin trait desugar to the protocol method call: the node is
+     * rewritten to MethodCall in place and rechecked. Operands were
+     * already typed by the caller, so the MethodCall arm's re-check is
+     * cheap. Returns the checkExpr result when the rewrite happened;
+     * false means "not a trait op — continue normal binary checking". */
+    bool rewriteTraitBinOp(NodeId id, Str traitName, Str methodName, NodeId left, NodeId right)
+    {
+        Node* n = self.ctx->nodes + id.index;
+        if (n->kind.tag != NodeKind::Expr) return false;
+        Ty lt = self.refValueType(self.exprType(left));
+        Ty rt = self.refValueType(self.exprType(right));
+        if (lt == 0 || rt == 0 || !self.sameType(lt, rt)) return false;
+        if (!self.traitProtocolReady(lt, traitName, self.fileOf(id))) return false;
+        NodeId* args = alloc<NodeId>(1);
+        if (args == null) return false;
+        args[0] = right;
+        Expr* e = &n->kind.payload.Expr.value;
+        e->kind.tag = ExprKind::MethodCall;
+        e->kind.payload.MethodCall.receiver = left;
+        e->kind.payload.MethodCall.method = methodName;
+        e->kind.payload.MethodCall.methodLoc = n->loc;
+        e->kind.payload.MethodCall.args = args;
+        e->kind.payload.MethodCall.argsLen = 1;
+        return self.checkExpr(id);
+    }
+
+    /* `a += b` on an `add`-trait type desugars to `a = a.addAssign(b)`:
+     * a fresh MethodCall node becomes the Assign's value while this node
+     * becomes the Assign. The target is evaluated twice (once as the
+     * lvalue, once as the call receiver) — the same semantics as writing
+     * the desugaring by hand. */
+    bool rewriteTraitCompoundAssign(NodeId id)
+    {
+        Node* n = self.ctx->nodes + id.index;
+        if (n->kind.tag != NodeKind::Expr) return false;
+        Expr* e = &n->kind.payload.Expr.value;
+        if (e->kind.tag != ExprKind::AssignAdd) return false;
+        NodeId target = e->kind.payload.AssignAdd.target;
+        NodeId value = e->kind.payload.AssignAdd.value;
+        Ty atgt = self.assignTargetType(target);
+        Ty vty = self.refValueType(self.exprType(value));
+        if (atgt == 0 || vty == 0 || !self.sameType(atgt, vty)) return false;
+        if (!self.traitProtocolReady(atgt, self.ctx->intern("add"), self.fileOf(id))) return false;
+        NodeId mc = self.ctx->allocNodeSlot();
+        NodeId* args = alloc<NodeId>(1);
+        if (mc.index == 0 || args == null) return false;
+        args[0] = value;
+        Node* mn = self.ctx->nodes + mc.index;
+        mn->loc = n->loc;
+        mn->endLoc = n->endLoc;
+        mn->kind.tag = NodeKind::Expr;
+        Expr* me = &mn->kind.payload.Expr.value;
+        me->kind.tag = ExprKind::MethodCall;
+        me->kind.payload.MethodCall.receiver = target;
+        me->kind.payload.MethodCall.method = self.ctx->intern("addAssign");
+        me->kind.payload.MethodCall.methodLoc = n->loc;
+        me->kind.payload.MethodCall.args = args;
+        me->kind.payload.MethodCall.argsLen = 1;
+        me->resolvedType = 0;
+        e->kind.tag = ExprKind::Assign;
+        e->kind.payload.Assign.target = target;
+        e->kind.payload.Assign.value = mc;
+        return self.checkExpr(id);
+    }
+
     bool checkBinaryBool(NodeId id, NodeId left, NodeId right)
     {
         if (!self.checkBinary(id, left, right, false)) return false;
+        /* `==`/`!=` on an `eq`-trait type already became a.eq(b)/a.ne(b) */
+        {
+            Node* bn = self.ctx->nodes + id.index;
+            Expr* be = &bn->kind.payload.Expr.value;
+            if ((be->kind.tag == ExprKind::Eq || be->kind.tag == ExprKind::Ne) &&
+                self.rewriteTraitBinOp(id, self.ctx->intern("eq"),
+                    be->kind.tag == ExprKind::Eq ? self.ctx->intern("eq") : self.ctx->intern("ne"), left, right))
+                return true;
+        }
         /* aggregates and `str` have no defined comparison semantics —
          * only reject when the pair would otherwise type-check, so an
          * already-reported operand mismatch doesn't cascade */
@@ -2087,13 +2188,13 @@ pub extend Sema
                         else iterMsg.pushView("?");
                         if (self.ctx->internEqHashLen(expr->kind.payload.MethodCall.method, 0xFADC0CD2, 5)) /* FNV("range") */
                         {
-                            iterMsg.pushView("` does not fully implement @iter: missing `range(usize, usize)`");
-                            self.semaErrorLocHelp(ErrorCode::SemaIterProtocol, expr->kind.payload.MethodCall.methodLoc, iterMsg.asView(), "the receiver implements @iter; ranged for-in requires `range(usize start, usize end)` returning an iterable, in addition to `usize count()` and `T at(usize)`");
+                            iterMsg.pushView("` does not fully implement iter: missing `range(usize, usize)`");
+                            self.semaErrorLocHelp(ErrorCode::SemaIterProtocol, expr->kind.payload.MethodCall.methodLoc, iterMsg.asView(), "the receiver implements iter; ranged for-in requires `range(usize start, usize end)` returning an iterable, in addition to `usize count()` and `T at(usize)`");
                         }
                         else
                         {
-                            iterMsg.pushView("` does not fully implement @iter: missing `count()`/`at(usize)`");
-                            self.semaErrorLocHelp(ErrorCode::SemaIterProtocol, expr->kind.payload.MethodCall.methodLoc, iterMsg.asView(), "the receiver implements @iter, whose indexed protocol requires `usize count()` and `T at(usize)`; ranged for-in also requires `range(usize, usize)`");
+                            iterMsg.pushView("` does not fully implement iter: missing `count()`/`at(usize)`");
+                            self.semaErrorLocHelp(ErrorCode::SemaIterProtocol, expr->kind.payload.MethodCall.methodLoc, iterMsg.asView(), "the receiver implements iter, whose indexed protocol requires `usize count()` and `T at(usize)`; ranged for-in also requires `range(usize, usize)`");
                         }
                     }
                     else
@@ -2604,6 +2705,8 @@ pub extend Sema
             ExprKind::AssignAdd => {
                 if (!self.assignExpr(expr->kind.payload.AssignAdd.target)) return false;
                 if (!self.checkExpr(expr->kind.payload.AssignAdd.value)) return false;
+                /* `a += b` on an `add`-trait type → `a = a.addAssign(b)` */
+                if (self.rewriteTraitCompoundAssign(id)) return true;
                 NodeId av = expr->kind.payload.AssignAdd.value;
                 Ty atgt = self.assignTargetType(expr->kind.payload.AssignAdd.target);
                 // `p += 1` is pointer arithmetic, not an int→pointer bind

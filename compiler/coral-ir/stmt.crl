@@ -8,12 +8,13 @@
  * so dead statements after Return/Break/Continue are skipped. No phis —
  * locals are alloca+load/store. */
 use lower { Muv, MuvDrop, muvNode, muvErr, muvStr, muvResolved, muvFindLocal, muvPushLocal,
-               muvBlock, muvSetBlock, muvTerm, muvPos, muvArr, muvSlotTy };
-use types { muvTy, muvFindTypeDecl };
+               muvBlock, muvSetBlock, muvTerm, muvPos, muvArr, muvSlotTy, muvSubstTy };
+use types { muvTy, muvFindTypeDecl, muvVariantDeclOf, muvVariantCaseIdx,
+               muvVariantCaseStructTy, muvVariantCaseFieldIdx };
 use expr { muvExpr, muvAddrOf, muvCond, muvAssignCommon, muvIsAgg, muvCopyAgg, muvAggSlot,
                muvDecodeLit, muvCompareVals, muvResolveConst, muvMakeGlobal, muvValBody,
                muvMethodFnFor, muvCast, muvUnwrapTy, muvTyUnsigned, muvIndexAddr,
-               muvGepField, muvFieldIdx };
+               muvGepField, muvFieldIdx, muvConstU64 };
 use decl { muvMethodSelfKind };
 use context::context { AstContext };
 use sem { scope { Symbol, ScopeStack } };
@@ -23,12 +24,12 @@ use ast {
     node { Node, NodeKind },
     expr { Expr, ExprKind },
     stmt { Stmt, StmtKind, SwitchCase },
-    decl { Decl, DeclKind, Param,
+    decl { Decl, DeclKind, Param, VariantVariant,
            ATTR_VECTORISE, ATTR_NOVECTOR },
     pat { Pat, PatKind }
 };
 use common::slice { Slice };
-import muvm::irtypes { IrContext, IrModule, IrFunc, IrValue, IrValueKind, IrType, IrTypeKind, IrInst, IrBlock };
+import muvm::irtypes { IrContext, IrModule, IrFunc, IrValue, IrValueKind, IrType, IrTypeKind, IrInst, IrBlock, IrStructType };
 import muvm::irOps { IrICmpPred };
 import muvm::irBuilder { IrBuilder };
 import muvm::irMetadata { setInstVectorizeLoop, setInstNoVectorizeLoop };
@@ -110,7 +111,106 @@ pub IrValue* muvPatTest(Muv* w, NodeId patId, IrValue* scrut, Ty scrutTy,
                 if (t == null) return null;
                 return muvV(w->b.andOp(t, g));
             },
-            PatKind::Variant => { muvErr(w, patId, "variant patterns are not supported by the muvm backend (variant layout is not lowered yet)"); return null; },
+            PatKind::Variant => {
+                Str vn = p->kind.payload.Variant.variantName;
+                /* enum scrutinee: `Color::Red`-style member patterns
+                 * compare the enum's value — auto members count up from
+                 * the previous explicit value like C */
+                Ty et = scrutTy;
+                while (et != 0)
+                {
+                    TypeEntry* ee = w->ctx->types + et;
+                    if (ee->kind.tag == TypeKind::Pointer) et = ee->kind.payload.Pointer.base;
+                    else if (ee->kind.tag == TypeKind::Const) et = ee->kind.payload.Const.base;
+                    else if (ee->kind.tag == TypeKind::Comptime) et = ee->kind.payload.Comptime.base;
+                    else break;
+                }
+                if (et != 0 && (w->ctx->types + et)->kind.tag == TypeKind::Named)
+                {
+                    Str root = (w->ctx->types + et)->kind.payload.Named.name;
+                    NodeId ed = muvFindTypeDecl(w, root);
+                    if (ed.index != 0)
+                    {
+                        Node* en = muvNode(w, ed);
+                        if (en->kind.tag == NodeKind::Decl &&
+                            en->kind.payload.Decl.value.kind.tag == DeclKind::Enum)
+                        {
+                            Decl* edd = &en->kind.payload.Decl.value;
+                            IrType* bt = edd->kind.payload.Enum.backingType != 0
+                                ? muvTy(w, edd->kind.payload.Enum.backingType, 0)
+                                : w->ir->tyInt(32);
+                            if (bt == null || bt->kind != IrTypeKind::Int) bt = w->ir->tyInt(32);
+                            u64 running = 0;
+                            u32 v = 0;
+                            bool done = false;
+                            while (v < edd->kind.payload.Enum.variantsLen && !done)
+                            {
+                                Node* vn2 = muvNode(w, edd->kind.payload.Enum.variants[v]);
+                                if (vn2->kind.tag == NodeKind::EnumVariant &&
+                                    vn2->kind.payload.EnumVariant.value.name == vn)
+                                {
+                                    u64 val = running;
+                                    if ((vn2->kind.payload.EnumVariant.value.flags & 1) != 0)
+                                    {
+                                        if (!muvConstU64(w, vn2->kind.payload.EnumVariant.value.value,
+                                                         bt, &val))
+                                        { muvErr(w, patId, "enum member value is not constant"); return null; }
+                                    }
+                                    IrValue* cv = w->ir->constInt(bt, val);
+                                    return muvCompareVals(w, ExprKind::Eq, scrut, cv, id, scrutTy);
+                                }
+                                if (vn2->kind.tag == NodeKind::EnumVariant &&
+                                    (vn2->kind.payload.EnumVariant.value.flags & 1) != 0)
+                                {
+                                    u64 ev = 0;
+                                    if (muvConstU64(w, vn2->kind.payload.EnumVariant.value.value,
+                                                    bt, &ev))
+                                        running = ev + 1;
+                                    else running++;
+                                }
+                                else running++;
+                                v++;
+                            }
+                            muvErr(w, patId, "unknown enum member in pattern");
+                            return null;
+                        }
+                    }
+                }
+                /* variant value scrutinee: load the tag field (offset 0)
+                 * and compare the case ordinal; `switch (x.tag)` with an
+                 * explicit type name compares the scrutinee directly */
+                Decl* vd = muvVariantDeclOf(w, scrutTy);
+                i32 ci = -1;
+                bool ordinalScrut = false;
+                if (vd == null && p->kind.payload.Variant.typeName != 0)
+                {
+                    NodeId td = muvFindTypeDecl(w, p->kind.payload.Variant.typeName);
+                    if (td.index != 0)
+                    {
+                        Node* dn = muvNode(w, td);
+                        if (dn->kind.tag == NodeKind::Decl &&
+                            dn->kind.payload.Decl.value.kind.tag == DeclKind::Variant)
+                        {
+                            vd = &dn->kind.payload.Decl.value;
+                            ci = muvVariantCaseIdx(w, vd, vn);
+                            ordinalScrut = true;
+                        }
+                    }
+                }
+                else if (vd != null) ci = muvVariantCaseIdx(w, vd, vn);
+                if (vd == null || ci < 0)
+                    { muvErr(w, patId, "pattern names an unknown variant case"); return null; }
+                IrValue* lhs = scrut;
+                if (!ordinalScrut)
+                {
+                    IrValue* tagA = muvGepField(w, scrut, 0);
+                    if (tagA == null) return null;
+                    lhs = muvV(w->b.load(w->ir->tyInt(32), tagA));
+                    if (lhs == null) return null;
+                }
+                return muvV(w->b.icmp(IrICmpPred::Eq, lhs,
+                    w->ir->constInt(w->ir->tyInt(32), (u64)(u32)ci)));
+            },
             PatKind::Tuple => { muvErr(w, patId, "tuple patterns are not supported by the muvm backend"); return null; },
             PatKind::Struct => { muvErr(w, patId, "struct patterns are not supported by the muvm backend"); return null; },
             PatKind::Type => { muvErr(w, patId, "type patterns are not supported by the muvm backend"); return null; },
@@ -473,6 +573,83 @@ bool muvSwitchHybrid(Muv* w, IrValue* scrut, Ty scrutTy,
  * source — the same shape cgEmitSwitchChain prints as if/else-if.
  * slot/vt are null for the statement form; a switch-expr passes its
  * result slot and every arm's body value is stored into it. */
+/* push one local per field named by this case's variant patterns —
+ * `V::Case { x, y }` binds x/y to the payload fields. Runs in the
+ * case's body block before the body lowers; the caller restores
+ * w->locLen afterwards. Mirrors the C backend's per-case `fname =
+ * scrut.u.vN.fname` emissions. */
+pub void muvVariantBinds(Muv* w, SwitchCase* c, IrValue* scrut, Ty scrutTy,
+                         NodeId id)
+{
+    u32 mark = w->locLen;
+    Decl* vd = muvVariantDeclOf(w, scrutTy);
+    if (vd == null || scrut == null) return;
+    u32 p = 0;
+    while (p < c->patternsLen)
+    {
+        Node* pn = muvNode(w, c->patterns[p]);
+        if (pn->kind.tag == NodeKind::Pat)
+        {
+            Pat* pv = &pn->kind.payload.Pat.value;
+            if (pv->kind.tag == PatKind::Variant &&
+                pv->kind.payload.Variant.fieldNamesLen > 0)
+            {
+                i32 ci = muvVariantCaseIdx(w, vd, pv->kind.payload.Variant.variantName);
+                if (ci >= 0)
+                {
+                    IrStructType* cst = muvVariantCaseStructTy(w, vd, (u32)ci, 0);
+                    IrValue* payA = cst != null ? muvGepField(w, scrut, 1) : null;
+                    IrValue* caseA = payA != null
+                        ? muvV(w->b.bitcast(payA, w->ir->tyPtr(cst->irType))) : null;
+                    VariantVariant* vv = vd->kind.payload.Variant.variants + ci;
+                    u32 ff = 0;
+                    while (ff < pv->kind.payload.Variant.fieldNamesLen && caseA != null)
+                    {
+                        Str fname = pv->kind.payload.Variant.fieldNames[ff];
+                        /* dedup names this case already bound (or-pattern
+                         * alternatives share the binding) — scan only the
+                         * slots pushed since mark so outer locals still
+                         * shadow correctly */
+                        bool dup = false;
+                        i32 di = (i32)w->locLen - 1;
+                        while (di >= (i32)mark) { if (w->locNames[di] == fname) { dup = true; break; } di--; }
+                        if (!dup)
+                        {
+                            i32 fi = muvVariantCaseFieldIdx(w, vd, (u32)ci, fname);
+                            if (fi >= 0 && (u32)fi < cst->nfields)
+                            {
+                                IrValue* fa = muvGepField(w, caseA, (u32)fi);
+                                IrType* ft = cst->irType->params[(u32)fi];
+                                IrValue* slot = fa != null
+                                    ? (muvIsAgg(ft) ? muvAggSlot(w, ft) : muvV(w->b.alloca(ft)))
+                                    : null;
+                                if (slot != null && fa != null)
+                                {
+                                    bool ok;
+                                    if (muvIsAgg(ft)) ok = muvCopyAgg(w, slot, fa, ft, 0);
+                                    else
+                                    {
+                                        IrValue* lv = muvV(w->b.load(ft, fa));
+                                        ok = lv != null;
+                                        if (ok) w->b.store(lv, slot);
+                                    }
+                                    if (ok)
+                                    {
+                                        Ty fty = (u32)fi < vv->fieldsLen ? vv->fieldTypes[fi] : 0;
+                                        muvPushLocal(w, fname, slot, muvSubstTy(w, fty));
+                                    }
+                                }
+                            }
+                        }
+                        ff++;
+                    }
+                }
+            }
+        }
+        p++;
+    }
+}
+
 /* everything after the scrutinee is evaluated: fast switch, hybrid
  * prefix+chain, or the full compare chain. Takes the already-lowered
  * scrutinee so the hybrid path can recurse on a suffix without
@@ -567,12 +744,15 @@ pub void muvSwitchCoreVal(Muv* w, IrValue* scrut, Ty scrutTy,
         }
 
         muvSetBlock(w, bbb[i]);
+        u32 bindMark = w->locLen;
+        muvVariantBinds(w, c, scrut, scrutTy, id);
         if (slot != null)
         {
             IrValue* v = muvValBody(w, c->body, vt);
             if (v != null) w->b.store(v, slot);
         }
         else muvStmt(w, c->body);
+        w->locLen = bindMark;
         if (!w->term) w->b.br(joinBb);
         i++;
     }
@@ -816,7 +996,7 @@ pub void muvVarDecl(Muv* w, Stmt* s, NodeId id)
 
 
 /* `for x in iterable` and `for x in iter(start, end)` — an index loop
- * over a slice/array, or count()/at() calls over an @iter collection
+ * over a slice/array, or count()/at() calls over an iter collection
  * (with range() when bounds are given). Mirrors the C backend's ForIn:
  * ranged bounds clamp to the collection, the receiver is the pointer
  * value or the iterable's own address, multi-binding reads tuple
@@ -874,7 +1054,7 @@ void muvForIn(Muv* w, Stmt* s, NodeId id)
         if (stor == null)
             { muvErr(w, id, "for-in iterable has no storage"); w->locLen = scopeMark; return; }
     }
-    IrValue* recv = null; // the @iter receiver (non-indexed loops only)
+    IrValue* recv = null; // the iter receiver (non-indexed loops only)
     if (!indexed)
     {
         if (iterIsPtr)
@@ -947,7 +1127,7 @@ void muvForIn(Muv* w, Stmt* s, NodeId id)
     }
     else
     {
-        /* @iter collections are consumed through count()/at(), plus
+        /* iter collections are consumed through count()/at(), plus
          * range() when bounds are given — both count and at must exist */
         bool nfC = false;
         bool nfA = false;
@@ -960,7 +1140,7 @@ void muvForIn(Muv* w, Stmt* s, NodeId id)
             rangeFn = muvMethodFnFor(w, iterTy, w->ctx->intern("range"), id, &nfR, &mdefR);
         if (nfC || nfA)
         {
-            muvErr(w, id, "for-in over non-slice/array without @iter count()/at()");
+            muvErr(w, id, "for-in over non-slice/array without iter count()/at()");
             w->locLen = scopeMark;
             return;
         }
