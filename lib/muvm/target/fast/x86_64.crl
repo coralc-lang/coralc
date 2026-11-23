@@ -31,6 +31,7 @@ pub struct FastX86Context
     u32 capSlots;
     i32 frameSize;
     i32 sretOff;
+    i32 phiTmpOff;
     str funcName;
     bool isWindows;
 
@@ -43,6 +44,7 @@ pub struct FastX86Context
             .capSlots = 0,
             .frameSize = 0,
             .sretOff = -1,
+            .phiTmpOff = 0,
             .funcName = str::empty(),
             .isWindows = isWindows
         };
@@ -202,8 +204,14 @@ void emitBBLabel(FastX86Context* ctx, IrFunc* func, IrValue* bv)
 /* emit the incoming-value copies for phis in each successor block.
  * phi operands are interleaved (val, block)*; the copy for predecessor
  * `pred` must run on the edge pred->succ, i.e. at the end of `pred`
- * before its terminator. Values live in stack slots, so a slot-to-slot
- * move is sufficient. */
+ * before its terminator. Values live in stack slots.
+ *
+ * Parallel-copy safety (same scheme as arm64's emitEdgeCopies): a
+ * source that is itself a destination on this edge — swap/rotation
+ * phis like `p = phi [q], q = phi [p]` — is staged through the phi
+ * temp area first, or the first copy would clobber the second's
+ * source. Vector pairs copy lane-by-lane and cannot collide (their
+ * slots are disjoint byte regions). */
 void emitPhiCopies(FastX86Context* ctx, IrContext* ictx, IrBlock* pred, IrInst* term)
 {
     u32 nsucc = 0;
@@ -229,7 +237,11 @@ void emitPhiCopies(FastX86Context* ctx, IrContext* ictx, IrBlock* pred, IrInst* 
         IrValue* sv = succs[s];
         if (sv == null || sv->kind != IrValueKind::Block) continue;
         IrBlock* sb = (IrBlock*)sv;
-        for (u32 pi = 0; pi < sb->ninsts; pi++)
+
+        IrValue*[32] dsts;
+        IrValue*[32] srcs;
+        u32 n = 0;
+        for (u32 pi = 0; pi < sb->ninsts && n < 32; pi++)
         {
             IrInst* phi = sb->insts[pi];
             if (phi == null || phi->opcode != IrOpcode::Phi) continue;
@@ -237,34 +249,68 @@ void emitPhiCopies(FastX86Context* ctx, IrContext* ictx, IrBlock* pred, IrInst* 
             {
                 if (phi->ops[k + 1] == &pred->base && phi->ops[k] != null)
                 {
-                    IrValue* src = phi->ops[k];
-                    IrValue* dst = &phi->base;
-                    // vector phis occupy count*elemSize bytes — copy
-                    // lane-by-lane or only lane 0 would land
-                    if (dst->type != null &&
-                        dst->type->kind == IrTypeKind::Vector &&
-                        vecLaneOk(src))
+                    dsts[n] = &phi->base;
+                    srcs[n] = phi->ops[k];
+                    n++;
+                    break;
+                }
+            }
+        }
+        if (n == 0) continue;
+
+        /* vector pairs copy lane-by-lane and are emitted directly —
+         * their slots are disjoint regions, no staging needed */
+        i32[32] staged;
+        for (u32 i = 0; i < n; i++) staged[i] = -1;
+        u32 nstaged = 0;
+        for (u32 i = 0; i < n; i++)
+        {
+            IrType* vt = dsts[i] != null ? dsts[i]->type : null;
+            if (vt != null && vt->kind == IrTypeKind::Vector &&
+                vecLaneOk(srcs[i]))
+            {
+                IrType* lvt = vt;
+                u32 lb = vecLaneBytes(ictx, lvt);
+                u32 ew = lvt->elem != null
+                    ? ictx->irTypeSizeOf(lvt->elem) * 8 : 64;
+                i32 laneOff = 0;
+                for (u32 lane = 0; lane < lvt->count; lane++)
+                {
+                    emitVecLaneLoad(ctx, srcs[i], laneOff, ew, "rax", false);
+                    emitVecLaneStore(ctx, dsts[i], laneOff, ew, "rax");
+                    laneOff += (i32)lb;
+                }
+                dsts[i] = null;
+                continue;
+            }
+            /* stage sources that collide with a destination slot */
+            for (u32 j = 0; j < n; j++)
+            {
+                if (dsts[j] != null && srcs[i] == dsts[j])
+                {
+                    if (nstaged < 8)
                     {
-                        IrType* vt = dst->type;
-                        u32 lb = vecLaneBytes(ictx, vt);
-                        u32 ew = vt->elem != null
-                            ? ictx->irTypeSizeOf(vt->elem) * 8 : 64;
-                        i32 laneOff = 0;
-                        for (u32 lane = 0; lane < vt->count; lane++)
-                        {
-                            emitVecLaneLoad(ctx, src, laneOff, ew, "rax", false);
-                            emitVecLaneStore(ctx, dst, laneOff, ew, "rax");
-                            laneOff += (i32)lb;
-                        }
-                    }
-                    else
-                    {
-                        emitValueToReg(ctx, src, "rax");
-                        emitRegToSlot(ctx, dst, "rax");
+                        staged[i] = (i32)nstaged;
+                        emitValueToReg(ctx, srcs[i], "rax");
+                        emitSlotStore(ctx, ctx->phiTmpOff + (i32)nstaged * 8, 64, "rax");
+                        nstaged++;
                     }
                     break;
                 }
             }
+        }
+        for (u32 i = 0; i < n; i++)
+        {
+            if (dsts[i] == null) continue;
+            if (staged[i] >= 0)
+            {
+                emitSlotLoad(ctx, ctx->phiTmpOff + staged[i] * 8, 64, "rax", false);
+            }
+            else
+            {
+                emitValueToReg(ctx, srcs[i], "rax");
+            }
+            emitRegToSlot(ctx, dsts[i], "rax");
         }
     }
 }
@@ -356,6 +402,30 @@ str x86RegForWidth(str reg64, u32 width)
     if (width <= 16) return x86Reg16(reg64);
     if (width <= 32) return x86Reg32(reg64);
     return reg64;
+}
+
+/* instruction suffix for a bit width — sub-64-bit ints must use the
+ * narrow form: slot values carry producer-dependent upper bits
+ * (consts/loads zero-extend, neg/arith sign-extend), so a 64-bit
+ * cmpq/idivq/sarq reads garbage. Width-correct ops only look at the
+ * bits the type actually has. */
+str x86OpSfx(u32 width)
+{
+    if (width <= 8) return "b";
+    if (width <= 16) return "w";
+    if (width <= 32) return "l";
+    return "q";
+}
+
+u32 instWidth(IrInst* inst)
+{
+    return inst != null && inst->base.type != null ? inst->base.type->width : 64;
+}
+
+u32 opWidth(IrInst* inst)
+{
+    return inst != null && inst->nops > 0 && inst->ops[0] != null &&
+           inst->ops[0]->type != null ? inst->ops[0]->type->width : 64;
 }
 
 // Load `width` bits from `disp(%rbp)` into `reg` (zero-extended unless
@@ -1703,6 +1773,11 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx, bool isWindows)
         ctx.sretOff = curOffset;
     }
 
+    /* phi parallel-copy staging: up to 8 qword temps for sources that
+     * are also destinations on the same edge (swap/rotation phis) */
+    curOffset -= 64;
+    ctx.phiTmpOff = curOffset;
+
     // Align stack frame to 16 bytes
     i32 rawFrame = -curOffset;
     ctx.frameSize = (rawFrame + 15) & ~15;
@@ -1814,6 +1889,24 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx, bool isWindows)
             emitRegToSlot(&ctx, func->args[ai], SYSV_ARG_REGS_64[ai + argRegShift]);
         }
     }
+    /* args past the register file arrive on the caller's stack: the
+     * caller stored them at rsp+0,8,… before `call`, so here they sit
+     * at rbp+16+8j for both ABIs (our caller never reserves win64
+     * shadow space). regCap must mirror the caller's nregs-cregShift. */
+    {
+        u32 nregs = win64 ? 4 : 6;
+        u32 regCap = nregs - argRegShift;
+        u32 base = func->nargs < regCap ? func->nargs : regCap;
+        u32 sj = 0;
+        for (u32 ai = base; ai < func->nargs; ai++)
+        {
+            ctx.emit("    movq ");
+            ctx.emitI64((i64)(16 + sj * 8));
+            ctx.emitLine("(%rbp), %rax");
+            emitRegToSlot(&ctx, func->args[ai], "rax");
+            sj++;
+        }
+    }
 
     // 4. Emit basic blocks and instructions
     for (u32 bi = 0; bi < func->nblocks; bi++)
@@ -1878,14 +1971,49 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx, bool isWindows)
                                     ctx.emit("    movq ");
                                     ctx.emitI64((i64)ctx.sretOff);
                                     ctx.emitLine("(%rbp), %rcx");    // dest
-                                    u64 nq = (rsz + 7) / 8;
-                                    for (u64 q = 0; q < nq; q++)
+                                    /* exact-size copy — same overflow
+                                     * hazard as aggregate store when
+                                     * the destination is a struct
+                                     * field rather than a padded
+                                     * alloca slot */
+                                    u64 rn = (u64)rsz;
+                                    u64 rq = 0;
+                                    while (rq * 8 + 8 <= rn)
                                     {
-                                        i64 o = (i64)(q * 8);
+                                        i64 o = (i64)(rq * 8);
                                         ctx.emit("    movq ");
                                         ctx.emitI64(o);
                                         ctx.emit("(%rax), %rdx\n    movq %rdx, ");
                                         ctx.emitI64(o);
+                                        ctx.emitLine("(%rcx)");
+                                        rq++;
+                                    }
+                                    u64 rrem = rn - rq * 8;
+                                    i64 ro = (i64)(rq * 8);
+                                    if (rrem >= 4)
+                                    {
+                                        ctx.emit("    movl ");
+                                        ctx.emitI64(ro);
+                                        ctx.emit("(%rax), %edx\n    movl %edx, ");
+                                        ctx.emitI64(ro);
+                                        ctx.emitLine("(%rcx)");
+                                        rrem -= 4; ro += 4;
+                                    }
+                                    if (rrem >= 2)
+                                    {
+                                        ctx.emit("    movw ");
+                                        ctx.emitI64(ro);
+                                        ctx.emit("(%rax), %dx\n    movw %dx, ");
+                                        ctx.emitI64(ro);
+                                        ctx.emitLine("(%rcx)");
+                                        rrem -= 2; ro += 2;
+                                    }
+                                    if (rrem >= 1)
+                                    {
+                                        ctx.emit("    movb ");
+                                        ctx.emitI64(ro);
+                                        ctx.emit("(%rax), %dl\n    movb %dl, ");
+                                        ctx.emitI64(ro);
                                         ctx.emitLine("(%rcx)");
                                     }
                                 }
@@ -1940,29 +2068,81 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx, bool isWindows)
                 IrOpcode::SDiv => {
                     emitValueToReg(&ctx, inst->ops[0], "rax");
                     emitValueToReg(&ctx, inst->ops[1], "rcx");
-                    ctx.emitLine("    cqto");
-                    ctx.emitLine("    idivq %rcx");
+                    u32 dw = instWidth(inst);
+                    if (dw <= 8)
+                    {
+                        ctx.emitLine("    movsbl %al, %eax");
+                        ctx.emitLine("    movsbl %cl, %ecx");
+                    }
+                    else if (dw <= 16)
+                    {
+                        ctx.emitLine("    movswl %ax, %eax");
+                        ctx.emitLine("    movswl %cx, %ecx");
+                    }
+                    ctx.emitLine(dw >= 64 ? "    cqto" : "    cltd");
+                    ctx.emit("    idiv");
+                    ctx.emit(x86OpSfx(dw <= 32 ? 32 : 64));
+                    ctx.emitLine(dw >= 64 ? " %rcx" : " %ecx");
                     emitRegToSlot(&ctx, &inst->base, "rax");
                 },
                 IrOpcode::UDiv => {
                     emitValueToReg(&ctx, inst->ops[0], "rax");
                     emitValueToReg(&ctx, inst->ops[1], "rcx");
-                    ctx.emitLine("    xorq %rdx, %rdx");
-                    ctx.emitLine("    divq %rcx");
+                    u32 dw = instWidth(inst);
+                    if (dw <= 8)
+                    {
+                        ctx.emitLine("    movzbl %al, %eax");
+                        ctx.emitLine("    movzbl %cl, %ecx");
+                    }
+                    else if (dw <= 16)
+                    {
+                        ctx.emitLine("    movzwl %ax, %eax");
+                        ctx.emitLine("    movzwl %cx, %ecx");
+                    }
+                    ctx.emitLine(dw >= 64 ? "    xorq %rdx, %rdx" : "    xorl %edx, %edx");
+                    ctx.emit("    div");
+                    ctx.emit(x86OpSfx(dw <= 32 ? 32 : 64));
+                    ctx.emitLine(dw >= 64 ? " %rcx" : " %ecx");
                     emitRegToSlot(&ctx, &inst->base, "rax");
                 },
                 IrOpcode::SRem => {
                     emitValueToReg(&ctx, inst->ops[0], "rax");
                     emitValueToReg(&ctx, inst->ops[1], "rcx");
-                    ctx.emitLine("    cqto");
-                    ctx.emitLine("    idivq %rcx");
+                    u32 dw = instWidth(inst);
+                    if (dw <= 8)
+                    {
+                        ctx.emitLine("    movsbl %al, %eax");
+                        ctx.emitLine("    movsbl %cl, %ecx");
+                    }
+                    else if (dw <= 16)
+                    {
+                        ctx.emitLine("    movswl %ax, %eax");
+                        ctx.emitLine("    movswl %cx, %ecx");
+                    }
+                    ctx.emitLine(dw >= 64 ? "    cqto" : "    cltd");
+                    ctx.emit("    idiv");
+                    ctx.emit(x86OpSfx(dw <= 32 ? 32 : 64));
+                    ctx.emitLine(dw >= 64 ? " %rcx" : " %ecx");
                     emitRegToSlot(&ctx, &inst->base, "rdx");
                 },
                 IrOpcode::URem => {
                     emitValueToReg(&ctx, inst->ops[0], "rax");
                     emitValueToReg(&ctx, inst->ops[1], "rcx");
-                    ctx.emitLine("    xorq %rdx, %rdx");
-                    ctx.emitLine("    divq %rcx");
+                    u32 dw = instWidth(inst);
+                    if (dw <= 8)
+                    {
+                        ctx.emitLine("    movzbl %al, %eax");
+                        ctx.emitLine("    movzbl %cl, %ecx");
+                    }
+                    else if (dw <= 16)
+                    {
+                        ctx.emitLine("    movzwl %ax, %eax");
+                        ctx.emitLine("    movzwl %cx, %ecx");
+                    }
+                    ctx.emitLine(dw >= 64 ? "    xorq %rdx, %rdx" : "    xorl %edx, %edx");
+                    ctx.emit("    div");
+                    ctx.emit(x86OpSfx(dw <= 32 ? 32 : 64));
+                    ctx.emitLine(dw >= 64 ? " %rcx" : " %ecx");
                     emitRegToSlot(&ctx, &inst->base, "rdx");
                 },
                 IrOpcode::And => {
@@ -1986,19 +2166,31 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx, bool isWindows)
                 IrOpcode::Shl => {
                     emitValueToReg(&ctx, inst->ops[0], "rax");
                     emitValueToReg(&ctx, inst->ops[1], "rcx");
-                    ctx.emitLine("    shlq %cl, %rax");
+                    u32 sw = instWidth(inst);
+                    ctx.emit("    shl");
+                    ctx.emit(x86OpSfx(sw));
+                    ctx.emit(" %cl, %");
+                    ctx.emitLine(x86RegForWidth("rax", sw));
                     emitRegToSlot(&ctx, &inst->base, "rax");
                 },
                 IrOpcode::Lshr => {
                     emitValueToReg(&ctx, inst->ops[0], "rax");
                     emitValueToReg(&ctx, inst->ops[1], "rcx");
-                    ctx.emitLine("    shrq %cl, %rax");
+                    u32 sw = instWidth(inst);
+                    ctx.emit("    shr");
+                    ctx.emit(x86OpSfx(sw));
+                    ctx.emit(" %cl, %");
+                    ctx.emitLine(x86RegForWidth("rax", sw));
                     emitRegToSlot(&ctx, &inst->base, "rax");
                 },
                 IrOpcode::Ashr => {
                     emitValueToReg(&ctx, inst->ops[0], "rax");
                     emitValueToReg(&ctx, inst->ops[1], "rcx");
-                    ctx.emitLine("    sarq %cl, %rax");
+                    u32 sw = instWidth(inst);
+                    ctx.emit("    sar");
+                    ctx.emit(x86OpSfx(sw));
+                    ctx.emit(" %cl, %");
+                    ctx.emitLine(x86RegForWidth("rax", sw));
                     emitRegToSlot(&ctx, &inst->base, "rax");
                 },
                 IrOpcode::Neg => {
@@ -2066,14 +2258,48 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx, bool isWindows)
                          * pointer itself) */
                         emitValueToReg(&ctx, inst->ops[0], "rax"); // src addr
                         emitValueToReg(&ctx, inst->ops[1], "rcx"); // dst addr
+                        /* exact-size copy: rounding the tail up to a
+                         * qword writes past the object when the
+                         * aggregate is a struct field (a 4-byte union
+                         * payload at offset 4 used to clobber the next
+                         * alloca slot) */
                         u64 n = (u64)ictx->irTypeSizeOf(inst->ops[0]->type);
-                        u64 nq = (n + 7) / 8;
-                        for (u64 q = 0; q < nq; q++)
+                        u64 q = 0;
+                        while (q * 8 + 8 <= n)
                         {
                             i64 o = (i64)(q * 8);
                             ctx.emit("    movq ");
                             ctx.emitI64(o);
                             ctx.emit("(%rax), %rdx\n    movq %rdx, ");
+                            ctx.emitI64(o);
+                            ctx.emitLine("(%rcx)");
+                            q++;
+                        }
+                        u64 rem = n - q * 8;
+                        i64 o = (i64)(q * 8);
+                        if (rem >= 4)
+                        {
+                            ctx.emit("    movl ");
+                            ctx.emitI64(o);
+                            ctx.emit("(%rax), %edx\n    movl %edx, ");
+                            ctx.emitI64(o);
+                            ctx.emitLine("(%rcx)");
+                            rem -= 4; o += 4;
+                        }
+                        if (rem >= 2)
+                        {
+                            ctx.emit("    movw ");
+                            ctx.emitI64(o);
+                            ctx.emit("(%rax), %dx\n    movw %dx, ");
+                            ctx.emitI64(o);
+                            ctx.emitLine("(%rcx)");
+                            rem -= 2; o += 2;
+                        }
+                        if (rem >= 1)
+                        {
+                            ctx.emit("    movb ");
+                            ctx.emitI64(o);
+                            ctx.emit("(%rax), %dl\n    movb %dl, ");
                             ctx.emitI64(o);
                             ctx.emitLine("(%rcx)");
                         }
@@ -2097,7 +2323,16 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx, bool isWindows)
                 IrOpcode::ICmp => {
                     emitValueToReg(&ctx, inst->ops[0], "rax");
                     emitValueToReg(&ctx, inst->ops[1], "rcx");
-                    ctx.emitLine("    cmpq %rcx, %rax");
+                    /* compare at the OPERAND's width — upper slot bits
+                     * are producer-dependent garbage for sub-64-bit
+                     * ints (see x86OpSfx) */
+                    u32 iw = opWidth(inst);
+                    ctx.emit("    cmp");
+                    ctx.emit(x86OpSfx(iw));
+                    ctx.emit(" %");
+                    ctx.emit(x86RegForWidth("rcx", iw));
+                    ctx.emit(", %");
+                    ctx.emitLine(x86RegForWidth("rax", iw));
                     str setInst = "sete";
                     switch (inst->icmpPred)
                     {
@@ -2149,18 +2384,135 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx, bool isWindows)
                         sretSlot = ctx.getSlot(&inst->base);
                     }
                     u32 cregShift = callSret ? 1 : 0;
-                    if (win64)
+                    /* extern C-ABI calls split the argument streams:
+                     * floats take xmm0-7, everything else the integer
+                     * sequence; AL carries the vector count (varargs
+                     * prototypes read it to decide how many xmm saves
+                     * to make). Internal calls keep the uniform
+                     * integer convention the callee prologue mirrors. */
+                    bool cext = false;
+                    u32 cextStk = 0;
+                    IrFunc* cfn = null;
+                    if (inst->ops[0] != null && inst->ops[0]->kind == IrValueKind::Func)
                     {
-                        for (u32 ai = 0; ai < nArgs && ai + cregShift < 4; ai++)
+                        cfn = (IrFunc*)inst->ops[0];
+                        cext = cfn != null && cfn->isExtern;
+                    }
+                    if (cext && !win64)
+                    {
+                        /* pass 1: classify each arg, count register vs
+                         * stack slots (stack slots are assigned in arg
+                         * order across BOTH classes) */
+                        u32 iused = cregShift;
+                        u32 xused = 0;
+                        u32 nstk = 0;
+                        for (u32 ai = 0; ai < nArgs; ai++)
                         {
-                            emitValueToReg(&ctx, inst->ops[ai + 1], WIN64_ARG_REGS_64[ai + cregShift]);
+                            IrValue* av = inst->ops[ai + 1];
+                            bool isF = av != null && av->type != null &&
+                                       av->type->kind == IrTypeKind::Float;
+                            if (isF) { if (xused < 8) xused++; else nstk++; }
+                            else { if (iused < 6) iused++; else nstk++; }
                         }
+                        if (nstk > 0)
+                        {
+                            /* the outgoing-arg area must keep %rsp
+                             * 16-aligned at the call: round the byte
+                             * count up (libc spills xmm regs with
+                             * movaps and faults on a misaligned rsp) */
+                            cextStk = ((nstk * 8 + 15) / 16) * 16;
+                            ctx.emit("    subq $");
+                            ctx.emitI64((i64)cextStk);
+                            ctx.emitLine(", %rsp");
+                        }
+                        /* pass 2: emit each arg into its slot */
+                        u32 ri = cregShift;
+                        u32 rx = 0;
+                        u32 rs = 0;
+                        for (u32 ai = 0; ai < nArgs; ai++)
+                        {
+                            IrValue* av = inst->ops[ai + 1];
+                            bool isF = av != null && av->type != null &&
+                                       av->type->kind == IrTypeKind::Float;
+                            if (isF)
+                            {
+                                if (rx < 8)
+                                {
+                                    emitValueToReg(&ctx, av, "rax");
+                                    ctx.emit("    movq %rax, %xmm");
+                                    ctx.emitU64((u64)rx);
+                                    ctx.emitLine("");
+                                    rx++;
+                                }
+                                else
+                                {
+                                    emitValueToReg(&ctx, av, "rax");
+                                    ctx.emit("    movq %rax, ");
+                                    ctx.emitI64((i64)(rs * 8));
+                                    ctx.emitLine("(%rsp)");
+                                    rs++;
+                                }
+                            }
+                            else
+                            {
+                                if (ri < 6)
+                                {
+                                    emitValueToReg(&ctx, av, SYSV_ARG_REGS_64[ri]);
+                                    ri++;
+                                }
+                                else
+                                {
+                                    emitValueToReg(&ctx, av, "rax");
+                                    ctx.emit("    movq %rax, ");
+                                    ctx.emitI64((i64)(rs * 8));
+                                    ctx.emitLine("(%rsp)");
+                                    rs++;
+                                }
+                            }
+                        }
+                        /* AL = number of vector registers used —
+                         * required by every variadic prototype and
+                         * ignored by fixed ones */
+                        ctx.emit("    movl $");
+                        ctx.emitU64((u64)rx);
+                        ctx.emitLine(", %eax");
                     }
                     else
                     {
-                        for (u32 ai = 0; ai < nArgs && ai + cregShift < 6; ai++)
+                        /* internal call: the uniform integer convention —
+                         * every arg (float bits included) occupies one
+                         * GP register or one 8-byte stack slot, in order.
+                         * Args past the register file go on the stack;
+                         * the callee prologue reads them back at
+                         * rbp+16+8j (sysv) / rbp+48+8j (win64 shadow). */
+                        u32 nregs = win64 ? 4 : 6;
+                        u32 regCap = nregs - cregShift;
+                        u32 nreg = nArgs < regCap ? nArgs : regCap;
+                        u32 nstk = nArgs - nreg;
+                        if (nstk > 0)
                         {
-                            emitValueToReg(&ctx, inst->ops[ai + 1], SYSV_ARG_REGS_64[ai + cregShift]);
+                            cextStk = ((nstk * 8 + 15) / 16) * 16;
+                            ctx.emit("    subq $");
+                            ctx.emitI64((i64)cextStk);
+                            ctx.emitLine(", %rsp");
+                        }
+                        u32 ai = 0;
+                        while (ai < nreg)
+                        {
+                            str rn = win64 ? WIN64_ARG_REGS_64[ai + cregShift]
+                                           : SYSV_ARG_REGS_64[ai + cregShift];
+                            emitValueToReg(&ctx, inst->ops[ai + 1], rn);
+                            ai++;
+                        }
+                        u32 rs = 0;
+                        while (ai < nArgs)
+                        {
+                            emitValueToReg(&ctx, inst->ops[ai + 1], "rax");
+                            ctx.emit("    movq %rax, ");
+                            ctx.emitI64((i64)(rs * 8));
+                            ctx.emitLine("(%rsp)");
+                            rs++;
+                            ai++;
                         }
                     }
                     if (callSret)
@@ -2196,6 +2548,20 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx, bool isWindows)
                             ctx.emitLine("    call *%r10");
                         }
                     }
+                    if (cextStk > 0)
+                    {
+                        ctx.emit("    addq $");
+                        ctx.emitI64((i64)cextStk);
+                        ctx.emitLine(", %rsp");
+                    }
+                    /* extern float returns arrive in xmm0, not rax —
+                     * move the bits so the generic result store below
+                     * sees them in the register it always reads */
+                    if (cext && cfn != null && cfn->retType != null &&
+                        cfn->retType->kind == IrTypeKind::Float &&
+                        inst->base.type != null &&
+                        inst->base.type->kind == IrTypeKind::Float)
+                        ctx.emitLine("    movq %xmm0, %rax");
                     if (inst->base.type != null && inst->base.type->kind != IrTypeKind::Void)
                     {
                         u64 rsz = valByteSize(ictx, &inst->base);
@@ -2534,6 +2900,10 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx, bool isWindows)
                     {
                         emitValueToReg(&ctx, inst->ops[0], "rax");
                         u32 nCases = inst->nops >= 2 ? (inst->nops - 2) / 2 : 0;
+                        /* compare at the scrutinee's width — i32 switch
+                         * tags carry producer-dependent upper bits */
+                        u32 sw = inst->ops[0]->type != null ?
+                                 inst->ops[0]->type->width : 64;
                         u32 ci = 0;
                         while (ci < nCases)
                         {
@@ -2542,7 +2912,12 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx, bool isWindows)
                             if (cv != null && cb != null)
                             {
                                 emitValueToReg(&ctx, cv, "rcx");
-                                ctx.emitLine("    cmpq %rcx, %rax");
+                                ctx.emit("    cmp");
+                                ctx.emit(x86OpSfx(sw));
+                                ctx.emit(" %");
+                                ctx.emit(x86RegForWidth("rcx", sw));
+                                ctx.emit(", %");
+                                ctx.emitLine(x86RegForWidth("rax", sw));
                                 ctx.emit("    je ");
                                 emitBBLabel(&ctx, func, cb);
                                 ctx.emitLine("");
@@ -2560,12 +2935,30 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx, bool isWindows)
                 },
                 IrOpcode::MulHi | IrOpcode::SMulHi => {
                     /* high half of the 2n-bit product: mul/imul leave
-                     * it in rdx */
+                     * it in rdx. Sub-64-bit operands need width forms —
+                     * a 64-bit mul reads garbage upper bits. <=16-bit
+                     * values are canonicalized into 32 bits first. */
                     if (inst->nops >= 2)
                     {
                         emitValueToReg(&ctx, inst->ops[0], "rax");
                         emitValueToReg(&ctx, inst->ops[1], "rcx");
-                        ctx.emitLine(inst->opcode == IrOpcode::MulHi ? "    mulq %rcx" : "    imulq %rcx");
+                        u32 hw = instWidth(inst);
+                        bool hsgn = inst->opcode == IrOpcode::SMulHi;
+                        if (hw <= 8)
+                        {
+                            ctx.emitLine(hsgn ? "    movsbl %al, %eax" : "    movzbl %al, %eax");
+                            ctx.emitLine(hsgn ? "    movsbl %cl, %ecx" : "    movzbl %cl, %ecx");
+                        }
+                        else if (hw <= 16)
+                        {
+                            ctx.emitLine(hsgn ? "    movswl %ax, %eax" : "    movzwl %ax, %eax");
+                            ctx.emitLine(hsgn ? "    movswl %cx, %ecx" : "    movzwl %cx, %ecx");
+                        }
+                        /* 32-bit mul/imul zero-extend the high half
+                         * into rdx, so movq %rdx is correct for all
+                         * widths */
+                        ctx.emit(hsgn ? (hw >= 64 ? "    imulq %rcx\n" : "    imull %ecx\n")
+                                     : (hw >= 64 ? "    mulq %rcx\n" : "    mull %ecx\n"));
                         ctx.emitLine("    movq %rdx, %rax");
                         emitRegToSlot(&ctx, &inst->base, "rax");
                     }
@@ -2574,23 +2967,88 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx, bool isWindows)
                     if (inst->nops >= 1)
                     {
                         emitValueToReg(&ctx, inst->ops[0], "rax");
+                        u32 cw = inst->ops[0]->type != null ? inst->ops[0]->type->width : 64;
                         if (inst->opcode == IrOpcode::Abs)
                         {
-                            ctx.emitLine("    movq %rax, %rcx");
-                            ctx.emitLine("    sarq $63, %rcx");
-                            ctx.emitLine("    xorq %rcx, %rax");
-                            ctx.emitLine("    subq %rcx, %rax");
+                            /* canonicalize <=16-bit operands into eax,
+                             * then run the abs idiom at 32 or 64 bits */
+                            if (cw <= 8)
+                                ctx.emitLine("    movsbl %al, %eax");
+                            else if (cw <= 16)
+                                ctx.emitLine("    movswl %ax, %eax");
+                            str asfx = cw >= 64 ? "q" : "l";
+                            ctx.emit("    mov");
+                            ctx.emit(asfx);
+                            ctx.emit(" %");
+                            ctx.emit(cw >= 64 ? "rax" : "eax");
+                            ctx.emit(", %");
+                            ctx.emitLine(cw >= 64 ? "rcx" : "ecx");
+                            ctx.emit("    sar");
+                            ctx.emit(asfx);
+                            ctx.emitLine(cw >= 64 ? " $63, %rcx" : " $31, %ecx");
+                            ctx.emit("    xor");
+                            ctx.emit(asfx);
+                            ctx.emit(" %");
+                            ctx.emit(cw >= 64 ? "rcx" : "ecx");
+                            ctx.emit(", %");
+                            ctx.emitLine(cw >= 64 ? "rax" : "eax");
+                            ctx.emit("    sub");
+                            ctx.emit(asfx);
+                            ctx.emit(" %");
+                            ctx.emitLine(cw >= 64 ? "rcx, %rax" : "ecx, %eax");
                         }
-                        else if (inst->opcode == IrOpcode::CtPop)
-                            ctx.emitLine("    popcntq %rax, %rax");
-                        else if (inst->opcode == IrOpcode::CtLz)
-                            ctx.emitLine("    lzcntq %rax, %rax");
-                        else if (inst->opcode == IrOpcode::CtTz)
-                            ctx.emitLine("    tzcntq %rax, %rax");
+                        else if (inst->opcode == IrOpcode::CtPop ||
+                                 inst->opcode == IrOpcode::CtLz ||
+                                 inst->opcode == IrOpcode::CtTz)
+                        {
+                            /* count within the operand's width: narrow
+                             * values are zero-extended into eax first;
+                             * CtLz then needs a bias correction */
+                            u32 bias = 0;
+                            if (cw <= 8)
+                            {
+                                ctx.emitLine("    movzbl %al, %eax");
+                                bias = 24;
+                            }
+                            else if (cw <= 16)
+                            {
+                                ctx.emitLine("    movzwl %ax, %eax");
+                                bias = 16;
+                            }
+                            else if (cw <= 32)
+                            {
+                                ctx.emitLine("    movl %eax, %eax");
+                            }
+                            str csfx = cw >= 64 ? "q" : "l";
+                            ctx.emit(inst->opcode == IrOpcode::CtPop ? "    popcnt" :
+                                     inst->opcode == IrOpcode::CtLz ? "    lzcnt" : "    tzcnt");
+                            ctx.emit(csfx);
+                            ctx.emit(" %");
+                            ctx.emit(cw >= 64 ? "rax" : "eax");
+                            ctx.emit(", %");
+                            ctx.emitLine(cw >= 64 ? "rax" : "eax");
+                            if (bias > 0 && inst->opcode == IrOpcode::CtLz)
+                            {
+                                ctx.emit("    subl $");
+                                ctx.emitI64((i64)bias);
+                                ctx.emitLine(", %eax");
+                            }
+                        }
                         else
                         {
-                            u32 w = inst->ops[0]->type != null ? inst->ops[0]->type->width : 64;
-                            ctx.emitLine(w <= 32 ? "    bswapl %eax" : "    bswapq %rax");
+                            /* bswap: i8 is the identity, i16 swaps the
+                             * low word only */
+                            if (cw <= 8)
+                                ctx.emitLine("    movzbl %al, %eax");
+                            else if (cw <= 16)
+                            {
+                                ctx.emitLine("    rolw $8, %ax");
+                                ctx.emitLine("    movzwl %ax, %eax");
+                            }
+                            else
+                            {
+                                ctx.emitLine(cw <= 32 ? "    bswapl %eax" : "    bswapq %rax");
+                            }
                         }
                         emitRegToSlot(&ctx, &inst->base, "rax");
                     }
@@ -2607,24 +3065,57 @@ pub str emitFastX86Func(IrFunc* func, IrContext* ictx, bool isWindows)
                             // high garbage into the low word. Pick the
                             // suffix/reg pair from the result width.
                             u32 rw = inst->base.type != null ? inst->base.type->width : 64;
-                            str rreg = rw <= 16 ? "%ax" : (rw <= 32 ? "%eax" : "%rax");
-                            str suf = rw <= 16 ? "w" : (rw <= 32 ? "l" : "q");
+                            str rreg = rw <= 8 ? "%al" : (rw <= 16 ? "%ax" : (rw <= 32 ? "%eax" : "%rax"));
+                            str suf = rw <= 8 ? "b" : (rw <= 16 ? "w" : (rw <= 32 ? "l" : "q"));
                             ctx.emit("    ro");
                             ctx.emit(inst->opcode == IrOpcode::Rotl ? "l" : "r");
                             ctx.emit(suf);
                             ctx.emit(" %cl, ");
                             ctx.emitLine(rreg);
+                            /* sub-32 rotates leave stale upper bits in
+                             * the register — canonicalize the result */
+                            if (rw <= 8)
+                                ctx.emitLine("    movzbl %al, %eax");
+                            else if (rw <= 16)
+                                ctx.emitLine("    movzwl %ax, %eax");
                         }
                         else
                         {
-                            ctx.emitLine("    cmpq %rcx, %rax");
+                            /* compare at operand width — sub-64 values
+                             * carry producer-dependent upper bits; <=16
+                             * canonicalize first so signed compares see
+                             * the real sign */
+                            u32 mw = inst->base.type != null ? inst->base.type->width : 64;
+                            bool msgn = inst->opcode == IrOpcode::SMin ||
+                                        inst->opcode == IrOpcode::SMax;
+                            if (mw <= 8)
+                            {
+                                ctx.emitLine(msgn ? "    movsbl %al, %eax" : "    movzbl %al, %eax");
+                                ctx.emitLine(msgn ? "    movsbl %cl, %ecx" : "    movzbl %cl, %ecx");
+                            }
+                            else if (mw <= 16)
+                            {
+                                ctx.emitLine(msgn ? "    movswl %ax, %eax" : "    movzwl %ax, %eax");
+                                ctx.emitLine(msgn ? "    movswl %cx, %ecx" : "    movzwl %cx, %ecx");
+                            }
+                            str msfx = mw >= 64 ? "q" : "l";
+                            ctx.emit("    cmp");
+                            ctx.emit(msfx);
+                            ctx.emit(" %");
+                            ctx.emit(mw >= 64 ? "rcx" : "ecx");
+                            ctx.emit(", %");
+                            ctx.emitLine(mw >= 64 ? "rax" : "eax");
                             str cc = "cmovg";
                             if (inst->opcode == IrOpcode::SMax) cc = "cmovl";
                             else if (inst->opcode == IrOpcode::UMin) cc = "cmova";
                             else if (inst->opcode == IrOpcode::UMax) cc = "cmovb";
                             ctx.emit("    ");
                             ctx.emit(cc);
-                            ctx.emitLine(" %rcx, %rax");
+                            ctx.emit(mw >= 64 ? "q " : "l ");
+                            ctx.emit("%");
+                            ctx.emit(mw >= 64 ? "rcx" : "ecx");
+                            ctx.emit(", %");
+                            ctx.emitLine(mw >= 64 ? "rax" : "eax");
                         }
                         emitRegToSlot(&ctx, &inst->base, "rax");
                     }

@@ -1,0 +1,1143 @@
+#[[no_drop_all]]
+// Scalar evolution — closed-form loop elimination for the provably-safe
+// subset of test/coral/for_ir/loops_scalar.crl.
+//
+// Finds canonical single-latch counted loops whose only observable
+// effect is a set of affine recurrences, computes the exact trip count,
+// rebuilds each loop-carried value at its exit value as straight-line
+// code in the preheader, and bypasses the loop. Wrapping (mod 2^w)
+// arithmetic is a ring, so the closed forms are exact for every input.
+//
+// Deliberately rejected (needs deeper analysis — see TODO.md):
+//   - `</<=/>/>=` exits with symbolic bounds and |step| > 1 (iv+s can
+//     wrap past the bound — needs a range/nuw proof)
+//   - `<=`/`>=` exits with symbolic bounds (bound+1 can hit the type
+//     max and make the loop infinite)
+//   - `!=` exits with |step| != 1 (termination needs a divisibility or
+//     coprimality proof)
+//   - signed exits without INST_FLAG_NSW on the IV update
+//   - geometric/multiplicative recurrences, conditional updates,
+//     memory ops, calls, floats, multi-exit loops, non-canonical CFG
+//
+// Pipeline position: O3 only, after loop_cse, before unroll.
+
+import muvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind, IrTypeKind, IrType };
+import muvm::irOps { IrOpcode, IrICmpPred, INST_FLAG_NSW };
+import muvm::passes::loop_detect { IrLoop, irLoopDetectNatural, irLoopDestroy };
+import std::mman { alloc, dealloc };
+
+bool isIntTy(IrType* t)
+{
+    return t != null && t->kind == IrTypeKind::Int && t->width >= 8 && t->width <= 64;
+}
+
+u64 tyMask(u32 w)
+{
+    return w >= 64 ? ~((u64)0) : (((u64)1 << (u64)w) - (u64)1);
+}
+
+i64 sextVal(u64 v, u32 w)
+{
+    if (w >= 64) return (i64)v;
+    u64 m = v & tyMask(w);
+    if (((m >> (u64)(w - 1)) & 1) != 0) m |= ~tyMask(w);
+    return (i64)m;
+}
+
+IrICmpPred swappedPred(IrICmpPred p)
+{
+    switch (p)
+    {
+        IrICmpPred::Slt => { return IrICmpPred::Sgt; },
+        IrICmpPred::Sle => { return IrICmpPred::Sge; },
+        IrICmpPred::Sgt => { return IrICmpPred::Slt; },
+        IrICmpPred::Sge => { return IrICmpPred::Sle; },
+        IrICmpPred::Ult => { return IrICmpPred::Ugt; },
+        IrICmpPred::Ule => { return IrICmpPred::Uge; },
+        IrICmpPred::Ugt => { return IrICmpPred::Ult; },
+        IrICmpPred::Uge => { return IrICmpPred::Ule; },
+        else => { return p; },
+    }
+}
+
+// ------------------------------------------------------------------
+// affine plan: a loop-invariant expression evaluated in the preheader.
+// ------------------------------------------------------------------
+
+enum PlanKind
+{
+    PL_INV,
+    PL_CONST,
+    PL_ADD,
+    PL_SUB,
+    PL_MUL,
+    PL_NEG
+}
+
+struct Plan
+{
+    PlanKind kind;
+    IrValue* v;
+    u64 c;
+    Plan* a;
+    Plan* b;
+}
+
+struct Affine
+{
+    Plan* A;
+    Plan* B;
+}
+
+struct Scev
+{
+    IrContext* ctx;
+    IrFunc* func;
+    u32 nblocks;
+    bool* inLoop;
+    IrBlock* header;
+    IrBlock* latch;
+    IrBlock* pre;
+    IrBlock* exit;
+    IrType* ivTy;
+    IrValue* ivPhi;
+    IrValue* ivStart;
+    IrValue* ivStepC;
+    i64 stepSigned;
+    u64 stepMag;
+    IrICmpPred xpred;
+    IrValue* bound;
+    bool boundIsConst;
+    u64 boundConst;
+    bool nsw;
+
+    IrValue** phis;
+    Affine* affs;
+    IrInst** updOp;
+    u32 nphi;
+    u32 ivIdx;
+    IrValue** ivExit;
+
+    IrInst* anchor;
+    IrValue* tc64;
+    IrValue* tri64;
+    bool triEmitted;
+
+    IrInst** escInst;
+    IrValue** escVals;
+    u32 nesc;
+    u32 capEsc;
+
+    // resolveEmit memo for non-escapee header insts
+    IrInst** resInst;
+    IrValue** resVal;
+    u32 nres;
+    u32 capRes;
+
+    Plan** plans;
+    u32 nplans;
+    u32 capPlans;
+}
+
+Plan* planNew(Scev* s, PlanKind k)
+{
+    if (s->nplans >= s->capPlans)
+    {
+        u32 nc = s->capPlans ? s->capPlans * 2 : 32;
+        Plan** np = alloc<Plan*>((usize)nc);
+        for (u32 i = 0; i < s->nplans; i++) np[i] = s->plans[i];
+        if (s->plans != null) dealloc<Plan*>(s->plans);
+        s->plans = np;
+        s->capPlans = nc;
+    }
+    Plan* p = alloc<Plan>((usize)1);
+    *p = Plan { .kind = k, .v = null, .c = 0, .a = null, .b = null };
+    s->plans[s->nplans++] = p;
+    return p;
+}
+
+Plan* planConst(Scev* s, u64 c, u32 w)
+{
+    Plan* p = planNew(s, PlanKind::PL_CONST);
+    p->c = c & tyMask(w);
+    return p;
+}
+
+Plan* planInv(Scev* s, IrValue* v)
+{
+    Plan* p = planNew(s, PlanKind::PL_INV);
+    p->v = v;
+    return p;
+}
+
+Plan* planBin(Scev* s, PlanKind k, Plan* a, Plan* b)
+{
+    Plan* p = planNew(s, k);
+    p->a = a;
+    p->b = b;
+    return p;
+}
+
+Plan* planNeg(Scev* s, Plan* a)
+{
+    Plan* p = planNew(s, PlanKind::PL_NEG);
+    p->a = a;
+    return p;
+}
+
+bool isInvariant(Scev* s, IrValue* v)
+{
+    if (v == null) return false;
+    if (v->kind != IrValueKind::Inst) return true;
+    IrInst* i = (IrInst*)v;
+    if (i->opcode == IrOpcode::Phi) return false;
+    if (i->parent == null) return true;
+    for (u32 k = 0; k < s->nblocks; k++)
+        if (s->func->blocks[k] == i->parent)
+            return !s->inLoop[k];
+    return true;
+}
+
+// pure-invariant leaf: const or defined outside the loop with no IV
+// inside (shallow check — deep invariant exprs still count since their
+// value doesn't change per iteration)
+bool pureInvariant(Scev* s, IrValue* t)
+{
+    if (t == null) return false;
+    if (t->kind == IrValueKind::ConstInt) return true;
+    if (t->kind != IrValueKind::Inst) return true; // arg/global/etc
+    return isInvariant(s, t);
+}
+
+bool planIsZero(Plan* p)
+{
+    if (p == null) return true;
+    return p->kind == PlanKind::PL_CONST && p->c == 0;
+}
+
+// E = A*iv + B extraction. All plans evaluate in ivTy width; the caller
+// enforces the width-match rule when A is nonzero.
+bool affineExtract(Scev* s, IrValue* v, Affine* out, u32 depth)
+{
+    if (v == null || depth > 24) return false;
+    u32 w = s->ivTy->width;
+
+    if (v == s->ivPhi)
+    {
+        out->A = planConst(s, 1, w);
+        out->B = planConst(s, 0, w);
+        return true;
+    }
+    if (v->kind == IrValueKind::ConstInt)
+    {
+        out->A = planConst(s, 0, w);
+        out->B = planConst(s, v->valData & tyMask(w), w);
+        return true;
+    }
+    if (v->kind == IrValueKind::Inst)
+    {
+        IrInst* i = (IrInst*)v;
+        if (i->opcode == IrOpcode::Trunc || i->opcode == IrOpcode::Zext ||
+            i->opcode == IrOpcode::Sext || i->opcode == IrOpcode::Bitcast)
+        {
+            if (i->nops >= 1) return affineExtract(s, i->ops[0], out, depth + 1);
+            return false;
+        }
+        if (i->opcode == IrOpcode::Neg && i->nops == 1)
+        {
+            Affine t;
+            t.A = null; t.B = null;
+            if (!affineExtract(s, i->ops[0], &t, depth + 1)) return false;
+            out->A = planNeg(s, t.A);
+            out->B = planNeg(s, t.B);
+            return true;
+        }
+        if ((i->opcode == IrOpcode::Add || i->opcode == IrOpcode::Sub) && i->nops == 2)
+        {
+            Affine x; x.A = null; x.B = null;
+            Affine y; y.A = null; y.B = null;
+            if (!affineExtract(s, i->ops[0], &x, depth + 1)) return false;
+            if (!affineExtract(s, i->ops[1], &y, depth + 1)) return false;
+            if (i->opcode == IrOpcode::Add)
+            {
+                out->A = planBin(s, PlanKind::PL_ADD, x.A, y.A);
+                out->B = planBin(s, PlanKind::PL_ADD, x.B, y.B);
+            }
+            else
+            {
+                out->A = planBin(s, PlanKind::PL_SUB, x.A, y.A);
+                out->B = planBin(s, PlanKind::PL_SUB, x.B, y.B);
+            }
+            return true;
+        }
+        if (i->opcode == IrOpcode::Mul && i->nops == 2)
+        {
+            Affine x; x.A = null; x.B = null;
+            Affine y; y.A = null; y.B = null;
+            bool xok = affineExtract(s, i->ops[0], &x, depth + 1);
+            bool yok = affineExtract(s, i->ops[1], &y, depth + 1);
+            if (!xok || !yok) return false;
+            bool xp = pureInvariant(s, i->ops[0]);
+            bool yp = pureInvariant(s, i->ops[1]);
+            if (xp && !yp)
+            {
+                out->A = planBin(s, PlanKind::PL_MUL, planInv(s, i->ops[0]), y.A);
+                out->B = planBin(s, PlanKind::PL_MUL, planInv(s, i->ops[0]), y.B);
+                return true;
+            }
+            if (yp && !xp)
+            {
+                out->A = planBin(s, PlanKind::PL_MUL, planInv(s, i->ops[1]), x.A);
+                out->B = planBin(s, PlanKind::PL_MUL, planInv(s, i->ops[1]), x.B);
+                return true;
+            }
+            if (xp && yp)
+            {
+                out->A = planConst(s, 0, w);
+                out->B = planBin(s, PlanKind::PL_MUL, planInv(s, i->ops[0]), planInv(s, i->ops[1]));
+                return true;
+            }
+            return false;
+        }
+        if (isInvariant(s, v))
+        {
+            out->A = planConst(s, 0, w);
+            out->B = planInv(s, v);
+            return true;
+        }
+        return false;
+    }
+    if (isInvariant(s, v))
+    {
+        out->A = planConst(s, 0, w);
+        out->B = planInv(s, v);
+        return true;
+    }
+    return false;
+}
+
+// ------------------------------------------------------------------
+// emission (all insert before s->anchor in the preheader)
+// ------------------------------------------------------------------
+
+IrInst* emitAt(Scev* s, IrOpcode op, IrType* ty, IrValue** ops, u32 nops, u64 aux)
+{
+    IrInst* i = s->ctx->createInst(op, ty, ops, nops, aux, 0);
+    s->pre->insertBefore(i, s->anchor);
+    for (u32 k = 0; k < nops; k++)
+        if (ops[k] != null) ops[k]->addUser(i);
+    return i;
+}
+
+IrInst* emitBin(Scev* s, IrOpcode op, IrType* ty, IrValue* a, IrValue* b)
+{
+    IrValue*[2] ops = { a, b };
+    return emitAt(s, op, ty, ops, 2, 0);
+}
+
+IrValue* adaptTo(Scev* s, IrValue* v, IrType* target)
+{
+    u32 vw = v->type != null ? v->type->width : 64;
+    u32 tw = target->width;
+    if (vw == tw) return v;
+    IrOpcode op = tw > vw ? IrOpcode::Zext : IrOpcode::Trunc;
+    IrValue*[1] ops = { v };
+    return &emitAt(s, op, target, ops, 1, 0)->base;
+}
+
+IrValue* emitPlan(Scev* s, Plan* p, IrType* ty, u32 depth)
+{
+    if (p == null || depth > 32) return null;
+    switch (p->kind)
+    {
+        PlanKind::PL_INV => {
+            if (p->v->type != null && p->v->type->width == ty->width) return p->v;
+            return adaptTo(s, p->v, ty);
+        },
+        PlanKind::PL_CONST => {
+            return s->ctx->constInt(ty, p->c & tyMask(ty->width));
+        },
+        PlanKind::PL_ADD => {
+            IrValue* a = emitPlan(s, p->a, ty, depth + 1);
+            IrValue* b = emitPlan(s, p->b, ty, depth + 1);
+            if (a == null || b == null) return null;
+            return &emitBin(s, IrOpcode::Add, ty, a, b)->base;
+        },
+        PlanKind::PL_SUB => {
+            IrValue* a = emitPlan(s, p->a, ty, depth + 1);
+            IrValue* b = emitPlan(s, p->b, ty, depth + 1);
+            if (a == null || b == null) return null;
+            return &emitBin(s, IrOpcode::Sub, ty, a, b)->base;
+        },
+        PlanKind::PL_MUL => {
+            IrValue* a = emitPlan(s, p->a, ty, depth + 1);
+            IrValue* b = emitPlan(s, p->b, ty, depth + 1);
+            if (a == null || b == null) return null;
+            return &emitBin(s, IrOpcode::Mul, ty, a, b)->base;
+        },
+        PlanKind::PL_NEG => {
+            IrValue* a = emitPlan(s, p->a, ty, depth + 1);
+            if (a == null) return null;
+            IrValue* z = s->ctx->constInt(ty, 0);
+            return &emitBin(s, IrOpcode::Sub, ty, z, a)->base;
+        },
+    }
+    return null;
+}
+
+// ------------------------------------------------------------------
+// analysis helpers
+// ------------------------------------------------------------------
+
+u32 blockIdx(Scev* s, IrBlock* b)
+{
+    for (u32 k = 0; k < s->nblocks; k++)
+        if (s->func->blocks[k] == b) return k;
+    return ~0u;
+}
+
+bool blockInLoop(Scev* s, IrBlock* b)
+{
+    u32 i = blockIdx(s, b);
+    return i != ~0u && s->inLoop[i];
+}
+
+bool opAllowed(IrOpcode op)
+{
+    switch (op)
+    {
+        IrOpcode::Phi | IrOpcode::ICmp | IrOpcode::Add | IrOpcode::Sub |
+        IrOpcode::Mul | IrOpcode::Neg | IrOpcode::Not | IrOpcode::And |
+        IrOpcode::Or | IrOpcode::Xor | IrOpcode::Shl | IrOpcode::Lshr |
+        IrOpcode::Ashr | IrOpcode::Select | IrOpcode::Zext | IrOpcode::Sext |
+        IrOpcode::Trunc | IrOpcode::Bitcast | IrOpcode::Br | IrOpcode::CondBr => {
+            return true;
+        },
+        else => { return false; },
+    }
+}
+
+bool phiPair(IrInst* phi, IrBlock* blk, IrValue** valOut)
+{
+    for (u32 k = 0; k + 1 < phi->nops; k += 2)
+    {
+        if (phi->ops[k + 1] == &blk->base)
+        {
+            *valOut = phi->ops[k];
+            return true;
+        }
+    }
+    return false;
+}
+
+void freeLoopScratch(Scev* s)
+{
+    if (s->inLoop != null) { dealloc<bool>(s->inLoop); s->inLoop = null; }
+    if (s->phis != null) { dealloc<IrValue*>(s->phis); s->phis = null; }
+    if (s->affs != null) { dealloc<Affine>(s->affs); s->affs = null; }
+    if (s->updOp != null) { dealloc<IrInst*>(s->updOp); s->updOp = null; }
+    if (s->ivExit != null) { dealloc<IrValue*>(s->ivExit); s->ivExit = null; }
+    if (s->escInst != null) { dealloc<IrInst*>(s->escInst); s->escInst = null; }
+    if (s->escVals != null) { dealloc<IrValue*>(s->escVals); s->escVals = null; }
+    if (s->resInst != null) { dealloc<IrInst*>(s->resInst); s->resInst = null; }
+    if (s->resVal != null) { dealloc<IrValue*>(s->resVal); s->resVal = null; }
+    if (s->plans != null)
+    {
+        for (u32 i = 0; i < s->nplans; i++) dealloc<Plan>(s->plans[i]);
+        dealloc<Plan*>(s->plans);
+        s->plans = null;
+        s->nplans = 0;
+        s->capPlans = 0;
+    }
+}
+
+void scevReset(Scev* s, IrContext* ctx, IrFunc* func)
+{
+    *s = Scev {
+        .ctx = ctx, .func = func, .nblocks = 0,
+        .inLoop = null, .header = null, .latch = null,
+        .pre = null, .exit = null, .ivTy = null, .ivPhi = null,
+        .ivStart = null, .ivStepC = null, .stepSigned = 0,
+        .stepMag = 0, .xpred = IrICmpPred::Eq, .bound = null,
+        .boundIsConst = false, .boundConst = 0, .nsw = false,
+        .phis = null, .affs = null, .updOp = null, .nphi = 0,
+        .ivIdx = ~0u, .ivExit = null,
+        .anchor = null, .tc64 = null, .tri64 = null, .triEmitted = false,
+        .escInst = null, .escVals = null, .nesc = 0, .capEsc = 0,
+        .resInst = null, .resVal = null, .nres = 0, .capRes = 0,
+        .plans = null, .nplans = 0, .capPlans = 0
+    };
+}
+
+// analyze one natural loop; true when eliminated. All failure paths
+// free inLoop and return false; scratch arrays are freed by caller.
+bool tryLoop(Scev* s, IrLoop* lp)
+{
+    IrFunc* func = s->func;
+    IrBlock* header = lp->header;
+    if (header == null || header == func->blocks[0]) return false;
+    if (lp->nblocks < 2) return false;
+
+    s->nblocks = func->nblocks;
+    s->inLoop = alloc<bool>((usize)s->nblocks);
+    for (u32 i = 0; i < s->nblocks; i++) s->inLoop[i] = false;
+    bool bad = false;
+    for (u32 i = 0; i < lp->nblocks; i++)
+    {
+        u32 idx = blockIdx(s, lp->blocks[i]);
+        if (idx == ~0u) { bad = true; break; }
+        s->inLoop[idx] = true;
+    }
+    if (bad) { dealloc<bool>(s->inLoop); s->inLoop = null; return false; }
+
+    // single latch
+    IrBlock* latch = null;
+    u32 nlatch = 0;
+    for (u32 bi = 0; bi < func->nblocks; bi++)
+    {
+        IrBlock* bb = func->blocks[bi];
+        if (!s->inLoop[bi]) continue;
+        for (u32 sj = 0; sj < bb->nsuccs; sj++)
+            if (bb->succs[sj] == header) { nlatch++; latch = bb; }
+    }
+    if (nlatch != 1 || latch == null || latch == header)
+    { dealloc<bool>(s->inLoop); s->inLoop = null; return false; }
+
+    // opcode whitelist
+    for (u32 bi = 0; bi < func->nblocks && !bad; bi++)
+    {
+        if (!s->inLoop[bi]) continue;
+        IrBlock* bb = func->blocks[bi];
+        for (u32 ii = 0; ii < bb->ninsts; ii++)
+            if (!opAllowed(bb->insts[ii]->opcode)) { bad = true; break; }
+    }
+    if (bad) { dealloc<bool>(s->inLoop); s->inLoop = null; return false; }
+
+    // header terminator: CondBr with exactly one in-loop succ
+    if (header->ninsts == 0) { dealloc<bool>(s->inLoop); s->inLoop = null; return false; }
+    IrInst* hterm = header->insts[header->ninsts - 1];
+    if (hterm->opcode != IrOpcode::CondBr || hterm->nops < 3)
+    { dealloc<bool>(s->inLoop); s->inLoop = null; return false; }
+    IrValue* tv = hterm->ops[1];
+    IrValue* ev = hterm->ops[2];
+    if (tv == null || ev == null || tv->kind != IrValueKind::Block || ev->kind != IrValueKind::Block)
+    { dealloc<bool>(s->inLoop); s->inLoop = null; return false; }
+    bool tin = blockInLoop(s, (IrBlock*)tv);
+    bool ein = blockInLoop(s, (IrBlock*)ev);
+    if (tin == ein)
+    { dealloc<bool>(s->inLoop); s->inLoop = null; return false; }
+    IrBlock* inSide = tin ? (IrBlock*)tv : (IrBlock*)ev;
+    IrBlock* outSide = tin ? (IrBlock*)ev : (IrBlock*)tv;
+    // no other exit edges
+    for (u32 bi = 0; bi < func->nblocks && !bad; bi++)
+    {
+        if (!s->inLoop[bi] || func->blocks[bi] == header) continue;
+        IrBlock* bb = func->blocks[bi];
+        for (u32 sj = 0; sj < bb->nsuccs; sj++)
+            if (!blockInLoop(s, bb->succs[sj])) { bad = true; break; }
+    }
+    if (bad) { dealloc<bool>(s->inLoop); s->inLoop = null; return false; }
+    (void)inSide;
+    s->header = header;
+    s->latch = latch;
+    s->exit = outSide;
+
+    // header preds: exactly {pre, latch}
+    if (header->npreds != 2)
+    { dealloc<bool>(s->inLoop); s->inLoop = null; return false; }
+    IrBlock* pre = null;
+    for (u32 pj = 0; pj < header->npreds; pj++)
+    {
+        IrBlock* p = header->preds[pj];
+        if (p == latch) continue;
+        if (blockInLoop(s, p) || pre != null)
+        { dealloc<bool>(s->inLoop); s->inLoop = null; return false; }
+        pre = p;
+    }
+    if (pre == null || pre->nsuccs != 1 || pre->ninsts == 0)
+    { dealloc<bool>(s->inLoop); s->inLoop = null; return false; }
+    IrInst* pterm = pre->insts[pre->ninsts - 1];
+    if (pterm->opcode != IrOpcode::Br || pterm->nops < 1 || pterm->ops[0] != &header->base)
+    { dealloc<bool>(s->inLoop); s->inLoop = null; return false; }
+    s->pre = pre;
+    s->anchor = pterm;
+
+    // header phis: leading run, each exactly (init,pre)+(next,latch)
+    u32 nphi = 0;
+    for (u32 ii = 0; ii < header->ninsts; ii++)
+    {
+        if (header->insts[ii]->opcode != IrOpcode::Phi) break;
+        nphi++;
+    }
+    if (nphi == 0)
+    { dealloc<bool>(s->inLoop); s->inLoop = null; return false; }
+    for (u32 pi = 0; pi < nphi; pi++)
+    {
+        IrInst* phi = header->insts[pi];
+        IrValue* dummy;
+        if (phi->nops != 4 || !phiPair(phi, pre, &dummy) || !phiPair(phi, latch, &dummy))
+        { dealloc<bool>(s->inLoop); s->inLoop = null; return false; }
+    }
+
+    // exit test
+    IrValue* cond = hterm->ops[0];
+    if (cond == null || cond->kind != IrValueKind::Inst)
+    { dealloc<bool>(s->inLoop); s->inLoop = null; return false; }
+    IrInst* cmp = (IrInst*)cond;
+    if (cmp->opcode != IrOpcode::ICmp || cmp->nops != 2)
+    { dealloc<bool>(s->inLoop); s->inLoop = null; return false; }
+    IrValue* lhs = cmp->ops[0];
+    IrValue* rhs = cmp->ops[1];
+    bool lhsPhi = lhs != null && lhs->kind == IrValueKind::Inst &&
+                  ((IrInst*)lhs)->opcode == IrOpcode::Phi && ((IrInst*)lhs)->parent == header;
+    bool rhsPhi = rhs != null && rhs->kind == IrValueKind::Inst &&
+                  ((IrInst*)rhs)->opcode == IrOpcode::Phi && ((IrInst*)rhs)->parent == header;
+    if (lhsPhi == rhsPhi)
+    { dealloc<bool>(s->inLoop); s->inLoop = null; return false; }
+
+    IrValue* ivPhi;
+    IrValue* boundV;
+    IrICmpPred pred = cmp->icmpPred;
+    if (lhsPhi) { ivPhi = lhs; boundV = rhs; }
+    else { ivPhi = rhs; boundV = lhs; pred = swappedPred(pred); }
+    s->ivPhi = ivPhi;
+    s->bound = boundV;
+    s->xpred = pred;
+    if (!isInvariant(s, boundV))
+    { dealloc<bool>(s->inLoop); s->inLoop = null; return false; }
+    if (boundV->kind == IrValueKind::ConstInt)
+    {
+        s->boundIsConst = true;
+        s->boundConst = boundV->valData;
+    }
+    if (!isIntTy(ivPhi->type))
+    { dealloc<bool>(s->inLoop); s->inLoop = null; return false; }
+    s->ivTy = ivPhi->type;
+
+    // iv update
+    IrInst* ivPhiI = (IrInst*)ivPhi;
+    IrValue* ivNext = null;
+    if (!phiPair(ivPhiI, latch, &ivNext) || ivNext == null || ivNext->kind != IrValueKind::Inst)
+    { dealloc<bool>(s->inLoop); s->inLoop = null; return false; }
+    IrInst* ivUpd = (IrInst*)ivNext;
+    if ((ivUpd->opcode != IrOpcode::Add && ivUpd->opcode != IrOpcode::Sub) || ivUpd->nops != 2)
+    { dealloc<bool>(s->inLoop); s->inLoop = null; return false; }
+    IrValue* stepV = null;
+    bool ivIsOps0 = ivUpd->ops[0] == ivPhi;
+    bool ivIsOps1 = ivUpd->ops[1] == ivPhi;
+    if (ivIsOps0 && !ivIsOps1) stepV = ivUpd->ops[1];
+    else if (ivIsOps1 && !ivIsOps0) stepV = ivUpd->ops[0];
+    else { dealloc<bool>(s->inLoop); s->inLoop = null; return false; } // iv+iv or neither
+    u32 w = ivPhi->type->width;
+    u64 wmask = tyMask(w);
+    u64 stepBits;
+    if (ivUpd->opcode == IrOpcode::Sub)
+    {
+        // only iv - const is a recurrence (const - iv is not)
+        if (!ivIsOps0 || stepV == null || stepV->kind != IrValueKind::ConstInt)
+        { dealloc<bool>(s->inLoop); s->inLoop = null; return false; }
+        stepBits = (0 - (stepV->valData & wmask)) & wmask;
+    }
+    else
+    {
+        if (stepV == null || stepV->kind != IrValueKind::ConstInt)
+        { dealloc<bool>(s->inLoop); s->inLoop = null; return false; }
+        stepBits = stepV->valData & wmask;
+    }
+    if (stepBits == 0)
+    { dealloc<bool>(s->inLoop); s->inLoop = null; return false; }
+    s->stepSigned = sextVal(stepBits, w);
+    s->stepMag = stepBits;
+    s->nsw = ivUpd->hasNsw();
+    s->ivStepC = s->ctx->constInt(ivPhi->type, stepBits);
+    if (!phiPair(ivPhiI, pre, &s->ivStart) || s->ivStart == null)
+    { dealloc<bool>(s->inLoop); s->inLoop = null; return false; }
+
+    // per-predicate legality
+    switch (pred)
+    {
+        IrICmpPred::Ne => {
+            if (stepBits != 1 && stepBits != wmask)
+            { dealloc<bool>(s->inLoop); s->inLoop = null; return false; }
+        },
+        IrICmpPred::Ult | IrICmpPred::Ule => {
+            if (s->stepSigned <= 0)
+            { dealloc<bool>(s->inLoop); s->inLoop = null; return false; }
+            if (pred == IrICmpPred::Ule &&
+                !(s->boundIsConst && (s->boundConst & wmask) != wmask))
+            { dealloc<bool>(s->inLoop); s->inLoop = null; return false; }
+            if (stepBits != 1)
+            {
+                if (!s->boundIsConst)
+                { dealloc<bool>(s->inLoop); s->inLoop = null; return false; }
+                u64 b = s->boundConst & wmask;
+                if (b != 0)
+                {
+                    u64 limit = wmask - b + 1; // 2^w - b, fits since b > 0
+                    if (stepBits > limit)
+                    { dealloc<bool>(s->inLoop); s->inLoop = null; return false; }
+                }
+            }
+        },
+        IrICmpPred::Ugt => {
+            if (s->stepSigned >= 0)
+            { dealloc<bool>(s->inLoop); s->inLoop = null; return false; }
+            u64 sm = (0 - stepBits) & wmask;
+            s->stepMag = sm;
+            if (sm != 1)
+            {
+                if (!s->boundIsConst)
+                { dealloc<bool>(s->inLoop); s->inLoop = null; return false; }
+                u64 b = s->boundConst & wmask;
+                if (sm > b + 1)
+                { dealloc<bool>(s->inLoop); s->inLoop = null; return false; }
+            }
+        },
+        IrICmpPred::Slt | IrICmpPred::Sle => {
+            if (!s->nsw || s->stepSigned <= 0)
+            { dealloc<bool>(s->inLoop); s->inLoop = null; return false; }
+            if (pred == IrICmpPred::Sle)
+            {
+                if (!s->boundIsConst)
+                { dealloc<bool>(s->inLoop); s->inLoop = null; return false; }
+                i64 bv = sextVal(s->boundConst & wmask, w);
+                if (bv == sextVal(wmask, w))
+                { dealloc<bool>(s->inLoop); s->inLoop = null; return false; }
+            }
+        },
+        IrICmpPred::Sgt => {
+            if (!s->nsw || s->stepSigned >= 0)
+            { dealloc<bool>(s->inLoop); s->inLoop = null; return false; }
+            u64 sm = (0 - stepBits) & wmask;
+            s->stepMag = sm == 0 ? 1 : sm;
+        },
+        else => { dealloc<bool>(s->inLoop); s->inLoop = null; return false; },
+    }
+
+    // phi analysis
+    s->nphi = nphi;
+    s->ivIdx = ~0u;
+    s->phis = alloc<IrValue*>((usize)nphi);
+    s->affs = alloc<Affine>((usize)nphi);
+    s->updOp = alloc<IrInst*>((usize)nphi);
+    s->ivExit = alloc<IrValue*>((usize)nphi);
+    for (u32 i = 0; i < nphi; i++) s->ivExit[i] = null;
+    for (u32 pi = 0; pi < nphi; pi++)
+    {
+        IrInst* phi = header->insts[pi];
+        IrValue* pv = &phi->base;
+        s->phis[pi] = pv;
+        IrValue* nxt = null;
+        if (!phiPair(phi, latch, &nxt) || nxt == null || nxt->kind != IrValueKind::Inst)
+        { freeLoopScratch(s); return false; }
+        IrInst* upd = (IrInst*)nxt;
+        s->updOp[pi] = upd;
+        if (pv == ivPhi)
+        {
+            s->ivIdx = pi;
+            continue;
+        }
+        if (!isIntTy(pv->type)) { freeLoopScratch(s); return false; }
+        if ((upd->opcode != IrOpcode::Add && upd->opcode != IrOpcode::Sub) || upd->nops != 2)
+        { freeLoopScratch(s); return false; }
+        IrValue* e = null;
+        if (upd->ops[0] == pv && upd->ops[1] != null) e = upd->ops[1];
+        else if (upd->opcode == IrOpcode::Add && upd->ops[1] == pv && upd->ops[0] != null) e = upd->ops[0];
+        if (e == null) { freeLoopScratch(s); return false; }
+        Affine af;
+        af.A = null; af.B = null;
+        if (!affineExtract(s, e, &af, 0)) { freeLoopScratch(s); return false; }
+        if (!planIsZero(af.A) && pv->type->width != ivPhi->type->width)
+        { freeLoopScratch(s); return false; }
+        s->affs[pi] = af;
+    }
+    if (s->ivIdx == ~0u) { freeLoopScratch(s); return false; }
+
+    // escapee scan: in-loop values used outside
+    s->capEsc = 16;
+    s->escInst = alloc<IrInst*>((usize)s->capEsc);
+    s->escVals = alloc<IrValue*>((usize)s->capEsc);
+    s->nesc = 0;
+    for (u32 bi = 0; bi < func->nblocks; bi++)
+    {
+        if (s->inLoop[bi]) continue;
+        IrBlock* bb = func->blocks[bi];
+        for (u32 ii = 0; ii < bb->ninsts; ii++)
+        {
+            IrInst* u = bb->insts[ii];
+            for (u32 oi = 0; oi < u->nops; oi++)
+            {
+                IrValue* op = u->ops[oi];
+                if (op == null || op->kind != IrValueKind::Inst) continue;
+                IrInst* opi = (IrInst*)op;
+                if (opi->parent == null) continue;
+                u32 pidx = blockIdx(s, opi->parent);
+                if (pidx == ~0u || !s->inLoop[pidx]) continue;
+                // only header values are resolvable (header runs every iter)
+                if (opi->parent != header) { freeLoopScratch(s); return false; }
+                bool dup = false;
+                for (u32 e = 0; e < s->nesc; e++)
+                    if (s->escInst[e] == opi) { dup = true; break; }
+                if (dup) continue;
+                if (s->nesc >= s->capEsc)
+                {
+                    u32 nc = s->capEsc * 2;
+                    IrInst** ni = alloc<IrInst*>((usize)nc);
+                    IrValue** nv = alloc<IrValue*>((usize)nc);
+                    for (u32 e = 0; e < s->nesc; e++) { ni[e] = s->escInst[e]; nv[e] = s->escVals[e]; }
+                    dealloc<IrInst*>(s->escInst);
+                    dealloc<IrValue*>(s->escVals);
+                    s->escInst = ni;
+                    s->escVals = nv;
+                    s->capEsc = nc;
+                }
+                s->escInst[s->nesc] = opi;
+                s->escVals[s->nesc] = null;
+                s->nesc++;
+            }
+        }
+    }
+
+    // ================= EMISSION =================
+    s->tc64 = null;
+    s->tri64 = null;
+    s->triEmitted = false;
+    s->capRes = 16;
+    s->resInst = alloc<IrInst*>((usize)s->capRes);
+    s->resVal = alloc<IrValue*>((usize)s->capRes);
+    s->nres = 0;
+
+    IrType* i64ty = s->ctx->tyInt(64);
+    IrValue* zero64 = s->ctx->constInt(i64ty, 0);
+    IrValue* one64 = s->ctx->constInt(i64ty, 1);
+
+    IrValue* start64 = adaptTo(s, s->ivStart, i64ty);
+    IrValue* bound64 = adaptTo(s, s->bound, i64ty);
+    bool down = (pred == IrICmpPred::Ugt || pred == IrICmpPred::Sgt ||
+                 (pred == IrICmpPred::Ne && s->stepSigned < 0));
+    IrValue* d64;
+    {
+        IrValue* hi = down ? start64 : bound64;
+        IrValue* lo = down ? bound64 : start64;
+        IrValue*[2] ops = { hi, lo };
+        d64 = &emitAt(s, IrOpcode::Sub, i64ty, ops, 2, 0)->base;
+    }
+
+    IrValue* tc;
+    if (pred == IrICmpPred::Ne)
+    {
+        tc = d64; // exact mod 2^w, no guard needed
+    }
+    else
+    {
+        u64 m = s->stepMag;
+        IrValue* mc = s->ctx->constInt(i64ty, m);
+        IrValue* q = &emitBin(s, IrOpcode::UDiv, i64ty, d64, mc)->base;
+        IrValue* r = &emitBin(s, IrOpcode::URem, i64ty, d64, mc)->base;
+        IrValue*[2] cops = { r, zero64 };
+        IrInst* ne = emitAt(s, IrOpcode::ICmp, s->ctx->tyInt(1), cops, 2, (u64)IrICmpPred::Ne);
+        IrValue*[3] sops = { &ne->base, one64, zero64 };
+        IrValue* inc = &emitAt(s, IrOpcode::Select, i64ty, sops, 3, 0)->base;
+        IrValue* ceil = &emitBin(s, IrOpcode::Add, i64ty, q, inc)->base;
+        if (pred == IrICmpPred::Ule || pred == IrICmpPred::Sle)
+        {
+            // floor(D/m)+1 — the ceil result stays dead (ADCE removes)
+            tc = &emitBin(s, IrOpcode::Add, i64ty, q, one64)->base;
+        }
+        else tc = ceil;
+        // zero-trip guard in iv type on (start, bound)
+        IrValue*[2] gops = { s->ivStart, s->bound };
+        IrInst* gi = emitAt(s, IrOpcode::ICmp, s->ctx->tyInt(1), gops, 2, (u64)s->xpred);
+        IrValue*[3] gsops = { &gi->base, tc, zero64 };
+        tc = &emitAt(s, IrOpcode::Select, i64ty, gsops, 3, 0)->base;
+    }
+    s->tc64 = tc;
+
+    // per-phi exit values
+    for (u32 pi = 0; pi < s->nphi; pi++)
+    {
+        IrValue* pv = s->phis[pi];
+        IrType* pty = pv->type;
+        IrValue* init = null;
+        phiPair((IrInst*)pv, pre, &init);
+        if (init == null) { freeLoopScratch(s); return false; }
+        if (pi == s->ivIdx)
+        {
+            IrValue* tca = adaptTo(s, tc, pty);
+            IrValue* stepA = adaptTo(s, s->ivStepC, pty);
+            IrValue* m = &emitBin(s, IrOpcode::Mul, pty, stepA, tca)->base;
+            s->ivExit[pi] = &emitBin(s, IrOpcode::Add, pty, s->ivStart, m)->base;
+            continue;
+        }
+        Affine* af = &s->affs[pi];
+        IrValue* sumE;
+        if (planIsZero(af->A))
+        {
+            IrValue* be = emitPlan(s, af->B, pty, 0);
+            IrValue* tca = adaptTo(s, tc, pty);
+            sumE = &emitBin(s, IrOpcode::Mul, pty, tca, be)->base;
+        }
+        else
+        {
+            if (!s->triEmitted)
+            {
+                IrValue* t1 = &emitBin(s, IrOpcode::Sub, i64ty, tc, one64)->base;
+                IrValue*[2] sh1 = { tc, one64 };
+                IrValue* tcSh = &emitAt(s, IrOpcode::Lshr, i64ty, sh1, 2, 0)->base;
+                IrValue* ev = &emitBin(s, IrOpcode::Mul, i64ty, tcSh, t1)->base;
+                IrValue*[2] sh2 = { t1, one64 };
+                IrValue* t1Sh = &emitAt(s, IrOpcode::Lshr, i64ty, sh2, 2, 0)->base;
+                IrValue* od = &emitBin(s, IrOpcode::Mul, i64ty, tc, t1Sh)->base;
+                IrValue* and1 = &emitBin(s, IrOpcode::And, i64ty, tc, one64)->base;
+                IrValue*[2] ncops = { and1, zero64 };
+                IrInst* ne2 = emitAt(s, IrOpcode::ICmp, s->ctx->tyInt(1), ncops, 2, (u64)IrICmpPred::Ne);
+                IrValue*[3] tsops = { &ne2->base, od, ev };
+                s->tri64 = &emitAt(s, IrOpcode::Select, i64ty, tsops, 3, 0)->base;
+                s->triEmitted = true;
+            }
+            IrValue* ae = emitPlan(s, af->A, pty, 0);
+            IrValue* be = emitPlan(s, af->B, pty, 0);
+            IrValue* startA = adaptTo(s, s->ivStart, pty);
+            IrValue* stepA = adaptTo(s, s->ivStepC, pty);
+            IrValue* pa = &emitBin(s, IrOpcode::Mul, pty, ae, startA)->base;
+            IrValue* p_ = &emitBin(s, IrOpcode::Add, pty, pa, be)->base;
+            IrValue* q_ = &emitBin(s, IrOpcode::Mul, pty, ae, stepA)->base;
+            IrValue* tca = adaptTo(s, tc, pty);
+            IrValue* tria = adaptTo(s, s->tri64, pty);
+            IrValue* s1 = &emitBin(s, IrOpcode::Mul, pty, tca, p_)->base;
+            IrValue* s2 = &emitBin(s, IrOpcode::Mul, pty, q_, tria)->base;
+            sumE = &emitBin(s, IrOpcode::Add, pty, s1, s2)->base;
+        }
+        if (s->updOp[pi]->opcode == IrOpcode::Add)
+            s->ivExit[pi] = &emitBin(s, IrOpcode::Add, pty, init, sumE)->base;
+        else
+            s->ivExit[pi] = &emitBin(s, IrOpcode::Sub, pty, init, sumE)->base;
+    }
+
+    // resolve escaping values
+    for (u32 e = 0; e < s->nesc; e++)
+    {
+        IrValue* r = resolveEmit(s, &s->escInst[e]->base, 0);
+        if (r == null) { freeLoopScratch(s); return false; }
+        s->escVals[e] = r;
+    }
+
+    // ================= REWIRE =================
+    for (u32 e = 0; e < s->nesc; e++)
+    {
+        IrInst* src = s->escInst[e];
+        IrValue* rv = s->escVals[e];
+        u32 nu = src->base.nusers;
+        IrInst** users = alloc<IrInst*>((usize)(nu > 0 ? nu : 1));
+        for (u32 i = 0; i < nu; i++) users[i] = src->base.users[i];
+        for (u32 ui = 0; ui < nu; ui++)
+        {
+            IrInst* u = users[ui];
+            if (u == null || u->parent == null) continue;
+            u32 pidx = blockIdx(s, u->parent);
+            if (pidx != ~0u && s->inLoop[pidx]) continue;
+            for (u32 oi = 0; oi < u->nops; oi++)
+            {
+                if (u->ops[oi] != &src->base) continue;
+                u->ops[oi] = rv;
+                src->base.removeUser(u);
+                rv->addUser(u);
+            }
+        }
+        dealloc<IrInst*>(users);
+    }
+
+    // exit-block phis: pairs (resolved, header) became dead-edge after
+    // the retarget below isn't done yet — header still lists exit as
+    // succ, so the pair is consistent; append (resolved, pre).
+    for (u32 ii = 0; ii < s->exit->ninsts; ii++)
+    {
+        IrInst* phi = s->exit->insts[ii];
+        if (phi->opcode != IrOpcode::Phi) break;
+        for (u32 k = 0; k + 1 < phi->nops; k += 2)
+        {
+            if (phi->ops[k + 1] != &header->base) continue;
+            IrValue* rv = phi->ops[k];
+            if (phi->nops + 2 > phi->capOps)
+            {
+                u32 nc = phi->capOps ? phi->capOps * 2 : 8;
+                while (nc < phi->nops + 2) nc *= 2;
+                IrValue** no = alloc<IrValue*>((usize)nc);
+                for (u32 q = 0; q < phi->nops; q++) no[q] = phi->ops[q];
+                if (phi->capOps > 0) dealloc<IrValue*>(phi->ops);
+                phi->ops = no;
+                phi->capOps = nc;
+            }
+            phi->ops[phi->nops] = rv;
+            phi->ops[phi->nops + 1] = &pre->base;
+            phi->nops += 2;
+            rv->addUser(phi);
+            (&pre->base)->addUser(phi);
+            break;
+        }
+    }
+
+    // retarget preheader terminator
+    pterm->ops[0] = &s->exit->base;
+    (&s->exit->base)->addUser(pterm);
+    (&header->base)->removeUser(pterm);
+    for (u32 sj = 0; sj < pre->nsuccs; sj++)
+        if (pre->succs[sj] == header) { pre->succs[sj] = s->exit; break; }
+    header->removePred(pre);
+    s->exit->addPred(pre);
+
+    // drop exit-phi pairs that came from in-loop blocks — those edges
+    // are gone once the loop blocks are deleted
+    for (u32 ii = 0; ii < s->exit->ninsts; ii++)
+    {
+        IrInst* phi = s->exit->insts[ii];
+        if (phi->opcode != IrOpcode::Phi) break;
+        u32 w = 0;
+        for (u32 k = 0; k + 1 < phi->nops; k += 2)
+        {
+            IrValue* bv = phi->ops[k + 1];
+            bool drop = false;
+            if (bv != null && bv->kind == IrValueKind::Block)
+            {
+                u32 pidx = blockIdx(s, (IrBlock*)bv);
+                drop = pidx != ~0u && s->inLoop[pidx];
+            }
+            if (drop)
+            {
+                if (phi->ops[k] != null) phi->ops[k]->removeUser(phi);
+                if (bv != null) bv->removeUser(phi);
+                continue;
+            }
+            phi->ops[w] = phi->ops[k];
+            phi->ops[w + 1] = phi->ops[k + 1];
+            w += 2;
+        }
+        phi->nops = w;
+    }
+
+    // delete the dead loop subgraph
+    {
+        IrBlock** dead = alloc<IrBlock*>((usize)lp->nblocks);
+        u32 nd = 0;
+        for (u32 i = 0; i < lp->nblocks; i++) dead[nd++] = lp->blocks[i];
+        for (u32 i = 0; i < nd; i++)
+        {
+            IrBlock* db = dead[i];
+            for (u32 j = 0; j < db->ninsts; j++)
+                if (db->insts[j] != null) db->insts[j]->detach();
+        }
+        for (u32 i = 0; i < nd; i++)
+            func->removeBlock(dead[i]);
+        dealloc<IrBlock*>(dead);
+    }
+
+    dealloc<bool>(s->inLoop);
+    s->inLoop = null;
+    return true;
+}
+
+// recursive exit-value resolver; emits the rebuilt expression in the
+// preheader. Header phis map to their exit values; header insts are
+// rebuilt from resolved operands; anything else must be invariant.
+IrValue* resolveEmit(Scev* s, IrValue* v, u32 depth)
+{
+    if (v == null || depth > 48) return null;
+    if (v->kind != IrValueKind::Inst) return v;
+    IrInst* i = (IrInst*)v;
+    if (i->parent == null) return v;
+    u32 pidx = blockIdx(s, i->parent);
+    if (pidx == ~0u || !s->inLoop[pidx]) return v;
+    if (i->parent != s->header) return null; // body/latch values unsafe
+
+    if (i->opcode == IrOpcode::Phi)
+    {
+        for (u32 pi = 0; pi < s->nphi; pi++)
+            if (s->phis[pi] == v) return s->ivExit[pi];
+        return null;
+    }
+
+    // memo hits: escapees and previously rebuilt insts
+    for (u32 e = 0; e < s->nesc; e++)
+        if (s->escInst[e] == i && s->escVals[e] != null) return s->escVals[e];
+    for (u32 e = 0; e < s->nres; e++)
+        if (s->resInst[e] == i) return s->resVal[e];
+
+    IrValue** ops = alloc<IrValue*>((usize)(i->nops > 0 ? i->nops : 1));
+    bool ok = true;
+    for (u32 oi = 0; oi < i->nops; oi++)
+    {
+        ops[oi] = resolveEmit(s, i->ops[oi], depth + 1);
+        if (ops[oi] == null) { ok = false; break; }
+    }
+    if (!ok) { dealloc<IrValue*>(ops); return null; }
+    u64 aux = i->opcode == IrOpcode::ICmp ? (u64)i->icmpPred : 0;
+    IrInst* ni = emitAt(s, i->opcode, i->base.type, ops, i->nops, aux);
+    dealloc<IrValue*>(ops);
+    IrValue* r = &ni->base;
+    if (s->nres >= s->capRes)
+    {
+        u32 nc = s->capRes * 2;
+        IrInst** ni2 = alloc<IrInst*>((usize)nc);
+        IrValue** nv2 = alloc<IrValue*>((usize)nc);
+        for (u32 e = 0; e < s->nres; e++) { ni2[e] = s->resInst[e]; nv2[e] = s->resVal[e]; }
+        dealloc<IrInst*>(s->resInst);
+        dealloc<IrValue*>(s->resVal);
+        s->resInst = ni2;
+        s->resVal = nv2;
+        s->capRes = nc;
+    }
+    s->resInst[s->nres] = i;
+    s->resVal[s->nres] = r;
+    s->nres++;
+    return r;
+}
+
+// ------------------------------------------------------------------
+
+pub struct ScalarEvolutionPass
+{
+    IrContext* ctx;
+    u64 eliminated;
+
+    ScalarEvolutionPass new(IrContext* ctx)
+    {
+        return ScalarEvolutionPass { .ctx = ctx, .eliminated = 0 };
+    }
+
+    bool run(IrFunc* func)
+    {
+        self.eliminated = 0;
+        bool changed = false;
+        u32 rounds = 0;
+        while (rounds < 32)
+        {
+            rounds++;
+            bool did = false;
+            IrLoop** loops = irLoopDetectNatural(func);
+            for (u32 li = 0; loops[li] != null; li++)
+            {
+                Scev s;
+                scevReset(&s, self.ctx, func);
+                if (tryLoop(&s, loops[li]))
+                {
+                    self.eliminated++;
+                    changed = true;
+                    did = true;
+                }
+                freeLoopScratch(&s);
+                if (did) break;
+            }
+            irLoopDestroy(loops);
+            if (!did) break;
+        }
+        return changed;
+    }
+}
+
+pub bool muvmPassScalarEvolution(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (ctx == null || func == null) return false;
+    ScalarEvolutionPass pass = ScalarEvolutionPass::new(ctx);
+    return pass.run(func);
+}

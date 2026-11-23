@@ -1,0 +1,1236 @@
+#[[no_drop_all]]
+// DWARF5 .debug_line generation for the x86-64 assembler.
+//
+// GNU as collects `.loc` directives while assembling code and turns them
+// into a DWARF line-number program inside `.debug_line`. This module does
+// the same: .loc entries are recorded per pass into AsmObject.lstate and
+// flushed as one unit whenever the assembler leaves the `.debug_line`
+// section (so `.Ldebug_lineN:` labels land at each unit's start), or at
+// end of input. `.file N "dir" "name"` entries feed the file-name table;
+// strings are appended to `.debug_line_str` and referenced through
+// DW_FORM_line_strp relocations, matching gas output.
+//
+// Header layout emitted (DWARF32, version 5):
+//   unit_length u32 | version u16=5 | address_size u8=8 |
+//   segment_selector_size u8=0 | header_length u32 |
+//   min_inst_len u8=1 | max_ops u8=1 | default_is_stmt u8=1 |
+//   line_base i8=-5 | line_range u8=14 | opcode_base u8=13 |
+//   std_opcode_lengths[12] | directory formats | directories |
+//   file-name formats | file_names | line program
+
+import std::mman { alloc, dealloc, realloc, zero };
+import std::string { str };
+import platform::libc { free };
+import muvm::assembly::common { AsmLexer, AsmParseError };
+import muvm::assembly::x86::common { AsmBytes };
+import muvm::assembly::x86::obj {
+    AsmObject, AsmRelocKind, AsmLineState, AsmLineEnt, AsmLineFile,
+    AsmCfiEnt,
+    asmAddReloc, asmFindOrAddSym,
+    asmSecData, asmSecSize, asmSecName, asmSecAlignPtr,
+    asmFindXSection, asmAddXSection
+};
+
+const u8 DW_LNCT_path = 0x01;
+const u8 DW_LNCT_directory_index = 0x02;
+const u8 DW_FORM_line_strp = 0x1f;
+const u8 DW_FORM_udata = 0x0f;
+
+pub AsmLineState* asmLineState(AsmObject* o)
+{
+    if (o->lstate == null)
+    {
+        o->lstate = alloc<AsmLineState>(1);
+        if (o->lstate != null) zero<AsmLineState>(o->lstate, 1);
+    }
+    return o->lstate;
+}
+
+str dlDup(str s)
+{
+    u8* b = alloc<u8>((usize)(s.len + 1));
+    if (b == null) return "";
+    for (usize i = 0; i < s.len; i++) b[i] = s.ptr[i];
+    b[s.len] = 0;
+    return str::fromParts((const u8*)b, s.len);
+}
+
+bool asmLineAddEnt(AsmObject* o, AsmLineEnt* e)
+{
+    AsmLineState* s = asmLineState(o);
+    if (s->nents >= s->ecap)
+    {
+        u32 ncap = s->ecap == 0 ? 256 : s->ecap * 2;
+        AsmLineEnt* ne = realloc<AsmLineEnt>(s->ents, (usize)ncap);
+        if (ne == null) return false;
+        s->ents = ne;
+        s->ecap = ncap;
+    }
+    s->ents[s->nents] = *e;
+    s->nents++;
+    return true;
+}
+
+i32 asmLineFindDir(AsmLineState* s, str d)
+{
+    for (u32 i = 0; i < s->ndirs; i++)
+    {
+        if (s->dirs[i].equals(d)) return (i32)i;
+    }
+    return -1;
+}
+
+i32 asmLineAddDir(AsmLineState* s, str d)
+{
+    i32 f = asmLineFindDir(s, d);
+    if (f >= 0) return f;
+    if (s->ndirs >= s->dcap)
+    {
+        u32 ncap = s->dcap == 0 ? 16 : s->dcap * 2;
+        str* nd = realloc<str>(s->dirs, (usize)ncap);
+        if (nd == null) return -1;
+        s->dirs = nd;
+        s->dcap = ncap;
+    }
+    s->dirs[s->ndirs] = d;
+    return (i32)s->ndirs++;
+}
+
+// `.file N "dir" "name"` / `.file N "name"` — numbered entries only; the
+// unnumbered form is ignored by gas and we match that.
+pub bool asmLineFile(AsmObject* o, str dargs, AsmParseError* err)
+{
+    AsmLexer lx = AsmLexer::new(dargs, err->lineNo);
+    i64 num = -1;
+    lx.skipSpace();
+    if (lx.done() || lx.peek() == (u8)'"')
+    {
+        return true; // `.file "name"` unnumbered: ignored like gas
+    }
+    if (!lx.lexNumber(&num) || num < 0)
+    {
+        err->msg = "bad .file directive";
+        return false;
+    }
+    str s1 = "";
+    str s2 = "";
+    bool have1 = false;
+    bool have2 = false;
+    AsmParseError le = AsmParseError { .msg = "", .lineNo = 0 };
+    if (!lx.lexQuoted(&s1, &le))
+    {
+        err->msg = "bad .file string";
+        return false;
+    }
+    have1 = true;
+    lx.skipSpace();
+    if (!lx.done() && lx.peek() == (u8)'"')
+    {
+        s2 = s1;
+        have2 = true;
+        if (!lx.lexQuoted(&s1, &le))
+        {
+            err->msg = "bad .file string";
+            free(s2.ptr);
+            return false;
+        }
+    }
+    // one string -> name; two strings -> first=dir second=name
+    str dirStr = have2 ? s2 : "";
+    str nameStr = s1;
+
+    AsmLineState* st = asmLineState(o);
+    i32 didx = -1;
+    u32 fi = (u32)num;
+    bool ok = true;
+    if (!dirStr.isEmpty())
+    {
+        str dc = dlDup(dirStr);
+        didx = asmLineAddDir(st, dc);
+        if (didx < 0) { err->msg = "out of memory"; ok = false; }
+    }
+    if (ok && fi >= st->fcap)
+    {
+        u32 ncap = st->fcap == 0 ? 16 : st->fcap;
+        while (ncap <= fi) ncap *= 2;
+        AsmLineFile* nf = realloc<AsmLineFile>(st->files, (usize)ncap);
+        if (nf == null) { err->msg = "out of memory"; ok = false; }
+        else
+        {
+            for (u32 i = st->fcap; i < ncap; i++)
+            {
+                nf[i] = AsmLineFile { .name = "", .dir = -2 };
+            }
+            st->files = nf;
+            st->fcap = ncap;
+        }
+    }
+    if (ok)
+    {
+        str nc = dlDup(nameStr);
+        st->files[fi] = AsmLineFile { .name = nc, .dir = didx };
+        if (fi >= st->nfiles) st->nfiles = fi + 1;
+    }
+    if (have1) free(s1.ptr);
+    if (have2) free(s2.ptr);
+    return ok;
+}
+
+// `.loc filenum line [col] [opts...] [view NAME]`
+pub bool asmLineLoc(AsmObject* o, i32 sec, str dargs, AsmParseError* err)
+{
+    AsmLexer lx = AsmLexer::new(dargs, err->lineNo);
+    i64 fnum = 0;
+    i64 lnum = 0;
+    i64 col = -1;
+    if (!lx.lexNumber(&fnum) || !lx.lexNumber(&lnum))
+    {
+        err->msg = "bad .loc directive";
+        return false;
+    }
+    // optional column: a third leading number before any keyword
+    {
+        usize save = lx.pos;
+        if (!lx.lexNumber(&col))
+        {
+            lx.pos = save;
+            col = -1;
+        }
+    }
+
+    AsmLineEnt e = AsmLineEnt {
+        .sec = sec, .off = asmSecSize(o, sec),
+        .file = (i32)fnum, .line = lnum, .col = col,
+        .isStmt = -1, .flags = 0, .discrim = -1, .isa = -1,
+        .secB = 0, .offB = 0
+    };
+    AsmLineState* st = asmLineState(o);
+
+    // pending sequence break from .cfi_endproc
+    if (st->brkPending)
+    {
+        AsmLineEnt b = AsmLineEnt {
+            .sec = -1, .off = 0, .file = 0, .line = 0, .col = -1,
+            .isStmt = -1, .flags = 0, .discrim = -1, .isa = -1,
+            .secB = st->brkSec, .offB = st->brkOff
+        };
+        if (!asmLineAddEnt(o, &b)) { err->msg = "out of memory"; return false; }
+        st->brkPending = false;
+    }
+
+    // keyword options
+    while (!lx.done())
+    {
+        lx.skipSpace();
+        if (lx.done()) break;
+        str kw = lx.lexIdent();
+        if (kw.isEmpty()) { lx.pos++; continue; }
+        if (kw.equals("is_stmt"))
+        {
+            i64 v = 0;
+            if (!lx.lexNumber(&v)) { err->msg = "bad .loc is_stmt"; return false; }
+            e.isStmt = v;
+        }
+        else if (kw.equals("discriminator"))
+        {
+            i64 v = 0;
+            if (!lx.lexNumber(&v)) { err->msg = "bad .loc discriminator"; return false; }
+            e.discrim = v;
+        }
+        else if (kw.equals("isa"))
+        {
+            i64 v = 0;
+            if (!lx.lexNumber(&v)) { err->msg = "bad .loc isa"; return false; }
+            e.isa = v;
+        }
+        else if (kw.equals("prologue_end")) { e.flags |= 1; }
+        else if (kw.equals("epilogue_begin")) { e.flags |= 2; }
+        else if (kw.equals("basic_block")) { e.flags |= 4; }
+        else if (kw.equals("view"))
+        {
+            lx.skipSpace();
+            usize vs = lx.pos;
+            while (lx.pos < dargs.len &&
+                   dargs.ptr[lx.pos] != (u8)' ' && dargs.ptr[lx.pos] != (u8)'\t' &&
+                   dargs.ptr[lx.pos] != (u8)',' && dargs.ptr[lx.pos] != (u8)'#') lx.pos++;
+            str vn = str::fromParts(dargs.ptr + vs, lx.pos - vs);
+            // gas treats view -0/-1 as "no view"; real labels get defined
+            if (vn.len > 0 && vn.ptr[0] != (u8)'-')
+            {
+                i32 vi = asmFindOrAddSym(o, vn);
+                if (vi < 0) { err->msg = "too many symbols"; return false; }
+                o->syms[vi].defined = true;
+                o->syms[vi].value = asmSecSize(o, sec);
+                o->syms[vi].section = sec;
+            }
+        }
+        else
+        {
+            // unknown keyword: skip a following bare number if present
+            i64 dummy = 0;
+            lx.lexNumber(&dummy);
+        }
+    }
+
+    if (!asmLineAddEnt(o, &e)) { err->msg = "out of memory"; return false; }
+    return true;
+}
+
+// called on .cfi_endproc: the next .loc (or end of input) closes the
+// current line sequence at the current section offset
+pub void asmLineEndProc(AsmObject* o, i32 sec)
+{
+    AsmLineState* st = asmLineState(o);
+    st->brkPending = true;
+    st->brkSec = sec;
+    st->brkOff = asmSecSize(o, sec);
+}
+
+// ------------------------------------------------------------------
+// program emission
+// ------------------------------------------------------------------
+
+bool dlU8(AsmBytes* b, u8 v) { return b->u8b(v); }
+bool dlU16(AsmBytes* b, u16 v) { return b->u16b(v); }
+bool dlU32(AsmBytes* b, u32 v) { return b->u32b(v); }
+bool dlImm(AsmBytes* b, i64 v, u32 n) { return b->immv(v, n); }
+
+bool dlUleb(AsmBytes* b, u64 v)
+{
+    while (v >= 0x80)
+    {
+        if (!b->u8b((u8)((v & 0x7F) | 0x80))) return false;
+        v >>= 7;
+    }
+    return b->u8b((u8)v);
+}
+
+u32 dlUlebLen(u64 v)
+{
+    u32 n = 1;
+    while (v >= 0x80) { v >>= 7; n++; }
+    return n;
+}
+
+bool dlSleb(AsmBytes* b, i64 v)
+{
+    bool more = true;
+    while (more)
+    {
+        u8 byte = (u8)(v & 0x7F);
+        v >>= 7;
+        if ((v == 0 && (byte & 0x40) == 0) || (v == -1 && (byte & 0x40) != 0))
+            more = false;
+        else
+            byte |= 0x80;
+        if (!b->u8b(byte)) return false;
+    }
+    return true;
+}
+
+// find or create the anchor symbol used for set_address relocs: one per
+// section at offset 0, so R_*_64 + addend=offset yields the address
+i32 dlAnchor(AsmObject* o, i32 sec)
+{
+    u8[40] nm;
+    usize p = 0;
+    str pre = ".Ldl_";
+    while (pre.ptr[p] != 0) { nm[p] = pre.ptr[p]; p++; }
+    if (sec <= 4)
+    {
+        nm[p++] = (u8)('0' + sec);
+    }
+    else
+    {
+        nm[p++] = (u8)'x';
+        u32 v = (u32)(sec - 5);
+        u8[12] tmp;
+        u32 tp = 0;
+        if (v == 0) tmp[tp++] = (u8)'0';
+        while (v > 0) { tmp[tp++] = (u8)('0' + (v % 10)); v /= 10; }
+        while (tp > 0) { nm[p++] = tmp[--tp]; }
+    }
+    nm[p] = 0;
+    // symbol names are stored by reference — must outlive the object
+    str name = dlDup(str::fromParts((const u8*)nm, p));
+    if (name.isEmpty()) return -1;
+    i32 si = asmFindOrAddSym(o, name);
+    if (si < 0) return -1;
+    if (!o->syms[si].defined)
+    {
+        o->syms[si].defined = true;
+        o->syms[si].section = sec;
+        o->syms[si].value = 0;
+    }
+    return si;
+}
+
+struct DlStr { str s; u64 off; }
+
+// append `s` + NUL to .debug_line_str (creating it if needed); returns
+// the string's offset or -1
+i64 dlStrOff(AsmObject* o, str s, AsmParseError* err)
+{
+    i32 xs = asmFindXSection(o, ".debug_line_str");
+    if (xs < 0)
+    {
+        xs = asmAddXSection(o, ".debug_line_str", 0, false);
+        if (xs < 0) { err->msg = "out of memory"; return -1; }
+    }
+    AsmBytes* d = asmSecData(o, xs);
+    u64 off = (u64)d->len;
+    for (usize i = 0; i < s.len; i++)
+    {
+        if (!d->u8b(s.ptr[i])) { err->msg = "out of memory"; return -1; }
+    }
+    if (!d->u8b(0)) { err->msg = "out of memory"; return -1; }
+    return (i64)off;
+}
+
+i64 dlAddStr(AsmObject* o, str s, DlStr** tbl, u32* n, u32* cap, AsmParseError* err)
+{
+    for (u32 i = 0; i < *n; i++)
+    {
+        if ((*tbl)[i].s.equals(s)) return (i64)(*tbl)[i].off;
+    }
+    i64 off = dlStrOff(o, s, err);
+    if (off < 0) return -1;
+    if (*n >= *cap)
+    {
+        u32 nc = *cap == 0 ? 32 : *cap * 2;
+        DlStr* nt = realloc<DlStr>(*tbl, (usize)nc);
+        if (nt == null) { err->msg = "out of memory"; return -1; }
+        *tbl = nt;
+        *cap = nc;
+    }
+    (*tbl)[*n] = DlStr { .s = s, .off = (u64)off };
+    (*n)++;
+    return off;
+}
+
+// emit set_address: extended opcode 2 + 8-byte relocatable field
+bool dlSetAddr(AsmObject* o, AsmBytes* prog, i32 dl, i32 sec, u64 off, AsmParseError* err)
+{
+    i32 ai = dlAnchor(o, sec);
+    if (ai < 0) { err->msg = "out of memory"; return false; }
+    u32 at = (u32)prog->len;
+    if (!dlU8(prog, 0)) return false;
+    if (!dlUleb(prog, 9)) return false;
+    if (!dlU8(prog, 2)) return false;
+    if (!dlImm(prog, 0, 8)) return false;
+    return asmAddReloc(o, (u64)at + 3, o->syms[ai].name,
+                       (u8)AsmRelocKind::RelAbs64, (i64)off, dl);
+}
+
+// emit one DWARF5 line unit covering all pending ents, appended to the
+// .debug_line xsec. Returns false on error.
+pub bool asmLineFlush(AsmObject* o, AsmParseError* err)
+{
+    AsmLineState* st = o->lstate;
+    if (st == null || st->nents == 0) return true;
+
+    // --- collect strings: directories then file names, dedup'd ---------
+    DlStr* strs = null;
+    u32 nstrs = 0;
+    u32 scap = 0;
+    u64* dirOff = null;
+    u64* fileNameOff = null;
+    u8* fileDirIdx = null;
+    bool ok = true;
+
+    if (st->ndirs > 0)
+    {
+        dirOff = alloc<u64>((usize)st->ndirs);
+        if (dirOff == null) { err->msg = "out of memory"; return false; }
+        for (u32 i = 0; i < st->ndirs && ok; i++)
+        {
+            i64 off = dlAddStr(o, st->dirs[i], &strs, &nstrs, &scap, err);
+            if (off < 0) ok = false;
+            else dirOff[i] = (u64)off;
+        }
+    }
+
+    // file table: entries 0..nfiles-1; holes copy the lowest defined file
+    u32 nfileEnt = st->nfiles;
+    i32 lowest = -1;
+    for (u32 i = 0; i < nfileEnt; i++)
+    {
+        if (!st->files[i].name.isEmpty()) { lowest = (i32)i; break; }
+    }
+    if (lowest < 0) nfileEnt = 0;
+    if (nfileEnt > 0 && ok)
+    {
+        fileNameOff = alloc<u64>((usize)nfileEnt);
+        fileDirIdx = alloc<u8>((usize)nfileEnt);
+        if (fileNameOff == null || fileDirIdx == null)
+        {
+            err->msg = "out of memory";
+            ok = false;
+        }
+        else
+        {
+            for (u32 i = 0; i < nfileEnt && ok; i++)
+            {
+                u32 src = i;
+                if (st->files[i].name.isEmpty()) src = (u32)lowest;
+                i64 off = dlAddStr(o, st->files[src].name, &strs, &nstrs, &scap, err);
+                if (off < 0) { ok = false; break; }
+                fileNameOff[i] = (u64)off;
+                i32 d = st->files[src].dir;
+                fileDirIdx[i] = (u8)(d < 0 ? 0 : d);
+            }
+        }
+    }
+
+    // --- ensure .debug_line and .debug_line_str sections/symbols ------
+    i32 dl = -1;
+    i32 xs = -1;
+    if (ok)
+    {
+        dl = asmFindXSection(o, ".debug_line");
+        if (dl < 0) dl = asmAddXSection(o, ".debug_line", 0, false);
+        xs = asmFindXSection(o, ".debug_line_str");
+        if (xs < 0) xs = asmAddXSection(o, ".debug_line_str", 0, false);
+        if (dl < 0 || xs < 0) { err->msg = "out of memory"; ok = false; }
+    }
+    // the strp relocations reference a symbol at the start of
+    // .debug_line_str so the linker resolves section_vma + addend
+    if (ok)
+    {
+        i32 lss = asmFindOrAddSym(o, ".debug_line_str");
+        if (lss < 0) { err->msg = "too many symbols"; ok = false; }
+        else if (!o->syms[lss].defined)
+        {
+            o->syms[lss].defined = true;
+            o->syms[lss].section = xs;
+            o->syms[lss].value = 0;
+        }
+    }
+    AsmBytes* prog = ok ? asmSecData(o, dl) : null;
+
+    u32 unitLenPos = 0;
+    u32 hdrLenPos = 0;
+    if (ok)
+    {
+        unitLenPos = (u32)prog->len;
+        if (!dlU32(prog, 0)) ok = false;                 // unit_length
+        if (ok && !dlU16(prog, 5)) ok = false;           // version
+        if (ok && !dlU8(prog, 8)) ok = false;            // address_size
+        if (ok && !dlU8(prog, 0)) ok = false;            // segment_selector_size
+        hdrLenPos = (u32)prog->len;
+        if (ok && !dlU32(prog, 0)) ok = false;           // header_length
+        if (ok && !dlU8(prog, 1)) ok = false;            // min_inst_len
+        if (ok && !dlU8(prog, 1)) ok = false;            // max_ops_per_inst
+        if (ok && !dlU8(prog, 1)) ok = false;            // default_is_stmt
+        if (ok && !dlU8(prog, (u8)0xFB)) ok = false;     // line_base = -5
+        if (ok && !dlU8(prog, 14)) ok = false;           // line_range
+        if (ok && !dlU8(prog, 13)) ok = false;           // opcode_base
+        const u8[12] sol = { 0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1 };
+        for (u32 i = 0; i < 12 && ok; i++)
+        {
+            if (!dlU8(prog, sol[i])) ok = false;
+        }
+        // directory_entry_format: one (path, line_strp)
+        if (ok && !dlU8(prog, 1)) ok = false;
+        if (ok && !dlU8(prog, DW_LNCT_path)) ok = false;
+        if (ok && !dlU8(prog, DW_FORM_line_strp)) ok = false;
+        // directories_count + strp entries
+        if (ok && !dlUleb(prog, (u64)st->ndirs)) ok = false;
+        for (u32 i = 0; i < st->ndirs && ok; i++)
+        {
+            u32 at = (u32)prog->len;
+            if (!dlImm(prog, 0, 4)) { ok = false; break; }
+            if (!asmAddReloc(o, (u64)at, ".debug_line_str",
+                             (u8)AsmRelocKind::RelAbs32, (i64)dirOff[i], dl))
+            {
+                ok = false; break;
+            }
+        }
+        // file_name_entry_format: (path,strp) + (dir_idx,udata)
+        if (ok && !dlU8(prog, 2)) ok = false;
+        if (ok && !dlU8(prog, DW_LNCT_path)) ok = false;
+        if (ok && !dlU8(prog, DW_FORM_line_strp)) ok = false;
+        if (ok && !dlU8(prog, DW_LNCT_directory_index)) ok = false;
+        if (ok && !dlU8(prog, DW_FORM_udata)) ok = false;
+        if (ok && !dlUleb(prog, (u64)nfileEnt)) ok = false;
+        for (u32 i = 0; i < nfileEnt && ok; i++)
+        {
+            u32 at = (u32)prog->len;
+            if (!dlImm(prog, 0, 4)) { ok = false; break; }
+            if (!asmAddReloc(o, (u64)at, ".debug_line_str",
+                             (u8)AsmRelocKind::RelAbs32, (i64)fileNameOff[i], dl))
+            {
+                ok = false; break;
+            }
+            if (!dlUleb(prog, (u64)fileDirIdx[i])) ok = false;
+        }
+        // patch header_length = bytes after this field up to program start
+        if (ok)
+        {
+            u32 progStart = (u32)prog->len;
+            u32 hlen = progStart - (hdrLenPos + 4);
+            prog->data[hdrLenPos + 0] = (u8)(hlen & 0xFF);
+            prog->data[hdrLenPos + 1] = (u8)((hlen >> 8) & 0xFF);
+            prog->data[hdrLenPos + 2] = (u8)((hlen >> 16) & 0xFF);
+            prog->data[hdrLenPos + 3] = (u8)((hlen >> 24) & 0xFF);
+        }
+    }
+
+    // --- line number program -------------------------------------------
+    i32 curSec = -1;
+    u64 curAddr = 0;
+    i64 curFile = 1;
+    i64 curLine = 1;
+    i64 curCol = 0;
+    i64 curIsStmt = 1;
+    bool seqOpen = false;
+
+    // close the current sequence: advance to (tsec,toff) when possible,
+    // then emit end_sequence and reset registers
+    // (inlined per call site via a small state machine below)
+
+    for (u32 i = 0; i < st->nents && ok; i++)
+    {
+        AsmLineEnt* en = &st->ents[i];
+        if (en->sec == -1)
+        {
+            if (seqOpen)
+            {
+                if (en->secB == curSec && en->offB >= curAddr)
+                {
+                    u64 d = en->offB - curAddr;
+                    if (d > 0)
+                    {
+                        if (!dlU8(prog, 2)) { ok = false; break; }
+                        if (!dlUleb(prog, d)) { ok = false; break; }
+                        curAddr = en->offB;
+                    }
+                }
+                else if (!dlSetAddr(o, prog, dl, en->secB, en->offB, err))
+                {
+                    ok = false; break;
+                }
+                if (!dlU8(prog, 0)) { ok = false; break; }
+                if (!dlU8(prog, 1)) { ok = false; break; }
+                if (!dlU8(prog, 1)) { ok = false; break; }
+                seqOpen = false;
+                curSec = -1; curAddr = 0;
+                curFile = 1; curLine = 1; curCol = 0; curIsStmt = 1;
+            }
+            continue;
+        }
+
+        i64 tline = en->line;
+        i64 tcol = en->col;
+        i64 tfile = (i64)en->file;
+        i64 addrDelta = 0;
+        bool needAddr = !seqOpen || en->sec != curSec || en->off < curAddr;
+
+        // if the address jumps backward/section changes mid-sequence,
+        // close the sequence first for a clean DWARF program
+        if (seqOpen && needAddr)
+        {
+            if (!dlU8(prog, 0)) { ok = false; break; }
+            if (!dlU8(prog, 1)) { ok = false; break; }
+            if (!dlU8(prog, 1)) { ok = false; break; }
+            seqOpen = false;
+            curSec = -1; curAddr = 0;
+            curFile = 1; curLine = 1; curCol = 0; curIsStmt = 1;
+            needAddr = true;
+        }
+
+        // state ops: file, column, is_stmt, flags, discriminator, isa
+        if (tfile != curFile)
+        {
+            if (!dlU8(prog, 4)) { ok = false; break; }
+            if (!dlUleb(prog, (u64)tfile)) { ok = false; break; }
+        }
+        if (tcol >= 0 && tcol != curCol)
+        {
+            if (!dlU8(prog, 5)) { ok = false; break; }
+            if (!dlUleb(prog, (u64)tcol)) { ok = false; break; }
+        }
+        if (en->isStmt >= 0 && en->isStmt != curIsStmt)
+        {
+            if (!dlU8(prog, 6)) { ok = false; break; } // negate_stmt toggles
+        }
+        if (en->flags & 4)
+        {
+            if (!dlU8(prog, 7)) { ok = false; break; } // set_basic_block
+        }
+        if (en->flags & 1)
+        {
+            if (!dlU8(prog, 10)) { ok = false; break; } // prologue_end
+        }
+        if (en->flags & 2)
+        {
+            if (!dlU8(prog, 11)) { ok = false; break; } // epilogue_begin
+        }
+        if (en->discrim >= 0)
+        {
+            // extended opcode 4: set_discriminator
+            u64 dv = (u64)en->discrim;
+            u32 dlen = 1 + dlUlebLen(dv);
+            if (!dlU8(prog, 0)) { ok = false; break; }
+            if (!dlUleb(prog, (u64)dlen)) { ok = false; break; }
+            if (!dlU8(prog, 4)) { ok = false; break; }
+            if (!dlUleb(prog, dv)) { ok = false; break; }
+        }
+        if (en->isa >= 0)
+        {
+            if (!dlU8(prog, 12)) { ok = false; break; } // set_isa
+            if (!dlUleb(prog, (u64)en->isa)) { ok = false; break; }
+        }
+
+        // address
+        if (needAddr)
+        {
+            if (!dlSetAddr(o, prog, dl, en->sec, en->off, err))
+            {
+                ok = false; break;
+            }
+            curSec = en->sec;
+            curAddr = en->off;
+            addrDelta = 0;
+            seqOpen = true;
+        }
+        else
+        {
+            addrDelta = (i64)(en->off - curAddr);
+        }
+
+        i64 lineDelta = tline - curLine;
+
+        // special opcode: encodes addr+line advance and emits the row
+        if (addrDelta >= 0 && lineDelta >= -5 && lineDelta <= 8)
+        {
+            i64 adjusted = addrDelta * 14 + (lineDelta + 5);
+            if (adjusted >= 0 && adjusted <= 242)
+            {
+                if (!dlU8(prog, (u8)(13 + adjusted))) { ok = false; break; }
+                curAddr = en->off;
+                curLine = tline;
+                curCol = tcol >= 0 ? tcol : curCol;
+                curFile = tfile;
+                if (en->isStmt >= 0) curIsStmt = en->isStmt;
+                continue;
+            }
+        }
+
+        if (addrDelta > 0)
+        {
+            if (!dlU8(prog, 2)) { ok = false; break; }  // advance_pc
+            if (!dlUleb(prog, (u64)addrDelta)) { ok = false; break; }
+        }
+        if (lineDelta != 0)
+        {
+            if (!dlU8(prog, 3)) { ok = false; break; }  // advance_line
+            if (!dlSleb(prog, lineDelta)) { ok = false; break; }
+        }
+        if (!dlU8(prog, 1)) { ok = false; break; }      // copy
+        curAddr = en->off;
+        curLine = tline;
+        curCol = tcol >= 0 ? tcol : curCol;
+        curFile = tfile;
+        if (en->isStmt >= 0) curIsStmt = en->isStmt;
+        seqOpen = true;
+    }
+
+    // trailing pending break or final sequence close
+    if (ok && seqOpen)
+    {
+        if (st->brkPending)
+        {
+            if (st->brkSec == curSec && st->brkOff >= curAddr)
+            {
+                u64 d = st->brkOff - curAddr;
+                if (d > 0)
+                {
+                    if (!dlU8(prog, 2)) ok = false;
+                    else if (!dlUleb(prog, d)) ok = false;
+                }
+            }
+            else if (ok && !dlSetAddr(o, prog, dl, st->brkSec, st->brkOff, err))
+            {
+                ok = false;
+            }
+            if (ok)
+            {
+                if (!dlU8(prog, 0)) ok = false;
+                else if (!dlU8(prog, 1)) ok = false;
+                else if (!dlU8(prog, 1)) ok = false;
+            }
+            st->brkPending = false;
+        }
+        else
+        {
+            if (!dlU8(prog, 0)) ok = false;
+            else if (!dlU8(prog, 1)) ok = false;
+            else if (!dlU8(prog, 1)) ok = false;
+        }
+    }
+
+    // patch unit_length = bytes after the length field
+    if (ok)
+    {
+        u32 total = (u32)prog->len - unitLenPos - 4;
+        prog->data[unitLenPos + 0] = (u8)(total & 0xFF);
+        prog->data[unitLenPos + 1] = (u8)((total >> 8) & 0xFF);
+        prog->data[unitLenPos + 2] = (u8)((total >> 16) & 0xFF);
+        prog->data[unitLenPos + 3] = (u8)((total >> 24) & 0xFF);
+    }
+    else
+    {
+        err->msg = err->msg.isEmpty() ? "out of memory" : err->msg;
+    }
+
+    if (dirOff != null) dealloc<u64>(dirOff);
+    if (fileNameOff != null) dealloc<u64>(fileNameOff);
+    if (fileDirIdx != null) dealloc<u8>(fileDirIdx);
+    if (strs != null) dealloc<DlStr>(strs);
+
+    if (ok)
+    {
+        // reset ents for the next unit
+        st->nents = 0;
+        st->brkPending = false;
+        return true;
+    }
+    return false;
+}
+
+// ================= .cfi_* -> .eh_frame =================
+//
+// gas turns .cfi_* directives into .eh_frame CIE/FDE records. We record
+// each directive as an AsmCfiEnt tagged with the code offset at which it
+// appeared; at .cfi_endproc one CIE+FDE pair is appended to the
+// ".eh_frame" xsec. CFI ops at the function-entry offset become CIE
+// "initial instructions" (matching gas); later ops become FDE
+// instructions preceded by DW_CFA_advance_loc. gas dedups identical
+// CIEs; emitting one CIE per FDE is always correct, just slightly larger.
+//
+// x86-64 DWARF constants used below:
+//   code_align = 1, data_align = -8, return_address_register = 16 (rip),
+//   FDE pointer encoding = DW_EH_PE_pcrel | DW_EH_PE_sdata4 = 0x1b.
+
+// DWARF x86-64 register number for a .cfi operand. GCC emits the DWARF
+// number directly; register names (with or without %) are also accepted.
+i64 cfiRegNum(str tok)
+{
+    // strip leading/trailing spaces
+    usize b = 0;
+    usize e = tok.len;
+    while (b < e && (tok.ptr[b] == (u8)' ' || tok.ptr[b] == (u8)'\t')) b++;
+    while (e > b && (tok.ptr[e - 1] == (u8)' ' || tok.ptr[e - 1] == (u8)'\t')) e--;
+    usize n = e - b;
+    if (n == 0) return -1;
+    if (tok.ptr[b] == (u8)'%') { b++; n--; }
+    if (n == 0) return -1;
+    // plain number -> already a DWARF register number
+    bool digits = true;
+    for (usize i = 0; i < n; i++)
+    {
+        u8 c = tok.ptr[b + i];
+        if (c < (u8)'0' || c > (u8)'9') { digits = false; break; }
+    }
+    if (digits)
+    {
+        i64 v = 0;
+        for (usize i = 0; i < n; i++) v = v * 10 + (i64)(tok.ptr[b + i] - (u8)'0');
+        return v;
+    }
+    // xmmN/ymmN -> 17+N ; stN -> 33+N ; mmN -> 41+N
+    str pre = "";
+    u8[4] nm;
+    u32 np = 0;
+    usize i = 0;
+    while (i < n && tok.ptr[b + i] >= (u8)'a' && tok.ptr[b + i] <= (u8)'z')
+    {
+        nm[np++] = tok.ptr[b + i]; i++;
+    }
+    if (np == 0) return -1;
+    nm[np] = 0;
+    pre = str::fromParts((const u8*)nm, (usize)np);
+    i64 num = -1;
+    if (i < n)
+    {
+        bool dg = true;
+        for (usize j = i; j < n; j++)
+        {
+            u8 c = tok.ptr[b + j];
+            if (c < (u8)'0' || c > (u8)'9') { dg = false; break; }
+        }
+        if (dg)
+        {
+            num = 0;
+            for (usize j = i; j < n; j++) num = num * 10 + (i64)(tok.ptr[b + j] - (u8)'0');
+        }
+    }
+    if (pre.equals("rax")) return 0;
+    if (pre.equals("rdx")) return 1;
+    if (pre.equals("rcx")) return 2;
+    if (pre.equals("rbx")) return 3;
+    if (pre.equals("rsi")) return 4;
+    if (pre.equals("rdi")) return 5;
+    if (pre.equals("rbp")) return 6;
+    if (pre.equals("rsp")) return 7;
+    if (pre.equals("rip")) return 16;
+    if (pre.equals("xmm") || pre.equals("ymm")) { if (num >= 0 && num < 16) return 17 + num; return -1; }
+    if (pre.equals("st")) { if (num >= 0 && num < 8) return 33 + num; return -1; }
+    if (pre.equals("mm")) { if (num >= 0 && num < 8) return 41 + num; return -1; }
+    if (pre.equals("r") && num >= 8 && num < 16) return num;
+    if (pre.equals("k") && num >= 0 && num < 8) return 118 + num;
+    return -1;
+}
+
+// split "a" or "a, b" into two operand values
+bool cfiArgs(str dargs, i64* a, i64* b, bool* hasB, AsmParseError* err)
+{
+    usize comma = dargs.len;
+    for (usize i = 0; i < dargs.len; i++)
+    {
+        if (dargs.ptr[i] == (u8)',') { comma = i; break; }
+    }
+    str t1 = str::fromParts(dargs.ptr, comma);
+    *a = cfiRegNum(t1);
+    *hasB = false;
+    *b = 0;
+    if (*a < 0)
+    {
+        // first operand may be a plain offset (def_cfa_offset etc.)
+        usize p = 0;
+        bool neg = false;
+        while (p < t1.len && (t1.ptr[p] == (u8)' ' || t1.ptr[p] == (u8)'\t')) p++;
+        if (p < t1.len && t1.ptr[p] == (u8)'-') { neg = true; p++; }
+        i64 v = 0; bool anyd = false;
+        while (p < t1.len)
+        {
+            u8 c = t1.ptr[p];
+            if (c < (u8)'0' || c > (u8)'9') break;
+            v = v * 10 + (i64)(c - (u8)'0'); anyd = true; p++;
+        }
+        if (anyd) { *a = neg ? -v : v; }
+        else { err->msg = "bad .cfi operand"; return false; }
+    }
+    if (comma < dargs.len)
+    {
+        str t2 = str::fromParts(dargs.ptr + comma + 1, dargs.len - comma - 1);
+        usize p = 0;
+        while (p < t2.len && (t2.ptr[p] == (u8)' ' || t2.ptr[p] == (u8)'\t')) p++;
+        bool neg = false;
+        if (p < t2.len && t2.ptr[p] == (u8)'-') { neg = true; p++; }
+        i64 v = 0; bool anyd = false;
+        while (p < t2.len)
+        {
+            u8 c = t2.ptr[p];
+            if (c < (u8)'0' || c > (u8)'9') break;
+            v = v * 10 + (i64)(c - (u8)'0'); anyd = true; p++;
+        }
+        if (!anyd) { err->msg = "bad .cfi operand"; return false; }
+        *b = neg ? -v : v;
+        *hasB = true;
+    }
+    return true;
+}
+
+// factored offset operand: stored = offset / data_align(-8); must divide
+// evenly. Returns the factored value, or -1 with err set on failure.
+i64 cfiFactored(i64 off, AsmParseError* err)
+{
+    if (off % 8 != 0)
+    {
+        err->msg = ".cfi offset not a multiple of 8";
+        return -1;
+    }
+    return -off / 8;
+}
+
+// encode one DWARF CFI instruction
+bool cfiEmitOp(AsmBytes* b, AsmCfiEnt* e, AsmParseError* err)
+{
+    i64 f;
+    switch (e->op)
+    {
+        1 => { if (!b->u8b(0x0E)) return false; return dlUleb(b, (u64)e->a); },
+        2 => { if (!b->u8b(0x0D)) return false; return dlUleb(b, (u64)e->a); },
+        3 =>
+        {
+            if (!b->u8b(0x0C)) return false;
+            if (!dlUleb(b, (u64)e->a)) return false;
+            return dlSleb(b, e->b);
+        },
+        4 =>
+        {
+            f = cfiFactored(e->b, err);
+            if (f < 0 && err->msg.len > 0) return false;
+            if (e->a >= 0 && e->a < 64 && f >= 0)
+            {
+                if (!b->u8b((u8)(0x80 | (e->a & 0x3F)))) return false;
+                return dlUleb(b, (u64)f);
+            }
+            if (!b->u8b(0x11)) return false;
+            if (!dlUleb(b, (u64)e->a)) return false;
+            return dlSleb(b, f);
+        },
+        5 =>
+        {
+            if (e->a >= 0 && e->a < 64) return b->u8b((u8)(0xC0 | (e->a & 0x3F)));
+            if (!b->u8b(0x06)) return false;
+            return dlUleb(b, (u64)e->a);
+        },
+        6 => { return b->u8b(0x0A); },
+        7 => { return b->u8b(0x0B); },
+        8 => { if (!b->u8b(0x07)) return false; return dlUleb(b, (u64)e->a); },
+        9 => { if (!b->u8b(0x08)) return false; return dlUleb(b, (u64)e->a); },
+        10 =>
+        {
+            if (!b->u8b(0x09)) return false;
+            if (!dlUleb(b, (u64)e->a)) return false;
+            return dlUleb(b, (u64)e->b);
+        },
+        11 =>
+        {
+            f = cfiFactored(e->b, err);
+            if (f < 0) { if (err->msg.len == 0) err->msg = "bad .cfi offset"; return false; }
+            if (!b->u8b(0x14)) return false;
+            if (!dlUleb(b, (u64)e->a)) return false;
+            return dlUleb(b, (u64)f);
+        },
+        else => { err->msg = "unsupported .cfi op"; return false; }
+    }
+}
+
+// DW_CFA_advance_loc: delta in code-align units (1 byte each)
+bool cfiAdvance(AsmBytes* b, u64 delta)
+{
+    if (delta == 0) return true;
+    if (delta < 64) return b->u8b((u8)(0x40 | delta));
+    if (delta <= 0xFF)
+    {
+        if (!b->u8b(0x02)) return false;
+        return b->u8b((u8)delta);
+    }
+    if (delta <= 0xFFFF)
+    {
+        if (!b->u8b(0x03)) return false;
+        return b->u16b((u16)delta);
+    }
+    if (!b->u8b(0x04)) return false;
+    return b->u32b((u32)delta);
+}
+
+// append bytes from src to dst
+bool cfiCat(AsmBytes* dst, AsmBytes* src)
+{
+    for (u32 i = 0; i < src->len; i++)
+    {
+        if (!dst->u8b(src->data[i])) return false;
+    }
+    return true;
+}
+
+// pad a CIE/FDE content buffer with DW_CFA_nop (0x00) until the whole
+// entry (4-byte length + content) is 8-byte aligned, matching gas
+bool cfiPad8(AsmBytes* content)
+{
+    while (((u64)content->len + 4) % 8 != 0)
+    {
+        if (!content->u8b(0)) return false;
+    }
+    return true;
+}
+
+// record a .cfi_* event at the current offset of `sec`
+pub bool asmCfiEvent(AsmObject* o, i32 sec, u8 op, i64 a, i64 b, AsmParseError* err)
+{
+    AsmLineState* st = asmLineState(o);
+    if (!st->cfiopen) { err->msg = ".cfi directive outside .cfi_startproc"; return false; }
+    if (st->ncf >= st->cficap)
+    {
+        u32 nc = st->cficap == 0 ? 64 : st->cficap * 2;
+        AsmCfiEnt* nt = realloc<AsmCfiEnt>(st->cfents, (usize)nc);
+        if (nt == null) { err->msg = "out of memory"; return false; }
+        st->cfents = nt;
+        st->cficap = nc;
+    }
+    st->cfents[st->ncf] = AsmCfiEnt {
+        .sec = sec, .off = asmSecSize(o, sec), .op = op, .a = a, .b = b
+    };
+    st->ncf++;
+    return true;
+}
+
+// .cfi_startproc / .cfi_endproc
+pub bool asmCfiProc(AsmObject* o, i32 sec, bool start, AsmParseError* err)
+{
+    AsmLineState* st = asmLineState(o);
+    if (start)
+    {
+        if (st->cfiopen) { err->msg = "nested .cfi_startproc"; return false; }
+        st->cfiopen = true;
+        st->cfisec = sec;
+        st->cfistart = asmSecSize(o, sec);
+        st->ncf = 0;
+        return true;
+    }
+    // endproc: emit CIE+FDE
+    if (!st->cfiopen) return true;
+    st->cfiopen = false;
+    u64 cend = asmSecSize(o, sec);
+    if (sec != st->cfisec || cend <= st->cfistart)
+    {
+        st->ncf = 0;
+        return true;
+    }
+    i32 xs = asmFindXSection(o, ".eh_frame");
+    if (xs < 0) xs = asmAddXSection(o, ".eh_frame", 2, false);
+    if (xs < 0) { err->msg = "out of memory"; return false; }
+    u64* al = asmSecAlignPtr(o, xs);
+    if (*al < 8) *al = 8;
+    AsmBytes* eh = asmSecData(o, xs);
+
+    // ---- CIE ----
+    // `cie` accumulates everything after the length word: CIE_id, the
+    // version/augmentation header, augmentation data, and initial
+    // instructions, so cfiPad8 aligns the whole entry.
+    AsmBytes cie = AsmBytes::new();
+    if (!cie.u32b(0)) { cie.deinit(); err->msg = "out of memory"; return false; }
+    if (!cie.u8b(1)) { cie.deinit(); err->msg = "out of memory"; return false; }
+    if (!cie.u8b((u8)'z') || !cie.u8b((u8)'R') || !cie.u8b(0)) { cie.deinit(); err->msg = "out of memory"; return false; }
+    if (!dlUleb(&cie, 1)) { cie.deinit(); err->msg = "out of memory"; return false; }
+    if (!dlSleb(&cie, -8)) { cie.deinit(); err->msg = "out of memory"; return false; }
+    if (!dlUleb(&cie, 16)) { cie.deinit(); err->msg = "out of memory"; return false; }
+    if (!cie.u8b(1)) { cie.deinit(); err->msg = "out of memory"; return false; }
+    if (!cie.u8b(0x1B)) { cie.deinit(); err->msg = "out of memory"; return false; }
+    // initial instructions: standard prologue state + ops recorded at
+    // the function-entry offset
+    if (!cie.u8b(0x0C)) { cie.deinit(); err->msg = "out of memory"; return false; }
+    if (!cie.u8b(0x07)) { cie.deinit(); err->msg = "out of memory"; return false; }
+    if (!dlSleb(&cie, 8)) { cie.deinit(); err->msg = "out of memory"; return false; }
+    if (!cie.u8b(0x90)) { cie.deinit(); err->msg = "out of memory"; return false; }
+    if (!dlUleb(&cie, 1)) { cie.deinit(); err->msg = "out of memory"; return false; }
+    for (u32 i = 0; i < st->ncf; i++)
+    {
+        AsmCfiEnt* e = &st->cfents[i];
+        if (e->sec == st->cfisec && e->off == st->cfistart)
+        {
+            if (!cfiEmitOp(&cie, e, err)) { cie.deinit(); return false; }
+        }
+    }
+    if (!cfiPad8(&cie)) { cie.deinit(); err->msg = "out of memory"; return false; }
+
+    u64 ciePos = (u64)eh->len;
+    u64 cieLenPos = ciePos;
+    if (!eh->u32b(0)) { cie.deinit(); err->msg = "out of memory"; return false; }
+    if (!cfiCat(eh, &cie)) { cie.deinit(); err->msg = "out of memory"; return false; }
+    cie.deinit();
+    // patch CIE length = bytes after the length field
+    {
+        u32 clen = (u32)((u64)eh->len - cieLenPos - 4);
+        eh->data[cieLenPos] = (u8)(clen & 0xFF);
+        eh->data[cieLenPos + 1] = (u8)((clen >> 8) & 0xFF);
+        eh->data[cieLenPos + 2] = (u8)((clen >> 16) & 0xFF);
+        eh->data[cieLenPos + 3] = (u8)((clen >> 24) & 0xFF);
+    }
+
+    // ---- FDE ----
+    AsmBytes fde = AsmBytes::new();
+    // cie_pointer: distance back from this field to the CIE. The field
+    // sits at fde entry start + 4 (after the length word).
+    u64 cieptrField = (u64)eh->len + 4;
+    if (!fde.u32b((u32)(cieptrField - ciePos))) { fde.deinit(); err->msg = "out of memory"; return false; }
+    // pc_begin: 4-byte pcrel field + reloc vs section anchor + startOff
+    if (!fde.u32b(0)) { fde.deinit(); err->msg = "out of memory"; return false; }
+    // pc_range: u32
+    if (!fde.u32b((u32)(cend - st->cfistart))) { fde.deinit(); err->msg = "out of memory"; return false; }
+    // 'z' augmentation: FDE begins with a uleb128 augmentation-data
+    // length; "zR" carries no FDE aug data -> length 0
+    if (!fde.u8b(0)) { fde.deinit(); err->msg = "out of memory"; return false; }
+    // instructions: advance_loc + op for each non-entry event
+    u64 prev = st->cfistart;
+    for (u32 i = 0; i < st->ncf; i++)
+    {
+        AsmCfiEnt* e = &st->cfents[i];
+        if (e->sec != st->cfisec || e->off == st->cfistart) continue;
+        if (e->off > prev)
+        {
+            if (!cfiAdvance(&fde, e->off - prev)) { fde.deinit(); err->msg = "out of memory"; return false; }
+        }
+        prev = e->off;
+        if (!cfiEmitOp(&fde, e, err)) { fde.deinit(); return false; }
+    }
+    if (!cfiPad8(&fde)) { fde.deinit(); err->msg = "out of memory"; return false; }
+
+    u64 fdeLenPos = (u64)eh->len;
+    if (!eh->u32b(0)) { fde.deinit(); err->msg = "out of memory"; return false; }
+    if (!cfiCat(eh, &fde)) { fde.deinit(); err->msg = "out of memory"; return false; }
+    fde.deinit();
+    {
+        u32 flen = (u32)((u64)eh->len - fdeLenPos - 4);
+        eh->data[fdeLenPos] = (u8)(flen & 0xFF);
+        eh->data[fdeLenPos + 1] = (u8)((flen >> 8) & 0xFF);
+        eh->data[fdeLenPos + 2] = (u8)((flen >> 16) & 0xFF);
+        eh->data[fdeLenPos + 3] = (u8)((flen >> 24) & 0xFF);
+    }
+    // reloc for pc_begin field: eh offset = fdeLenPos + 4 + 4
+    {
+        i32 ai = dlAnchor(o, st->cfisec);
+        if (ai < 0) { err->msg = "out of memory"; return false; }
+        if (!asmAddReloc(o, fdeLenPos + 8, o->syms[ai].name,
+                         (u8)AsmRelocKind::RelPc32, (i64)st->cfistart, xs))
+        {
+            err->msg = "out of memory";
+            return false;
+        }
+    }
+    st->ncf = 0;
+    return true;
+}
+
+// .cfi_* operand directives: dispatch on the directive name
+pub bool asmCfiDir(AsmObject* o, str mnem, str dargs, i32 sec, AsmParseError* err)
+{
+    AsmLineState* st = asmLineState(o);
+    if (!st->cfiopen) { err->msg = ".cfi directive outside .cfi_startproc"; return false; }
+    u8 op = 0;
+    if (mnem.equals(".cfi_def_cfa_offset")) op = 1;
+    else if (mnem.equals(".cfi_def_cfa_register")) op = 2;
+    else if (mnem.equals(".cfi_def_cfa")) op = 3;
+    else if (mnem.equals(".cfi_offset")) op = 4;
+    else if (mnem.equals(".cfi_restore")) op = 5;
+    else if (mnem.equals(".cfi_remember_state")) op = 6;
+    else if (mnem.equals(".cfi_restore_state")) op = 7;
+    else if (mnem.equals(".cfi_undefined")) op = 8;
+    else if (mnem.equals(".cfi_same_value")) op = 9;
+    else if (mnem.equals(".cfi_register")) op = 10;
+    else if (mnem.equals(".cfi_val_offset")) op = 11;
+    else if (mnem.equals(".cfi_adjust_cfa_offset") ||
+             mnem.equals(".cfi_escape") ||
+             mnem.equals(".cfi_personality") ||
+             mnem.equals(".cfi_lsda") ||
+             mnem.equals(".cfi_signal_frame") ||
+             mnem.equals(".cfi_window_save") ||
+             mnem.equals(".cfi_negate_ra_state") ||
+             mnem.equals(".cfi_return_column"))
+    {
+        // directives we do not encode: ignore rather than fail, so real
+        // compiler output still assembles
+        return true;
+    }
+    else { err->msg = "unsupported .cfi directive"; return false; }
+
+    i64 a = 0;
+    i64 b = 0;
+    bool hasB = false;
+    if (op == 6 || op == 7)
+    {
+        return asmCfiEvent(o, sec, op, 0, 0, err);
+    }
+    if (!cfiArgs(dargs, &a, &b, &hasB, err)) return false;
+    if ((op == 3 || op == 4 || op == 10 || op == 11) && !hasB)
+    {
+        err->msg = ".cfi directive needs two operands";
+        return false;
+    }
+    return asmCfiEvent(o, sec, op, a, b, err);
+}
