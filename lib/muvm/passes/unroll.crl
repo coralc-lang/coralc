@@ -2,6 +2,7 @@
 import muvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind, IrVarDebugInfo };
 import muvm::irOps { IrOpcode, IrICmpPred, irOpcodeIsTerminator };
 import muvm::passes::loop_detect { IrLoop, irLoopDetectNatural, irLoopDestroy };
+import muvm::domtree { IrDomTree, irDomtreeNew, irDomtreeDominates, irDomtreeFree };
 import std::mman { alloc, dealloc };
 
 // Loop unrolling for naturally-detected single-latch loops with a
@@ -634,24 +635,116 @@ pub struct UnrollPass
             }
         }
 
-        self.performUnroll(func, lp, k, exitBlock);
+        if (!self.performUnroll(func, lp, k, exitBlock, testBlock)) return false;
 
         self.workUsed += (u32)(k * total);
         self.unrolled++;
         return true;
     }
 
-    void performUnroll(IrFunc* func, IrLoop* lp, u64 k,
-                       IrBlock* exitBlock)
+    // Returns false without mutating when the exit-value materialization
+    // below cannot be proven correct (see the feasibility check).
+    bool performUnroll(IrFunc* func, IrLoop* lp, u64 k,
+                       IrBlock* exitBlock, IrBlock* testBlock)
     {
         IrBlock* header = lp->header;
         u32 nb = lp->nblocks;
         u32 headerIdx = self.loopIndex(lp, header);
         u32 latchIdx = self.loopIndex(lp, lp->latch);
 
+        // Exit predecessors: in-loop blocks with an edge to exitBlock.
+        u32* origPredIdx = alloc<u32>((usize)nb);
+        u32 nOrigPreds = 0;
+        for (u32 bi = 0; bi < nb; bi++)
+        {
+            IrBlock* b = lp->blocks[bi];
+            for (u32 sxi = 0; sxi < b->nsuccs; sxi++)
+                if (b->succs[sxi] == exitBlock) { origPredIdx[nOrigPreds++] = bi; break; }
+        }
+
+        // In-loop values used anywhere outside the loop need a phi of
+        // their own in the exit block (collected up-front so feasibility
+        // can be checked before any mutation).
+        u32 capU = 1;
+        for (u32 bi2 = 0; bi2 < func->nblocks; bi2++)
+        {
+            IrBlock* fb = func->blocks[bi2];
+            if (fb == null || self.isInLoop(lp, fb)) continue;
+            for (u32 ii = 0; ii < fb->ninsts; ii++) capU += fb->insts[ii]->nops;
+        }
+        IrValue** usedV = alloc<IrValue*>((usize)capU);
+        u32 nUsed = 0;
+        for (u32 bi2 = 0; bi2 < func->nblocks; bi2++)
+        {
+            IrBlock* fb = func->blocks[bi2];
+            if (fb == null || self.isInLoop(lp, fb)) continue;
+            for (u32 ii = 0; ii < fb->ninsts; ii++)
+            {
+                IrInst* ui = fb->insts[ii];
+                bool isPhi = ui->opcode == IrOpcode::Phi;
+                for (u32 oi = 0; oi < ui->nops; oi++)
+                {
+                    // Phi operands alternate value/pred-block; only the
+                    // value slots are value uses.
+                    if (isPhi && (oi & 1) == 1) continue;
+                    IrValue* op = ui->ops[oi];
+                    if (op == null || op->kind != IrValueKind::Inst) continue;
+                    IrBlock* def = ((IrInst*)op)->parent;
+                    if (def == null || !self.isInLoop(lp, def)) continue;
+                    bool seen = false;
+                    for (u32 u2 = 0; u2 < nUsed; u2++)
+                        if (usedV[u2] == op) { seen = true; break; }
+                    if (!seen) usedV[nUsed++] = op;
+                }
+            }
+        }
+
+        // Feasibility: the materialized exit phi emits, for every
+        // (exit-pred, iteration) pair, remapVal(V, it) as the value on
+        // that edge. That is only the correct reaching value when V's
+        // def dominates the pred — otherwise iteration 0's early-exit
+        // edge has no valid value for V at all (V is loop-defined) and
+        // later iterations would need V's previous-iteration clone,
+        // which itself must dominate the latch to be reachable. Require
+        // def(V) to dominate every exit pred and the latch; anything
+        // else is rejected rather than risking malformed phis.
+        {
+            IrDomTree* dt = irDomtreeNew(func);
+            bool feas = dt != null;
+            if (feas)
+            {
+                for (u32 u2 = 0; u2 < nUsed && feas; u2++)
+                {
+                    IrInst* vi = (IrInst*)usedV[u2];
+                    IrBlock* db = vi->parent;
+                    if (db == null) { feas = false; break; }
+                    for (u32 oi = 0; oi < nOrigPreds && feas; oi++)
+                    {
+                        IrBlock* pb = lp->blocks[origPredIdx[oi]];
+                        if (!irDomtreeDominates(dt, db, pb)) feas = false;
+                    }
+                    if (feas && vi->opcode != IrOpcode::Phi &&
+                        !irDomtreeDominates(dt, db, lp->latch))
+                        feas = false;
+                }
+            }
+            if (dt != null) irDomtreeFree(dt);
+            if (!feas)
+            {
+                dealloc<u32>(origPredIdx);
+                dealloc<IrValue*>(usedV);
+                return false;
+            }
+        }
+
         // Preheader, the loop's single entry block (ph -> header).
         IrBlock* ph = createPreheader(self.ctx, lp, func);
-        if (ph == null) return;
+        if (ph == null)
+        {
+            dealloc<u32>(origPredIdx);
+            dealloc<IrValue*>(usedV);
+            return false;
+        }
 
         // Per-iteration value/block maps and the block copy table.
         UnrollValMap* valMaps = alloc<UnrollValMap>((usize)k);
@@ -851,15 +944,8 @@ pub struct UnrollPass
         // plus that one retargeted edge. The original preds are dropped
         // from the exit block's pred list during teardown below; the
         // clone terminators already registered their edges via addSucc.
+        // origPredIdx/nOrigPreds/usedV/nUsed were computed above.
         IrBlock* s = exitBlock;
-        u32* origPredIdx = alloc<u32>((usize)nb);
-        u32 nOrigPreds = 0;
-        for (u32 bi = 0; bi < nb; bi++)
-        {
-            IrBlock* b = lp->blocks[bi];
-            for (u32 sxi = 0; sxi < b->nsuccs; sxi++)
-                if (b->succs[sxi] == s) { origPredIdx[nOrigPreds++] = bi; break; }
-        }
 
         // Rebuild existing exit phis: every in-loop incoming pair
         // becomes k per-iteration pairs plus the retargeted edge.
@@ -870,16 +956,24 @@ pub struct UnrollPass
             if (phi->opcode != IrOpcode::Phi) break;
             u32 nIn = 0;
             IrValue* baseV = null;
+            IrValue* testV = null;
             for (u32 pi = 1; pi < phi->nops; pi += 2)
             {
                 IrBlock* pb = (IrBlock*)phi->ops[pi];
                 if (pb != null && self.isInLoop(lp, pb))
                 {
                     if (baseV == null) baseV = phi->ops[pi - 1];
+                    // The retargeted last-backedge is the *normal*
+                    // completion edge, so its value must come from the
+                    // test block's pair — not whichever in-loop pair
+                    // happened to be first (early-exit pairs carry
+                    // different values).
+                    if (pb == testBlock) testV = phi->ops[pi - 1];
                     nIn++;
                 }
             }
             if (nIn == 0) continue;
+            if (testV == null) testV = baseV;
             u32 newN = phi->nops - nIn * 2 + nIn * (u32)k * 2 + 2;
             IrValue** newOps = alloc<IrValue*>((usize)newN);
             u32 ni = 0;
@@ -909,7 +1003,7 @@ pub struct UnrollPass
             }
             // The retargeted last backedge is a real pred of the exit
             // block with no original counterpart.
-            IrValue* ev = self.retargetExitVal(baseV, header, lp->latch,
+            IrValue* ev = self.retargetExitVal(testV, header, lp->latch,
                                                &valMaps[lastIt], &blkMaps[lastIt]);
             newOps[ni++] = ev;
             newOps[ni++] = &copies[lastIt * nb + latchIdx]->base;
@@ -928,39 +1022,7 @@ pub struct UnrollPass
         // validly reference an in-loop value, and the materialized phi
         // is usable at all of those sites — including phi value slots
         // in successor blocks and plain operands many blocks downstream.
-        u32 capU = 1;
-        for (u32 bi2 = 0; bi2 < func->nblocks; bi2++)
-        {
-            IrBlock* fb = func->blocks[bi2];
-            if (fb == null || self.isInLoop(lp, fb)) continue;
-            for (u32 ii = 0; ii < fb->ninsts; ii++) capU += fb->insts[ii]->nops;
-        }
-        IrValue** usedV = alloc<IrValue*>((usize)capU);
-        u32 nUsed = 0;
-        for (u32 bi2 = 0; bi2 < func->nblocks; bi2++)
-        {
-            IrBlock* fb = func->blocks[bi2];
-            if (fb == null || self.isInLoop(lp, fb)) continue;
-            for (u32 ii = 0; ii < fb->ninsts; ii++)
-            {
-                IrInst* ui = fb->insts[ii];
-                bool isPhi = ui->opcode == IrOpcode::Phi;
-                for (u32 oi = 0; oi < ui->nops; oi++)
-                {
-                    // Phi operands alternate value/pred-block; only the
-                    // value slots are value uses.
-                    if (isPhi && (oi & 1) == 1) continue;
-                    IrValue* op = ui->ops[oi];
-                    if (op == null || op->kind != IrValueKind::Inst) continue;
-                    IrBlock* def = ((IrInst*)op)->parent;
-                    if (def == null || !self.isInLoop(lp, def)) continue;
-                    bool seen = false;
-                    for (u32 u2 = 0; u2 < nUsed; u2++)
-                        if (usedV[u2] == op) { seen = true; break; }
-                    if (!seen) usedV[nUsed++] = op;
-                }
-            }
-        }
+        // usedV/nUsed computed above.
         for (u32 u2 = 0; u2 < nUsed; u2++)
         {
             IrValue* V = usedV[u2];
@@ -1055,6 +1117,7 @@ pub struct UnrollPass
         dealloc<UnrollValMap>(valMaps);
         dealloc<UnrollValMap>(blkMaps);
         dealloc<IrBlock*>(copies);
+        return true;
     }
 
     bool run(IrFunc* func)

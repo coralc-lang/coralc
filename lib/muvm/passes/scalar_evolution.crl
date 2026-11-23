@@ -172,6 +172,19 @@ Plan* planInv(Scev* s, IrValue* v)
 
 Plan* planBin(Scev* s, PlanKind k, Plan* a, Plan* b)
 {
+    // fold const+const so coefficient checks see through add-chains
+    if (a != null && b != null &&
+        a->kind == PlanKind::PL_CONST && b->kind == PlanKind::PL_CONST)
+    {
+        u32 w = s->ivTy != null ? s->ivTy->width : 64;
+        u64 m = tyMask(w);
+        u64 r;
+        if (k == PlanKind::PL_ADD) r = (a->c + b->c) & m;
+        else if (k == PlanKind::PL_SUB) r = (a->c - b->c) & m;
+        else if (k == PlanKind::PL_MUL) r = (a->c * b->c) & m;
+        else r = 0;
+        return planConst(s, r, w);
+    }
     Plan* p = planNew(s, k);
     p->a = a;
     p->b = b;
@@ -180,6 +193,8 @@ Plan* planBin(Scev* s, PlanKind k, Plan* a, Plan* b)
 
 Plan* planNeg(Scev* s, Plan* a)
 {
+    if (a != null && a->kind == PlanKind::PL_CONST)
+        return planConst(s, 0 - a->c, s->ivTy != null ? s->ivTy->width : 64);
     Plan* p = planNew(s, PlanKind::PL_NEG);
     p->a = a;
     return p;
@@ -310,6 +325,133 @@ bool affineExtract(Scev* s, IrValue* v, Affine* out, u32 depth)
     if (isInvariant(s, v))
     {
         out->A = planConst(s, 0, w);
+        out->B = planInv(s, v);
+        return true;
+    }
+    return false;
+}
+
+// ------------------------------------------------------------------
+// linear form: cP*pv + A*iv + B  (mod 2^w). Used for accumulator
+// updates so reassociated chains like `add(iv, add(iv, ... phi ...))`
+// still resolve to phi + affine(iv).
+// ------------------------------------------------------------------
+
+struct Lin
+{
+    Plan* cP;
+    Plan* A;
+    Plan* B;
+}
+
+bool planIsConstVal(Plan* p, u64 c)
+{
+    return p != null && p->kind == PlanKind::PL_CONST && p->c == c;
+}
+
+void linZero(Scev* s, Lin* l, u32 w)
+{
+    l->cP = planConst(s, 0, w);
+    l->A = planConst(s, 0, w);
+    l->B = planConst(s, 0, w);
+}
+
+bool linExtract(Scev* s, IrValue* v, IrValue* pv, Lin* out, u32 depth)
+{
+    if (v == null || depth > 24) return false;
+    u32 w = s->ivTy->width;
+
+    if (v == pv)
+    {
+        linZero(s, out, w);
+        out->cP = planConst(s, 1, w);
+        return true;
+    }
+    if (v == s->ivPhi)
+    {
+        linZero(s, out, w);
+        out->A = planConst(s, 1, w);
+        return true;
+    }
+    if (v->kind == IrValueKind::ConstInt)
+    {
+        linZero(s, out, w);
+        out->B = planConst(s, v->valData & tyMask(w), w);
+        return true;
+    }
+    if (v->kind == IrValueKind::Inst)
+    {
+        IrInst* i = (IrInst*)v;
+        if (i->opcode == IrOpcode::Trunc || i->opcode == IrOpcode::Zext ||
+            i->opcode == IrOpcode::Sext || i->opcode == IrOpcode::Bitcast)
+        {
+            if (i->nops >= 1) return linExtract(s, i->ops[0], pv, out, depth + 1);
+            return false;
+        }
+        if (i->opcode == IrOpcode::Neg && i->nops == 1)
+        {
+            Lin t;
+            t.cP = null; t.A = null; t.B = null;
+            if (!linExtract(s, i->ops[0], pv, &t, depth + 1)) return false;
+            out->cP = planNeg(s, t.cP);
+            out->A = planNeg(s, t.A);
+            out->B = planNeg(s, t.B);
+            return true;
+        }
+        if ((i->opcode == IrOpcode::Add || i->opcode == IrOpcode::Sub) && i->nops == 2)
+        {
+            Lin x; x.cP = null; x.A = null; x.B = null;
+            Lin y; y.cP = null; y.A = null; y.B = null;
+            if (!linExtract(s, i->ops[0], pv, &x, depth + 1)) return false;
+            if (!linExtract(s, i->ops[1], pv, &y, depth + 1)) return false;
+            PlanKind k = i->opcode == IrOpcode::Add ? PlanKind::PL_ADD : PlanKind::PL_SUB;
+            out->cP = planBin(s, k, x.cP, y.cP);
+            out->A = planBin(s, k, x.A, y.A);
+            out->B = planBin(s, k, x.B, y.B);
+            return true;
+        }
+        if (i->opcode == IrOpcode::Mul && i->nops == 2)
+        {
+            Lin x; x.cP = null; x.A = null; x.B = null;
+            Lin y; y.cP = null; y.A = null; y.B = null;
+            if (!linExtract(s, i->ops[0], pv, &x, depth + 1)) return false;
+            if (!linExtract(s, i->ops[1], pv, &y, depth + 1)) return false;
+            bool xfree = planIsConstVal(x.cP, 0) && planIsConstVal(x.A, 0);
+            bool yfree = planIsConstVal(y.cP, 0) && planIsConstVal(y.A, 0);
+            if (xfree && yfree)
+            {
+                out->cP = planConst(s, 0, w);
+                out->A = planConst(s, 0, w);
+                out->B = planBin(s, PlanKind::PL_MUL, x.B, y.B);
+                return true;
+            }
+            if (xfree && !yfree)
+            {
+                out->cP = planBin(s, PlanKind::PL_MUL, x.B, y.cP);
+                out->A = planBin(s, PlanKind::PL_MUL, x.B, y.A);
+                out->B = planBin(s, PlanKind::PL_MUL, x.B, y.B);
+                return true;
+            }
+            if (yfree && !xfree)
+            {
+                out->cP = planBin(s, PlanKind::PL_MUL, y.B, x.cP);
+                out->A = planBin(s, PlanKind::PL_MUL, y.B, x.A);
+                out->B = planBin(s, PlanKind::PL_MUL, y.B, x.B);
+                return true;
+            }
+            return false;
+        }
+        if (isInvariant(s, v))
+        {
+            linZero(s, out, w);
+            out->B = planInv(s, v);
+            return true;
+        }
+        return false;
+    }
+    if (isInvariant(s, v))
+    {
+        linZero(s, out, w);
         out->B = planInv(s, v);
         return true;
     }
@@ -738,17 +880,17 @@ bool tryLoop(Scev* s, IrLoop* lp)
             continue;
         }
         if (!isIntTy(pv->type)) { freeLoopScratch(s); return false; }
-        if ((upd->opcode != IrOpcode::Add && upd->opcode != IrOpcode::Sub) || upd->nops != 2)
+        // update must be pv + affine(iv): linExtract yields
+        // cP*pv + A*iv + B with cP required to be the constant 1
+        Lin ln;
+        ln.cP = null; ln.A = null; ln.B = null;
+        if (!linExtract(s, &upd->base, pv, &ln, 0)) { freeLoopScratch(s); return false; }
+        if (!planIsConstVal(ln.cP, 1)) { freeLoopScratch(s); return false; }
+        if (!planIsZero(ln.A) && pv->type->width != ivPhi->type->width)
         { freeLoopScratch(s); return false; }
-        IrValue* e = null;
-        if (upd->ops[0] == pv && upd->ops[1] != null) e = upd->ops[1];
-        else if (upd->opcode == IrOpcode::Add && upd->ops[1] == pv && upd->ops[0] != null) e = upd->ops[0];
-        if (e == null) { freeLoopScratch(s); return false; }
         Affine af;
-        af.A = null; af.B = null;
-        if (!affineExtract(s, e, &af, 0)) { freeLoopScratch(s); return false; }
-        if (!planIsZero(af.A) && pv->type->width != ivPhi->type->width)
-        { freeLoopScratch(s); return false; }
+        af.A = ln.A;
+        af.B = ln.B;
         s->affs[pi] = af;
     }
     if (s->ivIdx == ~0u) { freeLoopScratch(s); return false; }
@@ -908,10 +1050,9 @@ bool tryLoop(Scev* s, IrLoop* lp)
             IrValue* s2 = &emitBin(s, IrOpcode::Mul, pty, q_, tria)->base;
             sumE = &emitBin(s, IrOpcode::Add, pty, s1, s2)->base;
         }
-        if (s->updOp[pi]->opcode == IrOpcode::Add)
-            s->ivExit[pi] = &emitBin(s, IrOpcode::Add, pty, init, sumE)->base;
-        else
-            s->ivExit[pi] = &emitBin(s, IrOpcode::Sub, pty, init, sumE)->base;
+        // linExtract folds the update direction into A/B, so the
+        // recurrence is always P += (A*iv + B)
+        s->ivExit[pi] = &emitBin(s, IrOpcode::Add, pty, init, sumE)->base;
     }
 
     // resolve escaping values
