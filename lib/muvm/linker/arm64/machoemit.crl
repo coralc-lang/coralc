@@ -14,7 +14,8 @@ import std::mman { alloc, dealloc, copy };
 use macho {
     MH_MAGIC_64, MH_EXECUTE, MH_DYLIB, CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL,
     LC_SEGMENT_64, LC_SYMTAB, LC_DYSYMTAB, LC_MAIN, LC_UUID, LC_ID_DYLIB,
-    LC_VERSION_MIN_MACOSX, S_REGULAR, S_ZEROFILL, S_ATTR_PURE_INSTRUCTIONS,
+    LC_VERSION_MIN_MACOSX, LC_DYLD_EXPORTS_TRIE,
+    S_REGULAR, S_ZEROFILL, S_ATTR_PURE_INSTRUCTIONS,
     S_ATTR_SOME_INSTRUCTIONS, S_ATTR_DEBUG
 };
 use elf {
@@ -25,7 +26,7 @@ use object { ObjFile, Section };
 use resolve { GlobalDef };
 use layout {
     Layout, OutSec, Piece, defAddress, machoHeaderSize,
-    SEC_BSS, SEC_ALLOC_COUNT
+    SEC_BSS, SEC_INIT, SEC_ALLOC_COUNT
 };
 
 void _mName(u8* p, str name)
@@ -76,9 +77,9 @@ void _mSections(Layout* L, Vec<usize>* ord, Vec<u8>* segs)
         OutSec* s = L->secs.atPtr(i);
         if (s->size == 0) continue;
         u8 sg;
-        if (i < 6) sg = 0;          /* SEC_HOT..SEC_NOTE */
-        else if (i <= 9) sg = 1;    /* SEC_INIT..SEC_BSS */
-        else sg = 2;                /* debug passthrough */
+        if (i < SEC_INIT) sg = 0;        /* SEC_HOT..SEC_FINICODE */
+        else if (i < SEC_ALLOC_COUNT) sg = 1; /* SEC_INIT..SEC_BSS */
+        else sg = 2;                     /* debug passthrough */
         ord->push(i);
         segs->push(sg);
     }
@@ -142,8 +143,177 @@ usize _wSections(u8* img, usize pos, Layout* L, Vec<usize>* ord,
     return pos;
 }
 
+// ------------------------------------------------------------------
+// export trie (LC_DYLD_EXPORTS_TRIE / dyld export format)
+// ------------------------------------------------------------------
+struct MExpNode { u64 addr; bool hasTerm; i32 head; i32 tail; }
+struct MExpEdge { str label; i32 child; i32 next; }
+
+void _mUleb(Vec<u8>* v, u64 x)
+{
+    while (x >= 0x80) { v->push((u8)((x & 0x7F) | 0x80)); x >>= 7; }
+    v->push((u8)x);
+}
+
+u32 _mUlebLen(u64 x)
+{
+    u32 n = 1;
+    while (x >= 0x80) { n++; x >>= 7; }
+    return n;
+}
+
+// build compressed trie over sorted names[lo..hi) sharing consumed
+// prefix of `dep` bytes; returns node index (nodes/edges grow)
+i32 _mExpBuild(Vec<MExpNode>* nodes, Vec<MExpEdge>* edges,
+               Vec<str>* names, Vec<u64>* offs, usize lo, usize hi, usize dep)
+{
+    i32 ni = (i32)nodes->count();
+    MExpNode nd;
+    nd.addr = 0;
+    nd.hasTerm = false;
+    nd.head = -1;
+    nd.tail = -1;
+    nodes->push(nd);
+    // terminal: the name equal to the consumed prefix sorts first
+    if (lo < hi)
+    {
+        str nm = names->at(lo);
+        if (dep == nm.len)
+        {
+            nodes->atPtr((usize)ni)->hasTerm = true;
+            nodes->atPtr((usize)ni)->addr = offs->at(lo);
+        }
+    }
+    usize i = lo;
+    while (i < hi)
+    {
+        str nm = names->at(i);
+        if (dep >= nm.len) { i++; continue; }
+        u8 b = nm.ptr[dep];
+        usize j = i + 1;
+        while (j < hi)
+        {
+            str nm2 = names->at(j);
+            if (dep < nm2.len && nm2.ptr[dep] == b) j++;
+            else break;
+        }
+        // longest common prefix of the group's remaining suffixes
+        usize lcp = nm.len - dep;
+        for (usize k = i + 1; k < j; k++)
+        {
+            str nk = names->at(k);
+            usize m = nk.len - dep < lcp ? nk.len - dep : lcp;
+            usize p = 0;
+            while (p < m && nm.ptr[dep + p] == nk.ptr[dep + p]) p++;
+            if (p < lcp) lcp = p;
+        }
+        if (lcp == 0) lcp = 1;
+        str lbl = str { (const u8*)(nm.ptr + dep), lcp };
+        i32 child = _mExpBuild(nodes, edges, names, offs, i, j, dep + lcp);
+        MExpEdge e;
+        e.label = lbl;
+        e.child = child;
+        e.next = -1;
+        edges->push(e);
+        i32 ei = (i32)edges->count() - 1;
+        i32 tail = nodes->atPtr((usize)ni)->tail;
+        if (tail >= 0) edges->atPtr((usize)tail)->next = ei;
+        else nodes->atPtr((usize)ni)->head = ei;
+        nodes->atPtr((usize)ni)->tail = ei;
+        i = j;
+    }
+    return ni;
+}
+
+// serialized size of a node's own region (header+terminal+edges);
+// child offsets come from `offs` (previous fixpoint iteration)
+u64 _mExpNodeSize(Vec<MExpNode>* nodes, Vec<MExpEdge>* edges, i32 ni, Vec<usize>* offs)
+{
+    MExpNode* nd = nodes->atPtr((usize)ni);
+    u64 termSz = nd->hasTerm ? 1 + (u64)_mUlebLen(nd->addr) : 0;
+    u64 sz = (u64)_mUlebLen(termSz) + termSz + 1;
+    for (i32 e = nd->head; e >= 0; e = edges->atPtr((usize)e)->next)
+    {
+        MExpEdge* ed = edges->atPtr((usize)e);
+        sz += (u64)ed->label.len + 1 + (u64)_mUlebLen((u64)offs->at((usize)ed->child));
+    }
+    return sz;
+}
+
+void _mExpLayout(Vec<MExpNode>* nodes, Vec<MExpEdge>* edges, i32 ni,
+                 Vec<usize>* offs, usize* pos)
+{
+    *offs->atPtr((usize)ni) = *pos;
+    *pos += (usize)_mExpNodeSize(nodes, edges, ni, offs);
+    MExpNode* nd = nodes->atPtr((usize)ni);
+    for (i32 e = nd->head; e >= 0; e = edges->atPtr((usize)e)->next)
+        _mExpLayout(nodes, edges, edges->atPtr((usize)e)->child, offs, pos);
+}
+
+// assign node offsets; edge-offset uleb sizes depend on offsets, so
+// iterate the layout until the offsets stop changing (they only grow,
+// so this converges in a few passes)
+void _mExpOffsets(Vec<MExpNode>* nodes, Vec<MExpEdge>* edges, Vec<usize>* offs)
+{
+    usize nn = nodes->count();
+    Vec<usize> prev = Vec<usize>::new();
+    for (usize i = 0; i < nn; i++) { offs->push(0); prev.push(0); }
+    for (u32 iter = 0; iter < 12; iter++)
+    {
+        for (usize i = 0; i < nn; i++) *prev.atPtr(i) = *offs->atPtr(i);
+        usize pos = 0;
+        _mExpLayout(nodes, edges, 0, offs, &pos);
+        bool same = true;
+        for (usize i = 0; i < nn; i++)
+            if (offs->at(i) != prev.at(i)) { same = false; break; }
+        if (same) break;
+    }
+    prev.dispose();
+}
+
+void _mExpEmit(Vec<u8>* out, Vec<MExpNode>* nodes, Vec<MExpEdge>* edges,
+               Vec<usize>* offs, i32 ni)
+{
+    MExpNode* nd = nodes->atPtr((usize)ni);
+    u64 termSz = nd->hasTerm ? 1 + (u64)_mUlebLen(nd->addr) : 0;
+    u32 nchild = 0;
+    for (i32 e = nd->head; e >= 0; e = edges->atPtr((usize)e)->next) nchild++;
+    _mUleb(out, termSz);
+    if (nd->hasTerm)
+    {
+        out->push(0); /* EXPORT_SYMBOL_FLAGS */
+        _mUleb(out, nd->addr);
+    }
+    out->push((u8)nchild);
+    for (i32 e = nd->head; e >= 0; e = edges->atPtr((usize)e)->next)
+    {
+        MExpEdge* ed = edges->atPtr((usize)e);
+        for (usize k = 0; k < ed->label.len; k++) out->push(ed->label.ptr[k]);
+        out->push(0);
+        _mUleb(out, (u64)offs->at((usize)ed->child));
+    }
+    for (i32 e = nd->head; e >= 0; e = edges->atPtr((usize)e)->next)
+        _mExpEmit(out, nodes, edges, offs, edges->atPtr((usize)e)->child);
+}
+
+// build the whole trie into `out`; names must be sorted, addrs are
+// offsets from the image base (mach_header vmaddr)
+void _mExpTrie(Vec<u8>* out, Vec<str>* names, Vec<u64>* addrs)
+{
+    Vec<MExpNode> nodes = Vec<MExpNode>::new();
+    Vec<MExpEdge> edges = Vec<MExpEdge>::new();
+    _mExpBuild(&nodes, &edges, names, addrs, 0, names->count(), 0);
+    Vec<usize> offs = Vec<usize>::new();
+    for (usize i = 0; i < nodes.count(); i++) offs.push(0);
+    _mExpOffsets(&nodes, &edges, &offs);
+    _mExpEmit(out, &nodes, &edges, &offs, 0);
+    offs.dispose();
+    edges.dispose();
+    nodes.dispose();
+}
+
 pub bool emitMachOImage(bool isDll, str installName, Vec<ObjFile>* objs, Vec<GlobalDef>* defs,
-                        Layout* L, u8** outImg, usize* outLen, String* err)
+                        Layout* L, Vec<str>* exports, u8** outImg, usize* outLen, String* err)
 {
     u64 base = L->imageBase;
     bool needRW = L->hasRW;
@@ -184,9 +354,73 @@ pub bool emitMachOImage(bool isDll, str installName, Vec<ObjFile>* objs, Vec<Glo
             if ((i32)(undef ? 1 : 0) == pass) strSize += (u64)def->name.len + 1;
         }
 
+    /* export trie for dylibs: names arrive sorted; resolve each to a
+     * defined global's offset from the image base */
+    Vec<u8> trie = Vec<u8>::new();
+    if (isDll && exports != null && exports->count() > 0)
+    {
+        Vec<str> names = Vec<str>::new();
+        Vec<u64> offs = Vec<u64>::new();
+        for (usize i = 0; i < exports->count(); i++)
+        {
+            str nm = exports->at(i);
+            u64 val = 0;
+            bool found = false;
+            for (usize d = 0; d < defs->count(); d++)
+            {
+                GlobalDef* def = defs->atPtr(d);
+                if (def->isImport || def->shndx == SHN_UNDEF) continue;
+                if (!def->name.equals(nm)) continue;
+                if (!defAddress(objs, L, def, &val, err))
+                {
+                    names.dispose();
+                    offs.dispose();
+                    trie.dispose();
+                    return false;
+                }
+                found = true;
+                break;
+            }
+            if (!found) continue;
+            names.push(nm);
+            offs.push(val >= base ? val - base : val);
+        }
+        if (names.count() > 0) _mExpTrie(&trie, &names, &offs);
+        names.dispose();
+        offs.dispose();
+    }
+
+    /* bind stream (LC_DYLD_INFO_ONLY): one entry per imported def —
+     * SET_SYMBOL_NAME, SET_TYPE=pointer, SET_DYLIB_SPECIAL=flat-lookup,
+     * SET_SEGMENT_AND_OFFSET_ULEB (__DATA), DO_BIND. Non-lazy: every
+     * import lives in __got and is bound at load. */
+    Vec<u8> bind = Vec<u8>::new();
+    if (L->machoGot.count() > 0)
+    {
+        u64 dataVm = base + L->rwOff;
+        for (usize d = 0; d < defs->count(); d++)
+        {
+            GlobalDef* def = defs->atPtr(d);
+            if (!def->isImport || def->impIdx >= 0) continue;
+            if (d >= L->machoGot.count() || L->machoGot.at(d) < 0) continue;
+            u64 slotOff = def->value > dataVm ? def->value - dataVm : 0;
+            bind.push(0x40); /* SET_SYMBOL_NAME */
+            for (usize i = 0; i < def->name.len; i++) bind.push(def->name.ptr[i]);
+            bind.push(0);
+            bind.push(0x51); /* SET_TYPE_IMM pointer */
+            bind.push(0x3e); /* SET_DYLIB_SPECIAL_IMM flat-lookup (-2) */
+            bind.push((u8)(0x70 | (isDll ? 1 : 2))); /* __DATA seg idx */
+            _mUleb(&bind, slotOff);
+            bind.push(0x90); /* DO_BIND */
+        }
+        bind.push(0); /* DONE */
+    }
+
     u64 symOff = linkOff;
     u64 strOff = symOff + (u64)nSyms * 16;
-    u64 linkSize = (u64)nSyms * 16 + strSize;
+    u64 bindOff = strOff + strSize;
+    u64 trieOff = bindOff + (u64)bind.count();
+    u64 linkSize = (u64)nSyms * 16 + strSize + (u64)bind.count() + (u64)trie.count();
     u64 fileSize = linkOff + linkSize;
     if (fileSize > 0xffffffffu)
     {
@@ -195,7 +429,7 @@ pub bool emitMachOImage(bool isDll, str installName, Vec<ObjFile>* objs, Vec<Glo
     }
 
     u64 nameLen = isDll ? (installName.len > 0 ? installName.len : 14) : 0;
-    u64 hdrSize = machoHeaderSize(L, needRW, nameLen);
+    u64 hdrSize = machoHeaderSize(L, needRW, nameLen, true);
 
     u8* img = alloc<u8>((usize)fileSize);
     if (img == null) { err->pushView("linker: out of memory"); return false; }
@@ -205,15 +439,21 @@ pub bool emitMachOImage(bool isDll, str installName, Vec<ObjFile>* objs, Vec<Glo
     putU32(img + 4, CPU_TYPE_ARM64);
     putU32(img + 8, CPU_SUBTYPE_ARM64_ALL);
     putU32(img + 12, isDll ? MH_DYLIB : MH_EXECUTE);
-    u32 ncmds = 8 + (needRW ? 1 : 0) + (dbgEnd > 0 ? 1 : 0);
+    u32 ncmds = 8 + (needRW ? 1 : 0) + (dbgEnd > 0 ? 1 : 0) +
+                (isDll ? 0 : 1);
     putU32(img + 16, ncmds);
     putU32(img + 20, (u32)(hdrSize - 32));
     putU32(img + 24, isDll ? 0u : 0x200000u); /* MH_PIE */
     putU32(img + 28, 0);
 
     usize cmdPos = 32;
-    _wSeg64(img + cmdPos, "__PAGEZERO", 0, 0x100000000ULL, 0, 0, 0, 0, 0);
-    cmdPos += 72;
+    /* dylibs conventionally omit __PAGEZERO (ld64 does); this keeps
+     * bind-stream segment indices aligned with ld64 output */
+    if (!isDll)
+    {
+        _wSeg64(img + cmdPos, "__PAGEZERO", 0, 0x100000000ULL, 0, 0, 0, 0, 0);
+        cmdPos += 72;
+    }
     {
         u64 vmsz = alignUp(L->rxEnd, 0x4000);
         if (vmsz < 0x4000) vmsz = 0x4000;
@@ -299,6 +539,23 @@ pub bool emitMachOImage(bool isDll, str installName, Vec<ObjFile>* objs, Vec<Glo
     putU32(img + cmdPos + 12, 0x000C0000u);
     cmdPos += 16;
 
+    /* LC_DYLD_INFO_ONLY: rebase/bind/weak/lazy/export (off,size) pairs.
+     * Only bind and export are used; rebase is empty (no dyld fixups
+     * emitted for defined data yet), lazy is unused (non-lazy binds). */
+    putU32(img + cmdPos, 0x80000022);
+    putU32(img + cmdPos + 4, 48);
+    putU32(img + cmdPos + 8, 0);             /* rebase off */
+    putU32(img + cmdPos + 12, 0);            /* rebase size */
+    putU32(img + cmdPos + 16, (u32)bindOff); /* bind off */
+    putU32(img + cmdPos + 20, (u32)bind.count());
+    putU32(img + cmdPos + 24, 0);            /* weak bind off */
+    putU32(img + cmdPos + 28, 0);            /* weak bind size */
+    putU32(img + cmdPos + 32, 0);            /* lazy bind off */
+    putU32(img + cmdPos + 36, 0);            /* lazy bind size */
+    putU32(img + cmdPos + 40, (u32)trieOff); /* export trie off */
+    putU32(img + cmdPos + 44, (u32)trie.count());
+    cmdPos += 48;
+
     /* copy section contents */
     for (usize i = 0; i < L->secs.count(); i++)
     {
@@ -368,6 +625,37 @@ pub bool emitMachOImage(bool isDll, str installName, Vec<ObjFile>* objs, Vec<Glo
             copy<u8>(img + (usize)strOff + (usize)stroff, (u8*)def->name.ptr, def->name.len);
             stroff += (u64)def->name.len + 1;
             idx++;
+        }
+    }
+    if (bind.count() > 0)
+        copy<u8>(img + (usize)bindOff, bind.data, bind.count());
+    bind.dispose();
+    if (trie.count() > 0)
+        copy<u8>(img + (usize)trieOff, trie.data, trie.count());
+    trie.dispose();
+
+    /* __text stubs for branch-referenced imports: adrp x16 / ldr x16 /
+     * br x16 through the symbol's __got slot (bound by dyld) */
+    if (L->machoStub.count() > 0)
+    {
+        for (usize d = 0; d < defs->count(); d++)
+        {
+            GlobalDef* def = defs->atPtr(d);
+            if (!def->isImport || def->impIdx >= 0 || def->iatAddr == 0) continue;
+            if (d >= L->machoStub.count() || L->machoStub.at(d) < 0) continue;
+            u64 stubAddr = def->iatAddr;
+            u64 gotAddr = def->value;
+            if (stubAddr < base || gotAddr < base) continue;
+            usize sp = (usize)(stubAddr - base);
+            if (sp + 12 > (usize)fileSize) continue;
+            i64 pd = (i64)((gotAddr & ~0xFFFULL) - (stubAddr & ~0xFFFULL)) >> 12;
+            if (pd < -(1 << 20) || pd >= (1 << 20)) continue;
+            u64 dw = (u64)pd & 0x1FFFFF;
+            putU32(img + sp, 0x90000010u |
+                   (u32)((dw & 3u) << 29) | (u32)(((dw >> 2) & 0x7FFFFu) << 5));
+            u64 lo = gotAddr & 0xFFFu;
+            putU32(img + sp + 4, 0xF9400000u | (u32)((lo >> 3) << 10) | (16u << 5) | 16u);
+            putU32(img + sp + 8, 0xD61F0200u);
         }
     }
 

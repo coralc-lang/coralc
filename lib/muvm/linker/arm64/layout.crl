@@ -133,6 +133,10 @@ pub struct Layout
     u64 ipltOff;
     Vec<u32> ipltSlots;
     Vec<u64> ipltKeys;
+    u64 machoStubOff;
+    u64 machoGotImpOff;
+    Vec<i64> machoGot;
+    Vec<i64> machoStub;
 
     Layout empty()
     {
@@ -186,7 +190,11 @@ pub struct Layout
             .relaPltSize = 0,
             .ipltOff = 0,
             .ipltSlots = Vec<u32>::new(),
-            .ipltKeys = Vec<u64>::new()
+            .ipltKeys = Vec<u64>::new(),
+            .machoStubOff = 0,
+            .machoGotImpOff = 0,
+            .machoGot = Vec<i64>::new(),
+            .machoStub = Vec<i64>::new()
         };
     }
 
@@ -391,7 +399,7 @@ usize _countAbs(u16 machine, u8 outFmt, Vec<ObjFile>* objs)
  * __LINKEDIT, __DWARF (non-alloc passthrough secs). Followed by
  * LC_SYMTAB, LC_DYSYMTAB, LC_MAIN, LC_UUID, LC_VERSION_MIN_MACOSX.
  * Must agree exactly with the emitter in machoemit.crl. */
-pub u64 machoHeaderSize(Layout* L, bool needRW, u64 dylibNameLen)
+pub u64 machoHeaderSize(Layout* L, bool needRW, u64 dylibNameLen, bool hasExports)
 {
     usize nText = 0;
     usize nData = 0;
@@ -404,7 +412,9 @@ pub u64 machoHeaderSize(Layout* L, bool needRW, u64 dylibNameLen)
         else if (i <= SEC_BSS) nData++;
         else nDwarf++;
     }
-    u64 nseg = 3 + (needRW ? 1 : 0) + (nDwarf > 0 ? 1 : 0);
+    /* __PAGEZERO is emitted for executables only; dylibNameLen>0 marks
+     * a dylib (LC_ID_DYLIB name), which omits it like ld64 */
+    u64 nseg = (dylibNameLen > 0 ? 2 : 3) + (needRW ? 1 : 0) + (nDwarf > 0 ? 1 : 0);
     /* SYMTAB24 + DYSYMTAB80 + UUID24 + VERSION16, then either
      * LC_MAIN(24) for executables or LC_ID_DYLIB(24+name) for dylibs */
     u64 tail = 24 + 80 + 24 + 16;
@@ -412,11 +422,12 @@ pub u64 machoHeaderSize(Layout* L, bool needRW, u64 dylibNameLen)
         tail += 24 + ((dylibNameLen + 1 + 7) & ~7ULL);
     else
         tail += 24;
+    if (hasExports) tail += 48; /* LC_DYLD_INFO_ONLY */
     u64 sizeofcmds = nseg * 72 + (u64)(nText + nData + nDwarf) * 80 + tail;
     return 32 + sizeofcmds;
 }
 
-pub bool computeLayout(u16 machine, u8 outFmt, u64 imageBase, str entry, u64 entryAddr, bool entryAddrSet, usize edataSz, Vec<ObjFile>* objs, Vec<GlobalDef>* defs, Imports* imps, Layout* L, String* err, u64 machoNameLen)
+pub bool computeLayout(u16 machine, u8 outFmt, u64 imageBase, str entry, u64 entryAddr, bool entryAddrSet, usize edataSz, Vec<ObjFile>* objs, Vec<GlobalDef>* defs, Imports* imps, Layout* L, String* err, u64 machoNameLen, bool machoExports)
 {
     bool is64 = machine == EM_AARCH64;
     bool isPE = outFmt == FMT_PE_EXE || outFmt == FMT_PE_DLL;
@@ -781,10 +792,10 @@ pub bool computeLayout(u16 machine, u8 outFmt, u64 imageBase, str entry, u64 ent
     }
 
     /* Mach-O: ARM64_RELOC_GOT_LOAD_* references need GOT slots — one
-     * 8-byte entry per unique (object, symbol) pair, appended to the
-     * end of the writable data area. Entries hold the symbol's final
-     * address (defined symbols only; undefined imports would need
-     * bind opcodes, which are out of scope). */
+     * 8-byte entry per unique (object, symbol) pair for defined
+     * symbols, appended to the end of the writable data area.
+     * Undefined symbols become dyld imports: each gets a GOT slot
+     * (regular bind) plus a __text stub when reached via BRANCH26. */
     if (isMacho)
     {
         usize nGot = 0;
@@ -801,6 +812,12 @@ pub bool computeLayout(u16 machine, u8 outFmt, u64 imageBase, str entry, u64 ent
                     if (r->fmt != 2) continue;
                     u32 mrt = (r->type - 1000) >> 4;
                     if (mrt != 5 && mrt != 6) continue;
+                    Sym* rs = obj->syms.atPtr((usize)r->sym);
+                    if (rs->bind != STB_LOCAL)
+                    {
+                        i64 di = findDef(defs, rs->name);
+                        if (di >= 0 && defs->atPtr((usize)di)->isImport) continue;
+                    }
                     bool seen = false;
                     for (usize q = 0; q < syms.count(); q++)
                         if (syms.at(q) == r->sym) { seen = true; break; }
@@ -810,14 +827,59 @@ pub bool computeLayout(u16 machine, u8 outFmt, u64 imageBase, str entry, u64 ent
             nGot += syms.count();
             syms.dispose();
         }
-        if (nGot > 0)
+        /* import slots: one GOT entry per unique imported def referenced
+         * by GOT_LOAD or BRANCH26; stubs for the branch-referenced ones */
+        usize nImp = 0;
+        usize nStub = 0;
+        for (usize d = 0; d < defs->count(); d++)
+        {
+            L->machoGot.push(-1);
+            L->machoStub.push(-1);
+        }
+        for (usize o = 0; o < objs->count(); o++)
+        {
+            ObjFile* obj = objs->atPtr(o);
+            for (usize si = 0; si < obj->secs.count(); si++)
+            {
+                Vec<Reloc>* bucket = obj->rels.atPtr(si);
+                for (usize k = 0; k < bucket->count(); k++)
+                {
+                    Reloc* r = bucket->atPtr(k);
+                    if (r->fmt != 2) continue;
+                    u32 mrt = (r->type - 1000) >> 4;
+                    if (mrt != 5 && mrt != 6 && mrt != 2) continue;
+                    Sym* rs = obj->syms.atPtr((usize)r->sym);
+                    if (rs->bind == STB_LOCAL) continue;
+                    i64 di = findDef(defs, rs->name);
+                    if (di < 0 || !defs->atPtr((usize)di)->isImport) continue;
+                    if (L->machoGot.at((usize)di) < 0)
+                    {
+                        *L->machoGot.atPtr((usize)di) = (i64)nImp;
+                        nImp++;
+                    }
+                    if (mrt == 2 && L->machoStub.at((usize)di) < 0)
+                    {
+                        *L->machoStub.atPtr((usize)di) = (i64)nStub;
+                        nStub++;
+                    }
+                }
+            }
+        }
+        if (nGot > 0 || nImp > 0)
         {
             needRW = true;
             OutSec* rw = L->secs.atPtr((usize)SEC_DATA);
             u64 got = alignUp(rw->size, 8);
             L->gotOff = got;
-            L->gotSize = (u64)nGot * 8;
+            L->gotSize = (u64)(nGot + nImp) * 8;
+            L->machoGotImpOff = got + (u64)nGot * 8;
             rw->size = got + L->gotSize;
+        }
+        if (nStub > 0)
+        {
+            OutSec* text = L->secs.atPtr((usize)SEC_TEXT);
+            L->machoStubOff = alignUp(text->size, 4);
+            text->size = L->machoStubOff + (u64)nStub * 12;
         }
     }
 
@@ -850,7 +912,7 @@ pub bool computeLayout(u16 machine, u8 outFmt, u64 imageBase, str entry, u64 ent
     else if (isMacho)
     {
         phnum = 0;
-        phdrEnd = machoHeaderSize(L, needRW, machoNameLen);
+        phdrEnd = machoHeaderSize(L, needRW, machoNameLen, machoExports);
     }
     else
     {
@@ -1020,6 +1082,26 @@ pub bool computeLayout(u16 machine, u8 outFmt, u64 imageBase, str entry, u64 ent
             ImportRec* r = imps->recs.atPtr((usize)def->impIdx);
             def->value = r->thunkAddr;
             def->iatAddr = r->iatAddr;
+            def->size = 0;
+        }
+    }
+
+    /* Mach-O imports: def->value becomes the __got slot address (what
+     * GOT_LOAD relocs and addrs[] see), def->iatAddr the __text stub
+     * address for BRANCH26 targets (0 when only data-referenced) */
+    if (isMacho && L->machoGot.count() > 0 && L->secs.count() > SEC_DATA)
+    {
+        OutSec* rw = L->secs.atPtr((usize)SEC_DATA);
+        OutSec* text = L->secs.atPtr((usize)SEC_TEXT);
+        for (usize d = 0; d < defs->count(); d++)
+        {
+            GlobalDef* def = defs->atPtr(d);
+            if (!def->isImport || def->impIdx >= 0) continue;
+            i64 gi = L->machoGot.at(d);
+            if (gi < 0) continue;
+            def->value = rw->addr + L->machoGotImpOff + (u64)gi * 8;
+            i64 si = L->machoStub.at(d);
+            def->iatAddr = si >= 0 ? text->addr + L->machoStubOff + (u64)si * 12 : 0;
             def->size = 0;
         }
     }
