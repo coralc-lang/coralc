@@ -95,13 +95,10 @@ pub struct LoopInterchangePass
         // Try to interchange each nested loop pair
         for (u32 i = 0; i < nNested; i++)
         {
-            if (self.canInterchange(nested[i].inner, nested[i].outer, func))
+            if (self.interchangeCanonical(nested[i].inner, nested[i].outer, func))
             {
-                if (self.interchangeLoops(nested[i].inner, nested[i].outer, func))
-                {
-                    changed = true;
-                    self.interchanges++;
-                }
+                changed = true;
+                self.interchanges++;
             }
         }
 
@@ -409,6 +406,342 @@ pub struct LoopInterchangePass
             }
         }
         return null;
+    }
+
+    // ---- canonical loop interchange (real CFG rebuild) ----
+    //
+    // Handles the perfectly-nested counted shape only:
+    //
+    //   pred -> H_out { phi_i, icmp_i, cond_br -> E / EXIT }
+    //   E     -> H_in  (E is H_out itself, or a single `br` trampoline)
+    //   H_in  { phi_j, br -> B0 }
+    //   B0..Bk-1 -> ... -> L_in   (unconditional-br chain, no phis)
+    //   L_in  { jn = j+step, icmp_j, cond_br -> H_in / L_out }
+    //   L_out { in = i+step, br -> H_out }
+    //
+    // After the swap the inner header becomes the outer loop and the
+    // outer header becomes the inner loop; every edge is rewired in
+    // place (no block cloning). Legality is strict: exactly one phi per
+    // header (the IV), no other phis in the nest, no stores/calls/
+    // atomics/fences, no conditional branches inside the inner body,
+    // and the outer body must be exactly the inner nest.
+
+    // retarget one block operand of a terminator from oldT to newT,
+    // keeping succs[] positionally consistent with the operand list
+    void retargetTermBlock(IrInst* term, IrBlock* oldT, IrBlock* newT)
+    {
+        IrBlock* parent = term->parent;
+        u32 succIdx = 0;
+        for (u32 j = 0; j < term->nops; j++)
+        {
+            IrValue* op = term->ops[j];
+            if (op == null || op->kind != IrValueKind::Block) continue;
+            if ((IrBlock*)op == oldT)
+            {
+                op->removeUser(term);
+                term->ops[j] = &newT->base;
+                newT->base.addUser(term);
+                oldT->removePred(parent);
+                newT->addPred(parent);
+                if (parent != null && succIdx < parent->nsuccs)
+                    parent->succs[succIdx] = newT;
+                return;
+            }
+            succIdx++;
+        }
+    }
+
+    // unconditional `br` terminator?
+    bool isUncondBr(IrInst* inst)
+    {
+        return inst != null && inst->opcode == IrOpcode::Br && inst->nops >= 1;
+    }
+
+    // conditional branch terminator?
+    bool isCondBr(IrInst* inst)
+    {
+        return inst != null && inst->opcode == IrOpcode::CondBr && inst->nops >= 3;
+    }
+
+    IrInst* blockTerm(IrBlock* bb)
+    {
+        if (bb == null || bb->ninsts == 0) return null;
+        return bb->insts[bb->ninsts - 1];
+    }
+
+    // first block operand of a terminator (br target / cond_br arm)
+    IrBlock* termBlockAt(IrInst* term, u32 idx)
+    {
+        u32 seen = 0;
+        for (u32 j = 0; j < term->nops; j++)
+        {
+            IrValue* op = term->ops[j];
+            if (op == null || op->kind != IrValueKind::Block) continue;
+            if (seen == idx) return (IrBlock*)op;
+            seen++;
+        }
+        return null;
+    }
+
+    // block-valued operand index of a given block inside a terminator
+    bool termHasBlock(IrInst* term, IrBlock* bb)
+    {
+        for (u32 j = 0; j < term->nops; j++)
+        {
+            IrValue* op = term->ops[j];
+            if (op != null && op->kind == IrValueKind::Block && (IrBlock*)op == bb)
+                return true;
+        }
+        return false;
+    }
+
+    // is bb inside lp's block set?
+    bool blockInLoop(IrBlock* bb, IrLoop* lp)
+    {
+        for (u32 i = 0; i < lp->nblocks; i++)
+            if (lp->blocks[i] == bb) return true;
+        return false;
+    }
+
+    // does inst carry side effects we can't reorder across iterations?
+    bool isUnsafeInNest(IrOpcode op)
+    {
+        return op == IrOpcode::Store || op == IrOpcode::Call ||
+               op == IrOpcode::InlineAsm || op == IrOpcode::AtomicStore ||
+               op == IrOpcode::AtomicLoad || op == IrOpcode::AtomicRmw ||
+               op == IrOpcode::AtomicCmpXchg || op == IrOpcode::Fence;
+    }
+
+    // count phi insts in a block
+    u32 nPhis(IrBlock* bb)
+    {
+        u32 n = 0;
+        for (u32 i = 0; i < bb->ninsts; i++)
+            if (bb->insts[i]->opcode == IrOpcode::Phi) n++;
+        return n;
+    }
+
+    // the single phi of a header, or null
+    IrInst* onlyPhi(IrBlock* bb)
+    {
+        IrInst* found = null;
+        for (u32 i = 0; i < bb->ninsts; i++)
+        {
+            IrInst* inst = bb->insts[i];
+            if (inst->opcode != IrOpcode::Phi) continue;
+            if (found != null) return null;   // more than one phi
+            found = inst;
+        }
+        return found;
+    }
+
+    // retarget a phi's (value, block) pair that names oldPred to newPred,
+    // preserving the value. Returns false if no such pair exists.
+    bool phiRetargetPred(IrInst* phi, IrBlock* oldPred, IrBlock* newPred)
+    {
+        for (u32 j = 1; j + 1 < phi->nops; j += 2)
+        {
+            IrValue* bop = phi->ops[j];
+            if (bop != null && bop->kind == IrValueKind::Block && (IrBlock*)bop == oldPred)
+            {
+                bop->removeUser(phi);
+                phi->ops[j] = &newPred->base;
+                newPred->base.addUser(phi);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // canonical interchange; returns true when the rewrite happened
+    bool interchangeCanonical(IrLoop* inner, IrLoop* outer, IrFunc* func)
+    {
+        IrBlock* H_out = outer->header;
+        IrBlock* H_in = inner->header;
+        if (H_out == null || H_in == null || H_out == H_in) return false;
+
+        // ---- locate latch/exit structure ----
+        // outer latch: the in-outer block ending in unconditional br -> H_out
+        IrBlock* L_out = null;
+        for (u32 bi = 0; bi < outer->nblocks; bi++)
+        {
+            IrBlock* bb = outer->blocks[bi];
+            if (bb == H_out || self.blockInLoop(bb, inner)) continue;
+            IrInst* t = self.blockTerm(bb);
+            if (self.isUncondBr(t) && self.termHasBlock(t, H_out)) { L_out = bb; break; }
+        }
+        if (L_out == null) return false;
+
+        // inner latch: in-inner block ending cond_br -> {H_in, L_out}
+        IrBlock* L_in = null;
+        for (u32 bi = 0; bi < inner->nblocks; bi++)
+        {
+            IrBlock* bb = inner->blocks[bi];
+            if (bb == H_in) continue;
+            IrInst* t = self.blockTerm(bb);
+            if (self.isCondBr(t) && self.termHasBlock(t, H_in) && self.termHasBlock(t, L_out))
+            { L_in = bb; break; }
+        }
+        if (L_in == null) return false;
+
+        // inner header must end in unconditional br into the body
+        IrInst* hInTerm = self.blockTerm(H_in);
+        if (!self.isUncondBr(hInTerm)) return false;
+        IrBlock* B0 = self.termBlockAt(hInTerm, 0);
+        if (B0 == null || B0 == L_in || !self.blockInLoop(B0, inner)) return false;
+
+        // outer header must end in cond_br -> {entry-side, EXIT}
+        IrInst* hOutTerm = self.blockTerm(H_out);
+        if (!self.isCondBr(hOutTerm)) return false;
+        IrBlock* armA = self.termBlockAt(hOutTerm, 0);
+        IrBlock* armB = self.termBlockAt(hOutTerm, 1);
+        if (armA == null || armB == null) return false;
+        // the arm that stays inside the nest is the entry side; the other exits
+        IrBlock* E = null;
+        IrBlock* EXIT = null;
+        if (self.blockInLoop(armA, outer) && !self.blockInLoop(armB, outer)) { E = armA; EXIT = armB; }
+        else if (self.blockInLoop(armB, outer) && !self.blockInLoop(armA, outer)) { E = armB; EXIT = armA; }
+        else return false;
+        if (EXIT == null) return false;
+
+        // E is either H_in itself or a single-inst `br H_in` trampoline
+        IrBlock* entryPredBlock = null;   // block named in phi pairs as entry pred
+        if (E == H_in)
+        {
+            entryPredBlock = H_out;
+        }
+        else
+        {
+            if (E->ninsts != 1 || !self.isUncondBr(self.blockTerm(E))) return false;
+            if (!self.termHasBlock(self.blockTerm(E), H_in)) return false;
+            entryPredBlock = E;
+        }
+
+        // ---- legality sweep over both loops ----
+        // every outer block must be H_out, L_out, E, or inside inner
+        for (u32 bi = 0; bi < outer->nblocks; bi++)
+        {
+            IrBlock* bb = outer->blocks[bi];
+            if (bb == H_out || bb == L_out || bb == E) continue;
+            if (!self.blockInLoop(bb, inner)) return false;   // extra outer-body work
+        }
+        // headers: exactly one phi each; latch/entry blocks: no phis
+        if (self.onlyPhi(H_out) == null || self.onlyPhi(H_in) == null) return false;
+        if (self.nPhis(L_out) != 0 || self.nPhis(L_in) != 0) return false;
+        if (E != H_in && E != H_out && self.nPhis(E) != 0) return false;
+        // inner body: no phis except H_in's IV, no unsafe ops, no cond_br
+        // except L_in's exit test
+        for (u32 bi = 0; bi < inner->nblocks; bi++)
+        {
+            IrBlock* bb = inner->blocks[bi];
+            if (bb == H_in) continue;
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst->opcode == IrOpcode::Phi) return false;
+                if (self.isUnsafeInNest(inst->opcode)) return false;
+                if (inst == self.blockTerm(bb) && self.isCondBr(inst) && bb != L_in) return false;
+            }
+        }
+        // outer non-inner blocks: no unsafe ops either
+        for (u32 bi = 0; bi < outer->nblocks; bi++)
+        {
+            IrBlock* bb = outer->blocks[bi];
+            if (self.blockInLoop(bb, inner)) continue;
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+                if (self.isUnsafeInNest(bb->insts[ii]->opcode)) return false;
+        }
+        // both IVs must have an increment (add/sub using the phi)
+        IrInst* iPhi = self.onlyPhi(H_out);
+        IrInst* jPhi = self.onlyPhi(H_in);
+        if (self.findIncrement(outer, iPhi) == null) return false;
+        if (self.findIncrement(inner, jPhi) == null) return false;
+
+        // H_out must have exactly one predecessor outside the outer loop
+        // (the preheader). Collect it.
+        IrBlock* pre = null;
+        u32 nOutside = 0;
+        for (u32 pi = 0; pi < H_out->npreds; pi++)
+        {
+            IrBlock* p = H_out->preds[pi];
+            if (!self.blockInLoop(p, outer)) { pre = p; nOutside++; }
+        }
+        if (nOutside != 1 || pre == null) return false;
+
+        // every edge into L_in from inside the inner loop must be unique
+        // (single exit from the inner body into the j-latch)
+        u32 nIntoLin = 0;
+        for (u32 bi = 0; bi < inner->nblocks; bi++)
+        {
+            IrBlock* bb = inner->blocks[bi];
+            IrInst* t = self.blockTerm(bb);
+            if (t != null && self.termHasBlock(t, L_in)) nIntoLin++;
+        }
+        if (nIntoLin != 1) return false;
+
+        // ---- rewrite ----
+        // 1) pre -> H_out becomes pre -> H_in (entry now reaches j-header)
+        //    find the terminator operand in `pre` naming H_out and retarget.
+        //    pre may end in br or cond_br; retargetTermBlock handles both.
+        {
+            IrInst* pt = self.blockTerm(pre);
+            if (pt == null) return false;
+            self.retargetTermBlock(pt, H_out, H_in);
+        }
+
+        // 2) H_in terminator: br B0  ->  br H_out
+        self.retargetTermBlock(hInTerm, B0, H_out);
+
+        // 3) entry-side edge into H_in retargets to B0:
+        //    E's terminator (br H_in) or, when E==H_in... handled below.
+        if (E != H_in)
+        {
+            IrInst* et = self.blockTerm(E);
+            self.retargetTermBlock(et, H_in, B0);
+        }
+        else
+        {
+            // direct edge H_out -arm-> H_in: the in-arm now goes to B0
+            self.retargetTermBlock(hOutTerm, H_in, B0);
+        }
+
+        // 4) inner-body exit edges -> L_in become -> L_out
+        for (u32 bi = 0; bi < inner->nblocks; bi++)
+        {
+            IrBlock* bb = inner->blocks[bi];
+            if (bb == L_in) continue;
+            IrInst* t = self.blockTerm(bb);
+            if (t != null && self.termHasBlock(t, L_in))
+                self.retargetTermBlock(t, L_in, L_out);
+        }
+
+        // 5) H_out exit arm -> L_in (i exhausted advances j)
+        //    hOutTerm's EXIT arm retargets to L_in
+        self.retargetTermBlock(hOutTerm, EXIT, L_in);
+
+        // 6) L_in exit arm -> EXIT (j exhausted leaves the nest)
+        {
+            IrInst* lt = self.blockTerm(L_in);
+            self.retargetTermBlock(lt, L_out, EXIT);
+        }
+
+        // ---- phi incoming fixes ----
+        // j-phi (H_in): init pair names entryPredBlock -> now `pre`
+        if (!self.phiRetargetPred(jPhi, entryPredBlock, pre)) return false;
+        // i-phi (H_out): init pair names `pre` -> now H_in
+        if (!self.phiRetargetPred(iPhi, pre, H_in)) return false;
+        // EXIT phis: any pair naming H_out now names L_in
+        for (u32 ii = 0; ii < EXIT->ninsts; ii++)
+        {
+            IrInst* phi = EXIT->insts[ii];
+            if (phi->opcode != IrOpcode::Phi) break;
+            self.phiRetargetPred(phi, H_out, L_in);
+        }
+
+        // L_out phis were rejected; B0-entry phis rejected (no inner phis);
+        // P_in trampoline had no phis.
+
+        return true;
     }
 }
 

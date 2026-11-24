@@ -18,7 +18,7 @@ use elf {
     SHT_DYNSYM, SHT_RELA, SHT_REL, SHT_PROGBITS, SHF_ALLOC,
     SHF_WRITE, SHF_EXECINSTR, SHN_UNDEF, SHN_ABS, SHN_COMMON,
     STB_GLOBAL, STT_SECTION, STT_FILE, STT_FUNC, OUT_NONE, EM_AARCH64,
-    ET_EXEC, ET_DYN, FMT_ELF_DYN, PT_LOAD, PT_INTERP, PT_DYNAMIC,
+    ET_EXEC, ET_DYN, FMT_ELF_DYN, PT_LOAD, PT_INTERP, PT_DYNAMIC, PT_TLS,
     PT_GNU_STACK, PF_R, PF_W, PF_X, DT_NEEDED, DT_PLTRELSZ, DT_PLTGOT,
     DT_HASH, DT_STRTAB, DT_SYMTAB, DT_RELA, DT_RELASZ, DT_RELAENT,
     DT_REL, DT_RELSZ, DT_RELENT, DT_STRSZ, DT_SYMENT, DT_PLTREL,
@@ -380,6 +380,7 @@ pub bool emitImage(u16 machine, u8 outFmt, bool emitSymtab, Vec<ObjFile>* objs, 
     usize es = is64 ? SYM64_SIZE : SYM32_SIZE;
     usize shdrSize = is64 ? SHDR64_SIZE : SHDR32_SIZE;
     u32 phnum = isDynExe ? 5 : (isDyn ? (L->hasRW ? 4 : 3) : (L->hasRW ? 3 : 2));
+    if (L->tlsMemsz > 0) phnum += 1;
 
     usize nLocal = 0;
     usize strtabLen = 1;
@@ -486,6 +487,12 @@ pub bool emitImage(u16 machine, u8 outFmt, bool emitSymtab, Vec<ObjFile>* objs, 
         _wPhdr(img, is64, phi, PT_LOAD, PF_R | PF_W, L->rwOff, base + L->rwOff, L->rwFilesz, L->rwMemsz, 0x1000);
         phi++;
     }
+    if (L->tlsMemsz > 0 && outFmt != FMT_MACHO_EXE && outFmt != FMT_MACHO_DYLIB)
+    {
+        _wPhdr(img, is64, phi, PT_TLS, PF_R | PF_W, L->tlsOff, L->tlsBase,
+               L->tlsFilesz, L->tlsMemsz, L->tlsAlign);
+        phi++;
+    }
     if (isDyn || isDynExe)
     {
         OutSec* dat = L->secs.atPtr(SEC_DATA);
@@ -505,6 +512,76 @@ pub bool emitImage(u16 machine, u8 outFmt, bool emitSymtab, Vec<ObjFile>* objs, 
             ObjFile* obj = objs->atPtr(p->objIdx);
             Section* in = obj->secs.atPtr(p->secIdx);
             copy<u8>(img + (usize)out->offset + (usize)p->offset, (u8*)obj->data.ptr + (usize)in->offset, (usize)p->size);
+        }
+    }
+
+    /* .rela.plt IRELATIVE entries for IFUNC GOT slots: the static
+     * startup iterates __rela_iplt_start..__rela_iplt_end applying
+     * slot = ifunc_invoke(addend) */
+    if (is64 && L->relaPltSize > 0 &&
+        outFmt != FMT_MACHO_EXE && outFmt != FMT_MACHO_DYLIB)
+    {
+        OutSec* ro = L->secs.atPtr(SEC_RODATA);
+        OutSec* gs = L->secs.atPtr(SEC_GOT);
+        u8* rp = img + (usize)(ro->offset + L->relaPltOff);
+        for (usize i = 0; i < L->ipltSlots.count(); i++)
+        {
+            u32 slot = L->ipltSlots.at(i);
+            u64 key;
+            if ((usize)slot < L->tlsGot.count()) key = L->tlsGot.at((usize)slot);
+            else key = L->ipltKeys.at((usize)slot - L->tlsGot.count());
+            usize o = (usize)(key >> 33);
+            u32 si = (u32)(key & 0xffffffffu);
+            u64 resAddr = 0;
+            ObjFile* obj = objs->atPtr(o);
+            Sym* s = obj->syms.atPtr((usize)si);
+            if (s->bind != STB_LOCAL)
+            {
+                i64 di = findDef(defs, s->name);
+                if (di >= 0)
+                    defAddress(objs, L, defs->atPtr((usize)di), &resAddr, err);
+            }
+            else
+                localAddress(objs, L, o, (usize)si, &resAddr, err);
+            putU64(rp + i * 24, gs->addr + (u64)slot * 8);
+            putU64(rp + i * 24 + 8, (u64)R_AARCH64_IRELATIVE);
+            putU64(rp + i * 24 + 16, resAddr);
+            /* iplt slots start zeroed; seed with resolver addr so the
+             * stub is callable even before startup resolution */
+            if ((usize)slot >= L->tlsGot.count())
+            {
+                usize so = (usize)(gs->offset + (u64)slot * 8);
+                if (fits(so, 8, (usize)L->relaPltSize + (usize)gs->offset + (usize)gs->size))
+                    putU64(img + so, resAddr);
+            }
+        }
+    }
+
+    /* IPLT stubs: adrp x16, slot@PAGE; ldr x17, [x16, #off]; br x17
+     * appended to .text for direct calls to IFUNC symbols */
+    if (is64 && L->ipltKeys.count() > 0 &&
+        outFmt != FMT_MACHO_EXE && outFmt != FMT_MACHO_DYLIB)
+    {
+        OutSec* text = L->secs.atPtr(SEC_TEXT);
+        OutSec* gs = L->secs.atPtr(SEC_GOT);
+        for (usize i = 0; i < L->ipltKeys.count(); i++)
+        {
+            u64 slotAddr = gs->addr + (u64)(L->tlsGot.count() + i) * 8;
+            u64 stubAddr = text->addr + L->ipltOff + (u64)i * 12;
+            usize so = (usize)(text->offset + L->ipltOff + (u64)i * 12);
+            if (!fits(so, 12, imgLen)) continue;
+            /* adrp x16, slotAddr@PAGE : imm = page(slot)-page(stub) */
+            i64 pg = (i64)(_a64PageOf(slotAddr) - _a64PageOf(stubAddr));
+            u64 imm = (u64)(pg >> 12) & 0x1FFFFFu;
+            u32 w0 = 0x90000000u | ((u32)(imm & 3u) << 29) |
+                     ((u32)((imm >> 2) & 0x7FFFFu) << 5) | 16u;
+            putU32(img + so, w0);
+            /* ldr x17, [x16, #imm12] : unsigned offset, scale 8 */
+            u32 imm12 = (u32)((slotAddr & 0xFFFu) >> 3);
+            u32 w1 = 0xF9400000u | (imm12 << 10) | (16u << 5) | 17u;
+            putU32(img + so + 4, w1);
+            /* br x17 */
+            putU32(img + so + 8, 0xD61F0000u | (17u << 5));
         }
     }
 

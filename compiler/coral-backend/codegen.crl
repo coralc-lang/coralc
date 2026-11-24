@@ -105,6 +105,15 @@ void stPS(Stream* s, Slice v)
 
 void stCh(Stream* s, u8 c)
 {
+    /* fast path: almost every append has room — skip the stPut call
+     * and its memcpy(1) entirely */
+    if (s->p != null && s->len + 2 <= s->cap)
+    {
+        s->p[s->len] = c;
+        s->len++;
+        s->p[s->len] = 0;
+        return;
+    }
     stPut(s, &c, 1);
 }
 
@@ -284,6 +293,12 @@ pub struct Codegen
     u32* declCacheIds;
     u32* declCacheTags;
     u32 declCacheLen;
+    /* cgFindTypeDeclTy memo: direct-mapped 1024 slots keyed by
+     * (name, refFile) — codegen runs after sema so the scope stack is
+     * frozen and the result cannot change */
+    Str* tdNames;
+    u32* tdFiles;
+    u32* tdVals;
 
     /* names bound in the current function (params, locals, loop/pattern
      * binds): Ident refs to these stay raw, everything else goes
@@ -1059,7 +1074,7 @@ NodeId cgFindDeclFrom(Codegen* cg, Str name, u32 tag, u32 refFile)
  * prefers a decl in the type's own file: TypeEntry.loc records where the
  * name was spelled; else the first match by name. Constants are never
  * followed here — the entry point below adds that layer. */
-NodeId cgFindTypeDeclTy(Codegen* cg, Str name, u32 refFile)
+NodeId cgFindTypeDeclTyImpl(Codegen* cg, Str name, u32 refFile)
 {
     NodeId none;
     none.index = 0;
@@ -1131,6 +1146,25 @@ NodeId cgFindTypeDeclTy(Codegen* cg, Str name, u32 refFile)
         }
     }
     return first;
+}
+
+NodeId cgFindTypeDeclTy(Codegen* cg, Str name, u32 refFile)
+{
+    NodeId none;
+    none.index = 0;
+    if (cg->file == null || name == 0 || cg->tdNames == null) return cgFindTypeDeclTyImpl(cg, name, refFile);
+    u32 h = (u32)name * 0x9E3779B1u + refFile * 0x85EBCA77u;
+    u32 slot = (h >> 8) & 1023;
+    if (cg->tdNames[slot] == name && cg->tdFiles[slot] == refFile)
+    {
+        none.index = cg->tdVals[slot];
+        return none;
+    }
+    NodeId r = cgFindTypeDeclTyImpl(cg, name, refFile);
+    cg->tdNames[slot] = name;
+    cg->tdFiles[slot] = refFile;
+    cg->tdVals[slot] = r.index;
+    return r;
 }
 
 /* the type-decl a Named type refers to. `const c2 = cchar;` binds a name
@@ -1520,13 +1554,16 @@ NodeId cgFindMethodDeclOwner(Codegen* cg, Slice owner, Str methName)
     if (owner.len == 0 || methName == 0 || cg->file == null) return none;
     if (cg->moVal == null)
     {
-        cg->moOwner = (Slice*)cg->arena->alloc(256 * @sizeof(Slice), 8);
-        cg->moMeth = (Str*)cg->arena->alloc(256 * @sizeof(Str), 4);
-        cg->moVal = (u32*)cg->arena->alloc(256 * @sizeof(u32), 4);
+        /* 4096 slots: owner texts are rebuilt per call site so ptr
+         * equality never hits — compare content, and size for the
+         * distinct (owner, method) pairs a unit actually uses */
+        cg->moOwner = (Slice*)cg->arena->alloc(4096 * @sizeof(Slice), 8);
+        cg->moMeth = (Str*)cg->arena->alloc(4096 * @sizeof(Str), 4);
+        cg->moVal = (u32*)cg->arena->alloc(4096 * @sizeof(u32), 4);
         if (cg->moVal != null)
         {
             u32 z = 0;
-            while (z < 256) { cg->moVal[z] = 0xFFFFFFFFu; z++; }
+            while (z < 4096) { cg->moVal[z] = 0xFFFFFFFFu; z++; }
         }
     }
     if (cg->moVal == null) return cgFindMethodDeclOwnerImpl(cg, owner, methName);
@@ -1534,16 +1571,26 @@ NodeId cgFindMethodDeclOwner(Codegen* cg, Slice owner, Str methName)
     usize hi = 0;
     while (hi < owner.len) { h = (h ^ (u64)owner.ptr[hi]) * 1099511628211; hi++; }
     h = (h ^ (u64)methName) * 1099511628211;
-    u32 slot = (u32)(h & 255);
+    u32 slot = (u32)(h & 4095);
     if (cg->moVal[slot] != 0xFFFFFFFFu && cg->moMeth[slot] == methName &&
-        cg->moOwner[slot].len == owner.len && cg->moOwner[slot].ptr == owner.ptr)
+        cgSliceEq(cg->moOwner[slot], owner))
     {
         NodeId hit;
         hit.index = cg->moVal[slot];
         return hit;
     }
     NodeId r = cgFindMethodDeclOwnerImpl(cg, owner, methName);
-    cg->moOwner[slot] = owner;
+    /* the caller's Slice may point into a per-function stream buffer —
+     * copy the text into the arena so the cached key stays valid */
+    u8* ob = (u8*)cg->arena->alloc(owner.len + 1, 1);
+    if (ob != null)
+    {
+        usize oi = 0;
+        while (oi < owner.len) { ob[oi] = owner.ptr[oi]; oi++; }
+        ob[owner.len] = 0;
+        cg->moOwner[slot].ptr = ob;
+        cg->moOwner[slot].len = owner.len;
+    }
     cg->moMeth[slot] = methName;
     cg->moVal[slot] = r.index;
     return r;
@@ -2894,45 +2941,31 @@ bool slEqU8(Slice a, str b)
 Slice cgIdent(Codegen* cg, Str name)
 {
     Slice t = cgIntern(cg, name);
-    if (slEqU8(t, "auto") ||
-        slEqU8(t, "break") ||
-        slEqU8(t, "case") ||
-        slEqU8(t, "char") ||
-        slEqU8(t, "const") ||
-        slEqU8(t, "continue") ||
-        slEqU8(t, "default") ||
-        slEqU8(t, "do") ||
-        slEqU8(t, "double") ||
-        slEqU8(t, "else") ||
-        slEqU8(t, "enum") ||
-        slEqU8(t, "extern") ||
-        slEqU8(t, "float") ||
-        slEqU8(t, "for") ||
-        slEqU8(t, "goto") ||
-        slEqU8(t, "if") ||
-        slEqU8(t, "inline") ||
-        slEqU8(t, "int") ||
-        slEqU8(t, "long") ||
-        slEqU8(t, "register") ||
-        slEqU8(t, "restrict") ||
-        slEqU8(t, "return") ||
-        slEqU8(t, "short") ||
-        slEqU8(t, "signed") ||
-        slEqU8(t, "sizeof") ||
-        slEqU8(t, "static") ||
-        slEqU8(t, "struct") ||
-        slEqU8(t, "switch") ||
-        slEqU8(t, "typedef") ||
-        slEqU8(t, "union") ||
-        slEqU8(t, "unsigned") ||
-        slEqU8(t, "void") ||
-        slEqU8(t, "volatile") ||
-        slEqU8(t, "while") ||
-        slEqU8(t, "bool") ||
-        slEqU8(t, "true") ||
-        slEqU8(t, "false") ||
-        slEqU8(t, "size_t") ||
-        slEqU8(t, "NULL"))
+    /* length-gated: slEqU8 already rejects on len, but 38 calls per
+     * identifier still cost — switch on len first so only the few
+     * same-length keywords ever compare */
+    bool kw = false;
+    switch (t.len)
+    {
+        2 => { kw = slEqU8(t, "do") || slEqU8(t, "if"); },
+        3 => { kw = slEqU8(t, "for") || slEqU8(t, "int"); },
+        4 => { kw = slEqU8(t, "auto") || slEqU8(t, "bool") || slEqU8(t, "case") ||
+                     slEqU8(t, "char") || slEqU8(t, "else") || slEqU8(t, "enum") ||
+                     slEqU8(t, "goto") || slEqU8(t, "long") || slEqU8(t, "NULL") ||
+                     slEqU8(t, "true") || slEqU8(t, "void"); },
+        5 => { kw = slEqU8(t, "break") || slEqU8(t, "const") || slEqU8(t, "float") ||
+                     slEqU8(t, "short") || slEqU8(t, "union") || slEqU8(t, "while"); },
+        6 => { kw = slEqU8(t, "double") || slEqU8(t, "extern") || slEqU8(t, "inline") ||
+                     slEqU8(t, "return") || slEqU8(t, "signed") || slEqU8(t, "sizeof") ||
+                     slEqU8(t, "static") || slEqU8(t, "struct") || slEqU8(t, "switch") ||
+                     slEqU8(t, "size_t"); },
+        7 => { kw = slEqU8(t, "default") || slEqU8(t, "typedef"); },
+        8 => { kw = slEqU8(t, "continue") || slEqU8(t, "false") ||
+                     slEqU8(t, "register") || slEqU8(t, "restrict") || slEqU8(t, "unsigned") ||
+                     slEqU8(t, "volatile"); },
+        else => { kw = false; },
+    }
+    if (kw)
     {
         usize ns = cg->tybuf.len;
         stPS(&cg->tybuf, t);
@@ -8726,6 +8759,14 @@ pub CodegenResult generateC(AstContext* ctx, File* file, MonoContext* mono, Aren
     {
         u32 dci = 0;
         while (dci < 32) { cg.declCacheNames[dci] = 0; cg.declCacheIds[dci] = 0; cg.declCacheTags[dci] = 0; dci++; }
+    }
+    cg.tdNames = (Str*)cg.arena->alloc(1024 * @sizeof(Str), 8);
+    cg.tdFiles = (u32*)cg.arena->alloc(1024 * @sizeof(u32), 8);
+    cg.tdVals = (u32*)cg.arena->alloc(1024 * @sizeof(u32), 8);
+    if (cg.tdNames != null)
+    {
+        u32 tdi = 0;
+        while (tdi < 1024) { cg.tdNames[tdi] = 0; cg.tdFiles[tdi] = 0; cg.tdVals[tdi] = 0; tdi++; }
     }
     cg.labelSeq = 0;
     cg.tempSeq = 0;
