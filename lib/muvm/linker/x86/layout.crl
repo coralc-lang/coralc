@@ -22,7 +22,9 @@ use elf {
     SHN_UNDEF, OUT_NONE, EM_X86_64, EM_386, FMT_ELF_EXE, FMT_ELF_DYN, FMT_PE_EXE,
     FMT_PE_DLL, FMT_RAW, R_X86_64_64, R_X86_64_32, R_X86_64_32S, R_386_32,
     R_X86_64_GOTTPOFF, R_X86_64_GOTPCREL, R_X86_64_GOTPCRELX,
-    R_X86_64_REX_GOTPCRELX, alignUp, pushHex, elfInterp
+    R_X86_64_REX_GOTPCRELX, R_X86_64_PLT32,
+    STB_GLOBAL, STB_LOCAL, STT_GNU_IFUNC,
+    alignUp, pushHex, elfInterp
 };
 
 /* canonical output section indices (allocation order): hot text first
@@ -35,14 +37,16 @@ pub const usize SEC_COLD = 2;
 pub const usize SEC_RODATA = 3;
 pub const usize SEC_EH = 4;
 pub const usize SEC_NOTE = 5;
-pub const usize SEC_INIT = 6;
-pub const usize SEC_FINI = 7;
-pub const usize SEC_TDATA = 8;
-pub const usize SEC_TBSS = 9;
-pub const usize SEC_GOT = 10;
-pub const usize SEC_DATA = 11;
-pub const usize SEC_BSS = 12;
-pub const usize SEC_ALLOC_COUNT = 13;
+pub const usize SEC_INITCODE = 6;
+pub const usize SEC_FINICODE = 7;
+pub const usize SEC_INIT = 8;
+pub const usize SEC_FINI = 9;
+pub const usize SEC_TDATA = 10;
+pub const usize SEC_TBSS = 11;
+pub const usize SEC_GOT = 12;
+pub const usize SEC_DATA = 13;
+pub const usize SEC_BSS = 14;
+pub const usize SEC_ALLOC_COUNT = 15;
 
 pub struct Piece
 {
@@ -111,6 +115,11 @@ pub struct Layout
     u64 tlsMemsz;
     u64 tlsAlign;
     Vec<u64> tlsGot;
+    u64 relaPltOff;
+    u64 relaPltSize;
+    u64 ipltOff;
+    Vec<u32> ipltSlots;
+    Vec<u64> ipltKeys;
 
     Layout empty()
     {
@@ -159,7 +168,12 @@ pub struct Layout
             .tlsFilesz = 0,
             .tlsMemsz = 0,
             .tlsAlign = 0,
-            .tlsGot = Vec<u64>::new()
+            .tlsGot = Vec<u64>::new(),
+            .relaPltOff = 0,
+            .relaPltSize = 0,
+            .ipltOff = 0,
+            .ipltSlots = Vec<u32>::new(),
+            .ipltKeys = Vec<u64>::new()
         };
     }
 
@@ -169,6 +183,8 @@ pub struct Layout
             self.secs.atPtr(i)->pieces.dispose();
         self.secs.dispose();
         self.tlsGot.dispose();
+        self.ipltSlots.dispose();
+        self.ipltKeys.dispose();
     }
 }
 
@@ -205,6 +221,8 @@ i32 _bucketFor(u8 outFmt, str name, u32 type, u64 flags)
     if (type == SHT_NULL || type == SHT_SYMTAB || type == SHT_STRTAB ||
         type == SHT_RELA || type == SHT_REL) return -1;
     if (type == SHT_NOBITS) return (i32)SEC_BSS;
+    if (name.equals(".init")) return (i32)SEC_INITCODE;
+    if (name.equals(".fini")) return (i32)SEC_FINICODE;
     if ((flags & SHF_EXECINSTR) != 0)
     {
         if (name.startsWith(".text.hot") || name.startsWith(".text.startup") ||
@@ -215,6 +233,8 @@ i32 _bucketFor(u8 outFmt, str name, u32 type, u64 flags)
     }
     if ((flags & SHF_WRITE) != 0)
     {
+        if (name.equals(".init")) return (i32)SEC_INITCODE;
+        if (name.equals(".fini")) return (i32)SEC_FINICODE;
         if (name.startsWith(".init_array")) return (i32)SEC_INIT;
         if (name.startsWith(".fini_array")) return (i32)SEC_FINI;
         return (i32)SEC_DATA;
@@ -386,6 +406,8 @@ pub bool computeLayout(u16 machine, u8 outFmt, u64 imageBase, str entry, u64 ent
     _addOut(L, ".rodata", SHT_PROGBITS, SHF_ALLOC);
     _addOut(L, ".eh_frame", SHT_PROGBITS, SHF_ALLOC);
     _addOut(L, ".note", SHT_PROGBITS, SHF_ALLOC);
+    _addOut(L, ".init", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR);
+    _addOut(L, ".fini", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR);
     _addOut(L, ".init_array", SHT_PROGBITS, SHF_ALLOC | SHF_WRITE);
     _addOut(L, ".fini_array", SHT_PROGBITS, SHF_ALLOC | SHF_WRITE);
     _addOut(L, ".tdata", SHT_PROGBITS, SHF_ALLOC | SHF_WRITE | SHF_TLS);
@@ -522,11 +544,26 @@ pub bool computeLayout(u16 machine, u8 outFmt, u64 imageBase, str entry, u64 ent
                              r->type == R_X86_64_GOTPCRELX ||
                              r->type == R_X86_64_REX_GOTPCRELX)
                     {
-                        /* classify by opcode: scan back from the modrm
-                         * byte (field-1) over REX prefixes */
-                        if (r->offset >= 2 && r->offset + 4 <= in->size &&
+                        /* IFUNC symbols always need a runtime-resolved
+                         * slot regardless of instruction form */
+                        bool ifunc = false;
+                        if ((usize)r->sym < obj->syms.count())
+                        {
+                            Sym* ts = obj->syms.atPtr((usize)r->sym);
+                            u8 ty = ts->type;
+                            if (ts->bind != STB_LOCAL)
+                            {
+                                i64 di = findDef(defs, ts->name);
+                                if (di >= 0) ty = defs->atPtr((usize)di)->type;
+                            }
+                            ifunc = ty == STT_GNU_IFUNC;
+                        }
+                        if (!ifunc &&
+                            r->offset >= 2 && r->offset + 4 <= in->size &&
                             in->offset + r->offset + 4 <= obj->data.len)
                         {
+                            /* classify by opcode: scan back from the modrm
+                             * byte (field-1) over REX prefixes */
                             usize fpos = (usize)in->offset + (usize)r->offset;
                             u8 modrm = obj->data.ptr[fpos - 1];
                             if ((modrm & 0xc7) == 0x05)
@@ -539,7 +576,32 @@ pub bool computeLayout(u16 machine, u8 outFmt, u64 imageBase, str entry, u64 ent
                                 if (opc == 0x8b || opc == 0x8d) continue;
                             }
                         }
+                        else if (!ifunc) { /* bounds check failed: slot anyway */ }
                         kind = 1;
+                    }
+                    else if (r->type == R_X86_64_PLT32)
+                    {
+                        /* direct call/jmp to an IFUNC symbol needs an
+                         * IPLT stub: jmp *got_slot resolved at startup */
+                        if ((usize)r->sym < obj->syms.count())
+                        {
+                            Sym* ts = obj->syms.atPtr((usize)r->sym);
+                            u8 ty = ts->type;
+                            if (ts->bind != STB_LOCAL)
+                            {
+                                i64 di = findDef(defs, ts->name);
+                                if (di >= 0) ty = defs->atPtr((usize)di)->type;
+                            }
+                            if (ty == STT_GNU_IFUNC)
+                            {
+                                u64 key = ((u64)o << 33) | (u64)r->sym;
+                                bool seen = false;
+                                for (usize q = 0; q < L->ipltKeys.count(); q++)
+                                    if (L->ipltKeys.at(q) == key) { seen = true; break; }
+                                if (!seen) L->ipltKeys.push(key);
+                            }
+                        }
+                        continue;
                     }
                     if (kind == 0xffffffffu) continue;
                     u64 key = ((u64)o << 33) | ((u64)kind << 32) | (u64)r->sym;
@@ -555,6 +617,39 @@ pub bool computeLayout(u16 machine, u8 outFmt, u64 imageBase, str entry, u64 ent
             OutSec* got = L->secs.atPtr((usize)SEC_GOT);
             got->size = (u64)L->tlsGot.count() * 8;
             got->align = 8;
+        }
+        /* IFUNC GOT slots (kind 1) need R_X86_64_IRELATIVE entries in
+         * .rela.plt so the static startup resolves them at runtime */
+        for (usize q = 0; q < L->tlsGot.count(); q++)
+        {
+            u64 key = L->tlsGot.at(q);
+            if (((key >> 32) & 1) == 0) continue;
+            usize o = (usize)(key >> 33);
+            u32 si = (u32)(key & 0xffffffffu);
+            if (o >= objs->count() || si >= (u32)objs->at(o)->syms.count()) continue;
+            Sym* s = objs->at(o)->syms.atPtr((usize)si);
+            u8 ty = s->type;
+            if (s->bind != STB_LOCAL)
+            {
+                i64 di = findDef(defs, s->name);
+                if (di < 0) continue;
+                ty = defs->atPtr((usize)di)->type;
+            }
+            if (ty == STT_GNU_IFUNC) L->ipltSlots.push((u32)q);
+        }
+        /* IPLT stubs for direct calls to IFUNC symbols: each gets a
+         * .got slot (index tlsGot.count()+i) and an 8-byte
+         * `jmp *slot(%rip)` stub appended to .text */
+        if (L->ipltKeys.count() > 0)
+        {
+            OutSec* got = L->secs.atPtr((usize)SEC_GOT);
+            OutSec* text = L->secs.atPtr((usize)SEC_TEXT);
+            u64 base = got->size;
+            got->size += (u64)L->ipltKeys.count() * 8;
+            L->ipltOff = alignUp(text->size, 16);
+            text->size = L->ipltOff + (u64)L->ipltKeys.count() * 8;
+            for (usize i = 0; i < L->ipltKeys.count(); i++)
+                L->ipltSlots.push((u32)(base / 8 + i));
         }
     }
 
@@ -691,6 +786,17 @@ pub bool computeLayout(u16 machine, u8 outFmt, u64 imageBase, str entry, u64 ent
         phdrEnd = is64 ? (64 + (u64)phnum * 56) : (52 + (u64)phnum * 32);
     }
     L->phdrEnd = phdrEnd;
+
+    /* .rela.plt: IRELATIVE entries for IFUNC GOT slots, appended to
+     * .rodata so it lands inside the RX LOAD segment */
+    if (is64 && L->ipltSlots.count() > 0 && outFmt != FMT_RAW && !isPE)
+    {
+        OutSec* ro = L->secs.atPtr((usize)SEC_RODATA);
+        u64 m = alignUp(ro->size, 8);
+        L->relaPltOff = m;
+        L->relaPltSize = (u64)L->ipltSlots.count() * 24;
+        ro->size = m + L->relaPltSize;
+    }
 
     u64 cur = phdrEnd;
     for (usize i = 0; i < SEC_INIT; i++)
@@ -873,6 +979,10 @@ pub bool computeLayout(u16 machine, u8 outFmt, u64 imageBase, str entry, u64 ent
             else if (def->name.equals("__fini_array_end")) def->value = finiEnd;
             else if (def->name.equals("__preinit_array_start") ||
                      def->name.equals("__preinit_array_end")) def->value = initAddr;
+            else if (def->name.equals("__rela_iplt_start"))
+                def->value = L->secs.at((usize)SEC_RODATA).addr + L->relaPltOff;
+            else if (def->name.equals("__rela_iplt_end"))
+                def->value = L->secs.at((usize)SEC_RODATA).addr + L->relaPltOff + L->relaPltSize;
         }
     }
 
