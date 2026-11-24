@@ -4,7 +4,6 @@ import muvm::irOps { IrOpcode };
 import muvm::passes::loop_detect { IrLoop, irLoopDetectNatural };
 import muvm::passes::alias_analysis { AliasAnalysis };
 import std::mman { alloc, dealloc };
-import std::ios { eprintln };
 import platform::libc { snprintf };
 import core::cchar { cchar };
 
@@ -167,6 +166,11 @@ pub struct LoopDistributePass
         IrBlock* header = lp->header;
         if (header == null) return false;
 
+        // Real distribution: canonical 2-block counted loop -> one
+        // sequential loop per partition. Falls through to the legacy
+        // header-fission path when the shape doesn't qualify.
+        if (self.distributeCanonical(lp, func, aa)) return true;
+
         // Partition the loop body into independent chains
         LoopPartition[MAX_PARTITIONS] partitions;
         u32 nPartitions = 0;
@@ -175,7 +179,7 @@ pub struct LoopDistributePass
         self.partitionLoopBody(header, partitions, &nPartitions, MAX_PARTITIONS, aa);
 
         // Need at least 2 partitions to distribute
-        if (nPartitions < 2) { eprintln("[dist] nParts={}", nPartitions); return false; }
+        if (nPartitions < 2) return false;
 
         // The chain has exactly one place to end: the header's single
         // in-loop successor. Two in-loop arms would need the condition
@@ -201,7 +205,7 @@ pub struct LoopDistributePass
                 if (inLoop) { if (inTgt == null) inTgt = t; nIn++; }
             }
         }
-        if (nIn != 1) { eprintln("[dist] nIn={}", nIn); return false; }
+        if (nIn != 1) return false;
 
         // Safety: a partition's stores must not alias memory touched
         // anywhere else in the header. Those accesses keep their position
@@ -225,7 +229,7 @@ pub struct LoopDistributePass
                     IrValue* mAddr = m->opcode == IrOpcode::Load
                         ? m->ops[0]
                         : (m->nops > 1 ? m->ops[1] : null);
-                    if (!aa->isNoAlias(sAddr, mAddr)) { eprintln("[dist] alias reject"); return false; }
+                    if (!aa->isNoAlias(sAddr, mAddr)) return false;
                 }
             }
         }
@@ -470,6 +474,501 @@ pub struct LoopDistributePass
                 dealloc<IrInst*>(partitions[pi].insts);
             if (closure[pi] != null)
                 dealloc<IrInst*>(closure[pi]);
+        }
+
+        return true;
+    }
+
+    // ---- canonical loop distribution ----
+    // 2-block counted loop (header with all work + pure latch) whose
+    // header instructions partition into >=2 independent memory chains
+    // becomes N sequential loops, one per partition, each with its own
+    // induction variable covering the same trip count.
+
+    bool blockInLoopD(IrBlock* bb, IrLoop* lp)
+    {
+        for (u32 i = 0; i < lp->nblocks; i++)
+            if (lp->blocks[i] == bb) return true;
+        return false;
+    }
+
+    bool isUncondBrD(IrInst* t)
+    {
+        return t != null && t->opcode == IrOpcode::Br && t->nops >= 1;
+    }
+
+    bool isCondBrD(IrInst* t)
+    {
+        return t != null && t->opcode == IrOpcode::CondBr && t->nops >= 3;
+    }
+
+    IrBlock* termBlockAtD(IrInst* term, u32 idx)
+    {
+        u32 seen = 0;
+        for (u32 j = 0; j < term->nops; j++)
+        {
+            IrValue* op = term->ops[j];
+            if (op == null || op->kind != IrValueKind::Block) continue;
+            if (seen == idx) return (IrBlock*)op;
+            seen++;
+        }
+        return null;
+    }
+
+    // inst's def is inside the loop (any of its blocks)
+    bool defInLoop(IrInst* inst, IrLoop* lp)
+    {
+        if (inst == null || inst->parent == null) return false;
+        return self.blockInLoopD(inst->parent, lp);
+    }
+
+    // every user of every loop inst stays inside the loop
+    bool noOutsideUses(IrLoop* lp)
+    {
+        for (u32 bi = 0; bi < lp->nblocks; bi++)
+        {
+            IrBlock* bb = lp->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                for (u32 ui = 0; ui < inst->base.nusers; ui++)
+                {
+                    IrInst* u = inst->base.users[ui];
+                    if (u == null || u->parent == null) continue;
+                    if (!self.blockInLoopD(u->parent, lp)) return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    bool distributeCanonical(IrLoop* lp, IrFunc* func, AliasAnalysis* aa)
+    {
+        // exactly 2 blocks: header + latch
+        if (lp->nblocks != 2) return false;
+        IrBlock* H = lp->header;
+        IrBlock* L = null;
+        for (u32 bi = 0; bi < lp->nblocks; bi++)
+            if (lp->blocks[bi] != H) L = lp->blocks[bi];
+        if (H == null || L == null) return false;
+
+        IrInst* hTerm = H->terminator();
+        IrInst* lTerm = L->terminator();
+        if (!self.isCondBrD(hTerm) || !self.isUncondBrD(lTerm)) return false;
+
+        // one arm to latch, other to exit
+        IrBlock* armT = self.termBlockAtD(hTerm, 0);
+        IrBlock* armF = self.termBlockAtD(hTerm, 1);
+        IrBlock* EXIT = null;
+        if (armT == L && !self.blockInLoopD(armF, lp)) EXIT = armF;
+        else if (armF == L && !self.blockInLoopD(armT, lp)) EXIT = armT;
+        else return false;
+        if (EXIT == null) return false;
+
+        // latch branches back to header
+        if (lTerm->nops < 1 || lTerm->ops[0] != &H->base) return false;
+
+        // exit block: no phis
+        for (u32 ii = 0; ii < EXIT->ninsts; ii++)
+            if (EXIT->insts[ii]->opcode == IrOpcode::Phi) return false;
+
+        // header: exactly one phi (the IV); latch: none
+        IrInst* ivPhi = null;
+        u32 nPhiH = 0;
+        for (u32 ii = 0; ii < H->ninsts; ii++)
+        {
+            if (H->insts[ii]->opcode == IrOpcode::Phi)
+            { nPhiH++; ivPhi = H->insts[ii]; }
+        }
+        if (nPhiH != 1 || ivPhi == null) return false;
+        for (u32 ii = 0; ii < L->ninsts; ii++)
+            if (L->insts[ii]->opcode == IrOpcode::Phi) return false;
+
+        // compare feeding the cond_br must be an ICmp in the header
+        IrValue* condV = hTerm->ops[0];
+        if (condV == null || condV->kind != IrValueKind::Inst) return false;
+        IrInst* cmp = (IrInst*)condV;
+        if (cmp->opcode != IrOpcode::ICmp || cmp->parent != H) return false;
+
+        // iv phi: init outside loop; backedge value defined in latch
+        if (ivPhi->nops < 4) return false;
+        IrValue* initV = ivPhi->ops[0];
+        if (initV != null && initV->kind == IrValueKind::Inst &&
+            self.defInLoop((IrInst*)initV, lp)) return false;
+        IrValue* backV = null;
+        for (u32 pk = 0; pk + 1 < ivPhi->nops; pk += 2)
+        {
+            if (ivPhi->ops[pk + 1] == &L->base) backV = ivPhi->ops[pk];
+        }
+        if (backV == null || backV->kind != IrValueKind::Inst) return false;
+        IrInst* incr = (IrInst*)backV;
+        if (incr->parent != L) return false;
+
+        // single outside predecessor of H (preheader)
+        IrBlock* pre = null;
+        u32 nOut = 0;
+        for (u32 pi = 0; pi < H->npreds; pi++)
+        {
+            IrBlock* p = H->preds[pi];
+            if (!self.blockInLoopD(p, lp)) { pre = p; nOut++; }
+        }
+        if (nOut != 1 || pre == null) return false;
+
+        // latch non-terminator insts: pure only, operands not defined in H
+        for (u32 ii = 0; ii < L->ninsts; ii++)
+        {
+            IrInst* inst = L->insts[ii];
+            if (inst == lTerm) continue;
+            switch (inst->opcode)
+            {
+                IrOpcode::Load | IrOpcode::Store | IrOpcode::Call |
+                IrOpcode::InlineAsm | IrOpcode::AtomicStore |
+                IrOpcode::AtomicLoad | IrOpcode::AtomicRmw |
+                IrOpcode::AtomicCmpXchg | IrOpcode::Fence |
+                IrOpcode::Phi | IrOpcode::Br | IrOpcode::CondBr |
+                IrOpcode::Ret | IrOpcode::Switch | IrOpcode::Unreachable |
+                IrOpcode::Noret => { return false; },
+                else => { },
+            }
+            for (u32 oi = 0; oi < inst->nops; oi++)
+            {
+                IrValue* op = inst->ops[oi];
+                if (op == null || op->kind != IrValueKind::Inst) continue;
+                IrInst* opI = (IrInst*)op;
+                if (opI->parent == H && opI != ivPhi) return false;
+            }
+        }
+
+        // no uses of loop values outside the loop
+        if (!self.noOutsideUses(lp)) return false;
+
+        // partition header insts; every load/store must land in one
+        LoopPartition[MAX_PARTITIONS] parts;
+        u32 nParts = 0;
+        self.partitionLoopBody(H, parts, &nParts, MAX_PARTITIONS, aa);
+        if (nParts < 2) return false;
+
+        // map header inst -> partition id (-1 = not partitioned)
+        i32[128] partOf;
+        // header->ninsts can exceed the fixed map; bail if huge
+        if (H->ninsts > 128) return false;
+        for (u32 ii = 0; ii < H->ninsts; ii++) partOf[ii] = -1;
+        u32 nMem = 0;
+        for (u32 pi = 0; pi < nParts; pi++)
+        {
+            for (u32 ii = 0; ii < parts[pi].ninsts; ii++)
+            {
+                IrInst* inst = parts[pi].insts[ii];
+                for (u32 hi = 0; hi < H->ninsts; hi++)
+                    if (H->insts[hi] == inst) partOf[hi] = (i32)pi;
+            }
+        }
+        // every store must be partitioned; loads may stay unpartitioned
+        // (the closure clones them into whichever loop needs them, and
+        // the alias gate below proves no store can invalidate the reads)
+        for (u32 ii = 0; ii < H->ninsts; ii++)
+        {
+            if (H->insts[ii]->opcode == IrOpcode::Store && partOf[ii] < 0)
+                return false;
+        }
+
+        // partitioned insts: users inside header must stay in-partition;
+        // non-partitioned insts: header operands must be non-partitioned
+        for (u32 hi = 0; hi < H->ninsts; hi++)
+        {
+            IrInst* inst = H->insts[hi];
+            if (inst->opcode == IrOpcode::Phi || inst == hTerm) continue;
+            i32 pi = partOf[hi];
+            if (pi >= 0)
+            {
+                for (u32 ui = 0; ui < inst->base.nusers; ui++)
+                {
+                    IrInst* u = inst->base.users[ui];
+                    if (u == null || u->parent != H) continue;
+                    // find u's partition
+                    i32 up = -2;
+                    for (u32 hj = 0; hj < H->ninsts; hj++)
+                        if (H->insts[hj] == u) { up = partOf[hj]; break; }
+                    if (up != pi) return false;
+                }
+            }
+            else
+            {
+                for (u32 oi = 0; oi < inst->nops; oi++)
+                {
+                    IrValue* op = inst->ops[oi];
+                    if (op == null || op->kind != IrValueKind::Inst) continue;
+                    IrInst* opI = (IrInst*)op;
+                    if (opI->parent != H || opI == ivPhi || opI == hTerm) continue;
+                    for (u32 hj = 0; hj < H->ninsts; hj++)
+                        if (H->insts[hj] == opI && partOf[hj] >= 0) return false;
+                }
+            }
+        }
+
+        // alias safety: a partition's stores must not alias any memop
+        // outside that partition (same check as the fission path)
+        for (u32 pi = 0; pi < nParts; pi++)
+        {
+            for (u32 ii = 0; ii < parts[pi].ninsts; ii++)
+            {
+                IrInst* st = parts[pi].insts[ii];
+                if (st->opcode != IrOpcode::Store) continue;
+                IrValue* sAddr = st->nops > 1 ? st->ops[1] : null;
+                for (u32 hi = 0; hi < H->ninsts; hi++)
+                {
+                    IrInst* m = H->insts[hi];
+                    if (m->opcode != IrOpcode::Load && m->opcode != IrOpcode::Store) continue;
+                    if (partOf[hi] == (i32)pi) continue;
+                    IrValue* mAddr = m->opcode == IrOpcode::Load
+                        ? m->ops[0]
+                        : (m->nops > 1 ? m->ops[1] : null);
+                    if (!aa->isNoAlias(sAddr, mAddr))
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        // ---- build N sequential loops ----
+        IrBlock*[MAX_PARTITIONS] Hs;
+        IrBlock*[MAX_PARTITIONS] Ls;
+        IrInst*[MAX_PARTITIONS] phiPs;
+        IrInst*[MAX_PARTITIONS] cmpPs;
+        IrInst*[MAX_PARTITIONS] termPs;
+
+        // all blocks up front: loop p's exit edge targets Hs[p+1]
+        for (u32 p = 0; p < nParts; p++)
+        {
+            Hs[p] = self.createNamedBlock(func);
+            Ls[p] = self.createNamedBlock(func);
+        }
+
+        for (u32 p = 0; p < nParts; p++)
+        {
+            IrBlock* Hp = Hs[p];
+            IrBlock* Lp = Ls[p];
+
+            // phi_p: [init, pred_p], [incr_p, L_p]  (incr slot fixed below)
+            IrValue** pops = alloc<IrValue*>((usize)4);
+            IrBlock* predP = (p == 0) ? pre : Hs[p - 1];
+            pops[0] = initV;
+            pops[1] = &predP->base;
+            pops[2] = backV;              // placeholder, replaced after latch clone
+            pops[3] = &Lp->base;
+            IrInst* phiP = self.ctx->createInst(IrOpcode::Phi, ivPhi->base.type, pops, 4, 0, 0);
+            dealloc<IrValue*>(pops);
+            if (initV != null) initV->addUser(phiP);
+            predP->base.addUser(phiP);
+            backV->addUser(phiP);
+            Lp->base.addUser(phiP);
+            Hp->addInst(phiP);
+            phiPs[p] = phiP;
+
+            // latch clones: all non-terminator insts, operands remapped
+            // iv phi -> phiP, other latch insts -> their clones
+            IrInst** lmap = alloc<IrInst*>((usize)L->ninsts);
+            for (u32 ii = 0; ii < L->ninsts; ii++) lmap[ii] = null;
+            for (u32 ii = 0; ii < L->ninsts; ii++)
+            {
+                IrInst* inst = L->insts[ii];
+                if (inst == lTerm) continue;
+                IrInst* cl = self.ctx->createInst(inst->opcode, inst->base.type, null, inst->nops, 0, 0);
+                for (u32 oi = 0; oi < inst->nops; oi++)
+                {
+                    cl->ops[oi] = inst->ops[oi];
+                    if (inst->ops[oi] != null) inst->ops[oi]->addUser(cl);
+                }
+                cl->parent = Lp;
+                Lp->addInst(cl);
+                lmap[ii] = cl;
+            }
+            // fix latch clone operands
+            for (u32 ii = 0; ii < L->ninsts; ii++)
+            {
+                IrInst* cl = lmap[ii];
+                if (cl == null) continue;
+                IrInst* orig = L->insts[ii];
+                for (u32 oi = 0; oi < cl->nops; oi++)
+                {
+                    IrValue* op = cl->ops[oi];
+                    if (op == null) continue;
+                    if (op == &ivPhi->base)
+                    {
+                        op->removeUser(cl);
+                        cl->ops[oi] = &phiP->base; phiP->base.addUser(cl);
+                    }
+                    else if (op->kind == IrValueKind::Inst)
+                    {
+                        IrInst* opI = (IrInst*)op;
+                        if (opI->parent == L)
+                        {
+                            for (u32 lj = 0; lj < L->ninsts; lj++)
+                                if (L->insts[lj] == opI && lmap[lj] != null)
+                                {
+                                    op->removeUser(cl);
+                                    cl->ops[oi] = &lmap[lj]->base; lmap[lj]->base.addUser(cl);
+                                    break;
+                                }
+                        }
+                    }
+                }
+            }
+            // phi_p backedge = clone of incr
+            IrValue* newBack = backV;
+            if (backV->kind == IrValueKind::Inst)
+            {
+                IrInst* bi2 = (IrInst*)backV;
+                for (u32 lj = 0; lj < L->ninsts; lj++)
+                    if (L->insts[lj] == bi2 && lmap[lj] != null)
+                    { newBack = &lmap[lj]->base; break; }
+            }
+            backV->removeUser(phiP);
+            phiP->ops[2] = newBack;
+            newBack->addUser(phiP);
+
+            // latch terminator: br Hp
+            IrInst* lbr = self.ctx->createInst(IrOpcode::Br, self.ctx->tyVoid(), null, 1, 0, 0);
+            lbr->ops[0] = &Hp->base;
+            Hp->base.addUser(lbr);
+            lbr->parent = Lp;
+            Lp->addInst(lbr);
+            Lp->addSucc(Hp);
+            dealloc<IrInst*>(lmap);
+
+            // header body: compare clone + partition closure clones
+            // closure: partition insts + non-partitioned deps + cmp
+            bool* inCl = alloc<bool>((usize)H->ninsts);
+            for (u32 ii = 0; ii < H->ninsts; ii++) inCl[ii] = false;
+            for (u32 ii = 0; ii < parts[p].ninsts; ii++)
+            {
+                IrInst* inst = parts[p].insts[ii];
+                for (u32 hi = 0; hi < H->ninsts; hi++)
+                    if (H->insts[hi] == inst) { inCl[hi] = true; break; }
+            }
+            // seed the compare too (needed by the exit test)
+            for (u32 hi = 0; hi < H->ninsts; hi++)
+                if (H->insts[hi] == cmp) inCl[hi] = true;
+            // close under non-partitioned header operands
+            bool grew = true;
+            while (grew)
+            {
+                grew = false;
+                for (u32 ii = 0; ii < H->ninsts; ii++)
+                {
+                    if (!inCl[ii]) continue;
+                    IrInst* inst = H->insts[ii];
+                    for (u32 oi = 0; oi < inst->nops; oi++)
+                    {
+                        IrValue* op = inst->ops[oi];
+                        if (op == null || op->kind != IrValueKind::Inst) continue;
+                        IrInst* opI = (IrInst*)op;
+                        if (opI->parent != H || opI->opcode == IrOpcode::Phi) continue;
+                        bool partd = false;
+                        for (u32 hj = 0; hj < H->ninsts; hj++)
+                            if (H->insts[hj] == opI && partOf[hj] >= 0) { partd = true; break; }
+                        if (partd) continue;   // same-partition refs remap below
+                        for (u32 hj = 0; hj < H->ninsts; hj++)
+                            if (H->insts[hj] == opI && !inCl[hj])
+                            { inCl[hj] = true; grew = true; }
+                    }
+                }
+            }
+            // clone in header order, remap operands
+            IrInst** hmap = alloc<IrInst*>((usize)H->ninsts);
+            for (u32 ii = 0; ii < H->ninsts; ii++) hmap[ii] = null;
+            for (u32 hi = 0; hi < H->ninsts; hi++)
+            {
+                if (!inCl[hi]) continue;
+                IrInst* inst = H->insts[hi];
+                if (inst == hTerm || inst->opcode == IrOpcode::Phi) continue;
+                IrInst* cl = self.ctx->createInst(inst->opcode, inst->base.type, null, inst->nops, (u64)inst->icmpPred, (u64)inst->fcmpPred);
+                for (u32 oi = 0; oi < inst->nops; oi++) cl->ops[oi] = inst->ops[oi];
+                cl->parent = Hp;
+                Hp->addInst(cl);
+                hmap[hi] = cl;
+            }
+            cmpPs[p] = null;
+            for (u32 hi = 0; hi < H->ninsts; hi++)
+                if (H->insts[hi] == cmp) cmpPs[p] = hmap[hi];
+            // remap clone operands: iv->phiP, header insts->hmap clones
+            for (u32 hi = 0; hi < H->ninsts; hi++)
+            {
+                IrInst* cl = hmap[hi];
+                if (cl == null) continue;
+                IrInst* orig = H->insts[hi];
+                for (u32 oi = 0; oi < cl->nops; oi++)
+                {
+                    IrValue* op = cl->ops[oi];
+                    if (op == null) continue;
+                    if (op == &ivPhi->base)
+                    {
+                        op->removeUser(cl);
+                        cl->ops[oi] = &phiP->base; phiP->base.addUser(cl);
+                        continue;
+                    }
+                    if (op->kind != IrValueKind::Inst) continue;
+                    IrInst* opI = (IrInst*)op;
+                    if (opI->parent != H) continue;
+                    for (u32 hj = 0; hj < H->ninsts; hj++)
+                    {
+                        if (H->insts[hj] == opI && hmap[hj] != null)
+                        {
+                            op->removeUser(cl);
+                            cl->ops[oi] = &hmap[hj]->base; hmap[hj]->base.addUser(cl);
+                            break;
+                        }
+                    }
+                }
+            }
+            dealloc<bool>(inCl);
+            dealloc<IrInst*>(hmap);
+
+            // header terminator clone: cond -> cmpP, arms {Lp, next}
+            IrBlock* next = (p + 1 < nParts) ? Hs[p + 1] : EXIT;
+            IrInst* tp = self.ctx->createInst(IrOpcode::CondBr, self.ctx->tyVoid(), null, 3, 0, 0);
+            // cond operand = clone of original cond value (cmpP)
+            tp->ops[0] = cmpPs[p] != null ? &cmpPs[p]->base : condV;
+            if (tp->ops[0] != null) tp->ops[0]->addUser(tp);
+            // preserve arm order: whichever arm was L -> Lp, other -> next
+            if (armT == L) { tp->ops[1] = &Lp->base; tp->ops[2] = &next->base; }
+            else           { tp->ops[1] = &next->base; tp->ops[2] = &Lp->base; }
+            Lp->base.addUser(tp); next->base.addUser(tp);
+            tp->parent = Hp;
+            Hp->addInst(tp);
+            Hp->addSucc(Lp); Hp->addSucc(next);
+            termPs[p] = tp;
+        }
+
+        // rewire preheader's edge H -> Hs[0]
+        for (u32 ii = 0; ii < pre->ninsts; ii++)
+        {
+            IrInst* t = pre->insts[ii];
+            if (t->opcode != IrOpcode::Br && t->opcode != IrOpcode::CondBr) continue;
+            for (u32 oi = 0; oi < t->nops; oi++)
+            {
+                if (t->ops[oi] == &H->base)
+                {
+                    t->ops[oi] = &Hs[0]->base;
+                    H->base.removeUser(t);
+                    Hs[0]->base.addUser(t);
+                    // fix succs entry positionally
+                    for (u32 sj = 0; sj < pre->nsuccs; sj++)
+                        if (pre->succs[sj] == H) pre->succs[sj] = Hs[0];
+                    Hs[0]->addPred(pre);
+                    H->removePred(pre);
+                }
+            }
+        }
+
+        // erase the original loop blocks
+        for (u32 bi = 0; bi < lp->nblocks; bi++)
+        {
+            IrBlock* bb = lp->blocks[bi];
+            // remove from all successor/pred lists of outsiders handled above;
+            // removeBlock handles list excision
+            func->removeBlock(bb);
         }
 
         return true;
