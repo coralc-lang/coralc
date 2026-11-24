@@ -1,0 +1,559 @@
+#[[no_drop_all]]
+import muvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind, FunctionAnalysisCache };
+import muvm::irOps { IrOpcode };
+import muvm::passes::loop_detect { IrLoop, irLoopDetectNatural };
+import muvm::passes::alias_analysis { AliasAnalysis };
+import std::mman { alloc, dealloc };
+import platform::libc { snprintf };
+import core::cchar { cchar };
+
+// Loop Distribution Pass
+//
+// Splits a loop body into multiple independent loops to enable vectorization
+// or improve data locality. For example:
+//
+//   for i = 0..n            for i = 0..n
+//     a[i] = b[i] + c[i]  →   a[i] = b[i] + c[i]
+//     d[i] = a[i] * 2          for i = 0..n
+//                               d[i] = a[i] * 2
+//
+// This is useful when:
+// 1. One part of the loop body is vectorizable but another isn't
+// 2. Different parts access different arrays (reducing cache pressure)
+// 3. One part has loop-carried dependencies but another doesn't
+//
+// Safety criteria:
+// 1. The loop must be a counted loop (has induction variable)
+// 2. The loop body can be partitioned into independent chains
+// 3. No loop-carried dependencies between the partitions
+// 4. The loop must have a single latch block
+
+const u32 MAX_PARTITIONS = 16;
+
+pub struct LoopPartition
+{
+    IrInst** insts;  // Instructions in this partition
+    u32 ninsts;
+    bool hasStore;                   // Partition contains a store
+    bool hasLoad;                    // Partition contains a load
+}
+
+pub struct LoopDistributePass
+{
+    IrContext* ctx;
+    u64 distributions;
+    u32 blockCounter;
+
+    LoopDistributePass new(IrContext* ctx)
+    {
+        return LoopDistributePass {
+            .ctx = ctx,
+            .distributions = 0,
+            .blockCounter = 0
+        };
+    }
+
+    IrBlock* createNamedBlock(IrFunc* func)
+    {
+        char[32] buf;
+        u32 n = (u32)snprintf((cchar*)buf, 32, C"loopdist%u", self.blockCounter++); // is this debug output?
+        if (n < 0) n = 0;
+        if (n > 31) n = 31;
+        IrBlock* bb = self.ctx->createBlock(str::fromParts((const u8*)buf, (usize)n));
+        func->addBlock(bb);
+        return bb;
+    }
+
+    bool run(IrFunc* func)
+    {
+        self.distributions = 0;
+
+        // Detect all natural loops
+        IrLoop** loops = irLoopDetectNatural(func);
+        if (loops == null) return false;
+
+        // Check for cached AA
+        FunctionAnalysisCache* cache = self.ctx->getOrCreateAnalysisCache(func);
+        AliasAnalysis* aaPtr = (AliasAnalysis*)cache->aliasAnalysis;
+        AliasAnalysis aa;
+        bool ownAA = false;
+        if (aaPtr != null && cache->generation == self.ctx->analysisGeneration)
+        {
+            aa = *aaPtr;
+        }
+        else
+        {
+            aa = AliasAnalysis::new(self.ctx);
+            aa.analyze(func);
+            ownAA = true;
+        }
+
+        bool changed = false;
+
+        for (u32 li = 0; loops[li] != null; li++)
+        {
+            IrLoop* lp = loops[li];
+            if (self.canDistribute(lp, &aa))
+            {
+                if (self.distributeLoop(lp, func, &aa))
+                {
+                    changed = true;
+                    self.distributions++;
+                }
+            }
+        }
+
+        if (ownAA) aa.deinit();
+        dealloc<IrLoop*>(loops);
+        return changed;
+    }
+
+    // Check if a loop can be distributed
+    bool canDistribute(IrLoop* lp, AliasAnalysis* aa)
+    {
+        // Must be a natural loop with a header
+        if (lp->header == null || lp->latch == null) return false;
+
+        // Must have an induction variable
+        IrInst* phi = self.findInductionVar(lp);
+        if (phi == null) return false;
+
+        // Must have at least 2 blocks (header + latch)
+        if (lp->nblocks < 2) return false;
+
+        // Check that the loop body has multiple independent chains
+        // by looking for instructions that don't depend on each other
+        u32 nLoads = 0;
+        u32 nStores = 0;
+
+        for (u32 bi = 0; bi < lp->nblocks; bi++)
+        {
+            IrBlock* bb = lp->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst->opcode == IrOpcode::Load) nLoads++;
+                if (inst->opcode == IrOpcode::Store) nStores++;
+            }
+        }
+
+        // Need at least 2 loads or 2 stores to benefit from distribution
+        if (nLoads < 2 && nStores < 2) return false;
+
+        // Check that there are no calls or inline assembly (may alias with anything)
+        for (u32 bi = 0; bi < lp->nblocks; bi++)
+        {
+            IrBlock* bb = lp->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst->opcode == IrOpcode::Call ||
+                    inst->opcode == IrOpcode::InlineAsm ||
+                    inst->opcode == IrOpcode::AtomicStore ||
+                    inst->opcode == IrOpcode::AtomicLoad ||
+                    inst->opcode == IrOpcode::AtomicRmw ||
+                    inst->opcode == IrOpcode::Fence)
+                    return false;
+            }
+        }
+
+        return true;
+    }
+
+    // Distribute a loop into multiple independent loops
+    bool distributeLoop(IrLoop* lp, IrFunc* func, AliasAnalysis* aa)
+    {
+        IrBlock* header = lp->header;
+        if (header == null) return false;
+
+        // Partition the loop body into independent chains
+        LoopPartition[MAX_PARTITIONS] partitions;
+        u32 nPartitions = 0;
+
+        // Simple partitioning, separate loads and stores that don't alias
+        self.partitionLoopBody(header, partitions, &nPartitions, MAX_PARTITIONS, aa);
+
+        // Need at least 2 partitions to distribute
+        if (nPartitions < 2) return false;
+
+        // The chain has exactly one place to end: the header's single
+        // in-loop successor. Two in-loop arms would need the condition
+        // re-tested after the chain, and an out-of-loop-only header leaves
+        // the body unreachable — both shapes bail (B1b/B1e).
+        IrInst* hTerm = header->terminator();
+        IrBlock* inTgt = null;
+        u32 nIn = 0;
+        if (hTerm != null && hTerm->opcode == IrOpcode::Br && hTerm->nops >= 1)
+        {
+            IrBlock* t = (IrBlock*)hTerm->ops[0];
+            for (u32 bi = 0; bi < lp->nblocks; bi++)
+                if (lp->blocks[bi] == t) { inTgt = t; nIn = 1; break; }
+        }
+        else if (hTerm != null && hTerm->opcode == IrOpcode::CondBr && hTerm->nops >= 3)
+        {
+            for (u32 j = 1; j <= 2; j++)
+            {
+                IrBlock* t = (IrBlock*)hTerm->ops[j];
+                bool inLoop = false;
+                for (u32 bi = 0; bi < lp->nblocks && !inLoop; bi++)
+                    if (lp->blocks[bi] == t) inLoop = true;
+                if (inLoop) { if (inTgt == null) inTgt = t; nIn++; }
+            }
+        }
+        if (nIn != 1) return false;
+
+        // Safety: a partition's stores must not alias memory touched
+        // anywhere else in the header. Those accesses keep their position
+        // relative to the stores only when the objects are provably
+        // distinct (B1d — partitionLoopBody ignores aliasing entirely).
+        for (u32 pi = 0; pi < nPartitions; pi++)
+        {
+            for (u32 ii = 0; ii < partitions[pi].ninsts; ii++)
+            {
+                IrInst* st = partitions[pi].insts[ii];
+                if (st->opcode != IrOpcode::Store) continue;
+                IrValue* sAddr = st->nops > 1 ? st->ops[1] : null;
+                for (u32 hi = 0; hi < header->ninsts; hi++)
+                {
+                    IrInst* m = header->insts[hi];
+                    if (m->opcode != IrOpcode::Load && m->opcode != IrOpcode::Store) continue;
+                    bool inPi = false;
+                    for (u32 jj = 0; jj < partitions[pi].ninsts && !inPi; jj++)
+                        if (partitions[pi].insts[jj] == m) inPi = true;
+                    if (inPi) continue;
+                    IrValue* mAddr = m->opcode == IrOpcode::Load
+                        ? m->ops[0]
+                        : (m->nops > 1 ? m->ops[1] : null);
+                    if (!aa->isNoAlias(sAddr, mAddr)) return false;
+                }
+            }
+        }
+
+        // Create new loop bodies for each partition
+        IrBlock*[MAX_PARTITIONS] newBlocks;
+        for (u32 pi = 0; pi < nPartitions; pi++)
+            newBlocks[pi] = self.createNamedBlock(func);
+
+        // Each partition must be self-contained, every header instruction
+        // its clones reference is either partitioned (cloned once and
+        // shared), a Phi (kept alive in the header), or cloned into the
+        // same new block so the erase below cannot dangle the clones
+        IrInst**[MAX_PARTITIONS] closure;
+        u32[MAX_PARTITIONS] nClosure;
+        for (u32 pi = 0; pi < nPartitions; pi++)
+        {
+            closure[pi] = alloc<IrInst*>((usize)header->ninsts);
+            nClosure[pi] = 0;
+        }
+
+        for (u32 pi = 0; pi < nPartitions; pi++)
+        {
+            bool* inClosure = alloc<bool>((usize)header->ninsts);
+            for (u32 ii = 0; ii < header->ninsts; ii++) inClosure[ii] = false;
+
+            // Seed with this partition's own instructions
+            for (u32 ii = 0; ii < partitions[pi].ninsts; ii++)
+            {
+                IrInst* inst = partitions[pi].insts[ii];
+                for (u32 hi = 0; hi < header->ninsts; hi++)
+                {
+                    if (header->insts[hi] == inst) { inClosure[hi] = true; break; }
+                }
+            }
+
+            // Close under non-partitioned, non-Phi operands
+            bool grew = true;
+            while (grew)
+            {
+                grew = false;
+                for (u32 ii = 0; ii < header->ninsts; ii++)
+                {
+                    if (!inClosure[ii]) continue;
+                    for (u32 oi = 0; oi < header->insts[ii]->nops; oi++)
+                    {
+                        IrValue* op = header->insts[ii]->ops[oi];
+                        if (op == null || op->kind != IrValueKind::Inst) continue;
+                        IrInst* opInst = (IrInst*)op;
+                        if (opInst->parent != header) continue;
+                        if (opInst->opcode == IrOpcode::Phi) continue;
+
+                        // Already-partitioned instructions are remapped to
+                        // their own clone and need no extra copy here
+                        bool partitioned = false;
+                        for (u32 pj = 0; pj < nPartitions; pj++)
+                        {
+                            for (u32 jj = 0; jj < partitions[pj].ninsts; jj++)
+                            {
+                                if (partitions[pj].insts[jj] == opInst) { partitioned = true; break; }
+                            }
+                            if (partitioned) break;
+                        }
+                        if (partitioned) continue;
+
+                        for (u32 hi = 0; hi < header->ninsts; hi++)
+                        {
+                            if (header->insts[hi] == opInst && !inClosure[hi])
+                            {
+                                inClosure[hi] = true;
+                                grew = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // In header program order, which is topological within a block
+            for (u32 hi = 0; hi < header->ninsts; hi++)
+                if (inClosure[hi]) closure[pi][nClosure[pi]++] = header->insts[hi];
+            dealloc<bool>(inClosure);
+        }
+
+        for (u32 pi = 0; pi < nPartitions; pi++)
+        {
+            IrBlock* newBlock = newBlocks[pi];
+
+            // Copy this partition's instructions with their needed
+            // non-partitioned dependencies, in topological order
+            for (u32 ii = 0; ii < nClosure[pi]; ii++)
+            {
+                IrInst* inst = closure[pi][ii];
+                // Clone the instruction
+                IrInst* clone = self.ctx->createInst(inst->opcode, inst->base.type, null, inst->nops, 0, 0);
+                for (u32 oi = 0; oi < inst->nops; oi++)
+                {
+                    clone->ops[oi] = inst->ops[oi];
+                    // every operand kind — consts and blocks carry users too
+                    if (inst->ops[oi] != null) inst->ops[oi]->addUser(clone);
+                }
+                clone->parent = newBlock;
+                newBlock->addInst(clone);
+            }
+
+            // Chain link: the next partition, or — for the last one —
+            // where the header's arm used to go (the old header->inTgt
+            // edge is removed during retargeting below)
+            IrBlock* btarget = (pi + 1 < nPartitions) ? newBlocks[pi + 1] : inTgt;
+            IrInst* br = self.ctx->createInst(IrOpcode::Br, self.ctx->tyVoid(), null, 1, 0, 0);
+            br->ops[0] = &btarget->base;
+            btarget->base.addUser(br);
+            br->parent = newBlock;
+            newBlock->addInst(br);
+            newBlock->addSucc(btarget);
+        }
+
+        // Remap clone operands so they point at the clones, not the originals
+        // we're about to erase
+        for (u32 pi = 0; pi < nPartitions; pi++)
+        {
+            for (u32 ii = 0; ii < nClosure[pi]; ii++)
+            {
+                IrInst* clone = newBlocks[pi]->insts[ii];
+                for (u32 oi = 0; oi < clone->nops; oi++)
+                {
+                    IrValue* op = clone->ops[oi];
+                    if (op != null && op->kind == IrValueKind::Inst)
+                    {
+                        IrInst* opInst = (IrInst*)op;
+                        if (opInst->parent == header)
+                        {
+                            // Prefer the clone living in the same new block
+                            // (covers non-partitioned header instructions
+                            // cloned for this partition), then fall back to
+                            // the partition that owned the chain
+                            bool found = false;
+                            for (u32 k = 0; k < nClosure[pi]; k++)
+                            {
+                                if (closure[pi][k] == opInst)
+                                {
+                                    IrInst* opClone = newBlocks[pi]->insts[k];
+                                    opInst->base.removeUser(clone);
+                                    clone->ops[oi] = &opClone->base;
+                                    opClone->base.addUser(clone);
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (found) continue;
+                            for (u32 pj = 0; pj < nPartitions; pj++)
+                            {
+                                for (u32 jj = 0; jj < nClosure[pj]; jj++)
+                                {
+                                    if (closure[pj][jj] == opInst)
+                                    {
+                                        IrInst* opClone = newBlocks[pj]->insts[jj];
+                                        opInst->base.removeUser(clone);
+                                        clone->ops[oi] = &opClone->base;
+                                        opClone->base.addUser(clone);
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                                if (found) break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Remove original instructions from header (they've been copied to
+        // partitions). Anything still referenced — the terminator's ICmp
+        // condition, values the body reads — has to stay, or the header
+        // dangles (B1a: the old guard only protected the terminator).
+        // Iterating backwards removes users before their producers.
+        for (u32 ii = header->ninsts; ii > 0; ii--)
+        {
+            IrInst* inst = header->insts[ii - 1];
+            if (inst != hTerm && inst->opcode != IrOpcode::Phi &&
+                inst->base.nusers == 0)
+            {
+                inst->erase();
+            }
+        }
+
+        // The header's single in-loop arm now enters the partition chain.
+        // Entry edges and the latch backedge are left alone, so the header
+        // keeps its phi pairs (B1c). succs[] is patched in place because
+        // validate requires succs[k] == cond_br ops[k+1] positionally;
+        // removeSucc/addSucc would shuffle the order (B1e).
+        if (hTerm->opcode == IrOpcode::Br)
+        {
+            hTerm->ops[0]->removeUser(hTerm);
+            inTgt->removePred(header);
+            hTerm->ops[0] = &newBlocks[0]->base;
+            newBlocks[0]->base.addUser(hTerm);
+            header->succs[0] = newBlocks[0];
+            newBlocks[0]->addPred(header);
+        }
+        else
+        {
+            for (u32 j = 1; j <= 2; j++)
+            {
+                if ((IrBlock*)hTerm->ops[j] == inTgt)
+                {
+                    hTerm->ops[j]->removeUser(hTerm);
+                    inTgt->removePred(header);
+                    hTerm->ops[j] = &newBlocks[0]->base;
+                    newBlocks[0]->base.addUser(hTerm);
+                    header->succs[j - 1] = newBlocks[0];
+                    newBlocks[0]->addPred(header);
+                }
+            }
+        }
+
+        // The chain ends where the header used to go: rewrite the old
+        // target's phi pairs from (v, header) to (v, last partition),
+        // since the edge now comes from there.
+        {
+            IrBlock* last = newBlocks[nPartitions - 1];
+            for (u32 k = 0; k < inTgt->ninsts; k++)
+            {
+                IrInst* phi = inTgt->insts[k];
+                if (phi->opcode != IrOpcode::Phi) break;
+                for (u32 pk = 1; pk < phi->nops; pk += 2)
+                {
+                    if (phi->ops[pk] == &header->base)
+                    {
+                        phi->ops[pk] = &last->base;
+                        header->base.removeUser(phi);
+                        last->base.addUser(phi);
+                    }
+                }
+            }
+        }
+
+        // Free partition allocations
+        for (u32 pi = 0; pi < nPartitions; pi++)
+        {
+            if (partitions[pi].insts != null)
+                dealloc<IrInst*>(partitions[pi].insts);
+            if (closure[pi] != null)
+                dealloc<IrInst*>(closure[pi]);
+        }
+
+        return true;
+    }
+
+    // Partition loop body into independent chains
+    void partitionLoopBody(IrBlock* header, LoopPartition* partitions, u32* nPartitions, u32 maxPartitions, AliasAnalysis* aa)
+    {
+        *nPartitions = 0;
+
+        // Simple partitioning, each store gets its own partition,
+        // loads are grouped with the stores they feed
+        for (u32 ii = 0; ii < header->ninsts && *nPartitions < maxPartitions; ii++)
+        {
+            IrInst* inst = header->insts[ii];
+
+            if (inst->opcode == IrOpcode::Store)
+            {
+                // Start a new partition for this store
+                LoopPartition* p = &partitions[*nPartitions];
+                p->insts = alloc<IrInst*>((usize)header->ninsts);
+                p->ninsts = 0;
+                p->hasStore = true;
+                p->hasLoad = false;
+
+                // Add this store
+                p->insts[p->ninsts++] = inst;
+
+                // Add any loads that this store depends on (that aren't in other partitions)
+                for (u32 oi = 0; oi < inst->nops; oi++)
+                {
+                    if (inst->ops[oi] != null && inst->ops[oi]->kind == IrValueKind::Inst)
+                    {
+                        IrInst* opInst = (IrInst*)inst->ops[oi];
+                        if (opInst->opcode == IrOpcode::Load && opInst->parent == header)
+                        {
+                            // Check if this load is already in another partition
+                            bool alreadyUsed = false;
+                            for (u32 pi = 0; pi < *nPartitions; pi++)
+                            {
+                                for (u32 jj = 0; jj < partitions[pi].ninsts; jj++)
+                                {
+                                    if (partitions[pi].insts[jj] == opInst)
+                                    {
+                                        alreadyUsed = true;
+                                        break;
+                                    }
+                                }
+                                if (alreadyUsed) break;
+                            }
+
+                            if (!alreadyUsed)
+                            {
+                                p->insts[p->ninsts++] = opInst;
+                                p->hasLoad = true;
+                            }
+                        }
+                    }
+                }
+
+                (*nPartitions)++;
+            }
+        }
+    }
+
+    // Find the induction variable (phi) of a loop
+    IrInst* findInductionVar(IrLoop* lp)
+    {
+        IrBlock* header = lp->header;
+        if (header == null) return null;
+
+        for (u32 i = 0; i < header->ninsts; i++)
+        {
+            IrInst* inst = header->insts[i];
+            if (inst->opcode == IrOpcode::Phi)
+                return inst;
+        }
+        return null;
+    }
+}
+
+pub bool muvmPassLoopDistribute(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (ctx == null || func == null) return false;
+    LoopDistributePass pass = LoopDistributePass::new(ctx);
+    return pass.run(func);
+}
