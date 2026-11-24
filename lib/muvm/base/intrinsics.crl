@@ -1,0 +1,378 @@
+#[[no_drop_all]]
+import muvm::irtypes { IrContext, IrModule, IrFunc, IrBlock, IrInst, IrType, IrTypeKind, IrValue, IrValueKind };
+import muvm::irOps { IrICmpPred };
+import muvm::irBuilder { IrBuilder };
+import muvm::irMetadata { attachFuncMetadata, addBool };
+import std::mman { alloc, dealloc };
+
+// Built-in __muvm_intrinsic_* functions with real IR bodies —
+// platform-agnostic memory/string primitives written once in muvm IR
+// (loads, stores, branches only; every backend lowers them natively).
+// They are injected into a module on demand when nothing defines the
+// name, so a freestanding unit can still supply its own body.
+
+IrValue* ivOf(IrInst* i) { return &i->base; }
+
+IrValue* i64c(IrContext* ctx, u64 v) { return ctx->constInt(ctx->tyInt(64), v); }
+
+IrFunc* intrinsicFunc(IrContext* ctx, IrModule* modu, str name,
+                      IrType* ret, IrType** pts, u32 np)
+{
+    IrFunc* f = ctx->createFunc(name, ret, pts, np);
+    if (f == null) return null;
+    modu->addFunc(f);
+    for (u32 i = 0; i < np; i++)
+    {
+        IrValue* av = alloc<IrValue>((usize)1);
+        *av = IrValue { IrValueKind::Arg, pts[i], ctx->nextValueId(), 0, "", null, 0, 0 };
+        f->addArg(av);
+    }
+    return f;
+}
+
+// phi backedge fixup: phi ops are [val0, blk0, val1, blk1]; the latch
+// value is only known after the body is emitted, so patch ops[2] and
+// register the use directly.
+void phiBack(IrInst* phi, IrValue* v)
+{
+    phi->ops[2] = v;
+    if (v != null) v->addUser(phi);
+}
+
+// WORD-WISE TEST VARIANT
+void buildForwardCopy(IrContext* ctx, IrFunc* f, bool isMemset)
+{
+    IrBuilder b = IrBuilder::new(ctx);
+    IrType* ty8 = ctx->tyInt(8);
+    IrType* ty64 = ctx->tyInt(64);
+    IrValue* dst = f->args[0];
+    IrValue* src = f->args[1];
+    IrValue* n = f->args[2];
+    IrBlock* entry = ctx->createBlock("entry");
+    IrBlock* h1 = ctx->createBlock("chunk.head");
+    IrBlock* b1 = ctx->createBlock("chunk.body");
+    IrBlock* h2 = ctx->createBlock("tail.head");
+    IrBlock* b2 = ctx->createBlock("tail.body");
+    IrBlock* exit = ctx->createBlock("exit");
+    IrBlock*[6] blks = { entry, h1, b1, h2, b2, exit };
+    for (u32 i = 0; i < 6; i++) f->addBlock(blks[i]);
+    IrValue* zero = i64c(ctx, 0);
+    IrValue* one = i64c(ctx, 1);
+    IrValue* eight = i64c(ctx, 8);
+    // NB: pos() must precede any inst emission — insts created with no
+    // current block are orphaned (no slot, no def) and crash codegen.
+    b.pos(entry, null);
+    IrValue* chunks = ivOf(b.udiv(n, eight));
+    IrValue* tail0 = ivOf(b.mul(chunks, eight));
+    IrValue* fill8 = null;
+    IrValue* fillW = null;
+    if (isMemset)
+    {
+        fill8 = f->args[1]->type != null && f->args[1]->type->width <= 8
+            ? f->args[1] : ivOf(b.trunc(f->args[1], ty8));
+        IrValue* c64 = ivOf(b.zext(fill8, ty64));
+        IrValue* pat = i64c(ctx, 0x0101010101010101);
+        fillW = ivOf(b.mul(c64, pat));
+    }
+    b.br(h1);
+    IrValue*[2] iv_v = { zero, null };
+    IrBlock*[2] iv_b = { entry, b1 };
+    b.pos(h1, null);
+    IrInst* p1 = b.phi(ty64, iv_v, iv_b, 2);
+    IrValue* iv = ivOf(p1);
+    IrValue* cc = ivOf(b.icmp(IrICmpPred::Ult, iv, chunks));
+    b.condBr(cc, b1, h2);
+    b.pos(b1, null);
+    IrValue* iv1 = ivOf(b.add(iv, one));
+    IrValue* boff = ivOf(b.mul(iv, eight));
+    IrValue*[1] widx = { boff };
+    IrValue* wp = ivOf(b.gep(dst, widx, 1));
+    if (isMemset) { b.store(fillW, wp); }
+    else
+    {
+        IrValue* ws = ivOf(b.gep(src, widx, 1));
+        IrValue* wv = ivOf(b.load(ty64, ws));
+        b.store(wv, wp);
+    }
+    phiBack(p1, iv1);
+    b.br(h1);
+    IrValue*[2] jv = { tail0, null };
+    IrBlock*[2] jb = { h1, b2 };
+    b.pos(h2, null);
+    IrInst* p2 = b.phi(ty64, jv, jb, 2);
+    IrValue* j = ivOf(p2);
+    IrValue* tc = ivOf(b.icmp(IrICmpPred::Ult, j, n));
+    b.condBr(tc, b2, exit);
+    b.pos(b2, null);
+    IrValue* j1 = ivOf(b.add(j, one));
+    IrValue*[1] tidx = { j };
+    IrValue* tp = ivOf(b.gep(dst, tidx, 1));
+    if (isMemset) { b.store(fill8, tp); }
+    else
+    {
+        IrValue* ts = ivOf(b.gep(src, tidx, 1));
+        IrValue* tv = ivOf(b.load(ty8, ts));
+        b.store(tv, tp);
+    }
+    phiBack(p2, j1);
+    b.br(h2);
+    b.pos(exit, null);
+    b.retVoid();
+}
+
+// memmove: dst<src → forward copy; else backward copy of i-1 slots.
+void buildMemmove(IrContext* ctx, IrFunc* f)
+{
+    IrBuilder b = IrBuilder::new(ctx);
+    IrType* ty8 = ctx->tyInt(8);
+    IrType* ty64 = ctx->tyInt(64);
+    IrValue* dst = f->args[0];
+    IrValue* src = f->args[1];
+    IrValue* n = f->args[2];
+    IrBlock* entry = ctx->createBlock("entry");
+    IrBlock* fwd = ctx->createBlock("fwd");
+    IrBlock* fwdHead = ctx->createBlock("fwd.head");
+    IrBlock* fwdBody = ctx->createBlock("fwd.body");
+    IrBlock* bwdHead = ctx->createBlock("bwd.head");
+    IrBlock* bwdBody = ctx->createBlock("bwd.body");
+    IrBlock* exit = ctx->createBlock("exit");
+    for (u32 i = 0; i < 7; i++)
+    {
+        IrBlock*[7] bl = { entry, fwd, fwdHead, fwdBody, bwdHead, bwdBody, exit };
+        f->addBlock(bl[i]);
+    }
+
+    IrValue* zero = i64c(ctx, 0);
+    IrValue* one = i64c(ctx, 1);
+
+    b.pos(entry, null);
+    IrValue* di = ivOf(b.bitcast(dst, ty64));
+    IrValue* si = ivOf(b.bitcast(src, ty64));
+    IrValue* lt = ivOf(b.icmp(IrICmpPred::Ult, di, si));
+    b.condBr(lt, fwd, bwdHead);
+
+    // forward: identical shape to memcpy
+    b.pos(fwd, null);
+    b.br(fwdHead);
+    IrValue*[2] fv = { zero, null };
+    IrBlock*[2] fb = { fwd, fwdBody };
+    b.pos(fwdHead, null);
+    IrInst* fphi = b.phi(ty64, fv, fb, 2);
+    IrValue* fiv = ivOf(fphi);
+    IrValue* fc = ivOf(b.icmp(IrICmpPred::Ult, fiv, n));
+    b.condBr(fc, fwdBody, exit);
+    b.pos(fwdBody, null);
+    IrValue* fiv1 = ivOf(b.add(fiv, one));
+    IrValue*[1] fidx = { fiv };
+    IrValue* fp = ivOf(b.gep(dst, fidx, 1));
+    IrValue* fs = ivOf(b.gep(src, fidx, 1));
+    IrValue* fval = ivOf(b.load(ty8, fs));
+    b.store(fval, fp);
+    phiBack(fphi, fiv1);
+    b.br(fwdHead);
+
+    // backward: i = n, n-1, ...; copy slot i-1 while i != 0
+    IrValue*[2] bv = { n, null };
+    IrBlock*[2] bb = { entry, bwdBody };
+    b.pos(bwdHead, null);
+    IrInst* bphi = b.phi(ty64, bv, bb, 2);
+    IrValue* biv = ivOf(bphi);
+    IrValue* zc = ivOf(b.icmp(IrICmpPred::Eq, biv, zero));
+    b.condBr(zc, exit, bwdBody);
+    b.pos(bwdBody, null);
+    IrValue* biv1 = ivOf(b.sub(biv, one));
+    IrValue*[1] bidx = { biv1 };
+    IrValue* bp = ivOf(b.gep(dst, bidx, 1));
+    IrValue* bs = ivOf(b.gep(src, bidx, 1));
+    IrValue* bval = ivOf(b.load(ty8, bs));
+    b.store(bval, bp);
+    phiBack(bphi, biv1);
+    b.br(bwdHead);
+
+    b.pos(exit, null);
+    b.retVoid();
+}
+
+// a, b, n -> ty32 ; first differing byte as (u8)a - (u8)b, else 0
+void buildMemcmp(IrContext* ctx, IrFunc* f)
+{
+    IrBuilder b = IrBuilder::new(ctx);
+    IrType* ty8 = ctx->tyInt(8);
+    IrType* ty32 = ctx->tyInt(32);
+    IrType* ty64 = ctx->tyInt(64);
+    IrValue* a = f->args[0];
+    IrValue* bb = f->args[1];
+    IrValue* n = f->args[2];
+    IrBlock* entry = ctx->createBlock("entry");
+    IrBlock* head = ctx->createBlock("loop");
+    IrBlock* body = ctx->createBlock("body");
+    IrBlock* diff = ctx->createBlock("diff");
+    IrBlock* cont = ctx->createBlock("cont");
+    IrBlock* done = ctx->createBlock("done");
+    IrBlock*[6] blks = { entry, head, body, diff, cont, done };
+    for (u32 i = 0; i < 6; i++) f->addBlock(blks[i]);
+
+    IrValue* zero = i64c(ctx, 0);
+    IrValue* one = i64c(ctx, 1);
+    IrValue* z32 = ctx->constInt(ty32, 0);
+
+    b.pos(entry, null);
+    b.br(head);
+    IrValue*[2] iv_v = { zero, null };
+    IrBlock*[2] iv_b = { entry, cont };
+    b.pos(head, null);
+    IrInst* phiI = b.phi(ty64, iv_v, iv_b, 2);
+    IrValue* iv = ivOf(phiI);
+    IrValue* c = ivOf(b.icmp(IrICmpPred::Ult, iv, n));
+    b.condBr(c, body, done);
+    b.pos(body, null);
+    IrValue*[1] idx = { iv };
+    IrValue* pa = ivOf(b.gep(a, idx, 1));
+    IrValue* pb = ivOf(b.gep(bb, idx, 1));
+    IrValue* ca = ivOf(b.load(ty8, pa));
+    IrValue* cb = ivOf(b.load(ty8, pb));
+    IrValue* ne = ivOf(b.icmp(IrICmpPred::Ne, ca, cb));
+    b.condBr(ne, diff, cont);
+    b.pos(diff, null);
+    IrValue* za = ivOf(b.zext(ca, ty32));
+    IrValue* zb = ivOf(b.zext(cb, ty32));
+    IrValue* d = ivOf(b.sub(za, zb));
+    b.ret(d);
+    b.pos(cont, null);
+    IrValue* iv1 = ivOf(b.add(iv, one));
+    phiBack(phiI, iv1);
+    b.br(head);
+    b.pos(done, null);
+    b.ret(z32);
+}
+
+// a, b -> ty32 ; NUL-terminated strcmp
+void buildStrcmp(IrContext* ctx, IrFunc* f)
+{
+    IrBuilder b = IrBuilder::new(ctx);
+    IrType* ty8 = ctx->tyInt(8);
+    IrType* pty8 = ctx->tyPtr(ty8);
+    IrType* ty32 = ctx->tyInt(32);
+    IrType* ty64 = ctx->tyInt(64);
+    IrValue* a0 = f->args[0];
+    IrValue* b0 = f->args[1];
+    IrBlock* entry = ctx->createBlock("entry");
+    IrBlock* head = ctx->createBlock("loop");
+    IrBlock* diff = ctx->createBlock("diff");
+    IrBlock* next = ctx->createBlock("next");
+    IrBlock* done = ctx->createBlock("done");
+    IrBlock*[5] blks = { entry, head, diff, next, done };
+    for (u32 i = 0; i < 5; i++) f->addBlock(blks[i]);
+
+    IrValue* one = i64c(ctx, 1);
+    IrValue* z8 = ctx->constInt(ty8, 0);
+    IrValue* z32 = ctx->constInt(ty32, 0);
+
+    b.pos(entry, null);
+    b.br(head);
+    IrValue*[2] pa_v = { a0, null };
+    IrValue*[2] pb_v = { b0, null };
+    IrBlock*[2] p_b = { entry, next };
+    b.pos(head, null);
+    IrInst* pphi = b.phi(pty8, pa_v, p_b, 2);
+    IrValue* pa = ivOf(pphi);
+    // second phi for b shares the same incoming blocks
+    IrInst* pphi2 = b.phi(pty8, pb_v, p_b, 2);
+    IrValue* pb = ivOf(pphi2);
+    IrValue* ca = ivOf(b.load(ty8, pa));
+    IrValue* cb = ivOf(b.load(ty8, pb));
+    IrValue* ne = ivOf(b.icmp(IrICmpPred::Ne, ca, cb));
+    b.condBr(ne, diff, done);
+    // equal bytes: stop at NUL, else advance both pointers
+    IrValue* ze = ivOf(b.icmp(IrICmpPred::Eq, ca, z8));
+    b.condBr(ze, done, next);
+    b.pos(diff, null);
+    IrValue* za = ivOf(b.zext(ca, ty32));
+    IrValue* zb = ivOf(b.zext(cb, ty32));
+    IrValue* d = ivOf(b.sub(za, zb));
+    b.ret(d);
+    b.pos(next, null);
+    IrValue*[1] idx = { one };
+    IrValue* pa2 = ivOf(b.gep(pa, idx, 1));
+    IrValue* pb2 = ivOf(b.gep(pb, idx, 1));
+    // patch both phis' backedge slots (ops[2])
+    pphi->ops[2] = pa2;
+    pa2->addUser(pphi);
+    pphi2->ops[2] = pb2;
+    pb2->addUser(pphi2);
+    b.br(head);
+    b.pos(done, null);
+    b.ret(z32);
+    (void)ty64;
+}
+
+// signature gate for filling an existing extern shell: arg count must
+// match and pointer args must be Ptr-typed, integer args Int-typed.
+bool sigOk(IrFunc* f, bool* isPtr, u32 np)
+{
+    if (f == null || f->nargs < np || f->paramTypes == null) return false;
+    for (u32 i = 0; i < np; i++)
+    {
+        IrType* t = f->paramTypes[i];
+        if (t == null) return false;
+        if (isPtr[i])
+        {
+            if (t->kind != IrTypeKind::Ptr) return false;
+        }
+        else if (t->kind != IrTypeKind::Int) return false;
+    }
+    return true;
+}
+
+// ensure `name` has a body when the module declares it: convert a
+// matching extern declaration (the C-header shape) or a bodyless func
+// into the definition. Undeclared names are NOT injected — the
+// intrinsics materialize only where referenced, so ordinary modules
+// stay free of dead functions.
+void ensureOne(IrContext* ctx, IrModule* modu, str name, IrType* ret,
+               IrType** pts, u32 np, bool* isPtr, i32 which)
+{
+    IrFunc* f = modu->getFunc(name);
+    if (f == null) return;
+    if (f->nblocks != 0) return; // real definition already present
+    if (!sigOk(f, isPtr, np)) return;
+    f->isExtern = false;
+    f->externLib = "";
+    f->externSym = "";
+    // request auto-vectorization — the byte loops widen cleanly under
+    // simd_vec once the vectorizer's legality checks pass
+    // vectorize attr disabled for bisect
+    switch (which)
+    {
+        0 => { buildForwardCopy(ctx, f, true); },
+        1 => { buildForwardCopy(ctx, f, false); },
+        2 => { buildMemmove(ctx, f); },
+        3 => { buildMemcmp(ctx, f); },
+        else => { buildStrcmp(ctx, f); },
+    }
+}
+
+// fill in bodies for every declared __muvm_intrinsic_* function.
+// Idempotent — existing definitions (user or earlier call) win.
+pub void irEnsureIntrinsics(IrContext* ctx, IrModule* modu)
+{
+    if (ctx == null || modu == null) return;
+    IrType* ty8 = ctx->tyInt(8);
+    IrType* pty8 = ctx->tyPtr(ty8);
+    IrType* ty32 = ctx->tyInt(32);
+    IrType* ty64 = ctx->tyInt(64);
+    IrType* vty = ctx->tyVoid();
+    bool[3] ppp = { true, true, false };
+    bool[3] pppp = { true, false, false };
+    bool[2] pp = { true, true };
+
+    IrType*[3] pts3 = { pty8, pty8, ty64 };
+    IrType*[3] ptsSet = { pty8, ty32, ty64 };
+    IrType*[2] pts2 = { pty8, pty8 };
+
+    ensureOne(ctx, modu, "__muvm_intrinsic_memset", vty, ptsSet, 3, pppp, 0);
+    ensureOne(ctx, modu, "__muvm_intrinsic_memcpy", vty, pts3, 3, ppp, 1);
+    ensureOne(ctx, modu, "__muvm_intrinsic_memmove", vty, pts3, 3, ppp, 2);
+    ensureOne(ctx, modu, "__muvm_intrinsic_memcmp", ty32, pts3, 3, ppp, 3);
+    ensureOne(ctx, modu, "__muvm_intrinsic_strcmp", ty32, pts2, 2, pp, 4);
+}
