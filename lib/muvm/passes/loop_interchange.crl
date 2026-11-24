@@ -1,5 +1,5 @@
 #[[no_drop_all]]
-import muvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind };
+import muvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind, IrType, IrTypeKind };
 import muvm::irOps { IrOpcode };
 import muvm::passes::loop_detect { IrLoop, irLoopDetectNatural };
 import std::mman { alloc, dealloc };
@@ -506,8 +506,7 @@ pub struct LoopInterchangePass
     // does inst carry side effects we can't reorder across iterations?
     bool isUnsafeInNest(IrOpcode op)
     {
-        return op == IrOpcode::Store || op == IrOpcode::Call ||
-               op == IrOpcode::InlineAsm || op == IrOpcode::AtomicStore ||
+        return op == IrOpcode::Call || op == IrOpcode::InlineAsm || op == IrOpcode::AtomicStore ||
                op == IrOpcode::AtomicLoad || op == IrOpcode::AtomicRmw ||
                op == IrOpcode::AtomicCmpXchg || op == IrOpcode::Fence;
     }
@@ -623,7 +622,7 @@ pub struct LoopInterchangePass
         {
             IrBlock* bb = outer->blocks[bi];
             if (bb == H_out || bb == L_out || bb == E) continue;
-            if (!self.blockInLoop(bb, inner)) return false;   // extra outer-body work
+            if (!self.blockInLoop(bb, inner)) return false;
         }
         // headers: exactly one phi each; latch/entry blocks: no phis
         if (self.onlyPhi(H_out) == null || self.onlyPhi(H_in) == null) return false;
@@ -678,6 +677,10 @@ pub struct LoopInterchangePass
             if (t != null && self.termHasBlock(t, L_in)) nIntoLin++;
         }
         if (nIntoLin != 1) return false;
+
+        // memory ops in the nest must be dependence-safe under the
+        // swapped iteration order
+        if (!self.memOpsSafe(inner, outer, iPhi, jPhi)) return false;
 
         // ---- rewrite ----
         // 1) pre -> H_out becomes pre -> H_in (entry now reaches j-header)
@@ -741,6 +744,224 @@ pub struct LoopInterchangePass
         // L_out phis were rejected; B0-entry phis rejected (no inner phis);
         // P_in trampoline had no phis.
 
+        return true;
+    }
+
+    // ---- dependence analysis for memory nests ----
+
+    bool constIntVal(IrValue* v, i64* out)
+    {
+        if (v == null || v->kind != IrValueKind::ConstInt) return false;
+        *out = (i64)v->valData;
+        return true;
+    }
+
+    i64 gcd64(i64 a, i64 b)
+    {
+        if (a < 0) a = -a;
+        if (b < 0) b = -b;
+        while (b != 0) { i64 t = a % b; a = b; b = t; }
+        return a;
+    }
+
+    // affine index in the two IVs: v = pi*i + pj*j + koff
+    bool affineIdx(IrValue* v, IrInst* iPhi, IrInst* jPhi,
+                   i64* pi, i64* pj, i64* koff, u32 depth)
+    {
+        if (v == null || depth > 24) return false;
+        *pi = 0; *pj = 0; *koff = 0;
+        if (v == &iPhi->base) { *pi = 1; return true; }
+        if (v == &jPhi->base) { *pj = 1; return true; }
+        if (v->kind == IrValueKind::ConstInt) { *koff = (i64)v->valData; return true; }
+        if (v->kind != IrValueKind::Inst)
+        return false;
+        IrInst* inst = (IrInst*)v;
+        switch (inst->opcode)
+        {
+            IrOpcode::Add | IrOpcode::Sub =>
+            {
+                if (inst->nops < 2) return false;
+                i64 a1 = 0; i64 b1 = 0; i64 c1 = 0; i64 a2 = 0; i64 b2 = 0; i64 c2 = 0;
+                if (!self.affineIdx(inst->ops[0], iPhi, jPhi, &a1, &b1, &c1, depth + 1)) return false;
+                if (!self.affineIdx(inst->ops[1], iPhi, jPhi, &a2, &b2, &c2, depth + 1)) return false;
+                if (inst->opcode == IrOpcode::Add)
+                { *pi = a1 + a2; *pj = b1 + b2; *koff = c1 + c2; }
+                else
+                { *pi = a1 - a2; *pj = b1 - b2; *koff = c1 - c2; }
+                return true;
+            },
+            IrOpcode::Mul =>
+            {
+                if (inst->nops < 2) return false;
+                i64 tc0 = 0; i64 tc1 = 0;
+                bool kc0 = self.constIntVal(inst->ops[0], &tc0);
+                bool kc1 = self.constIntVal(inst->ops[1], &tc1);
+
+                i64 k;
+                if (self.constIntVal(inst->ops[0], &k))
+                {
+                    i64 a = 0; i64 b = 0; i64 c = 0;
+                    if (!self.affineIdx(inst->ops[1], iPhi, jPhi, &a, &b, &c, depth + 1)) return false;
+                    *pi = a * k; *pj = b * k; *koff = c * k;
+                    return true;
+                }
+                if (self.constIntVal(inst->ops[1], &k))
+                {
+                    i64 a = 0; i64 b = 0; i64 c = 0;
+                    if (!self.affineIdx(inst->ops[0], iPhi, jPhi, &a, &b, &c, depth + 1)) return false;
+                    *pi = a * k; *pj = b * k; *koff = c * k;
+                    return true;
+                }
+                return false;
+            },
+            IrOpcode::Zext | IrOpcode::Sext | IrOpcode::Trunc | IrOpcode::Bitcast =>
+            {
+                if (inst->nops < 1) return false;
+                return self.affineIdx(inst->ops[0], iPhi, jPhi, pi, pj, koff, depth + 1);
+            },
+            else => { return false; },
+        }
+    }
+
+    // pointer as base + pi*i + pj*j + koff (koff bytes)
+    bool affinePtr(IrValue* v, IrInst* iPhi, IrInst* jPhi,
+                   IrValue** base, i64* pi, i64* pj, i64* koff, u32 depth)
+    {
+        if (v == null || depth > 24) return false;
+        *pi = 0; *pj = 0; *koff = 0;
+        if (v->kind == IrValueKind::Global || v->kind == IrValueKind::Arg)
+        { *base = v; return true; }
+        if (v->kind != IrValueKind::Inst)
+        return false;
+        IrInst* inst = (IrInst*)v;
+        if (inst->opcode == IrOpcode::Alloca) { *base = v; return true; }
+        if (inst->opcode == IrOpcode::Bitcast && inst->nops >= 1)
+            return self.affinePtr(inst->ops[0], iPhi, jPhi, base, pi, pj, koff, depth + 1);
+        if (inst->opcode == IrOpcode::Gep && inst->nops == 2)
+        {
+            IrValue* pbase = null;
+            i64 ppi = 0;
+            i64 ppj = 0;
+            i64 pkoff = 0;
+            if (!self.affinePtr(inst->ops[0], iPhi, jPhi, &pbase, &ppi, &ppj, &pkoff, depth + 1))
+                return false;
+            i64 ii = 0;
+            i64 ij = 0;
+            i64 ik = 0;
+            if (!self.affineIdx(inst->ops[1], iPhi, jPhi, &ii, &ij, &ik, depth + 1))
+                return false;
+            IrType* bt = inst->ops[0]->type;
+            if (bt == null || bt->elem == null) return false;
+            if (bt->kind != IrTypeKind::Ptr && bt->kind != IrTypeKind::Array)
+                return false;
+            i64 esz = (i64)((bt->elem->width + 7) / 8);
+            if (esz <= 0) return false;
+            *base = pbase;
+            *pi = ppi + ii * esz;
+            *pj = ppj + ij * esz;
+            *koff = pkoff + ik * esz;
+            return true;
+        }
+        return false;
+    }
+
+    // injective over the difference box |x| < Ni && |y| < Nj.
+    // The minimal nonzero lattice solution has
+    // |x| = |pj|/g, |y| = |pi|/g where g = gcd(pi,pj).
+    bool injectiveAffine(i64 pi, i64 pj, i64 ni, i64 nj)
+    {
+        if (ni <= 1 && nj <= 1) return true;
+        if (pi == 0 && pj == 0) return false;
+        i64 g = self.gcd64(pi, pj);
+        i64 x0 = (pj < 0 ? -pj : pj) / g;
+        i64 y0 = (pi < 0 ? -pi : pi) / g;
+        return x0 >= ni || y0 >= nj;
+    }
+
+    // constant trip bound for a counted loop phi
+    bool loopBoundOf(IrLoop* lp, IrInst* phi, i64* out)
+    {
+        IrInst* cmp = self.findLoopCompare(lp);
+        if (cmp == null) return false;
+        i64 bound = 0; i64 init = 0;
+        bool gotB = false;
+        for (u32 k = 0; k + 1 < cmp->nops; k += 2)
+        {
+            i64 c;
+            if (self.constIntVal(cmp->ops[k + 1], &c)) { bound = c; gotB = true; break; }
+            if (self.constIntVal(cmp->ops[k], &c)) { bound = c; gotB = true; break; }
+        }
+        if (!gotB) return false;
+        if (phi->nops < 1 || !self.constIntVal(phi->ops[0], &init)) return false;
+        i64 d = bound - init;
+        if (d < 0) d = -d;
+        *out = d;
+        return true;
+    }
+
+    // all Load/Store addresses in the nest must be dependence-safe
+    bool memOpsSafe(IrLoop* inner, IrLoop* outer,
+                    IrInst* iPhi, IrInst* jPhi)
+    {
+        i64 ni = 0; i64 nj = 0;
+        bool haveBounds = self.loopBoundOf(outer, iPhi, &ni) &&
+                          self.loopBoundOf(inner, jPhi, &nj);
+
+        IrValue*[64] bases;
+        i64[64] pis;
+        i64[64] pjs;
+        u32 nm = 0;
+
+        for (u32 li = 0; li < 2; li++)
+        {
+            IrLoop* lp = li == 0 ? inner : outer;
+            for (u32 bi = 0; bi < lp->nblocks; bi++)
+            {
+                IrBlock* bb = lp->blocks[bi];
+                for (u32 ii = 0; ii < bb->ninsts; ii++)
+                {
+                    IrInst* inst = bb->insts[ii];
+                    bool isLd = inst->opcode == IrOpcode::Load;
+                    bool isSt = inst->opcode == IrOpcode::Store;
+                    if (!isLd && !isSt) continue;
+                    u32 need = isSt ? 2u : 1u;
+                    if (inst->nops < need) continue;
+                    IrValue* addr = isSt ? inst->ops[1] : inst->ops[0];
+                    IrValue* base = null;
+                    i64 pi = 0; i64 pj = 0; i64 koff = 0;
+                    if (!self.affinePtr(addr, iPhi, jPhi, &base, &pi, &pj, &koff, 0))
+                    return false;
+                    u32 g = 64;
+                    for (u32 m = 0; m < nm; m++)
+                    {
+                        bool same = bases[m] == base;
+                        bool argMerge = !same &&
+                            (bases[m]->kind == IrValueKind::Arg || base->kind == IrValueKind::Arg);
+                        if (same || argMerge) { g = m; break; }
+                    }
+                    if (g == 64)
+                    {
+                        if (nm >= 64) return false;
+                        g = nm++;
+                        bases[g] = base; pis[g] = 0; pjs[g] = 0;
+                    }
+                    else
+                    {
+                        // existing group: coefficient pair must match exactly,
+                        // else two accesses could hit the same address
+                        if (pi != pis[g] || pj != pjs[g])
+                        return false;
+                    }
+                    pis[g] = pi; pjs[g] = pj;
+                }
+            }
+        }
+
+        if (nm == 0) return true;
+        if (!haveBounds) return false;
+        for (u32 m = 0; m < nm; m++)
+            if (!self.injectiveAffine(pis[m], pjs[m], ni, nj))
+            return false;
         return true;
     }
 }
