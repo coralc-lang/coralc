@@ -8,7 +8,7 @@ use ast::expr { Expr, ExprKind };
 use ast::id { Str, NodeId, SourceLoc };
 use ast::types { Ty, TypeEntry, TypeKind };
 use ast::node { Node, NodeKind };
-use ast::decl { Decl, DeclKind, Param, GenericParam, VariantVariant, Attribute,
+use ast::decl { Decl, DeclKind, Param, Field, GenericParam, VariantVariant, Attribute,
                 ATTR_NO_DROP, ATTR_NO_DROP_ALL, ATTR_FALLTHROUGH, ATTR_MAYBE_UNUSED,
                 ATTR_NORETURN, ATTR_NAKED, ATTR_ENTRY, ATTR_NOALIAS,
                 ATTR_INLINE, ATTR_INLINE_ALWAYS, ATTR_INLINE_NEVER,
@@ -153,6 +153,10 @@ pub extend Sema
                     if (dropInfo.declaration.index != 0 &&
                         self.dropMethodIsValid(dropInfo.declaration))
                         stmt->kind.payload.VarDecl.dropMethod = dropInfo.declaration;
+                    else if (self.typeHasDropGlue(declaredType, 0))
+                        stmt->kind.payload.VarDecl.flags |= 8;
+                    else if (self.typeHasDropFields(declaredType, 0))
+                        stmt->kind.payload.VarDecl.flags |= 8;
                 }
                 if (!self.stmtHasAttr(stmt, ATTR_MAYBE_UNUSED))
                     self.noteLocal(stmt->kind.payload.VarDecl.name, stmt->kind.payload.VarDecl.nameLoc);
@@ -1014,6 +1018,10 @@ pub extend Sema
                     MemberInfo pdi = self.findMethod(param->typeNode, self.ctx->intern("drop"), self.fileOf(paramId));
                     if (pdi.declaration.index != 0 && self.dropMethodIsValid(pdi.declaration))
                         param->dropMethod = pdi.declaration;
+                    else if (self.typeHasDropGlue(param->typeNode, 0))
+                        param->flags |= 32;
+                    else if (self.typeHasDropFields(param->typeNode, 0))
+                        param->flags |= 32;
                 }
             }
             i++;
@@ -1317,6 +1325,223 @@ pub extend Sema
     {
         if (stmt == null) return false;
         return (stmt->attrBits & bit) != 0;
+    }
+
+    /* does `ty` own droppable storage through its fields — some struct
+     * field (at any depth) has a valid drop method? Memoized per Ty:
+     * the walk runs once per type for the whole compile, not per
+     * local. Generic params are treated as non-droppable. */
+    bool typeHasDropFields(Ty ty, u32 depth)
+    {
+        if (depth > 32) return false;
+        ty = self.stripType(ty);
+        if (ty == 0) return false;
+        if (self.dropFieldsMemo == null || self.dropFieldsMemoLen <= ty)
+        {
+            u32 need = ty + 1;
+            u8* nm = alloc<u8>((usize)need);
+            if (nm == null) return false;
+            u32 k = 0;
+            while (k < self.dropFieldsMemoLen) { nm[k] = self.dropFieldsMemo[k]; k++; }
+            self.dropFieldsMemo = nm;
+            self.dropFieldsMemoLen = need;
+        }
+        u8 m = self.dropFieldsMemo[ty];
+        if (m == 2) return true;
+        if (m == 1 || m == 3) return false;
+        self.dropFieldsMemo[ty] = 3;
+        TypeEntry* te = self.ctx->types + ty;
+        if (te->kind.tag != TypeKind::Named) { self.dropFieldsMemo[ty] = 1; return false; }
+        Symbol* sym = self.lookupTypeEntry(te);
+        if (sym == null) { self.dropFieldsMemo[ty] = 1; return false; }
+        Node* dn = self.ctx->nodes + sym->declaration.index;
+        if (dn->kind.tag != NodeKind::Decl) { self.dropFieldsMemo[ty] = 1; return false; }
+        Decl* dd = &dn->kind.payload.Decl.value;
+        NodeId* fields = null;
+        u32 flen = 0;
+        if (dd->kind.tag == DeclKind::Struct)
+        { fields = dd->kind.payload.Struct.fields; flen = dd->kind.payload.Struct.fieldsLen; }
+        else if (dd->kind.tag == DeclKind::Union)
+        { fields = dd->kind.payload.Union.fields; flen = dd->kind.payload.Union.fieldsLen; }
+        else { self.dropFieldsMemo[ty] = 1; return false; }
+        Str dropName = self.ctx->intern("drop");
+        u32 f = 0;
+        while (f < flen)
+        {
+            Node* fn = self.ctx->nodes + fields[f].index;
+            if (fn->kind.tag == NodeKind::Field)
+            {
+                Field* fd = &fn->kind.payload.Field.value;
+                Ty fty = fd->typeNode;
+                if (fty == 0) { f++; continue; }
+                Ty fu = self.stripType(fty);
+                TypeEntry* fe = fu != 0 ? self.ctx->types + fu : null;
+                if (fe != null &&
+                    (fe->kind.tag == TypeKind::Pointer ||
+                     fe->kind.tag == TypeKind::Reference ||
+                     fe->kind.tag == TypeKind::Slice)) { f++; continue; }
+                MemberInfo fdi = self.findMethod(fty, dropName, self.fileOf(fields[f]));
+                if (fdi.declaration.index != 0 && self.dropMethodIsValid(fdi.declaration))
+                { self.dropFieldsMemo[ty] = 2; return true; }
+                if (self.typeHasDropFields(fty, depth + 1))
+                { self.dropFieldsMemo[ty] = 2; return true; }
+            }
+            f++;
+        }
+        self.dropFieldsMemo[ty] = 1;
+        return false;
+    }
+
+    /* Rust-style drop glue: a type needs drop tracking iff it has its
+     * own `drop` method OR any field's type has drop glue. Memoized
+     * per Ty for the whole compile — the walk runs once per type, not
+     * per local. Unions glue only their own drop (fields overlap);
+     * variants glue their own drop only (payload glue is a separate
+     * gap); generic-param fields resolve to nothing and are skipped. */
+    void buildDropTypeNames()
+    {
+        if (self.dropTypeNamesBuilt) return;
+        self.dropTypeNamesBuilt = true;
+        Str dropName = self.ctx->intern("drop");
+        u32 e = 0;
+        while (e < self.extendsLen)
+        {
+            Node* en = self.ctx->nodes + self.extends[e].index;
+            if (en->kind.tag == NodeKind::Decl)
+            {
+                Decl* ed = &en->kind.payload.Decl.value;
+                NodeId* ms = null;
+                u32 ml = 0;
+                Ty st = 0;
+                if (ed->kind.tag == DeclKind::Extend)
+                { ms = ed->kind.payload.Extend.methods; ml = ed->kind.payload.Extend.methodsLen; st = ed->kind.payload.Extend.selfType; }
+                else if (ed->kind.tag == DeclKind::ExtendTrait)
+                { ms = ed->kind.payload.ExtendTrait.methods; ml = ed->kind.payload.ExtendTrait.methodsLen; st = ed->kind.payload.ExtendTrait.selfType; }
+                if (ms != null && st != 0)
+                {
+                    bool hasDrop = false;
+                    u32 mi = 0;
+                    while (mi < ml)
+                    {
+                        Node* mn = self.ctx->nodes + ms[mi].index;
+                        if (mn->kind.tag == NodeKind::Decl &&
+                            mn->kind.payload.Decl.value.kind.tag == DeclKind::Func &&
+                            self.ctx->internEqHashLen(mn->kind.payload.Decl.value.kind.payload.Func.name, 0xA9A58D8C, 4))
+                        { hasDrop = true; break; }
+                        mi++;
+                    }
+                    if (hasDrop)
+                    {
+                        Ty base = self.stripType(st);
+                        TypeEntry* te = base != 0 ? self.ctx->types + base : null;
+                        if (te != null && te->kind.tag == TypeKind::Named)
+                        {
+                            Str nm = te->kind.payload.Named.name;
+                            u32 k = 0;
+                            while (k < self.dropTypeNamesLen && self.dropTypeNames[k] != nm) k++;
+                            if (k == self.dropTypeNamesLen)
+                            {
+                                if (self.dropTypeNamesLen >= self.dropTypeNamesCap)
+                                {
+                                    u32 nc = self.dropTypeNamesCap != 0 ? self.dropTypeNamesCap * 2 : 16;
+                                    Str* nn = alloc<Str>((usize)nc);
+                                    u32 j = 0;
+                                    while (j < self.dropTypeNamesLen) { nn[j] = self.dropTypeNames[j]; j++; }
+                                    self.dropTypeNames = nn;
+                                    self.dropTypeNamesCap = nc;
+                                }
+                                self.dropTypeNames[self.dropTypeNamesLen] = nm;
+                                self.dropTypeNamesLen++;
+                            }
+                        }
+                    }
+                }
+            }
+            e++;
+        }
+    }
+
+    bool typeHasOwnDropName(Str name)
+    {
+        self.buildDropTypeNames();
+        u32 k = 0;
+        while (k < self.dropTypeNamesLen)
+        {
+            if (self.dropTypeNames[k] == name) return true;
+            k++;
+        }
+        /* a drop declared inside the type body itself */
+        return false;
+    }
+
+    bool typeHasDropGlue(Ty ty, u32 depth)
+    {
+        if (depth > 32) return false;
+        ty = self.stripType(ty);
+        if (ty == 0) return false;
+        if (self.dropGlueMemo == null || self.dropGlueMemoLen <= ty)
+        {
+            u32 need = ty + 1;
+            u8* nm = alloc<u8>((usize)need);
+            if (nm == null) return false;
+            u32 k = 0;
+            while (k < self.dropGlueMemoLen) { nm[k] = self.dropGlueMemo[k]; k++; }
+            self.dropGlueMemo = nm;
+            self.dropGlueMemoLen = need;
+        }
+        u8 m = self.dropGlueMemo[ty];
+        if (m == 2) return true;
+        if (m == 1 || m == 3) return false;
+        self.dropGlueMemo[ty] = 3;
+        TypeEntry* te = self.ctx->types + ty;
+        if (te->kind.tag != TypeKind::Named) { self.dropGlueMemo[ty] = 1; return false; }
+        Str tn = te->kind.payload.Named.name;
+        if (tn == 0) { self.dropGlueMemo[ty] = 1; return false; }
+        Symbol* sym = self.lookupTypeEntry(te);
+        if (sym == null) { self.dropGlueMemo[ty] = 1; return false; }
+        Node* dn = self.ctx->nodes + sym->declaration.index;
+        if (dn->kind.tag != NodeKind::Decl) { self.dropGlueMemo[ty] = 1; return false; }
+        Decl* dd = &dn->kind.payload.Decl.value;
+        /* own drop: a method named `drop` in the decl's method list, or
+         * an extend/extend-trait on this type name providing one */
+        bool own = self.typeHasOwnDropName(tn);
+        if (!own)
+        {
+            NodeId* ms = null;
+            u32 ml = 0;
+            if (dd->kind.tag == DeclKind::Struct) { ms = dd->kind.payload.Struct.methods; ml = dd->kind.payload.Struct.methodsLen; }
+            else if (dd->kind.tag == DeclKind::Union) { ms = dd->kind.payload.Union.methods; ml = dd->kind.payload.Union.methodsLen; }
+            else if (dd->kind.tag == DeclKind::Variant) { ms = dd->kind.payload.Variant.methods; ml = dd->kind.payload.Variant.methodsLen; }
+            u32 mi = 0;
+            while (mi < ml)
+            {
+                Node* mn = self.ctx->nodes + ms[mi].index;
+                if (mn->kind.tag == NodeKind::Decl &&
+                    mn->kind.payload.Decl.value.kind.tag == DeclKind::Func &&
+                    self.ctx->internEqHashLen(mn->kind.payload.Decl.value.kind.payload.Func.name, 0xA9A58D8C, 4))
+                { own = true; break; }
+                mi++;
+            }
+        }
+        if (own) { self.dropGlueMemo[ty] = 2; return true; }
+        /* field glue: structs only — unions overlap, variants' payload
+         * glue is not lowered yet */
+        if (dd->kind.tag != DeclKind::Struct) { self.dropGlueMemo[ty] = 1; return false; }
+        u32 f = 0;
+        while (f < dd->kind.payload.Struct.fieldsLen)
+        {
+            Node* fn = self.ctx->nodes + dd->kind.payload.Struct.fields[f].index;
+            if (fn->kind.tag == NodeKind::Field)
+            {
+                Field* fd = &fn->kind.payload.Field.value;
+                Ty fty = fd->typeNode;
+                if (fty != 0 && self.typeHasDropGlue(fty, depth + 1))
+                { self.dropGlueMemo[ty] = 2; return true; }
+            }
+            f++;
+        }
+        self.dropGlueMemo[ty] = 1;
+        return false;
     }
 
     /* a `drop` method is only an RAII hook when it is `void drop()`: the
