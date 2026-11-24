@@ -14,7 +14,7 @@ use types { muvTy, muvFindTypeDecl, muvVariantDeclOf, muvVariantCaseIdx,
                muvPushTySubs };
 use expr { muvExpr, muvAddrOf, muvCond, muvAssignCommon, muvIsAgg, muvCopyAgg, muvAggSlot,
                muvDecodeLit, muvCompareVals, muvResolveConst, muvMakeGlobal, muvValBody,
-               muvMethodFnFor, muvCast, muvUnwrapTy, muvTyUnsigned, muvIndexAddr,
+               muvMethodFnFor, muvFindMethodDecl, muvCast, muvUnwrapTy, muvTyUnsigned, muvIndexAddr,
                muvGepField, muvFieldIdx, muvConstU64, muvStoreVal, muvArmStore,
                muvCoerceToIr };
 use decl { muvMethodSelfKind };
@@ -27,7 +27,7 @@ use ast {
     node { Node, NodeKind },
     expr { Expr, ExprKind },
     stmt { Stmt, StmtKind, SwitchCase },
-    decl { Decl, DeclKind, Param, VariantVariant,
+    decl { Decl, DeclKind, Param, Field, VariantVariant,
            ATTR_VECTORISE, ATTR_NOVECTOR },
     pat { Pat, PatKind }
 };
@@ -848,7 +848,7 @@ pub void muvDefersBranch(Muv* w, u32 mark)
 
 /* ── RAII drop stack ────────────────────────────────────────── */
 
-void muvDropPush(Muv* w, Str name, IrValue* slot, Ty ty, NodeId mdef)
+pub void muvDropPush(Muv* w, Str name, IrValue* slot, Ty ty, NodeId mdef)
 {
     if (w->dropLen >= w->dropCap)
     {
@@ -865,7 +865,7 @@ void muvDropPush(Muv* w, Str name, IrValue* slot, Ty ty, NodeId mdef)
     w->dropLen++;
 }
 
-i32 muvDropFind(Muv* w, Str name)
+pub i32 muvDropFind(Muv* w, Str name)
 {
     if (name == 0) return -1;
     i32 i = (i32)w->dropLen - 1;
@@ -890,29 +890,143 @@ void muvDropRemoveAt(Muv* w, u32 idx)
 }
 
 /* emit `owner_drop(&slot);` for one entry */
-void muvEmitDropEntry(Muv* w, MuvDrop* d)
+/* recursive field drops: after a type's own drop() runs, every struct
+ * field unwinds too — a field with its own drop method emits it, then
+ * recurses into ITS fields (post-order). Fields without a drop method
+ * still recurse so `struct Inner{ Res r }` can't leak. Unions have no
+ * active-field tag and pointers/slices don't own their pointee, so
+ * only struct fields participate. `base` is the slot the drops hang
+ * off; `depth` bounds pathological nesting. */
+void muvEmitDropFields(Muv* w, IrValue* base, Ty ty, u32 depth)
+{
+    if (base == null || depth > 32) return;
+    ty = muvUnwrapTy(w, ty);
+    if (ty == 0) return;
+    TypeEntry* te = w->ctx->types + ty;
+    if (te->kind.tag != TypeKind::Named) return;
+    Str tn = te->kind.payload.Named.name;
+    if (tn == 0) return;
+    NodeId td = muvFindTypeDecl(w, tn);
+    if (td.index == 0) return;
+    Node* dn = muvNode(w, td);
+    if (dn->kind.tag != NodeKind::Decl) return;
+    Decl* dd = &dn->kind.payload.Decl.value;
+    if (dd->kind.tag != DeclKind::Struct) return;
+    Str dropName = w->ctx->intern("drop");
+    u32 f = 0;
+    while (f < dd->kind.payload.Struct.fieldsLen)
+    {
+        Node* fn = muvNode(w, dd->kind.payload.Struct.fields[f]);
+        if (fn->kind.tag == NodeKind::Field)
+        {
+            Field* fd = &fn->kind.payload.Field.value;
+            Ty fty = fd->typeNode;
+            Ty fu = fty != 0 ? muvUnwrapTy(w, fty) : 0;
+            TypeEntry* fe = fu != 0 ? w->ctx->types + fu : null;
+            bool ptrLike = fe != null &&
+                (fe->kind.tag == TypeKind::Pointer ||
+                 fe->kind.tag == TypeKind::Reference ||
+                 fe->kind.tag == TypeKind::Slice);
+            if (!ptrLike && fty != 0)
+            {
+                u32 fi = muvFieldIdx(w, ty, fd->name);
+                if (fi != 0xFFFFFFFF)
+                {
+                    IrValue* faddr = muvGepField(w, base, fi);
+                    if (faddr != null)
+                    {
+                        NodeId fm = NodeId{ .index = 0 };
+                        IrFunc* ff = muvMethodFnFor(w, fty, dropName,
+                            NodeId{ .index = 0 }, null, &fm);
+                        if (ff != null)
+                        {
+                            MuvDrop fd2;
+                            fd2.name = 0;
+                            fd2.slot = faddr;
+                            fd2.ty = fty;
+                            fd2.mdef = fm;
+                            muvEmitDropEntry(w, &fd2);
+                        }
+                        else muvEmitDropFields(w, faddr, fty, depth + 1);
+                    }
+                }
+            }
+        }
+        f++;
+    }
+}
+
+/* does `ty` own droppable storage through its fields — some struct
+ * field (at any depth) has a drop method? Locals/params of such types
+ * need a drop entry even when the type itself declares no drop(), or
+ * `struct NoDrop { Res r }` would leak r (mirrors cgTypeHasDropFields) */
+pub bool muvTypeHasDropFields(Muv* w, Ty ty, u32 depth)
+{
+    if (depth > 32) return false;
+    ty = muvUnwrapTy(w, ty);
+    if (ty == 0) return false;
+    TypeEntry* te = w->ctx->types + ty;
+    if (te->kind.tag != TypeKind::Named) return false;
+    Str tn = te->kind.payload.Named.name;
+    if (tn == 0) return false;
+    NodeId td = muvFindTypeDecl(w, tn);
+    if (td.index == 0) return false;
+    Node* dn = muvNode(w, td);
+    if (dn->kind.tag != NodeKind::Decl) return false;
+    Decl* dd = &dn->kind.payload.Decl.value;
+    if (dd->kind.tag != DeclKind::Struct) return false;
+    Str dropName = w->ctx->intern("drop");
+    u32 f = 0;
+    while (f < dd->kind.payload.Struct.fieldsLen)
+    {
+        Node* fn = muvNode(w, dd->kind.payload.Struct.fields[f]);
+        if (fn->kind.tag == NodeKind::Field)
+        {
+            Field* fd = &fn->kind.payload.Field.value;
+            Ty fty = fd->typeNode;
+            if (fty == 0) continue;
+            Ty fu = muvUnwrapTy(w, fty);
+            TypeEntry* fe = fu != 0 ? w->ctx->types + fu : null;
+            if (fe != null &&
+                (fe->kind.tag == TypeKind::Pointer ||
+                 fe->kind.tag == TypeKind::Reference ||
+                 fe->kind.tag == TypeKind::Slice)) continue;
+            if (muvFindMethodDecl(w, fty, dropName).index != 0) return true;
+            if (muvTypeHasDropFields(w, fty, depth + 1)) return true;
+        }
+        f++;
+    }
+    return false;
+}
+
+pub void muvEmitDropEntry(Muv* w, MuvDrop* d)
 {
     if (d == null || d->slot == null) return;
     NodeId mdef = NodeId{ .index = 0 };
     IrFunc* f = muvMethodFnFor(w, d->ty, w->ctx->intern("drop"), NodeId{ .index = 0 }, null, &mdef);
-    if (f == null) return;
-    u8 sk = muvMethodSelfKind(w, mdef);
-    u32 n = sk != 0 ? 1 : 0;
-    IrValue*[1] args;
-    if (n != 0)
+    if (f != null)
     {
-        Ty u = muvUnwrapTy(w, d->ty);
-        bool recvPtr = u != 0 && muvIsIndirect(w->ctx->types + u);
-        if (recvPtr)
+        u8 sk = muvMethodSelfKind(w, mdef);
+        u32 n = sk != 0 ? 1 : 0;
+        IrValue*[1] args;
+        if (n != 0)
         {
-            IrType* st = muvSlotTy(d->slot->type);
-            IrValue* pv = muvV(w->b.load(st, d->slot));
-            if (pv == null) return;
-            args[0] = pv;
+            Ty u = muvUnwrapTy(w, d->ty);
+            bool recvPtr = u != 0 && muvIsIndirect(w->ctx->types + u);
+            if (recvPtr)
+            {
+                IrType* st = muvSlotTy(d->slot->type);
+                IrValue* pv = muvV(w->b.load(st, d->slot));
+                if (pv == null) return;
+                args[0] = pv;
+            }
+            else args[0] = d->slot;
         }
-        else args[0] = d->slot;
+        w->b.call(&f->base, args, n);
     }
-    w->b.call(&f->base, args, n);
+    /* fields unwind after the owner's own drop() — even when the type
+     * has no drop method of its own */
+    muvEmitDropFields(w, d->slot, d->ty, 0);
 }
 
 /* walk the live set above `mark` innermost-first; `skip` leaves one
@@ -932,6 +1046,36 @@ void muvDropsFrom(Muv* w, u32 mark, i32 skip, bool pop)
 pub void muvDropsBranch(Muv* w, u32 mark, i32 skip)
 {
     muvDropsFrom(w, mark, skip, false);
+}
+
+/* consuming methods `x.dispose()` / `x.free()` / `x.drop()` release the
+ * receiver immediately: cancel its pending drop so a later automatic
+ * drop at a scope exit cannot free the same buffer twice (mirrors
+ * cgMoveDisposeRecv; trait-drop calls never reach codegen — sema bans
+ * them — so any `drop` here is an inherent method consuming normally) */
+pub void muvMoveDisposeRecv(Muv* w, Str methName, Node* rn)
+{
+    if (!w->ctx->internEqHashLen(methName, 0x95DA0566, 7) && /* FNV("dispose") */
+        !w->ctx->internEqHashLen(methName, 0x99B3EEDB, 4) && /* FNV("free") */
+        !w->ctx->internEqHashLen(methName, 0xA9A58D8C, 4)) return; /* FNV("drop") */
+    if (rn == null || rn->kind.tag != NodeKind::Expr) return;
+    if (rn->kind.payload.Expr.value.kind.tag != ExprKind::Ident) return;
+    Str nm = rn->kind.payload.Expr.value.kind.payload.Ident.name;
+    i32 i = muvDropFind(w, nm);
+    if (i >= 0) muvDropRemoveAt(w, (u32)i);
+}
+
+/* a bare identifier argument is passed by value: the callee's param
+ * owns it now, so the caller's pending drop is cancelled — same move
+ * discipline as `T x = y;` and `return s;` (mirrors cgMoveArg) */
+pub void muvMoveArg(Muv* w, NodeId arg)
+{
+    Node* an = muvNode(w, arg);
+    if (an->kind.tag != NodeKind::Expr) return;
+    if (an->kind.payload.Expr.value.kind.tag != ExprKind::Ident) return;
+    Str nm = an->kind.payload.Expr.value.kind.payload.Ident.name;
+    i32 i = muvDropFind(w, nm);
+    if (i >= 0) muvDropRemoveAt(w, (u32)i);
 }
 
 /* lower a VarDecl: alloca, optionally initialise (aggregates copy
@@ -992,8 +1136,11 @@ pub void muvVarDecl(Muv* w, Stmt* s, NodeId id)
         }
     }
     /* RAII move: `T x = y;` transfers y's ownership, so y must not
-     * drop at scope exit (the C backend's cgPushDrop does the same) */
-    if (s->kind.payload.VarDecl.dropMethod.index != 0)
+     * drop at scope exit (the C backend's cgPushDrop does the same).
+     * Types with droppable fields but no own drop() still need the
+     * entry so the fields unwind */
+    if (s->kind.payload.VarDecl.dropMethod.index != 0 ||
+        muvTypeHasDropFields(w, vt, 0))
     {
         NodeId initId = s->kind.payload.VarDecl.init;
         if (initId.index != 0)

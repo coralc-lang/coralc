@@ -433,22 +433,146 @@ void cgPushDrop(Codegen* cg, Str name, Ty ty, NodeId mdef)
     cg->dropsLen++;
 }
 
+/* recursive field drops: after a type's own drop() runs, every struct
+ * field unwinds too — a field with its own drop method emits it, then
+ * recurses into ITS fields (post-order, Rust-style). Fields without a
+ * drop method still recurse so `struct Inner{ Res r }` can't leak.
+ * unions have no active-field tag and arrays/pointers aren't tracked
+ * per element, so only struct fields participate. `base` is the C
+ * lvalue text (`x`, `x.f`, …) the drops hang off. */
+void cgEmitDropFields(Codegen* cg, Slice base, Ty ty)
+{
+    ty = cgTyUnwrap(cg, cgSubstTy(cg, ty));
+    if (ty == 0) return;
+    TypeEntry* te = cg->ctx->types + ty;
+    if (te->kind.tag != TypeKind::Named) return;
+    Str tn = te->kind.payload.Named.name;
+    if (tn == 0) return;
+    NodeId td = cgFindTypeDecl(cg, tn, locFile(te->loc));
+    if (td.index == 0) return;
+    Node* dn = cgNode(cg, td);
+    if (dn->kind.tag != NodeKind::Decl) return;
+    Decl* dd = &dn->kind.payload.Decl.value;
+    if (dd->kind.tag != DeclKind::Struct) return;
+    Str dropName = cg->ctx->intern("drop");
+    u32 f = 0;
+    while (f < dd->kind.payload.Struct.fieldsLen)
+    {
+        Node* fn = cgNode(cg, dd->kind.payload.Struct.fields[f]);
+        if (fn->kind.tag == NodeKind::Field)
+        {
+            Field* fd = &fn->kind.payload.Field.value;
+            Ty fty = fd->typeNode;
+            /* pointer-like fields never own a drop (same rule sema
+             * applies to locals) */
+            Ty fu = cgTyUnwrap(cg, fty);
+            TypeEntry* fe = fu != 0 ? cg->ctx->types + fu : null;
+            bool ptrLike = fe != null &&
+                (fe->kind.tag == TypeKind::Pointer ||
+                 fe->kind.tag == TypeKind::Reference ||
+                 fe->kind.tag == TypeKind::Slice);
+            if (!ptrLike && fty != 0)
+            {
+                /* `name.field` lvalue text for this field's drops */
+                usize bs = cg->ebuf.len;
+                stPS(&cg->ebuf, base);
+                stCh(&cg->ebuf, '.');
+                stPS(&cg->ebuf, cgIntern(cg, fd->name));
+                Slice fbase = stTail(&cg->ebuf, bs);
+                NodeId fm = cgFindMethodDecl(cg, fty, dropName);
+                if (fm.index != 0)
+                {
+                    Slice owner = cgOwnerName(cg, cgTyUnwrap(cg, cgSubstTy(cg, fty)));
+                    usize cs = cg->ebuf.len;
+                    stPS(&cg->ebuf, owner);
+                    stCh(&cg->ebuf, '_');
+                    stPS(&cg->ebuf, cgIntern(cg, dropName));
+                    Slice raw = stTail(&cg->ebuf, cs);
+                    Slice callee = cgMangleS(cg, fm, raw, 0);
+                    stNL(&cg->body, cg->ind);
+                    stPS(&cg->body, callee);
+                    stP(&cg->body, "(&");
+                    stPS(&cg->body, fbase);
+                    stP(&cg->body, ");");
+                }
+                cgEmitDropFields(cg, fbase, fty);
+            }
+        }
+        f++;
+    }
+}
+
+/* does `ty` own droppable storage through its fields — i.e. some struct
+ * field (at any depth) has a drop method? Locals/params of such types
+ * need a drop entry even when the type itself declares no drop(), or
+ * `struct NoDrop { Res r }` would leak r. */
+bool cgTypeHasDropFields(Codegen* cg, Ty ty, u32 depth)
+{
+    if (depth > 32) return false;
+    ty = cgTyUnwrap(cg, cgSubstTy(cg, ty));
+    if (ty == 0) return false;
+    TypeEntry* te = cg->ctx->types + ty;
+    if (te->kind.tag != TypeKind::Named) return false;
+    Str tn = te->kind.payload.Named.name;
+    if (tn == 0) return false;
+    NodeId td = cgFindTypeDecl(cg, tn, locFile(te->loc));
+    if (td.index == 0) return false;
+    Node* dn = cgNode(cg, td);
+    if (dn->kind.tag != NodeKind::Decl) return false;
+    Decl* dd = &dn->kind.payload.Decl.value;
+    if (dd->kind.tag != DeclKind::Struct) return false;
+    Str dropName = cg->ctx->intern("drop");
+    u32 f = 0;
+    while (f < dd->kind.payload.Struct.fieldsLen)
+    {
+        Node* fn = cgNode(cg, dd->kind.payload.Struct.fields[f]);
+        if (fn->kind.tag == NodeKind::Field)
+        {
+            Field* fd = &fn->kind.payload.Field.value;
+            Ty fty = fd->typeNode;
+            if (fty == 0) continue;
+            Ty fu = cgTyUnwrap(cg, fty);
+            TypeEntry* fe = fu != 0 ? cg->ctx->types + fu : null;
+            if (fe != null &&
+                (fe->kind.tag == TypeKind::Pointer ||
+                 fe->kind.tag == TypeKind::Reference ||
+                 fe->kind.tag == TypeKind::Slice)) continue;
+            if (cgFindMethodDecl(cg, fty, dropName).index != 0) return true;
+            if (cgTypeHasDropFields(cg, fty, depth + 1)) return true;
+        }
+        f++;
+    }
+    return false;
+}
+
 void cgEmitDropEntry(Codegen* cg, DropEntry* e)
 {
     Ty ty = cgTyUnwrap(cg, cgSubstTy(cg, e->typeNode));
     if (ty == 0) return;
-    Slice owner = cgOwnerName(cg, ty);
-    usize cs = cg->ebuf.len;
-    stPS(&cg->ebuf, owner);
-    stCh(&cg->ebuf, '_');
-    stPS(&cg->ebuf, cgIntern(cg, cg->ctx->intern("drop")));
-    Slice raw = stTail(&cg->ebuf, cs);
-    Slice callee = cgMangleS(cg, e->mdef, raw, 0);
-    stNL(&cg->body, cg->ind);
-    stPS(&cg->body, callee);
-    stP(&cg->body, "(&");
-    stPS(&cg->body, cgIdent(cg, e->name));
-    stP(&cg->body, ");");
+    /* own drop() only when the type actually has one — entries also
+     * exist for field-only droppables (mdef == 0) */
+    if (e->mdef.index != 0)
+    {
+        Slice owner = cgOwnerName(cg, ty);
+        usize cs = cg->ebuf.len;
+        stPS(&cg->ebuf, owner);
+        stCh(&cg->ebuf, '_');
+        stPS(&cg->ebuf, cgIntern(cg, cg->ctx->intern("drop")));
+        Slice raw = stTail(&cg->ebuf, cs);
+        Slice callee = cgMangleS(cg, e->mdef, raw, 0);
+        stNL(&cg->body, cg->ind);
+        stPS(&cg->body, callee);
+        stP(&cg->body, "(&");
+        stPS(&cg->body, cgIdent(cg, e->name));
+        stP(&cg->body, ");");
+    }
+    /* fields unwind after the owner's own drop() */
+    {
+        usize bs = cg->ebuf.len;
+        stPS(&cg->ebuf, cgIdent(cg, e->name));
+        Slice base = stTail(&cg->ebuf, bs);
+        cgEmitDropFields(cg, base, ty);
+    }
 }
 
 /* emit `T_drop(&name);` for every live local above `mark`, innermost
@@ -533,7 +657,8 @@ void cgMoveArg(Codegen* cg, NodeId arg)
 void cgMoveDisposeRecv(Codegen* cg, Str methName, Node* recvNode)
 {
     if (!cg->ctx->internEqHashLen(methName, 0x95DA0566, 7) && /* FNV("dispose") */
-        !cg->ctx->internEqHashLen(methName, 0x99B3EEDB, 4)) return; /* FNV("free") */
+        !cg->ctx->internEqHashLen(methName, 0x99B3EEDB, 4) && /* FNV("free") */
+        !cg->ctx->internEqHashLen(methName, 0xA9A58D8C, 4)) return; /* FNV("drop") */
     if (recvNode->kind.tag != NodeKind::Expr) return;
     if (recvNode->kind.payload.Expr.value.kind.tag != ExprKind::Ident) return;
     i32 ci = cgFindDrop(cg, recvNode->kind.payload.Expr.value.kind.payload.Ident.name);
@@ -5831,8 +5956,8 @@ void cgStmt(Codegen* cg, NodeId id)
             /* RAII: register the local so its drop runs at scope exit.
              * `T x = y;` with y a droppable local moves the value: y is
              * unregistered and x's future drop owns the buffer */
-            if (s->kind.payload.VarDecl.dropMethod.index != 0 &&
-                ty != 0)
+            if ((s->kind.payload.VarDecl.dropMethod.index != 0 ||
+                 cgTypeHasDropFields(cg, ty, 0)) && ty != 0)
             {
                 if (init.index != 0)
                 {
@@ -6858,6 +6983,11 @@ void cgEmitFuncCommon(Codegen* cg, NodeId declId, Slice cname, Ty retTy, Ty* par
             {
                 Param* p = &pn->kind.payload.Param.value;
                 cgAddLocal(cg, p->name);
+                /* RAII: by-value droppable params unwind on every exit
+                 * path, same as VarDecl locals */
+                if ((p->dropMethod.index != 0 ||
+                     cgTypeHasDropFields(cg, p->typeNode, 0)) && p->typeNode != 0)
+                    cgPushDrop(cg, p->name, cgSubstTy(cg, p->typeNode), p->dropMethod);
             }
             pi++;
         }

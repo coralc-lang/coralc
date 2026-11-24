@@ -114,6 +114,9 @@ struct Scev
     IrValue** phis;
     Affine* affs;
     IrInst** updOp;
+    u64* phiStepBits;   // const-step phis: update is phi +/- ConstInt
+    bool* phiHasStep;
+    IrValue** phiInitV; // preheader value of each phi
     u32 nphi;
     u32 ivIdx;
     IrValue** ivExit;
@@ -184,6 +187,27 @@ Plan* planBin(Scev* s, PlanKind k, Plan* a, Plan* b)
         else if (k == PlanKind::PL_MUL) r = (a->c * b->c) & m;
         else r = 0;
         return planConst(s, r, w);
+    }
+    // identities: x+0=x, x-0=x, x*0=0, x*1=x (also 0+x, 1*x)
+    if (a != null && a->kind == PlanKind::PL_CONST)
+    {
+        if (k == PlanKind::PL_ADD && a->c == 0) return b;
+        if (k == PlanKind::PL_SUB && a->c == 0) return b;
+        if (k == PlanKind::PL_MUL)
+        {
+            if (a->c == 0) return a;
+            if (a->c == 1) return b;
+        }
+    }
+    if (b != null && b->kind == PlanKind::PL_CONST)
+    {
+        if (k == PlanKind::PL_ADD && b->c == 0) return a;
+        if (k == PlanKind::PL_SUB && b->c == 0) return a;
+        if (k == PlanKind::PL_MUL)
+        {
+            if (b->c == 0) return b;
+            if (b->c == 1) return a;
+        }
     }
     Plan* p = planNew(s, k);
     p->a = a;
@@ -441,6 +465,27 @@ bool linExtract(Scev* s, IrValue* v, IrValue* pv, Lin* out, u32 depth)
             }
             return false;
         }
+        // other header phi with a const step: q_k = qinit + step*k and
+        // k = iv - ivStart when the IV has unit up-step, so q is
+        // affine in iv: A=step, B=qinit - step*ivStart
+        if (i->opcode == IrOpcode::Phi && i->parent == s->header &&
+            s->stepSigned == 1 && s->ivIdx != ~0u)
+        {
+            for (u32 q = 0; q < s->nphi; q++)
+            {
+                if (s->phis[q] != v || !s->phiHasStep[q] || q == s->ivIdx) continue;
+                if (v->type == null || v->type->width != w) break;
+                IrValue* qinit = s->phiInitV[q];
+                if (qinit == null || s->ivStart == null) break;
+                Plan* pc = planConst(s, s->phiStepBits[q], w);
+                Plan* pm = planBin(s, PlanKind::PL_MUL, pc, planInv(s, s->ivStart));
+                Plan* pb = planBin(s, PlanKind::PL_SUB, planInv(s, qinit), pm);
+                out->cP = planConst(s, 0, w);
+                out->A = pc;
+                out->B = pb;
+                return true;
+            }
+        }
         if (isInvariant(s, v))
         {
             linZero(s, out, w);
@@ -578,6 +623,9 @@ void freeLoopScratch(Scev* s)
     if (s->phis != null) { dealloc<IrValue*>(s->phis); s->phis = null; }
     if (s->affs != null) { dealloc<Affine>(s->affs); s->affs = null; }
     if (s->updOp != null) { dealloc<IrInst*>(s->updOp); s->updOp = null; }
+    if (s->phiStepBits != null) { dealloc<u64>(s->phiStepBits); s->phiStepBits = null; }
+    if (s->phiHasStep != null) { dealloc<bool>(s->phiHasStep); s->phiHasStep = null; }
+    if (s->phiInitV != null) { dealloc<IrValue*>(s->phiInitV); s->phiInitV = null; }
     if (s->ivExit != null) { dealloc<IrValue*>(s->ivExit); s->ivExit = null; }
     if (s->escInst != null) { dealloc<IrInst*>(s->escInst); s->escInst = null; }
     if (s->escVals != null) { dealloc<IrValue*>(s->escVals); s->escVals = null; }
@@ -603,6 +651,7 @@ void scevReset(Scev* s, IrContext* ctx, IrFunc* func)
         .stepMag = 0, .xpred = IrICmpPred::Eq, .bound = null,
         .boundIsConst = false, .boundConst = 0, .nsw = false,
         .phis = null, .affs = null, .updOp = null, .nphi = 0,
+        .phiStepBits = null, .phiHasStep = null, .phiInitV = null,
         .ivIdx = ~0u, .ivExit = null,
         .anchor = null, .tc64 = null, .tri64 = null, .triEmitted = false,
         .escInst = null, .escVals = null, .nesc = 0, .capEsc = 0,
@@ -856,14 +905,23 @@ bool tryLoop(Scev* s, IrLoop* lp)
         else => { dealloc<bool>(s->inLoop); s->inLoop = null; return false; },
     }
 
-    // phi analysis
+    // phi analysis — pass 1: latch/pre pairs + const-step detection
     s->nphi = nphi;
     s->ivIdx = ~0u;
     s->phis = alloc<IrValue*>((usize)nphi);
     s->affs = alloc<Affine>((usize)nphi);
     s->updOp = alloc<IrInst*>((usize)nphi);
     s->ivExit = alloc<IrValue*>((usize)nphi);
-    for (u32 i = 0; i < nphi; i++) s->ivExit[i] = null;
+    s->phiStepBits = alloc<u64>((usize)nphi);
+    s->phiHasStep = alloc<bool>((usize)nphi);
+    s->phiInitV = alloc<IrValue*>((usize)nphi);
+    for (u32 i = 0; i < nphi; i++)
+    {
+        s->ivExit[i] = null;
+        s->phiStepBits[i] = 0;
+        s->phiHasStep[i] = false;
+        s->phiInitV[i] = null;
+    }
     for (u32 pi = 0; pi < nphi; pi++)
     {
         IrInst* phi = header->insts[pi];
@@ -874,14 +932,45 @@ bool tryLoop(Scev* s, IrLoop* lp)
         { freeLoopScratch(s); return false; }
         IrInst* upd = (IrInst*)nxt;
         s->updOp[pi] = upd;
+        IrValue* init = null;
+        if (!phiPair(phi, pre, &init)) { freeLoopScratch(s); return false; }
+        s->phiInitV[pi] = init;
         if (pv == ivPhi)
         {
             s->ivIdx = pi;
             continue;
         }
+        // const-step phi: update is exactly pv +/- ConstInt — its value
+        // at iteration k is init + step*k, substitutable into other
+        // accumulators' updates (chained recurrences like a+=b; b+=2)
+        if ((upd->opcode == IrOpcode::Add || upd->opcode == IrOpcode::Sub) &&
+            upd->nops == 2)
+        {
+            IrValue* stp = null;
+            bool pvIs0 = upd->ops[0] == pv;
+            bool pvIs1 = upd->ops[1] == pv;
+            if (pvIs0 && !pvIs1) stp = upd->ops[1];
+            else if (pvIs1 && !pvIs0) stp = upd->ops[0];
+            if (stp != null && stp->kind == IrValueKind::ConstInt &&
+                pv->type != null && pv->type->width == w)
+            {
+                u64 sb = stp->valData & wmask;
+                if (upd->opcode == IrOpcode::Sub) sb = (0 - sb) & wmask;
+                s->phiStepBits[pi] = sb;
+                s->phiHasStep[pi] = true;
+            }
+        }
+    }
+    if (s->ivIdx == ~0u) { freeLoopScratch(s); return false; }
+    // phi analysis — pass 2: accumulator affine forms
+    for (u32 pi = 0; pi < nphi; pi++)
+    {
+        if (pi == s->ivIdx) continue;
+        IrValue* pv = s->phis[pi];
         if (!isIntTy(pv->type)) { freeLoopScratch(s); return false; }
         // update must be pv + affine(iv): linExtract yields
         // cP*pv + A*iv + B with cP required to be the constant 1
+        IrInst* upd = s->updOp[pi];
         Lin ln;
         ln.cP = null; ln.A = null; ln.B = null;
         if (!linExtract(s, &upd->base, pv, &ln, 0)) { freeLoopScratch(s); return false; }
@@ -893,7 +982,6 @@ bool tryLoop(Scev* s, IrLoop* lp)
         af.B = ln.B;
         s->affs[pi] = af;
     }
-    if (s->ivIdx == ~0u) { freeLoopScratch(s); return false; }
 
     // escapee scan: in-loop values used outside
     s->capEsc = 16;
@@ -969,6 +1057,15 @@ bool tryLoop(Scev* s, IrLoop* lp)
     if (pred == IrICmpPred::Ne)
     {
         tc = d64; // exact mod 2^w, no guard needed
+    }
+    else if (s->stepMag == 1 && pred == IrICmpPred::Ult &&
+             s->ivStart != null && s->ivStart->kind == IrValueKind::ConstInt &&
+             s->ivStart->valData == 0)
+    {
+        // `for (i = 0; i < bound; i++)`: select(0 < bound, bound - 0, 0)
+        // is identically bound for every u64 bound — emit it bare so
+        // nested loops see an affine trip count in the outer IV
+        tc = bound64;
     }
     else
     {
