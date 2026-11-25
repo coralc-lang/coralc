@@ -40,12 +40,24 @@ use ast {
 import std::mman { alloc, dealloc, realloc, zero };
 import platform::libc { printf };
 
-// use platform libc, and then for allocations, i will refactor the whole allocator to use std::mman::alloc
+/* one translation unit of generated C: name is the suggested file
+ * stem, text the complete source (shared sections + TU-local defs
+ * and bodies) */
+pub struct TuCode
+{
+    Slice name;
+    Slice text;
+}
 
 pub struct CodegenResult
 {
-    Slice cCode;
+    TuCode* tus;
+    u32 tusLen;
     u32 errors;
+    /* shared decls (preamble, typedefs, prototypes, global externs)
+     * emitted once as coral_pch.h and precompiled to .gch; every TU
+     * .c file is just `#include "coral_pch.h"` + its own definitions */
+    Slice pch;
 }
 
 /* append-only output buffer; every section of the generated C (typedefs,
@@ -246,8 +258,27 @@ pub struct Codegen
      * bit0 = eligible lookup target (right kind, non-generic). Built
      * once — cgDeclOwner/cgOwnerGeneric are too costly to rerun per
      * method-call miss */
-    Slice* doOwner;
-    u8* doFlags;
+    /* multi-TU partition: tuFileIds[tuIdx] is the source file id that
+     * owns the TU; decl-defined bodies/globals emit only into their
+     * home TU, mono instances shard by name hash across all TUs.
+     * tuBodies/tuGlobals are per-TU streams swapped into cg.bodies /
+     * cg.defs during each TU's emission pass */
+    u32* tuFileIds;
+    u32 tuCount;
+    u32 tuIdx;
+    u32 tuFileId;
+    /* sub-sharding: a file with many owning decls splits into
+     * fileShards[f] TUs; tuShardIdx picks which hash bucket this TU
+     * is. 0xFFFFFFFF tuFileId remains the match-all sentinel */
+    u32* fileShards;
+    u32* tuShards;
+    u32 tuShardIdx;
+    u32 maxFid;
+    u32* instShard;
+    Stream* tuBodies;
+    Stream* tuGlobals;
+    /* diagnostic engine for TU naming (fileId → source path) */
+    DiagnosticEngine* eng;
     MonoSubstitution* subs;
     u32 subsLen;
     /* the mono instance picked for the call currently being emitted:
@@ -7842,8 +7873,17 @@ void cgAddDynInit(Codegen* cg, NodeId decl)
 /* runtime `var` globals: the assignments run from a constructor before
  * main, so the emitted C storage stays plain zero-initialized */
 void cgEmitGlobalInit(Codegen* cg)
-{
-    if (cg->dynInitsLen == 0) return;
+    /* per-TU pass: this TU's constructor only initializes the globals
+     * its own source file declared */
+    u32 mine = 0;
+    u32 pre = 0;
+    while (pre < cg->dynInitsLen)
+    {
+        if (!cgDeclInTu(cg, cg->dynInits[pre])) { pre++; continue; }
+        mine++;
+        pre++;
+    }
+    if (mine == 0) return;
     usize bodyStart = cg->body.len;
     cg->tempsLen = 0;
     cg->loopDepth = 0;
@@ -7854,8 +7894,7 @@ void cgEmitGlobalInit(Codegen* cg)
     cg->localNamesLen = 0;
     u32 i = 0;
     while (i < cg->dynInitsLen)
-    {
-        Node* dn = cgNode(cg, cg->dynInits[i]);
+        if (!cgDeclInTu(cg, cg->dynInits[i])) { i++; continue; }
         Decl* dd = &dn->kind.payload.Decl.value;
         stNL(&cg->body, cg->ind);
         stPS(&cg->body, cgMangle(cg, cg->dynInits[i], dd->kind.payload.Constant.name, 0));
@@ -7901,9 +7940,13 @@ void cgEmitGlobalInit(Codegen* cg)
 }
 
 /* file-scope constants and variables, emitted after the prototypes so
- * fn-pointer initializers (`const A = { .alloc = f }`) see a prior
- * declaration of f */
-void cgEmitGlobals(Codegen* cg)
+/* file-scope constants and variables. `tu < 0` is the shared pass:
+ * extern-flagged decls, type-bound typedefs and `extern` declarations
+ * for every defined global (so each TU sees the symbol) plus dyn-init
+ * registration — all landing in the shared prototypes section.
+ * `tu >= 0` is the per-TU pass: only globals whose decl lives in this
+ * TU's source file emit their definition, into tuGlobals[tu]. */
+void cgEmitGlobals(Codegen* cg, i32 tu)
 {
     u32 i = 0;
     while (i < cg->file->declsLen)
@@ -7912,18 +7955,19 @@ void cgEmitGlobals(Codegen* cg)
         if (d->kind.tag == NodeKind::Decl)
         {
             Decl* dd = &d->kind.payload.Decl.value;
-            if (dd->kind.tag == DeclKind::Constant)
-            {
+                if (tu >= 0 && !cgDeclInTu(cg, cg->file->decls[i])) { i++; continue; }
                 u8 cflags = dd->kind.payload.Constant.flags;
                 NodeId cval = dd->kind.payload.Constant.value;
                 Ty cty = dd->kind.payload.Constant.typeNode;
                 Str cname = dd->kind.payload.Constant.name;
-                if ((cflags & 2) != 0)
-                {
-                    // extern variable: declaration only
-                    stP(&cg->defs, "extern ");
-                    cgEmitGlobalDeclarator(cg, cty, cgMangle(cg, cg->file->decls[i], cname, 0));
-                    stP(&cg->defs, ";\n");
+                    // extern variable: declaration only (shared pass)
+                    if (tu < 0)
+                    {
+                        stP(&cg->defs, "extern ");
+                        if ((dd->attrBits & ATTR_THREADLOCAL) != 0) stP(&cg->defs, "_Thread_local ");
+                        cgEmitGlobalDeclarator(cg, cty, cgMangle(cg, cg->file->decls[i], cname, 0));
+                        stP(&cg->defs, ";\n");
+                    }
                 }
                 else
                 {
@@ -7941,52 +7985,65 @@ void cgEmitGlobals(Codegen* cg)
                                             locFile(vn->loc)).index != 0)
                             typeNamed = true;
                     }
-                    if (typeNamed)
+                        if (tu < 0)
+                        {
+                            stP(&cg->defs, "typedef ");
+                            stPS(&cg->defs, tyStr(cg, cty));
+                            stCh(&cg->defs, ' ');
+                            stPS(&cg->defs, cgMangle(cg, cg->file->decls[i], cname, 0));
+                            stP(&cg->defs, ";\n");
+                        }
+                    }
+                    else if (tu < 0)
                     {
-                        stP(&cg->defs, "typedef ");
-                        stPS(&cg->defs, tyStr(cg, cty));
-                        stCh(&cg->defs, ' ');
-                        stPS(&cg->defs, cgMangle(cg, cg->file->decls[i], cname, 0));
+                        /* shared pass: every TU needs the declaration;
+                         * the definition lands in the home TU's globals
+                         * stream. dyn-init registration and the
+                         * const-expression checks run here once. */
+                        if (cval.index != 0)
+                        {
+                            bool isArray = cty != 0 &&
+                                (cg->ctx->types + cty)->kind.tag == TypeKind::Array;
+                            Node* inn = cgNode(cg, cval);
+                            bool isArrLit = inn->kind.tag == NodeKind::Expr &&
+                                inn->kind.payload.Expr.value.kind.tag == ExprKind::ArrayLiteral;
+                            if (isArray && !isArrLit)
+                                cgError(cg, "array constant needs an array-literal initializer");
+                            /* C only accepts constant expressions at file scope.
+                             * a `const` decl must be one; a runtime `var`
+                             * initializer is deferred to coral_globals_init() */
+                            bool constShaped = cgInitConstP(cg, cval);
+                            if (!constShaped && (cflags & 16) != 0)
+                            {
+                                cgErrorUnsupported(cg, cg->file->decls[i],
+                                    "initializer of a file-scope constant must be a constant expression");
+                            }
+                            else if (!constShaped && isArray)
+                            {
+                                cgErrorUnsupported(cg, cg->file->decls[i],
+                                    "file-scope array initializer must be constant");
+                            }
+                            else if (!constShaped)
+                            {
+                                cgAddDynInit(cg, cg->file->decls[i]);
+                            }
+                        }
+                        if ((dd->attrBits & ATTR_THREADLOCAL) != 0) stP(&cg->defs, "extern _Thread_local ");
+                        else stP(&cg->defs, "extern ");
+                        cgEmitGlobalDeclarator(cg, cty, cgMangle(cg, cg->file->decls[i], cname, 0));
                         stP(&cg->defs, ";\n");
                     }
                     else
                     {
-                    if ((dd->attrBits & ATTR_THREADLOCAL) != 0) stP(&cg->defs, "_Thread_local ");
-                    cgEmitGlobalDeclarator(cg, cty, cgMangle(cg, cg->file->decls[i], cname, 0));
-                    if (cval.index != 0)
-                    {
-                        bool isArray = cty != 0 &&
-                            (cg->ctx->types + cty)->kind.tag == TypeKind::Array;
-                        Node* inn = cgNode(cg, cval);
-                        bool isArrLit = inn->kind.tag == NodeKind::Expr &&
-                            inn->kind.payload.Expr.value.kind.tag == ExprKind::ArrayLiteral;
-                        if (isArray && !isArrLit)
-                            cgError(cg, "array constant needs an array-literal initializer");
-                        /* C only accepts constant expressions at file scope.
-                         * a `const` decl must be one; a runtime `var`
-                         * initializer is deferred to coral_globals_init() */
-                        bool constShaped = cgInitConstP(cg, cval);
-                        if (!constShaped && (cflags & 16) != 0)
-                        {
-                            cgErrorUnsupported(cg, cg->file->decls[i],
-                                "initializer of a file-scope constant must be a constant expression");
-                        }
-                        else if (!constShaped && isArray)
-                        {
-                            cgErrorUnsupported(cg, cg->file->decls[i],
-                                "file-scope array initializer must be constant");
-                        }
-                        else if (!constShaped)
-                        {
-                            cgAddDynInit(cg, cg->file->decls[i]);
-                        }
-                        else
+                        /* definition pass: this TU owns the decl */
+                        if ((dd->attrBits & ATTR_THREADLOCAL) != 0) stP(&cg->defs, "_Thread_local ");
+                        cgEmitGlobalDeclarator(cg, cty, cgMangle(cg, cg->file->decls[i], cname, 0));
+                        if (cval.index != 0 && cgInitConstP(cg, cval))
                         {
                             stP(&cg->defs, " = ");
                             cgEmitInitValue(cg, cval);
                         }
-                    }
-                    stP(&cg->defs, ";\n");
+                        stP(&cg->defs, ";\n");
                     }
                 }
             }
@@ -8748,18 +8805,81 @@ void cgEmitProtos(Codegen* cg)
             i++;
         }
     }
+/* does decl `id` own emitted definitions (bodies/globals) in a TU?
+ * externs and generic fns do not — their instances carry the code */
+bool cgDeclOwnsTu(Codegen* cg, NodeId id)
+{
+    Node* dn = cgNode(cg, id);
+    if (dn->kind.tag != NodeKind::Decl) return false;
+    Decl* dd = &dn->kind.payload.Decl.value;
+    if (dd->kind.tag == DeclKind::Func)
+    {
+        u8 f = dd->kind.payload.Func.flags;
+        return (f & 8) != 0 && (f & 2) == 0 && !cgDeclIsGeneric(cg, id);
+    }
+    if (dd->kind.tag == DeclKind::Struct || dd->kind.tag == DeclKind::Union ||
+        dd->kind.tag == DeclKind::Variant || dd->kind.tag == DeclKind::Extend ||
+        dd->kind.tag == DeclKind::ExtendTrait)
+    {
+        return true;
+    }
+    if (dd->kind.tag == DeclKind::Constant)
+    {
+        return (dd->kind.payload.Constant.flags & 2) == 0;
+    }
+    return false;
+}
+
+/* hash bucket of decl `id` inside its file's shard range —
+ * FNV-1a over node index + file id, same scheme as instance shards */
+u32 cgDeclShard(Codegen* cg, NodeId id, u32 lf)
+{
+    u64 h = 1469598103934665603u;
+    u32 v = id.index;
+    u32 s = 0;
+    while (s < 4)
+    {
+        h = (h ^ (u64)(v & 255u)) * 1099511628211u;
+        v >>= 8;
+        s++;
+    }
+    h = (h ^ (u64)lf) * 1099511628211u;
+    return (u32)(h % (u64)cg->fileShards[lf]);
+}
+
+/* does decl `id` belong to the TU currently being emitted? decls
+ * partition by source file (locFile), sub-sharded by decl hash when
+ * a file owns enough decls to need several TUs; tuFileId
+ * 0xFFFFFFFF is the match-all sentinel used when there is a single TU */
+bool cgDeclInTu(Codegen* cg, NodeId id)
+{
+    if (cg->tuCount == 0 || cg->tuFileId == 0xFFFFFFFFu) return true;
+    Node* n = cgNode(cg, id);
+    if (n->kind.tag != NodeKind::Decl) return true;
+    u32 lf = locFile(n->loc);
+    if (lf != cg->tuFileId) return false;
+    if (lf > cg->maxFid || cg->fileShards == null) return true;
+    u32 sc = cg->fileShards[lf];
+    if (sc <= 1) return true;
+    return cgDeclShard(cg, id, lf) == cg->tuShardIdx;
+}
+
+bool cgInstInTu(Codegen* cg, u32 instIdx)
+{
+    if (cg->tuCount == 0) return true;
+    return cg->instShard[instIdx] == cg->tuIdx;
 }
 
 /* emits every body the module owns: non-generic funcs, then each mono
- * function instance and every type instance's methods */
+ * function instance and every type instance's methods. With multi-TU
+ * partitioning (tuCount > 0) only decls whose source file owns this
+ * TU emit here; instances emit in their hash-assigned shard TU. */
 void cgEmitBodies(Codegen* cg)
 {
     u32 i = 0;
     while (i < cg->file->declsLen)
     {
-        NodeId id = cg->file->decls[i];
-        Node* d = cgNode(cg, id);
-        if (d->kind.tag == NodeKind::Decl)
+        if (d->kind.tag == NodeKind::Decl && cgDeclInTu(cg, id))
         {
             Decl* dd = &d->kind.payload.Decl.value;
             if (dd->kind.tag == DeclKind::Func)
@@ -8783,8 +8903,7 @@ void cgEmitBodies(Codegen* cg)
     if (cg->mono != null)
     {
         i = 0;
-        while (i < cg->mono->instancesLen)
-        {
+            if (!cgInstInTu(cg, i)) { i++; continue; }
             MonoInstance* inst = cg->mono->instances + i;
             if (inst->kind == MonoInstanceKind::FunctionInstance)
             {
@@ -8815,16 +8934,70 @@ void cgEmitBodies(Codegen* cg)
             i++;
         }
     }
+/* TU file stem: sanitized basename of the decl's source path plus the
+ * file id (always unique); sub-sharded files append _s<bucket>.
+ * Falls back to tu<idx> without a path table */
+Slice cgTuName(Codegen* cg, u32 fileId, u32 shardIdx, u32 idx)
+{
+    Slice base = Slice { null, 0 };
+    if (cg->eng != null && fileId != 0xFFFFFFFFu && (usize)fileId < cg->eng->filePaths.len)
+    {
+        str p = cg->eng->filePaths.at((usize)fileId);
+        usize b = 0;
+        usize start = 0;
+        while (b < p.len)
+        {
+            if (p.ptr[b] == 47 || p.ptr[b] == 92) start = b + 1;
+            b++;
+        }
+        base = Slice { p.ptr + start, p.len - start };
+    }
+    u8* buf = (u8*)cg->arena->alloc(base.len + 24, 1);
+    if (buf == null) return Slice { null, 0 };
+    usize n = 0;
+    usize i = 0;
+    while (i < base.len)
+    {
+        u8 c = base.ptr[i];
+        bool ok = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) ||
+                  (c >= 48 && c <= 57) || c == 95 || c == 46;
+        buf[n] = ok ? c : 95;
+        n++; i++;
+    }
+    if (n == 0)
+    {
+        buf[n] = 116; buf[n + 1] = 117; n += 2; /* "tu" */
+    }
+    buf[n] = 95; n++;
+    u32 v = base.ptr != null ? fileId : idx;
+    u8[10] tmp; u32 tl = 0;
+    if (v == 0) { tmp[tl++] = 48; }
+    while (v > 0) { tmp[tl++] = (u8)(48 + (v % 10)); v /= 10; }
+    while (tl > 0) { buf[n] = tmp[--tl]; n++; }
+    /* multi-shard file: _s<bucket> keeps .c names unique per TU */
+    if (base.ptr != null && fileId != 0xFFFFFFFFu && fileId <= cg->maxFid &&
+        cg->fileShards != null && cg->fileShards[fileId] > 1)
+    {
+        buf[n] = 95; buf[n + 1] = 115; n += 2; /* "_s" */
+        u32 sv = shardIdx;
+        tl = 0;
+        if (sv == 0) { tmp[tl++] = 48; }
+        while (sv > 0) { tmp[tl++] = (u8)(48 + (sv % 10)); sv /= 10; }
+        while (tl > 0) { buf[n] = tmp[--tl]; n++; }
+    }
+    buf[n] = 0;
+    return Slice { buf, n };
 }
 
 /* ── entry point: analyzed AST → flat C ──────────────────────── */
 
-pub CodegenResult generateC(AstContext* ctx, File* file, MonoContext* mono, Arena* arena)
+pub CodegenResult generateC(AstContext* ctx, File* file, MonoContext* mono, Arena* arena, DiagnosticEngine* eng)
 {
     Codegen cg;
     cg.ctx = ctx;
     cg.file = file;
     cg.mono = mono;
+    cg.eng = eng;
     cg.sema = null;
     cg.extProtoNames = null;
     cg.extProtoFids = null;
@@ -8909,61 +9082,227 @@ pub CodegenResult generateC(AstContext* ctx, File* file, MonoContext* mono, Aren
     cg.dynInits = (NodeId*)arena->alloc(512 * @sizeof(NodeId), 8);
     cg.foldDepth = 0;
     cg.ind = 0;
-    if (cg.tempTys == null || cg.tempArrs == null || cg.regNames == null || cg.dynInits == null) {
-        CodegenResult r;
-        r.cCode = Slice { null, 0 };
+        r.tus = null;
+        r.tusLen = 0;
         r.errors = 1;
+        r.pch = Slice { null, 0 };
         return r;
     }
 
     cgEmitFwd(&cg);
     cgEmitAliasBridges(&cg);
-    cgEmitTypeDefs(&cg);
-    cgEmitProtos(&cg);
+    /* ── multi-TU partition ──────────────────────────────────────
+     * one TU per source file that owns emitted definitions; regular
+     * decl bodies/globals go to their home file's TU, mono instances
+     * shard across TUs by name hash so no single module absorbs every
+     * generic instantiation. Shared sections (preamble, typedefs,
+     * prototypes) are identical in every TU. */
+    u32 maxFid = 0;
     {
-        /* file-scope globals land after the prototypes: their initializers
-         * may name functions (`const A = { .alloc = f }`). Re-bind the
-         * stream after emission; growth reallocates the buffer. */
-        Stream defsSaved = cg.defs;
-        cg.defs = cg.protos;
-        cgEmitGlobals(&cg);
-        cg.protos = cg.defs;
-        cg.defs = defsSaved;
+        u32 di = 0;
+        while (di < cg.file->declsLen)
+        {
+            Node* dn = cgNode(&cg, cg.file->decls[di]);
+            if (dn->kind.tag == NodeKind::Decl)
+            {
+                u32 lf = locFile(dn->loc);
+                if (lf > maxFid) maxFid = lf;
+            }
+            di++;
+        }
     }
-    cgEmitGlobalInit(&cg);
-    cgEmitBodies(&cg);
+    cg.maxFid = maxFid;
+    /* per-file owning-decl counts → shard count. A file splits into
+     * ceil(decls / 400) TUs so no single module (codegen.crl
+     * is ~9k lines) becomes the gcc critical path */
+    u32* fileDecls = (u32*)arena->alloc(((usize)maxFid + 1) * @sizeof(u32), 4);
+    cg.fileShards = (u32*)arena->alloc(((usize)maxFid + 1) * @sizeof(u32), 4);
+    if (fileDecls != null) zero<u32>(fileDecls, (usize)maxFid + 1);
+    if (cg.fileShards != null) zero<u32>(cg.fileShards, (usize)maxFid + 1);
+    if (fileDecls != null && cg.fileShards != null && maxFid > 0)
+    {
+        u32 di = 0;
+        while (di < cg.file->declsLen)
+        {
+            NodeId did = cg.file->decls[di];
+            if (cgDeclOwnsTu(&cg, did))
+            {
+                Node* dn = cgNode(&cg, did);
+                fileDecls[locFile(dn->loc)]++;
+            }
+            di++;
+        }
+        /* TU list: for each file, one entry per shard bucket */
+        cg.tuCount = 0;
+        u32 f = 0;
+        while (f <= maxFid)
+        {
+            u32 d = fileDecls[f];
+            u32 s = 0;
+            if (d > 400) s = (d + 399) / 400;
+            else if (d > 0) s = 1;
+            cg.fileShards[f] = s;
+            cg.tuCount += s;
+            f++;
+        }
+        cg.tuFileIds = (u32*)arena->alloc((usize)cg.tuCount * @sizeof(u32), 4);
+        cg.tuShards = (u32*)arena->alloc((usize)cg.tuCount * @sizeof(u32), 4);
+        if (cg.tuFileIds != null && cg.tuShards != null)
+        {
+            u32 k = 0;
+            f = 0;
+            while (f <= maxFid)
+            {
+                u32 s = cg.fileShards[f];
+                if (s > 0)
+                {
+                    u32 j = 0;
+                    while (j < s) { cg.tuFileIds[k] = f; cg.tuShards[k] = j; k++; j++; }
+                }
+                f++;
+            }
+            cg.tuCount = k;
+        }
+        else cg.tuCount = 0;
+    }
+    /* no TU-owning decls: still emit one match-all TU so the caller
+     * always gets at least one translation unit */
+    if (cg.tuCount == 0)
+    {
+        cg.tuFileIds = (u32*)arena->alloc(@sizeof(u32), 4);
+        cg.tuShards = (u32*)arena->alloc(@sizeof(u32), 4);
+        if (cg.tuFileIds != null && cg.tuShards != null)
+        {
+            cg.tuFileIds[0] = 0xFFFFFFFFu;
+            cg.tuShards[0] = 0;
+            cg.tuCount = 1;
+        }
+    }
+    cg.tuIdx = 0;
+    cg.tuFileId = 0xFFFFFFFFu;
+    cg.tuShardIdx = 0;
+    cg.instShard = null;
+    cg.tuBodies = null;
+    cg.tuGlobals = null;
+    if (cg.tuCount > 0 && cg.tuFileIds != null && cg.tuShards != null)
+    {
+        cg.tuBodies = (Stream*)arena->alloc((usize)cg.tuCount * @sizeof(Stream), 8);
+        cg.tuGlobals = (Stream*)arena->alloc((usize)cg.tuCount * @sizeof(Stream), 8);
+        u32 k = 0;
+        while (k < cg.tuCount)
+        {
+            cg.tuBodies[k] = stNew(arena, 65536);
+            cg.tuGlobals[k] = stNew(arena, 16384);
+            k++;
+        }
+        /* instance shard: FNV-1a over the instance's arg-string name
+         * folded with the declaration index — deterministic across
+         * runs, uniform enough to balance generic-heavy modules */
+        if (cg.mono != null && cg.mono->instancesLen > 0)
+        {
+            cg.instShard = (u32*)arena->alloc((usize)cg.mono->instancesLen * @sizeof(u32), 4);
+            if (cg.instShard != null)
+            {
+                u32 ii = 0;
+                while (ii < cg.mono->instancesLen)
+                {
+                    MonoInstance* inst = cg.mono->instances + ii;
+                    Slice nm = cgInstanceNameV(&cg, inst->name, inst->arguments,
+                                               inst->argumentsLen, inst->valueKey);
+                    u64 h = 1469598103934665603u;
+                    usize hi = 0;
+                    while (hi < nm.len) { h = (h ^ (u64)nm.ptr[hi]) * 1099511628211u; hi++; }
+                    h = (h ^ (u64)inst->declaration.index) * 1099511628211u;
+                    cg.instShard[ii] = (u32)(h % (u64)cg.tuCount);
+                    ii++;
+                }
+            }
+        }
+        /* shared pass: extern decls / typedefs / extern-decls for every
+         * defined global + dyn-init registration, into the protos
+         * section every TU shares */
+        {
+            Stream defsSaved = cg.defs;
+            cg.defs = cg.protos;
+            cgEmitGlobals(&cg, -1);
+            cg.protos = cg.defs;
+            cg.defs = defsSaved;
+        }
+        /* per-TU passes: global definitions, this TU's globals_init,
+         * filtered bodies. cg.bodies / cg.defs are rebound per pass;
+         * growth reallocates so the grown stream is adopted back. */
+        Stream bodiesSaved = cg.bodies;
+        Stream defsSaved0 = cg.defs;
+        u32 pk = 0;
+        while (pk < cg.tuCount)
+        {
+            cg.tuIdx = pk;
+            cg.tuFileId = cg.tuFileIds[pk];
+            cg.tuShardIdx = cg.tuShards[pk];
+            cg.bodies = cg.tuBodies[pk];
+            cg.defs = cg.tuGlobals[pk];
+            cgEmitGlobals(&cg, (i32)pk);
+            cg.tuGlobals[pk] = cg.defs;
+            cg.defs = defsSaved0;
+            cgEmitGlobalInit(&cg);
+            cgEmitBodies(&cg);
+            cg.tuBodies[pk] = cg.bodies;
+            pk++;
+        }
+        cg.bodies = bodiesSaved;
+        cg.defs = defsSaved0;
+        cg.tuIdx = 0;
+        cg.tuFileId = 0xFFFFFFFFu;
+        cg.tuShardIdx = 0;
+    }
 
-    // assemble: preamble | fwd typedefs | alias/enum typedefs | registry typedefs | defs | protos | bodies
-    /* Type/macro headers ONLY; no function-declaring headers (stdio,
-     * stdlib, string, unistd). The generated C carries coral's own extern
-     * prototypes (libc.crl / `extern` decls) and links against libc; a
-     * second set of system prototypes only causes conflicting-types
-     * errors (const placement, int32_t vs int, ...). assert.h stays:
-     * it defines the assert() macro and declares no libc function
-     * prototypes that coral also declares. */
-    stP(&cg.out, "#include <stdint.h>\n#include <stddef.h>\n#include <stdbool.h>\n");
-    stP(&cg.out, "#include <assert.h>\n\n");
-    /* memcmp for str/struct equality and memcpy for array assignment:
-       bare prototypes, not headers (generated C must not include system
-       headers) */
-    stP(&cg.out, "extern int memcmp(const void*, const void*, size_t);\n");
-    stP(&cg.out, "extern void* memcpy(void*, const void*, size_t);\n\n");
-    /* limits.crl defines the same names: drop the stdint macros so the
-       emitted constants win */
-    stP(&cg.out, "#undef INT8_MIN\n#undef INT8_MAX\n#undef INT16_MIN\n#undef INT16_MAX\n");
-    stP(&cg.out, "#undef INT32_MIN\n#undef INT32_MAX\n#undef INT64_MIN\n#undef INT64_MAX\n\n");
-    stP(&cg.out, "typedef struct _coral_str { const uint8_t* ptr; size_t len; } _coral_str;\n");
-    stP(&cg.out, "static bool _coral_streq(_coral_str a, _coral_str b) { return a.len == b.len && memcmp(a.ptr, b.ptr, a.len) == 0; }\n");
-    stP(&cg.out, "static bool _coral_strtruth(_coral_str s) { return s.len > 0; }\n");
-    stPS(&cg.out, Slice { cg.fwd.p, cg.fwd.len });
-    stPS(&cg.out, Slice { cg.typedefs.p, cg.typedefs.len });
-    stPS(&cg.out, Slice { cg.tdecl.p, cg.tdecl.len });
-    stPS(&cg.out, Slice { cg.defs.p, cg.defs.len });
-    stPS(&cg.out, Slice { cg.protos.p, cg.protos.len });
-    stPS(&cg.out, Slice { cg.bodies.p, cg.bodies.len });
+    /* shared blob: preamble + fwd + typedefs + tdecl + defs + protos,
+     * compiled once into coral_pch.h.gch. Every TU includes it. */
+    Stream pchS = stNew(arena, 1 << 20);
+    {
+        /* Type/macro headers ONLY; no function-declaring headers
+         * (stdio, stdlib, string, unistd). The generated C carries
+         * coral's own extern prototypes and links against libc. */
+        stP(&pchS, "#include <stdint.h>\n#include <stddef.h>\n#include <stdbool.h>\n");
+        stP(&pchS, "#include <assert.h>\n\n");
+        stP(&pchS, "extern int memcmp(const void*, const void*, size_t);\n");
+        stP(&pchS, "extern void* memcpy(void*, const void*, size_t);\n\n");
+        stP(&pchS, "#undef INT8_MIN\n#undef INT8_MAX\n#undef INT16_MIN\n#undef INT16_MAX\n");
+        stP(&pchS, "#undef INT32_MIN\n#undef INT32_MAX\n#undef INT64_MIN\n#undef INT64_MAX\n\n");
+        stP(&pchS, "typedef struct _coral_str { const uint8_t* ptr; size_t len; } _coral_str;\n");
+        stP(&pchS, "static bool _coral_streq(_coral_str a, _coral_str b) { return a.len == b.len && memcmp(a.ptr, b.ptr, a.len) == 0; }\n");
+        stP(&pchS, "static bool _coral_strtruth(_coral_str s) { return s.len > 0; }\n");
+        stPS(&pchS, Slice { cg.fwd.p, cg.fwd.len });
+        stPS(&pchS, Slice { cg.typedefs.p, cg.typedefs.len });
+        stPS(&pchS, Slice { cg.tdecl.p, cg.tdecl.len });
+        stPS(&pchS, Slice { cg.defs.p, cg.defs.len });
+        stPS(&pchS, Slice { cg.protos.p, cg.protos.len });
+    }
+
+    /* assemble each non-empty TU: #include pch | tu globals | tu bodies */
+    TuCode* tus = (TuCode*)arena->alloc((usize)cg.tuCount * @sizeof(TuCode), 8);
+    u32 ntu = 0;
+    if (tus != null && cg.tuBodies != null && cg.tuGlobals != null)
+    {
+        u32 k = 0;
+        while (k < cg.tuCount)
+        {
+            if (cg.tuBodies[k].len == 0 && cg.tuGlobals[k].len == 0) { k++; continue; }
+            Stream o = stNew(arena, 262144);
+            stP(&o, "#include \"coral_pch.h\"\n\n");
+            stPS(&o, Slice { cg.tuGlobals[k].p, cg.tuGlobals[k].len });
+            stPS(&o, Slice { cg.tuBodies[k].p, cg.tuBodies[k].len });
+            tus[ntu].name = cgTuName(&cg, cg.tuFileIds[k], cg.tuShards[k], (u32)ntu);
+            tus[ntu].text = Slice { o.p, o.len };
+            ntu++;
+            k++;
+        }
+    }
 
     CodegenResult result;
-    result.cCode = Slice { cg.out.p, cg.out.len };
+    result.tus = tus;
+    result.tusLen = ntu;
     result.errors = cg.errors;
+    result.pch = Slice { pchS.p, pchS.len };
     return result;
 }

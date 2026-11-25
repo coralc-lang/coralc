@@ -4,22 +4,18 @@
 use common::slice { Slice };
 use args { Options };
 use io { readFile, sliceCStr, writeFile };
-use sem::analyze { CompileUnit, AnalyzeOptions, analyzeForCompile, freeUnit };
-use build::arena { Arena };
-use backend::codegen { generateC, CodegenResult };
+use backend::codegen { generateC, CodegenResult, TuCode };
 use ir::muvm { generateMuvm, MuvmResult };
 import muvm::muvm { CallingConvention };
 use build::parser { CrlbParser };
 use build::ast { CrlbNode, CrlbNodeKind, CrlbField, Value, ValueArray };
-
-import core::cchar { cchar };
-import std::mman { alloc, dealloc };
+import std::mman { alloc, dealloc, zero };
 import std::ios { print };
 import std::vec { Vec };
 import std::result { Result };
-import std::fs { IoError };
+import std::fs { IoError, createDirRecursive };
 import std::process { spawn, writeStdin, waitFor, pollfd, Process, ProcessResult };
-import platform::libc { close, read, write, poll, getenv, printf };
+import platform::libc { close, read, write, poll, getenv, printf, sysconf };
 import std::time { Timespec, nowMonotonic, subTimespec };
 
 /* the --platform/--flag {platform=...} value picks the module calling
@@ -192,10 +188,9 @@ i32 runGcc(str outPath, str opt, Slice cCode, bool hasMain, bool showGcc, bool a
             }
         }
         args.push("-lm");
-    }
-
-    Result<Process, IoError> sr = spawn("gcc", &args);
-    if (sr.isErr()) return 127;
+    str cc = ccPick();
+    Result<Process, IoError> sr = spawn(cc, &args);
+    if (sr.isErr()) { dealloc<u8>(cc.ptr); return 127; }
     Process p = sr.unwrap();
 
     usize off = 0;
@@ -248,20 +243,518 @@ i32 runGcc(str outPath, str opt, Slice cCode, bool hasMain, bool showGcc, bool a
         }
         dealloc<u8>(buf);
     }
+    i32 rc = gw.isErr() ? 127 : gw.unwrap().exitCode;
+    dealloc<u8>(cc.ptr);
+    return rc;
+}
 
-    Result<ProcessResult, IoError> gw = waitFor(&p);
-    if (gw.isErr()) return 127;
-    return gw.unwrap().exitCode;
+// we'd strip from here. because what i see here is even too linux cnetred. so when it is time for the strip, this will go.
+/* C compiler driver: CORAL_CC overrides (e.g. "clang"); default gcc.
+ * Returns a malloc'd str; caller deallocs. */
+str ccPick()
+{
+    cchar* e = getenv(C"CORAL_CC");
+    const cchar* src = e != null ? e : C"gcc";
+    usize n = 0;
+    while (src[n] != 0) n++;
+    u8* b = alloc<u8>(n + 1);
+    if (b == null) return str { null, 0 };
+    usize i = 0;
+    while (i < n) { b[i] = (u8)src[i]; i++; }
+    b[n] = 0; /* spawn execvp's cmd.ptr — must be NUL-terminated */
+    return str { b, n };
+}
+
+/* does `hay` contain `needle`? tiny substring scan for "gcc" */
+bool slContains(Slice hay, str needle)
+{
+    if (needle.len == 0 || hay.len < needle.len) return false;
+    usize i = 0;
+    while (i + needle.len <= hay.len)
+    {
+        bool m = true;
+        usize j = 0;
+        while (j < needle.len)
+        {
+            if (hay.ptr[i + j] != needle.ptr[j]) { m = false; break; }
+            j++;
+        }
+        if (m) return true;
+        i++;
+    }
+    return false;
+}
+
+/* rough per-cc1 RSS budget for the parallel pool: each compile holds
+ * the PCH/AST plus its own bodies — a few hundred MB. Returns
+ * MemAvailable in MB from /proc/meminfo, 0 when unreadable. */
+u32 memAvailMB()
+{
+    usize len = 0;
+    Slice t = readFile("/proc/meminfo", &len);
+    if (t.ptr == null) return 0;
+    /* find "MemAvailable:" then parse the kB figure */
+    usize i = 0;
+    while (i + 13 <= t.len)
+    {
+        if (t.ptr[i] == 77 && t.ptr[i+1] == 101 && t.ptr[i+2] == 109 &&
+            t.ptr[i+3] == 65 && t.ptr[i+4] == 118 && t.ptr[i+5] == 97 &&
+            t.ptr[i+6] == 105 && t.ptr[i+7] == 108 && t.ptr[i+8] == 97 &&
+            t.ptr[i+9] == 98 && t.ptr[i+10] == 108 && t.ptr[i+11] == 101 &&
+            t.ptr[i+12] == 58)
+        {
+            usize j = i + 13;
+            while (j < t.len && (t.ptr[j] == 32 || t.ptr[j] == 9)) j++;
+            u64 kb = 0;
+            while (j < t.len && t.ptr[j] >= 48 && t.ptr[j] <= 57)
+            {
+                kb = kb * 10 + (u64)(t.ptr[j] - 48);
+                j++;
+            }
+            return (u32)(kb / 1024);
+        }
+        i++;
+    }
+    return 0;
+}
+
+/* drain a spawned gcc's stdout/stderr so it can never block on a full
+ * pipe; diagnostics are echoed only under showGcc */
+void drainGcc(Process* p, bool showGcc)
+{
+    u8* buf = alloc<u8>(4096);
+    if (buf == null) return;
+    bool outOpen = true;
+    bool errOpen = true;
+    while (outOpen || errOpen)
+    {
+        pollfd[2] fds;
+        i32 outIdx = -1;
+        i32 errIdx = -1;
+        usize nfds = 0;
+        if (outOpen) { outIdx = (i32)nfds; fds[nfds].fd = (i32)p->stdoutFd; fds[nfds].events = 1; fds[nfds].revents = 0; nfds++; }
+        if (errOpen) { errIdx = (i32)nfds; fds[nfds].fd = (i32)p->stderrFd; fds[nfds].events = 1; fds[nfds].revents = 0; nfds++; }
+        if (nfds == 0) break;
+        i32 prc = poll((rawptr)fds, nfds, -1);
+        if (prc <= 0) break;
+        usize i = 0;
+        while (i < nfds)
+        {
+            if ((fds[i].revents & 17) == 0) { i++; continue; }
+            isize n = read(fds[i].fd, (cchar*)buf, 4096);
+            if (n <= 0)
+            {
+                close(fds[i].fd);
+                if ((i32)i == outIdx) outOpen = false;
+                else if ((i32)i == errIdx) errOpen = false;
+            }
+            else if (showGcc)
+            {
+                if ((i32)i == outIdx) write(1, (const cchar*)buf, (usize)n);
+                else write(2, (const cchar*)buf, (usize)n);
+            }
+            i++;
+        }
+    }
+    dealloc<u8>(buf);
+}
+
+/* multi-TU compile: each generated C file becomes <out>.d/<name>.c,
+ * compiled to <name>.o by a parallel gcc -c pool, then linked once.
+ * Returns the link/compile status (127 = could not start gcc). */
+i32 runGccMulti(str outPath, str opt, CodegenResult* cg, bool hasMain, bool showGcc, Slice* linkLibs, u32 linkLibsLen, Slice* linkFlags, u32 linkFlagsLen)
+{
+    str cc = ccPick();
+    /* gcc consumes coral_pch.h.gch; other drivers (clang) parse the
+     * header text themselves, so the .gch step is gcc-only */
+    bool isGcc = slContains(Slice { cc.ptr, cc.len }, "gcc");
+
+    /* <out>.d/ holds the per-TU sources and objects */
+    usize outLen = outPath.len;
+    u8* dirBuf = alloc<u8>(outLen + 4);
+    if (dirBuf == null) { dealloc<u8>(cc.ptr); return 1; }
+    usize di = 0;
+    while (di < outLen) { dirBuf[di] = outPath.ptr[di]; di++; }
+    dirBuf[di] = 46; dirBuf[di + 1] = 100; dirBuf[di + 2] = 0;
+    str dirS = str { .ptr = dirBuf, .len = outLen + 2 };
+    Result<bool, IoError> mk = createDirRecursive(dirS, 493);
+    if (mk.isErr() || !mk.unwrap()) { dealloc<u8>(dirBuf); dealloc<u8>(cc.ptr); return 1; }
+
+    bool release = opt.len == 7 && opt.ptr[0] == 114 && opt.ptr[1] == 101 && opt.ptr[2] == 108 && opt.ptr[3] == 101 && opt.ptr[4] == 97 && opt.ptr[5] == 115 && opt.ptr[6] == 101;
+
+    /* shared decls → coral_pch.h (+ .gch under gcc); every TU .c
+     * starts with #include "coral_pch.h" */
+    Slice pch = cg->pch;
+    if (pch.ptr != null && pch.len > 0)
+    {
+        usize hlen = dirS.len + 1 + 11;
+        u8* hp = alloc<u8>(hlen + 1);
+        if (hp == null) { dealloc<u8>(dirBuf); dealloc<u8>(cc.ptr); return 1; }
+        usize w = 0;
+        while (w < dirS.len) { hp[w] = dirS.ptr[w]; w++; }
+        hp[w] = 47; w++;
+        const cchar* hn = C"coral_pch.h";
+        u32 hi = 0;
+        while (hi < 11) { hp[w] = (u8)hn[hi]; w++; hi++; }
+        hp[w] = 0;
+        str hps = str { .ptr = hp, .len = hlen };
+        if (!writeFile(hps, pch)) { dealloc<u8>(hp); dealloc<u8>(dirBuf); dealloc<u8>(cc.ptr); return 1; }
+
+        if (isGcc)
+        {
+            /* <dir>/coral_pch.h.gch */
+            u8* gp = alloc<u8>(hlen + 5);
+            w = 0;
+            while (w < dirS.len) { gp[w] = dirS.ptr[w]; w++; }
+            gp[w] = 47; w++;
+            hi = 0;
+            while (hi < 11) { gp[w] = (u8)hn[hi]; w++; hi++; }
+            gp[w] = 46; gp[w + 1] = 103; gp[w + 2] = 99; gp[w + 3] = 104; gp[w + 4] = 0;
+            str gps = str { .ptr = gp, .len = hlen + 4 };
+
+            Vec<str> hargs = Vec<str>::new();
+            hargs.push("-std=gnu11");
+            if (release) hargs.push("-O2");
+            else if (opt.len == 4 && opt.ptr[0] == 115 && opt.ptr[1] == 105 && opt.ptr[2] == 122 && opt.ptr[3] == 101) hargs.push("-Os");
+            else if (opt.len == 2 && opt.ptr[0] == 79 && opt.ptr[1] == 49) hargs.push("-O1");
+            else if (opt.len == 2 && opt.ptr[0] == 79 && opt.ptr[1] == 51) hargs.push("-O3");
+            else { hargs.push("-O0"); hargs.push("-g"); }
+            hargs.push("-x");
+            hargs.push("c-header");
+            hargs.push(hps);
+            hargs.push("-o");
+            hargs.push(gps);
+            Result<Process, IoError> hsr = spawn(cc, &hargs);
+            i32 hst = 127;
+            if (!hsr.isErr())
+            {
+                Process hp2 = hsr.unwrap();
+                close((i32)hp2.stdinFd);
+                drainGcc(&hp2, showGcc);
+                Result<ProcessResult, IoError> hw = waitFor(&hp2);
+                hst = hw.isErr() ? 127 : hw.unwrap().exitCode;
+            }
+            dealloc<u8>(gp);
+            if (hst != 0) { dealloc<u8>(hp); dealloc<u8>(dirBuf); dealloc<u8>(cc.ptr); return hst; }
+        }
+        dealloc<u8>(hp);
+    }
+
+    /* per-TU paths: <dir>/<name>.c and <dir>/<name>.o */
+    u32 n = cg->tusLen;
+    Slice* cpaths = alloc<Slice>((usize)n);
+    Slice* opaths = alloc<Slice>((usize)n);
+    i64 nproc = sysconf(84); /* _SC_NPROCESSORS_ONLN */
+    u32 coreCap = (u32)(nproc > 0 && nproc < 6 ? nproc : (nproc >= 6 ? 6 : 4));
+    /* never run more cc1s than free memory affords (~512MB each),
+     * and never fewer than one — parallel gcc OOM'd a 9GB desktop */
+    u32 memCap = memAvailMB() / 512;
+    u32 maxPar = memCap < coreCap ? memCap : coreCap;
+    if (maxPar < 1) maxPar = 1;
+    Process* procs = alloc<Process>((usize)maxPar);
+    i32 status = 0;
+    if (cpaths == null || opaths == null || procs == null) { dealloc<u8>(dirBuf); dealloc<u8>(cc.ptr); return 1; }
+    zero<Slice>(cpaths, (usize)n);
+    zero<Slice>(opaths, (usize)n);
+
+    /* bounded parallel pool: each batch spawns ≤ maxPar compiles,
+     * then drains+waits them (draining lets cc1 exit; the rest of the
+     * batch keeps running meanwhile). Bounded because each cc1 can
+     * hold hundreds of MB — spawning all TUs at once OOMs. */
+    u32 base = 0;
+    while (base < n && status == 0)
+    {
+        u32 cnt = n - base < maxPar ? n - base : maxPar;
+        u32 j = 0;
+        while (j < cnt && status == 0)
+        {
+            u32 ti = base + j;
+            Slice nm = cg->tus[ti].name;
+            usize plen = dirS.len + 1 + nm.len + 2;
+            u8* cp = alloc<u8>(plen + 1);
+            usize w = 0;
+            while (w < dirS.len) { cp[w] = dirS.ptr[w]; w++; }
+            cp[w] = 47; w++;
+            usize ni = 0;
+            while (ni < nm.len) { cp[w] = nm.ptr[ni]; w++; ni++; }
+            cp[w] = 46; cp[w + 1] = 99; cp[w + 2] = 0;
+            str cps = str { .ptr = cp, .len = plen };
+            cpaths[ti] = Slice { cp, plen };
+            if (!writeFile(cps, cg->tus[ti].text)) { status = 1; break; }
+
+            u8* op = alloc<u8>(plen + 1);
+            w = 0;
+            while (w < dirS.len) { op[w] = dirS.ptr[w]; w++; }
+            op[w] = 47; w++;
+            ni = 0;
+            while (ni < nm.len) { op[w] = nm.ptr[ni]; w++; ni++; }
+            op[w] = 46; op[w + 1] = 111; op[w + 2] = 0;
+            str ops = str { .ptr = op, .len = plen };
+            opaths[ti] = Slice { op, plen };
+
+            Vec<str> args = Vec<str>::new();
+            args.push("-std=gnu11");
+            args.push("-x");
+            args.push("c");
+            args.push(cps);
+            if (release) args.push("-O2");
+            else if (opt.len == 4 && opt.ptr[0] == 115 && opt.ptr[1] == 105 && opt.ptr[2] == 122 && opt.ptr[3] == 101) args.push("-Os");
+            else if (opt.len == 2 && opt.ptr[0] == 79 && opt.ptr[1] == 49) args.push("-O1");
+            else if (opt.len == 2 && opt.ptr[0] == 79 && opt.ptr[1] == 51) args.push("-O3");
+            else { args.push("-O0"); args.push("-g"); }
+            args.push("-c");
+            args.push("-o");
+            args.push(ops);
+            Result<Process, IoError> sr = spawn(cc, &args);
+            if (sr.isErr()) { status = 127; break; }
+            procs[j] = sr.unwrap();
+            j++;
+        }
+        u32 spawned = j;
+
+        /* wait for every spawned compile in this batch */
+        j = 0;
+        while (j < spawned && status == 0)
+        {
+            close((i32)procs[j].stdinFd);
+            drainGcc(&procs[j], showGcc);
+            Result<ProcessResult, IoError> gw = waitFor(&procs[j]);
+            if (gw.isErr()) { status = 127; break; }
+            if (gw.unwrap().exitCode != 0) status = 3;
+            j++;
+        }
+        while (j < spawned)
+        {
+            close((i32)procs[j].stdinFd);
+            drainGcc(&procs[j], false);
+            waitFor(&procs[j]);
+            j++;
+        }
+        base += cnt;
+    }
+
+    if (status == 0)
+    {
+        /* link: all objects + flags/libs, or -r merge for !hasMain */
+        Vec<str> args = Vec<str>::new();
+        if (!hasMain) args.push("-r");
+        u32 oi = 0;
+        while (oi < n) { args.push(str { .ptr = opaths[oi].ptr, .len = opaths[oi].len }); oi++; }
+        args.push("-o");
+        args.push(outPath);
+        if (hasMain)
+        {
+            if (release) args.push("-s");
+            else args.push("-rdynamic");
+            args.push("-x");
+            args.push("none");
+            u32 fi = 0;
+            while (fi < linkFlagsLen) { args.push(linkFlags[fi].asStr()); fi++; }
+            u32 li = 0;
+            while (li < linkLibsLen)
+            {
+                Slice lib = linkLibs[li];
+                if (linkLibIsRaw(lib)) args.push(lib.asStr());
+                else { args.push("-l"); args.push(lib.asStr()); }
+                li++;
+            }
+            args.push("-lm");
+        }
+        Result<Process, IoError> lr = spawn(cc, &args);
+        if (lr.isErr()) status = 127;
+        else
+        {
+            Process lp = lr.unwrap();
+            close((i32)lp.stdinFd);
+            drainGcc(&lp, showGcc);
+            Result<ProcessResult, IoError> lw = waitFor(&lp);
+            if (lw.isErr()) status = 127;
+            else if (lw.unwrap().exitCode != 0) status = 3;
+        }
+    }
+
+    u32 fi2 = 0;
+    while (fi2 < n)
+    {
+        if (cpaths[fi2].ptr != null) dealloc<u8>(cpaths[fi2].ptr);
+        if (opaths[fi2].ptr != null) dealloc<u8>(opaths[fi2].ptr);
+        fi2++;
+    }
+    dealloc<Slice>(cpaths);
+    dealloc<Slice>(opaths);
+    dealloc<Process>(procs);
+    dealloc<u8>(dirBuf);
+    dealloc<u8>(cc.ptr);
+    return status;
+}
+
+/* multi-TU muvm asm: each generated .s becomes <out>.d/<name>.s,
+ * assembled to <name>.o by a bounded parallel pool, then linked once
+ * (-no-pie: muvm asm needs it; -r merge when the unit has no main).
+ * Assembler jobs are tiny — the same memory-aware cap is overkill
+ * but harmless. Returns link/compile status (127 = could not start). */
+i32 runAsmMulti(str outPath, str opt, MuvmResult* muv, bool hasMain, bool showGcc, Slice* linkLibs, u32 linkLibsLen, Slice* linkFlags, u32 linkFlagsLen)
+{
+    str cc = ccPick();
+    usize outLen = outPath.len;
+    u8* dirBuf = alloc<u8>(outLen + 4);
+    if (dirBuf == null) { dealloc<u8>(cc.ptr); return 1; }
+    usize di = 0;
+    while (di < outLen) { dirBuf[di] = outPath.ptr[di]; di++; }
+    dirBuf[di] = 46; dirBuf[di + 1] = 100; dirBuf[di + 2] = 0;
+    str dirS = str { .ptr = dirBuf, .len = outLen + 2 };
+    Result<bool, IoError> mk = createDirRecursive(dirS, 493);
+    if (mk.isErr() || !mk.unwrap()) { dealloc<u8>(dirBuf); dealloc<u8>(cc.ptr); return 1; }
+
+    u32 n = muv->tusLen;
+    Slice* spaths = alloc<Slice>((usize)n);
+    Slice* opaths = alloc<Slice>((usize)n);
+    i64 nproc = sysconf(84); /* _SC_NPROCESSORS_ONLN */
+    u32 coreCap = (u32)(nproc > 0 && nproc < 6 ? nproc : (nproc >= 6 ? 6 : 4));
+    u32 memCap = memAvailMB() / 512;
+    u32 maxPar = memCap < coreCap ? memCap : coreCap;
+    if (maxPar < 1) maxPar = 1;
+    Process* procs = alloc<Process>((usize)maxPar);
+    i32 status = 0;
+    if (spaths == null || opaths == null || procs == null) { dealloc<u8>(dirBuf); dealloc<u8>(cc.ptr); return 1; }
+    zero<Slice>(spaths, (usize)n);
+    zero<Slice>(opaths, (usize)n);
+
+    u32 base = 0;
+    while (base < n && status == 0)
+    {
+        u32 cnt = n - base < maxPar ? n - base : maxPar;
+        u32 j = 0;
+        while (j < cnt && status == 0)
+        {
+            u32 ti = base + j;
+            Slice nm = muv->tus[ti].name;
+            usize plen = dirS.len + 1 + nm.len + 2;
+            u8* sp = alloc<u8>(plen + 1);
+            usize w = 0;
+            while (w < dirS.len) { sp[w] = dirS.ptr[w]; w++; }
+            sp[w] = 47; w++;
+            usize ni = 0;
+            while (ni < nm.len) { sp[w] = nm.ptr[ni]; w++; ni++; }
+            sp[w] = 46; sp[w + 1] = 115; sp[w + 2] = 0;
+            str sps = str { .ptr = sp, .len = plen };
+            spaths[ti] = Slice { sp, plen };
+            if (!writeFile(sps, muv->tus[ti].text)) { status = 1; break; }
+
+            u8* op = alloc<u8>(plen + 1);
+            w = 0;
+            while (w < dirS.len) { op[w] = dirS.ptr[w]; w++; }
+            op[w] = 47; w++;
+            ni = 0;
+            while (ni < nm.len) { op[w] = nm.ptr[ni]; w++; ni++; }
+            op[w] = 46; op[w + 1] = 111; op[w + 2] = 0;
+            str ops = str { .ptr = op, .len = plen };
+            opaths[ti] = Slice { op, plen };
+
+            Vec<str> args = Vec<str>::new();
+            args.push("-x");
+            args.push("assembler");
+            args.push(sps);
+            args.push("-c");
+            args.push("-o");
+            args.push(ops);
+            Result<Process, IoError> sr = spawn(cc, &args);
+            if (sr.isErr()) { status = 127; break; }
+            procs[j] = sr.unwrap();
+            j++;
+        }
+        u32 spawned = j;
+
+        j = 0;
+        while (j < spawned && status == 0)
+        {
+            close((i32)procs[j].stdinFd);
+            drainGcc(&procs[j], showGcc);
+            Result<ProcessResult, IoError> gw = waitFor(&procs[j]);
+            if (gw.isErr()) { status = 127; break; }
+            if (gw.unwrap().exitCode != 0) status = 3;
+            j++;
+        }
+        while (j < spawned)
+        {
+            close((i32)procs[j].stdinFd);
+            drainGcc(&procs[j], false);
+            waitFor(&procs[j]);
+            j++;
+        }
+        base += cnt;
+    }
+
+    if (status == 0)
+    {
+        /* link: -no-pie (muvm asm requirement); -r merge into one
+         * relocatable object when the unit has no main */
+        Vec<str> args = Vec<str>::new();
+        args.push("-no-pie");
+        if (!hasMain) args.push("-r");
+        u32 oi = 0;
+        while (oi < n) { args.push(str { .ptr = opaths[oi].ptr, .len = opaths[oi].len }); oi++; }
+        args.push("-o");
+        args.push(outPath);
+        if (hasMain)
+        {
+            args.push("-rdynamic");
+            args.push("-x");
+            args.push("none");
+            u32 fi = 0;
+            while (fi < linkFlagsLen) { args.push(linkFlags[fi].asStr()); fi++; }
+            u32 li = 0;
+            while (li < linkLibsLen)
+            {
+                Slice lib = linkLibs[li];
+                if (linkLibIsRaw(lib)) args.push(lib.asStr());
+                else { args.push("-l"); args.push(lib.asStr()); }
+                li++;
+            }
+            args.push("-lm");
+        }
+        Result<Process, IoError> lr = spawn(cc, &args);
+        if (lr.isErr()) status = 127;
+        else
+        {
+            Process lp = lr.unwrap();
+            close((i32)lp.stdinFd);
+            drainGcc(&lp, showGcc);
+            Result<ProcessResult, IoError> lw = waitFor(&lp);
+            if (lw.isErr()) status = 127;
+            else if (lw.unwrap().exitCode != 0) status = 3;
+        }
+    }
+
+    u32 fi2 = 0;
+    while (fi2 < n)
+    {
+        if (spaths[fi2].ptr != null) dealloc<u8>(spaths[fi2].ptr);
+        if (opaths[fi2].ptr != null) dealloc<u8>(opaths[fi2].ptr);
+        fi2++;
+    }
+    dealloc<Slice>(spaths);
+    dealloc<Slice>(opaths);
+    dealloc<Process>(procs);
+    dealloc<u8>(dirBuf);
+    dealloc<u8>(cc.ptr);
+    return status;
 }
 
 bool codeHasSlice(Slice code, str pat)
 {
     if (code.ptr == null || code.len < pat.len) return false;
+    /* skip to candidate first-byte hits — generated C is ~12MB, a
+     * naive per-position compare shows up in profiles */
+    u8 first = pat.ptr[0];
     usize i = 0;
-    while (i + pat.len <= code.len)
+    usize lim = code.len - pat.len;
+    while (i <= lim)
     {
+        while (i <= lim && code.ptr[i] != first) i++;
+        if (i > lim) return false;
         bool m = true;
-        usize j = 0;
+        usize j = 1;
         while (j < pat.len)
         {
             if (code.ptr[i + j] != pat.ptr[j]) { m = false; break; }
@@ -334,8 +827,11 @@ pub i32 compileUnitTo(str inPath, str outPath, Options* o, Slice* modKeys, Slice
     a.init(4194304);
 
     Slice code = Slice { null, 0 };
-    bool hasMain = false;
-    bool failed = false;
+    CodegenResult cgKeep;
+    bool multiTu = false;
+    u8* mergedBuf = null;
+    MuvmResult muvKeep;
+    bool muvMulti = false;
 
     if (o->muvm)
     {
@@ -358,11 +854,60 @@ pub i32 compileUnitTo(str inPath, str outPath, Options* o, Slice* modKeys, Slice
                     print("coralc: emit {} ({} bytes)\n", (const cchar*)irPath, muv.irText.len);
                 }
                 dealloc<u8>(irPath);
-            }
-        }
-        if (muv.errors > 0 || muv.asmText.ptr == null) {
+        if (muv.errors > 0 || (muv.asmText.ptr == null && muv.tusLen == 0)) {
             print("error: muvm codegen failed ({} errors)\n", muv.errors);
             failed = true;
+        } else if (muv.tusLen > 1 && muv.tus != null) {
+            /* multi-TU asm: hasMain is program-wide (any TU may own
+             * it); the .s files land in <out>.d/ via runAsmMulti —
+             * --emit-asm mirrors them there eagerly for inspection */
+            hasMain = false;
+            u32 mti = 0;
+            while (mti < muv.tusLen)
+            {
+                if (asmHasMain(muv.tus[mti].text)) { hasMain = true; break; }
+                mti++;
+            }
+            muvKeep = muv;
+            muvMulti = true;
+            if (o->emitAsm)
+            {
+                u8* dirBuf = alloc<u8>(outLen + 4);
+                if (dirBuf != null)
+                {
+                    usize di = 0;
+                    while (di < outLen) { dirBuf[di] = outPath.ptr[di]; di++; }
+                    dirBuf[di] = 46; dirBuf[di + 1] = 100; dirBuf[di + 2] = 0;
+                    str dirS = str { .ptr = dirBuf, .len = outLen + 2 };
+                    createDirRecursive(dirS, 493);
+                    mti = 0;
+                    while (mti < muv.tusLen)
+                    {
+                        Slice nm = muv.tus[mti].name;
+                        usize plen = dirS.len + 1 + nm.len + 2;
+                        u8* sp = alloc<u8>(plen + 1);
+                        usize w = 0;
+                        while (w < dirS.len) { sp[w] = dirS.ptr[w]; w++; }
+                        sp[w] = 47; w++;
+                        usize ni = 0;
+                        while (ni < nm.len) { sp[w] = nm.ptr[ni]; w++; ni++; }
+                        sp[w] = 46; sp[w + 1] = 115; sp[w + 2] = 0;
+                        str sps = str { .ptr = sp, .len = plen };
+                        if (!writeFile(sps, muv.tus[mti].text))
+                        {
+                            print("error[D0005]: cannot write {}\n  fix: check that the output path is writable\n", (const cchar*)sp);
+                            failed = true;
+                        }
+                        else
+                        {
+                            print("coralc: emit {} ({} bytes)\n", (const cchar*)sp, muv.tus[mti].text.len);
+                        }
+                        dealloc<u8>(sp);
+                        mti++;
+                    }
+                    dealloc<u8>(dirBuf);
+                }
+            }
         } else {
             code = muv.asmText;
             hasMain = asmHasMain(code);
@@ -383,24 +928,140 @@ pub i32 compileUnitTo(str inPath, str outPath, Options* o, Slice* modKeys, Slice
             }
         }
     }
-    else
-    {
-        CodegenResult cg = generateC(unit.ctx, unit.file, unit.mono, &a);
-        if (cg.errors > 0 || cg.cCode.ptr == null) {
+        CodegenResult cg = generateC(unit.ctx, unit.file, unit.mono, &a, unit.engineObj);
+        if (cg.errors > 0 || cg.tus == null || cg.tusLen == 0) {
             print("error: codegen failed ({} errors)\n", cg.errors);
             failed = true;
         } else {
-            code = cg.cCode;
-            hasMain = codeHasMain(code);
+            hasMain = false;
+            u32 ti = 0;
+            while (ti < cg.tusLen)
+            {
+                if (codeHasMain(cg.tus[ti].text)) hasMain = true;
+                ti++;
+            }
             if (o->emitC)
             {
-                if (!writeFile(str { .ptr = cPath, .len = outLen + 2 }, code)) {
-                    print("error[D0005]: cannot write {}\n  fix: check that the output path is writable\n", (cchar*)cPath);
-                    failed = true;
-                } else {
-                    print("coralc: emit {} ({} bytes)\n", (const cchar*)cPath, code.len);
+                /* <out>.d/<name>.c per TU; a lone TU also lands at
+                 * <out>.c for --emit-c compatibility */
+                u8* dirBuf = alloc<u8>(outLen + 4);
+                if (dirBuf != null)
+                {
+                    usize di = 0;
+                    while (di < outLen) { dirBuf[di] = outPath.ptr[di]; di++; }
+                    dirBuf[di] = 46; dirBuf[di + 1] = 100; dirBuf[di + 2] = 0;
+                    str dirS = str { .ptr = dirBuf, .len = outLen + 2 };
+                    createDirRecursive(dirS, 493);
+                    /* TU sources #include "coral_pch.h" — emit it too */
+                    if (cg.pch.ptr != null && cg.pch.len > 0)
+                    {
+                        u8* hp = alloc<u8>(dirS.len + 1 + 11 + 1);
+                        if (hp != null)
+                        {
+                            usize w = 0;
+                            while (w < dirS.len) { hp[w] = dirS.ptr[w]; w++; }
+                            hp[w] = 47; w++;
+                            const cchar* hn = C"coral_pch.h";
+                            u32 hi = 0;
+                            while (hi < 11) { hp[w] = (u8)hn[hi]; w++; hi++; }
+                            hp[w] = 0;
+                            str hps = str { .ptr = hp, .len = dirS.len + 1 + 11 };
+                            if (!writeFile(hps, cg.pch))
+                            {
+                                print("error[D0005]: cannot write {}\n  fix: check that the output path is writable\n", (cchar*)hp);
+                                failed = true;
+                            }
+                            else
+                            {
+                                print("coralc: emit {} ({} bytes)\n", (const cchar*)hp, cg.pch.len);
+                            }
+                            dealloc<u8>(hp);
+                        }
+                    }
+                    ti = 0;
+                    while (ti < cg.tusLen)
+                    {
+                        Slice nm = cg.tus[ti].name;
+                        usize plen = dirS.len + 1 + nm.len + 2;
+                        u8* cp = alloc<u8>(plen + 1);
+                        usize w = 0;
+                        while (w < dirS.len) { cp[w] = dirS.ptr[w]; w++; }
+                        cp[w] = 47; w++;
+                        usize ni = 0;
+                        while (ni < nm.len) { cp[w] = nm.ptr[ni]; w++; ni++; }
+                        cp[w] = 46; cp[w + 1] = 99; cp[w + 2] = 0;
+                        str cps = str { .ptr = cp, .len = plen };
+                        if (!writeFile(cps, cg.tus[ti].text))
+                        {
+                            print("error[D0005]: cannot write {}\n  fix: check that the output path is writable\n", (cchar*)cp);
+                            failed = true;
+                        }
+                        else
+                        {
+                            print("coralc: emit {} ({} bytes)\n", (const cchar*)cp, cg.tus[ti].text.len);
+                        }
+                        dealloc<u8>(cp);
+                        ti++;
+                    }
+                    if (cg.tusLen == 1)
+                    {
+                        if (!writeFile(str { .ptr = cPath, .len = outLen + 2 }, cg.tus[0].text))
+                        {
+                            print("error[D0005]: cannot write {}\n  fix: check that the output path is writable\n", (cchar*)cPath);
+                            failed = true;
+                        }
+                        else
+                        {
+                            print("coralc: emit {} ({} bytes)\n", (const cchar*)cPath, cg.tus[0].text.len);
+                        }
+                    }
+                    dealloc<u8>(dirBuf);
                 }
             }
+            cgKeep = cg;
+            /* debug (-O0) builds merge every TU back into one
+             * self-contained .c: per-TU spawn+PCH+dwarf overhead
+             * dwarfs any parallelism win there. release/size/O*
+             * keep the multi-TU split where cc1 time dominates. */
+            bool dbg = o->opt.len == 5 && o->opt.ptr[0] == 100 && o->opt.ptr[1] == 101 && o->opt.ptr[2] == 98 && o->opt.ptr[3] == 117 && o->opt.ptr[4] == 103;
+            multiTu = !dbg;
+            if (!multiTu && cg.pch.ptr != null)
+            {
+                /* merged = pch text + each TU's globals/bodies with the
+                 * leading `#include "coral_pch.h"\n\n` line stripped */
+                usize total = cg.pch.len;
+                u32 ti = 0;
+                while (ti < cg.tusLen)
+                {
+                    Slice tx = cg.tus[ti].text;
+                    usize off = 0;
+                    while (off + 1 < tx.len && !(tx.ptr[off] == 10 && tx.ptr[off + 1] == 10)) off++;
+                    off += 2;
+                    if (off < tx.len) total += tx.len - off;
+                    ti++;
+                }
+                mergedBuf = alloc<u8>(total + 1);
+                if (mergedBuf != null)
+                {
+                    usize w = 0;
+                    usize pi = 0;
+                    while (pi < cg.pch.len) { mergedBuf[w] = cg.pch.ptr[pi]; w++; pi++; }
+                    ti = 0;
+                    while (ti < cg.tusLen)
+                    {
+                        Slice tx = cg.tus[ti].text;
+                        usize off = 0;
+                        while (off + 1 < tx.len && !(tx.ptr[off] == 10 && tx.ptr[off + 1] == 10)) off++;
+                        off += 2;
+                        usize bi = off;
+                        while (bi < tx.len) { mergedBuf[w] = tx.ptr[bi]; w++; bi++; }
+                        ti++;
+                    }
+                    mergedBuf[w] = 0;
+                    code = Slice { mergedBuf, w };
+                }
+            }
+            if (multiTu) code = cg.tusLen > 0 ? cg.tus[0].text : Slice { null, 0 };
         }
     }
 
@@ -426,9 +1087,20 @@ pub i32 compileUnitTo(str inPath, str outPath, Options* o, Slice* modKeys, Slice
         print("coralc: dry run, would link {}\n", (const cchar*)outZ);
         dealloc<u8>(outZ);
     } else {
-        /* helper/library files emit no main: compile to an object instead
-         * of linking an executable (which would fail with undefined main) */
-        i32 st = runGcc(outPath, o->opt.asStr(), code, hasMain, o->showGcc, o->muvm, o->linkLibs, o->linkLibsLen, o->linkFlags, o->linkFlagsLen);
+        i32 st;
+        if (muvMulti)
+        {
+            st = runAsmMulti(outPath, o->opt.asStr(), &muvKeep, hasMain, o->showGcc, o->linkLibs, o->linkLibsLen, o->linkFlags, o->linkFlagsLen);
+        }
+        else if (multiTu)
+        {
+            st = runGccMulti(outPath, o->opt.asStr(), &cgKeep, hasMain, o->showGcc, o->linkLibs, o->linkLibsLen, o->linkFlags, o->linkFlagsLen);
+        }
+        else
+        {
+            st = runGcc(outPath, o->opt.asStr(), code, hasMain, o->showGcc, o->muvm, o->linkLibs, o->linkLibsLen, o->linkFlags, o->linkFlagsLen);
+        }
+        if (mergedBuf != null) dealloc<u8>(mergedBuf);
         Timespec t3 = nowMonotonic();
         if (timed)
         {

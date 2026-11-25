@@ -20,14 +20,19 @@
 //      B each had T as their only pred)
 //   2. for each phi in J emit `select %c, v-from-A, v-from-B` in T
 //   3. T's cond_br becomes `br J`; phi uses move to the selects
-//   4. A and B are removed
-//
-// Loads/stores/calls/div/rem are NOT speculated in v1 — LLVM speculates
-// dereferenceable loads too, but that needs alias info; revisit later.
+// Loads are speculated in v2 when dereferenceability is provable:
+// the address — peeled through zero-offset casts — must be the start
+// of an alloca or global whose size covers the access. GEP offsets,
+// phi-merged pointers and argument-derived addresses stay rejected:
+// their byte offset from the object base is unproven, so an
+// out-of-bounds access could not be ruled out. Stores, calls and
+// atomics remain un-speculated, which also means no memory op can be
+// reordered against a speculated load — the only hazard left is the
+// fault itself, covered by the bounds check.
 
 import muvm::passes::common { gVerbose };
 import muvm::irOps { IrOpcode };
-import muvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrType, IrTypeKind };
+import muvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind, IrType, IrTypeKind };
 import std::mman { alloc, dealloc };
 
 pub struct IfConvPass
@@ -77,18 +82,71 @@ pub struct IfConvPass
             IrOpcode::Select => { return true; },
             else => { return false; }
         }
+    // Object size in bytes for an alloca/global base value: the
+    // declared type is ptr-to-T for allocas (and compiler globals) but
+    // bare T for parser globals — look through one pointer level.
+    u32 objectSizeOf(IrValue* base)
+    {
+        IrType* t = base->type;
+        if (t == null) return 0;
+        if (t->kind == IrTypeKind::Ptr && t->elem != null) t = t->elem;
+        return self.ctx->irTypeSizeOf(t);
+    }
+
+    // Dereferenceability proof for a speculated load: peel zero-offset
+    // casts, then require the base to be an alloca result or a global
+    // with enough room for the access. Everything else — gep offsets,
+    // phis, args, call results — cannot prove the byte offset, so the
+    // load stays put.
+    bool loadSpeculatable(IrInst* load)
+    {
+        if (load->opcode != IrOpcode::Load || load->nops < 1) return false;
+        IrValue* base = load->ops[0];
+        while (base != null && base->kind == IrValueKind::Inst)
+        {
+            IrInst* bi = (IrInst*)base;
+            if (bi->opcode == IrOpcode::Bitcast ||
+                bi->opcode == IrOpcode::Zext ||
+                bi->opcode == IrOpcode::Sext)
+            {
+                if (bi->nops < 1) return false;
+                base = bi->ops[0];
+                continue;
+            }
+            break;
+        }
+        if (base == null) return false;
+        if (base->kind == IrValueKind::Global)
+        {
+            // fallthrough to the shared size check below
+        }
+        else if (base->kind == IrValueKind::Inst)
+        {
+            IrInst* bi = (IrInst*)base;
+            if (bi->opcode != IrOpcode::Alloca) return false;
+        }
+        else return false;
+
+        u32 objSize = self.objectSizeOf(base);
+        u32 access = self.ctx->irTypeSizeOf(load->base.type);
+        if (objSize == 0 || access == 0 || access > objSize) return false;
+        return true;
     }
 
     // Every inst in bb except the terminator must be movable: no phis
-    // (single-pred blocks shouldn't have them anyway) and speculatable.
+    // (single-pred blocks shouldn't have them anyway), speculatable
+    // pure ops, or provably-dereferenceable loads.
     bool armMovable(IrBlock* bb)
     {
         if (bb == null) return false;
         for (u32 i = 0; i + 1 < bb->ninsts; i++)
         {
             IrInst* inst = bb->insts[i];
-            if (inst == null) continue;
-            if (inst->opcode == IrOpcode::Phi) return false;
+            if (inst->opcode == IrOpcode::Load)
+            {
+                if (!self.loadSpeculatable(inst)) return false;
+                continue;
+            }
             if (!self.isSpeculatable(inst)) return false;
         }
         return true;

@@ -4,12 +4,10 @@
  * generateMuvm: analyzed AST → muvm IR → pipeline → asm. Mirrors
  * generateC's shape but builds IR directly (no text streams). Phase 1:
  * one collection pass that mangles each symbol exactly once, detects
- * raw-name collisions at compile time, declares IrFunc shells (externs
- * + definitions), then lowers definition bodies. */
-use lower { Muv, MuvmResult, MuvNameEnt, MuvNames, muvNode, muvErr, muvStr, muvResolved,
+use lower { Muv, MuvmResult, MuvmTu, MuvNameEnt, MuvNames, muvNode, muvErr, muvStr, muvResolved,
                muvPushLocal, muvBlock, muvSetBlock, muvTerm, muvPos, muvFnMapInit, muvFnMapPut,
                muvTyMapInit, muvTdMapInit, muvGMapInit, muvHashStr, muvNamesInit, muvNamesFind,
-               muvNamesInsert, muvTypeInstanceName };
+               muvNamesInsert, muvTypeInstanceName, muvAddFunc, muvAddGlobal };
 use types { muvTy, muvDeclTy, muvTyHasParam, muvTypeInstanceTy, muvFindTypeDecl };
 use decl { muvMangle, muvMangleExempt, muvDeclareMethod, muvMethodSelfKind,
                muvOwnerStr, muvMethodMangle, muvMethodMangleEx, muvDeclareInstanceFunc,
@@ -29,17 +27,13 @@ use ast {
     expr { Expr, ExprKind },
     stmt { Stmt, StmtKind },
     decl { Decl, DeclKind, File, Param, ATTR_FREESTANDING }
-};
-use common::slice { Slice };
-import muvm::irtypes { IrContext, IrModule, IrFunc, IrBlock, IrValue, IrValueKind, IrType, IrTypeKind, irCtxCreate, irCtxDestroy };
+import muvm::irtypes { IrContext, IrModule, IrFunc, IrBlock, IrValue, IrValueKind, IrType, IrTypeKind, IrGlobal, irCtxCreate, irCtxDestroy };
 import muvm::irOps { IrICmpPred };
 import muvm::irBuilder { IrBuilder };
 import muvm::irPrinter { IrPrinter };
 import muvm::passes::diagnostics::verify { muvmPassVerify };
 import muvm::passes::diagnostics::safety { muvmPassSafety };
-import muvm::muvm { muvmCompileAsm, muvmOptions, MuvmOptions, OptLevel, CallingConvention, muvmCCId };
-import platform::libc { printf };
-import std::mman { alloc, dealloc };
+import std::mman { alloc, dealloc, zero };
 import std::string { String };
 
 /* ── opt-level mapping (mirror of runGcc's C flags) ─────────── */
@@ -339,9 +333,7 @@ IrFunc* muvRegisterFunc(Muv* w, MuvNames* names, NodeId declId, Decl* d, str nam
     }
 
     /* new name: declare the shell, claim the slot, register for calls */
-    IrFunc* f = muvDeclareMethod(w, declId, d, name, selfTy);
-    if (f == null) return null;
-    w->module->addFunc(f);
+    muvAddFunc(w, f);
     if (names != null && name.len != 0)
     {
         /* key from the IrFunc's own copy: muvTy inside the declare may
@@ -380,8 +372,7 @@ struct MuvBodyEnt
 {
     IrFunc* f;
     NodeId decl;
-    NodeId body;
-    u32 inst;
+    u32 tu;         // partition TU (instance hash shard)
     u8 self;
 }
 
@@ -410,9 +401,7 @@ void muvQueueInstMethod(Muv* w, NodeId mdef, Decl* md, Str iown, IrType* selfPt,
     w->subsLen = inst->substitutionsLen;
     IrFunc* f = muvDeclareMethod(w, mdef, md, msym, sk == 1 ? selfPt : null);
     w->subs = oldS;
-    w->subsLen = oldSL;
-    if (f == null) return;
-    w->module->addFunc(f);
+    muvAddFunc(w, f);
     if (w->names != null)
     {
         /* key from the IrFunc's own copy: `msym` is a view into w->mb,
@@ -428,9 +417,8 @@ void muvQueueInstMethod(Muv* w, NodeId mdef, Decl* md, Str iown, IrType* selfPt,
     }
     if ((flags & 8) != 0 && (flags & 2) == 0 && ents != null && qlen != null && *qlen < qcap)
     {
-        ents[*qlen] = MuvBodyEnt { .f = f, .decl = mdef,
-                                  .body = md->kind.payload.Func.body,
-                                  .inst = ii, .self = sk == 1 ? 1 : 0 };
+                                  .inst = ii, .tu = w->curTu,
+                                  .self = sk == 1 ? 1 : 0 };
         *qlen = *qlen + 1;
     }
 }
@@ -455,6 +443,73 @@ void muvQueueInstMethods(Muv* w, NodeId* methods, u32 mlen, Str iown, IrType* se
         }
         k++;
     }
+/* ── multi-TU partition (Rust-CGU model) ───────────────────────
+ * decls group by home file (locFile); a file owning more than 400
+ * code decls sub-shards by decl hash (
+ mono instances hash-shard across ALL TUs so generic
+ * code spreads evenly instead of piling into std's modules. */
+
+/* decl-hash bucket inside file lf's shard range — FNV-1a over node
+ * index + file id, */
+u32 muvDeclShard(Muv* w, NodeId id, u32 lf)
+{
+    u32 sc = 1;
+    if (w->fileShards != null && lf <= w->maxFid) sc = w->fileShards[lf];
+    if (sc <= 1) return 0;
+    u64 h = 1469598103934665603u;
+    u32 v = id.index;
+    u32 s = 0;
+    while (s < 4)
+    {
+        h = (h ^ (u64)(v & 255u)) * 1099511628211u;
+        v >>= 8;
+        s++;
+    }
+    h = (h ^ (u64)lf) * 1099511628211u;
+    return (u32)(h % (u64)sc);
+}
+
+/* TU owning decl `id`; 0 when partitioning is off or the decl has
+ * no code-owning file (non-decl nodes, files with no code decls) */
+u32 muvTuOfDecl(Muv* w, NodeId id)
+{
+    if (w->tuCount <= 1 || w->fileTuBase == null) return 0;
+    Node* n = muvNode(w, id);
+    if (n->kind.tag != NodeKind::Decl) return 0;
+    u32 lf = locFile(n->loc);
+    if (lf > w->maxFid || w->fileShards == null || w->fileShards[lf] == 0) return 0;
+    return w->fileTuBase[lf] + muvDeclShard(w, id, lf);
+}
+
+u32 muvFnvBytes(str s)
+{
+    u64 h = 1469598103934665603u;
+    usize i = 0;
+    while (i < s.len)
+    {
+        h = (h ^ (u64)s.ptr[i]) * 1099511628211u;
+        i++;
+    }
+    return (u32)h;
+}
+
+/* mono-instance TU: hash of the instance's symbol/name across the
+ * whole TU space (not per-file) for statistical balance */
+u32 muvInstTu(Muv* w, str key)
+{
+    if (w->tuCount <= 1) return 0;
+    return muvFnvBytes(key) % w->tuCount;
+}
+
+/* owner-decl method count for partition sizing */
+u32 muvOwnerMethodCount(Decl* d)
+{
+    if (d->kind.tag == DeclKind::Struct) return d->kind.payload.Struct.methodsLen;
+    if (d->kind.tag == DeclKind::Union) return d->kind.payload.Union.methodsLen;
+    if (d->kind.tag == DeclKind::Variant) return d->kind.payload.Variant.methodsLen;
+    if (d->kind.tag == DeclKind::Extend) return d->kind.payload.Extend.methodsLen;
+    if (d->kind.tag == DeclKind::ExtendTrait) return d->kind.payload.ExtendTrait.methodsLen;
+    return 0;
 }
 
 pub MuvmResult generateMuvm(AstContext* ctx, File* file, MonoContext* mono, DiagnosticEngine* diag, Arena* arena, str opt, i32 safetyMode, bool wantIr, CallingConvention cc)
@@ -462,6 +517,8 @@ pub MuvmResult generateMuvm(AstContext* ctx, File* file, MonoContext* mono, Diag
     MuvmResult result;
     result.asmText = Slice { null, 0 };
     result.irText = Slice { null, 0 };
+    result.tus = null;
+    result.tusLen = 0;
     result.errors = 0;
     u32 ccId = muvmCCId(cc);
 
@@ -527,8 +584,19 @@ pub MuvmResult generateMuvm(AstContext* ctx, File* file, MonoContext* mono, Diag
     w.tyBusy = null;
     w.tyCap = 0;
     w.tdKeys = null;
-    w.tdVals = null;
-    w.tdCap = 0;
+    w.funcTus = null;
+    w.funcTusLen = 0;
+    w.funcTusCap = 0;
+    w.globTus = null;
+    w.globTusLen = 0;
+    w.globTusCap = 0;
+    w.curTu = 0;
+    w.fileShards = null;
+    w.fileTuBase = null;
+    w.maxFid = 0;
+    w.tuCount = 1;
+    w.tuFileId = null;
+    w.tuShard = null;
 
     w.ir = irCtxCreate();
     if (w.ir == null) { result.errors = 1; return result; }
@@ -569,6 +637,84 @@ pub MuvmResult generateMuvm(AstContext* ctx, File* file, MonoContext* mono, Diag
                                  pinst->argumentsLen, 0);
             pj++;
         }
+    /* ── partition: count code-owning decls per file, derive shard
+     * counts and the flat TU list (file-major order). tuCount stays
+     * 1 for small units — the single-module path then runs unchanged. */
+    if (file != null && file->declsLen > 0)
+    {
+        u32 pfi = 0;
+        while (pfi < file->declsLen)
+        {
+            Node* pn = muvNode(&w, file->decls[pfi]);
+            if (pn->kind.tag == NodeKind::Decl)
+            {
+                u32 plf = locFile(pn->loc);
+                if (plf > w.maxFid) w.maxFid = plf;
+            }
+            pfi++;
+        }
+        u32* fileCnt = alloc<u32>((usize)w.maxFid + 1);
+        if (fileCnt != null) zero<u32>(fileCnt, (usize)w.maxFid + 1);
+        pfi = 0;
+        while (pfi < file->declsLen)
+        {
+            Node* pn = muvNode(&w, file->decls[pfi]);
+            if (pn->kind.tag == NodeKind::Decl && fileCnt != null)
+            {
+                Decl* pd = &pn->kind.payload.Decl.value;
+                u32 plf = locFile(pn->loc);
+                if (plf <= w.maxFid)
+                {
+                    if (pd->kind.tag == DeclKind::Func || pd->kind.tag == DeclKind::Constant)
+                        fileCnt[plf] = fileCnt[plf] + 1;
+                    else if (muvIsOwnerDecl(pd))
+                    {
+                        u32 ml = muvOwnerMethodCount(pd);
+                        fileCnt[plf] = fileCnt[plf] + (ml > 0 ? ml : 1);
+                    }
+                }
+            }
+            pfi++;
+        }
+        w.fileShards = alloc<u32>((usize)w.maxFid + 1);
+        w.fileTuBase = alloc<u32>((usize)w.maxFid + 1);
+        if (w.fileShards != null) zero<u32>(w.fileShards, (usize)w.maxFid + 1);
+        if (w.fileTuBase != null) zero<u32>(w.fileTuBase, (usize)w.maxFid + 1);
+        if (fileCnt != null && w.fileShards != null && w.fileTuBase != null)
+        {
+            u32 f = 0;
+            u32 tc = 0;
+            while (f <= w.maxFid)
+            {
+                u32 dcnt = fileCnt[f];
+                u32 s = 0;
+                if (dcnt > 400) s = (dcnt + 399) / 400;
+                else if (dcnt > 0) s = 1;
+                w.fileShards[f] = s;
+                w.fileTuBase[f] = tc;
+                tc += s;
+                f++;
+            }
+            if (tc > 1)
+            {
+                w.tuFileId = alloc<u32>((usize)tc);
+                w.tuShard = alloc<u32>((usize)tc);
+                if (w.tuFileId != null && w.tuShard != null)
+                {
+                    u32 k = 0;
+                    f = 0;
+                    while (f <= w.maxFid)
+                    {
+                        u32 s = w.fileShards[f];
+                        u32 j = 0;
+                        while (j < s) { w.tuFileId[k] = f; w.tuShard[k] = j; k++; j++; }
+                        f++;
+                    }
+                    w.tuCount = k;
+                }
+            }
+        }
+        if (fileCnt != null) dealloc<u32>(fileCnt);
     }
 
     /* collect + declare every function (externs + non-generic defs) */
@@ -655,8 +801,7 @@ pub MuvmResult generateMuvm(AstContext* ctx, File* file, MonoContext* mono, Diag
         NodeId did = file->decls[i];
         Node* n = muvNode(&w, did);
         if (n->kind.tag == NodeKind::Decl)
-        {
-            Decl* d = &n->kind.payload.Decl.value;
+            w.curTu = muvTuOfDecl(&w, did);
             if (d->kind.tag == DeclKind::Func)
             {
                 IrFunc* f = muvCollectFunc(&w, &names, did, d);
@@ -700,8 +845,7 @@ pub MuvmResult generateMuvm(AstContext* ctx, File* file, MonoContext* mono, Diag
                             if (md->kind.tag == DeclKind::Func &&
                                 (w.mono == null || w.mono->genericCount(mdef) == 0))
                             {
-                                u8 sk = muvMethodSelfKind(&w, mdef);
-                                str msym = muvMethodMangle(&w, mdef, owner, md->kind.payload.Func.name);
+                                w.curTu = muvTuOfDecl(&w, mdef);
                                 IrFunc* f = muvRegisterFunc(&w, &names, mdef, md, msym,
                                                            sk == 1 ? selfPt : null);
                                 if (f != null && bodiesLen < bodiesCap)
@@ -774,9 +918,8 @@ pub MuvmResult generateMuvm(AstContext* ctx, File* file, MonoContext* mono, Diag
                                 w.sema->semaErrorNode(ErrorCode::CodegenInternal, inst->declaration,
                                                      "cannot declare the function instance");
                             }
-                            else
-                            {
-                                w.module->addFunc(f);
+                                w.curTu = muvInstTu(&w, isym);
+                                muvAddFunc(&w, f);
                                 /* key from the IrFunc's own copy: isym is
                                  * a view into w->mb, which the instance's
                                  * substituted signature just rewrote */
@@ -790,9 +933,8 @@ pub MuvmResult generateMuvm(AstContext* ctx, File* file, MonoContext* mono, Diag
                                 }
                                 w.instFns[ii] = f;
                                 iEnts[iBodiesLen] = MuvBodyEnt { .f = f,
-                                                                .decl = inst->declaration,
-                                                                .body = inst->body,
-                                                                .inst = ii, .self = 0 };
+                                                                .inst = ii, .tu = w.curTu,
+                                                                .self = 0 };
                                 iBodiesLen++;
                             }
                         }
@@ -816,8 +958,7 @@ pub MuvmResult generateMuvm(AstContext* ctx, File* file, MonoContext* mono, Diag
                     muvErr(&w, inst->declaration, "cannot build the instance type for its methods");
                 else
                 {
-                    Str iown = muvTypeInstanceName(&w, inst->name, inst->arguments,
-                                                  inst->argumentsLen);
+                    w.curTu = muvInstTu(&w, muvStr(&w, iown));
                     IrType* selfPt = w.ir->tyPtr(w.instTys[ii]);
                     Node* pn = muvNode(&w, inst->declaration);
                     if (pn->kind.tag == NodeKind::Decl)
@@ -866,8 +1007,7 @@ pub MuvmResult generateMuvm(AstContext* ctx, File* file, MonoContext* mono, Diag
     i = 0;
     while (i < bodiesLen && w.errors == 0)
     {
-        Node* n = muvNode(&w, bodyDecls[i]);
-        Decl* d = &n->kind.payload.Decl.value;
+        w.curTu = muvTuOfDecl(&w, bodyDecls[i]);
         muvLowerBody(&w, bodyDecls[i], d, bodies[i], bodySelf != null ? bodySelf[i] : 0,
                     d->kind.payload.Func.body, null);
         i++;
@@ -886,8 +1026,7 @@ pub MuvmResult generateMuvm(AstContext* ctx, File* file, MonoContext* mono, Diag
             Decl* d = &n->kind.payload.Decl.value;
             MonoSubstitution* oldS = w.subs;
             u32 oldSL = w.subsLen;
-            w.subs = inst->substitutions;
-            w.subsLen = inst->substitutionsLen;
+            w.curTu = ent->tu;
             muvLowerBody(&w, ent->decl, d, ent->f, ent->self, ent->body, inst);
             w.subs = oldS;
             w.subsLen = oldSL;
@@ -950,20 +1089,113 @@ pub MuvmResult generateMuvm(AstContext* ctx, File* file, MonoContext* mono, Diag
                 muvmPassSafety(f, w.ir, muvTrapName());
             fi++;
         }
-    }
-
-    /* compile to asm */
+    /* compile to asm — one IrModule per TU when the partition
+     * produced several; per-TU modules share the IrContext and
+     * replicate the read-only tables (struct types are layout-only,
+     * string constants emit .L local labels so duplicating is
+     * link-safe, externs replicate as decls — dyn externs need their
+     * .globl/.type in every object that references them). Function
+     * bodies and non-extern globals stay in their home TU; cross-TU
+     * references resolve as ordinary undefined symbols at link. */
     if (w.errors == 0)
     {
         MuvmOptions o = muvmOptions(muvOptEnum(optLvl));
         o.unroll = optLvl == 3;
-        str asmText = muvmCompileAsm(w.module, w.ir, cc, o);
-        if (asmText.ptr != null && asmText.len > 0)
-            result.asmText = Slice::from((u8*)asmText.ptr, asmText.len);
+        if (w.tuCount > 1 && w.tuFileId != null && w.funcTus != null)
+        {
+            result.tusLen = w.tuCount;
+            result.tus = alloc<MuvmTu>((usize)w.tuCount);
+            if (result.tus == null) w.errors++;
+            u32 k = 0;
+            while (k < w.tuCount && w.errors == 0 && result.tus != null)
+            {
+                IrModule* mk = w.ir->createModule("tu");
+                if (mk == null) { w.errors++; break; }
+                mk->attrGroups = w.module->attrGroups;
+                mk->nAttrGroups = w.module->nAttrGroups;
+                mk->capAttrGroups = w.module->capAttrGroups;
+                u32 mi = 0;
+                while (mi < w.module->nstructs)
+                {
+                    mk->addStruct(w.module->structs[mi]);
+                    mi++;
+                }
+                mi = 0;
+                while (mi < w.module->nconstStrings)
+                {
+                    mk->addConstString(w.module->constStrings[mi]);
+                    mi++;
+                }
+                /* externs first: addFunc re-collects the extern list,
+                 * so keeping this pass small bounds that rescan */
+                mi = 0;
+                while (mi < w.module->nfuncs)
+                {
+                    IrFunc* f = w.module->funcs[mi];
+                    if (f != null && f->isExtern) mk->addFunc(f);
+                    mi++;
+                }
+                mi = 0;
+                while (mi < w.module->nfuncs)
+                {
+                    IrFunc* f = w.module->funcs[mi];
+                    if (f != null && !f->isExtern && mi < w.funcTusLen &&
+                        w.funcTus != null && w.funcTus[mi] == k)
+                        mk->addFunc(f);
+                    mi++;
+                }
+                mi = 0;
+                while (mi < w.module->nglobals)
+                {
+                    IrGlobal* g = w.module->globals[mi];
+                    if (g != null && !g->isExtern && mi < w.globTusLen &&
+                        w.globTus != null && w.globTus[mi] == k)
+                        mk->addGlobal(g);
+                    mi++;
+                }
+                str asmText = muvmCompileAsm(mk, w.ir, cc, o);
+                if (asmText.ptr != null && asmText.len > 0)
+                {
+                    /* TU name "tu<k>" in the arena so it outlives the
+                     * result hand-off */
+                    u8* nb = (u8*)arena->alloc(24, 1);
+                    if (nb != null)
+                    {
+                        usize nn = 0;
+                        nb[nn++] = 116; nb[nn++] = 117; /* "tu" */
+                        u8[10] tmp;
+                        u32 tn = 0;
+                        u32 kv = k;
+                        if (kv == 0) tmp[tn++] = 48;
+                        else
+                        {
+                            while (kv > 0) { tmp[tn++] = (u8)(48 + (kv % 10)); kv /= 10; }
+                            while (tn > 0) { tn = tn - 1; nb[nn++] = tmp[tn]; }
+                        }
+                        nb[nn] = 0;
+                        result.tus[k].name = Slice::from(nb, nn);
+                        result.tus[k].text = Slice::from((u8*)asmText.ptr, asmText.len);
+                    }
+                    else w.errors++;
+                }
+                else
+                {
+                    w.errors++;
+                    printf(C"error: muvm asm generation failed (tu %u)\n", k);
+                }
+                k++;
+            }
+        }
         else
         {
-            w.errors++;
-            printf(C"error: muvm asm generation failed\n");
+            str asmText = muvmCompileAsm(w.module, w.ir, cc, o);
+            if (asmText.ptr != null && asmText.len > 0)
+                result.asmText = Slice::from((u8*)asmText.ptr, asmText.len);
+            else
+            {
+                w.errors++;
+                printf(C"error: muvm asm generation failed\n");
+            }
         }
     }
 
@@ -981,8 +1213,12 @@ pub MuvmResult generateMuvm(AstContext* ctx, File* file, MonoContext* mono, Diag
     if (w.tdKeys != null) dealloc<u32>(w.tdKeys);
     if (w.tdVals != null) dealloc<u32>(w.tdVals);
     w.mb.free();
-    if (w.locNames != null) dealloc<Str>(w.locNames);
-    if (w.locSlots != null) dealloc<IrValue*>(w.locSlots);
+    if (w.funcTus != null) dealloc<u32>(w.funcTus);
+    if (w.globTus != null) dealloc<u32>(w.globTus);
+    if (w.fileShards != null) dealloc<u32>(w.fileShards);
+    if (w.fileTuBase != null) dealloc<u32>(w.fileTuBase);
+    if (w.tuFileId != null) dealloc<u32>(w.tuFileId);
+    if (w.tuShard != null) dealloc<u32>(w.tuShard);
     irCtxDestroy(w.ir);
     return result;
 }
