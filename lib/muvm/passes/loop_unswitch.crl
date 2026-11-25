@@ -1,0 +1,514 @@
+#[[no_drop_all]]
+// Loop unswitching for muvm — LLVM LoopUnswitch, canonical-form edition.
+//
+// When a natural loop contains a `cond_br` whose condition is invariant
+// for the whole loop execution (defined outside the loop, or a constant
+// other than the already-folded ConstInt case), the loop is specialized
+// twice: a dispatch `cond_br` in the preheader picks between the
+// original body — with the inner test pinned to constant true — and a
+// full clone of every loop block — pinned to constant false. sccp folds
+// the pinned tests on the next pipeline round and DCE removes the dead
+// arm of each copy, leaving two straight-line-specialized loops.
+//
+// Correctness argument: the condition is a single SSA value that
+// dominates the loop preheader (any value used inside the loop and
+// defined outside it must dominate every entry path — verified against
+// the dominator tree anyway), so it cannot change while the loop runs.
+// Each iteration of the original loop therefore took the same arm of
+// the test; pinning that arm in each copy is exact, not speculative.
+//
+// Shape required (single-entry natural loop):
+//   - header has exactly one predecessor from outside the loop, and
+//     that preheader ends in an unconditional `br` to the header
+//   - every non-header loop block has all predecessors inside the loop
+//   - the chosen condition's def (when an instruction) is outside the
+//     loop and dominates the preheader
+//
+// Exit edges are preserved: clone terminators keep out-of-loop targets,
+// and every exit-block phi gains one (remapped-value, clone-pred) pair
+// per original in-loop pair so the merged continuation sees identical
+// SSA on both specializations.
+//
+// One unswitch per run(): the transform invalidates the dominator tree
+// and loop list, so the pipeline fixpoint re-invokes the pass for
+// additional candidates. This also bounds code growth per round.
+
+import muvm::passes::common { gVerbose };
+import std::ios { eprintln };
+import std::mman { alloc, dealloc };
+import std::string { String };
+import muvm::passes::loop_detect { IrLoop, irLoopDetectNatural, irLoopDestroy };
+import muvm::domtree { IrDomTree, irDomtreeNew, irDomtreeDominates, irDomtreeFree };
+import muvm::irOps { IrOpcode, irOpcodeIsTerminator };
+import muvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind, IrType };
+
+// parallel-array value map: original SSA value/block -> clone. Keys are
+// the IrValue base of insts and blocks alike, so one map serves operand
+// remapping for both.
+struct UnswitchValMap
+{
+    IrValue** keys;
+    IrValue** vals;
+    u32 count;
+    u32 cap;
+
+    void init()
+    {
+        self.keys = null;
+        self.vals = null;
+        self.count = 0;
+        self.cap = 0;
+    }
+
+    void put(IrValue* k, IrValue* v)
+    {
+        if (self.count >= self.cap)
+        {
+            u32 nc = self.cap ? self.cap * 2 : 16;
+            IrValue** nk = alloc<IrValue*>((usize)nc);
+            IrValue** nv = alloc<IrValue*>((usize)nc);
+            for (u32 i = 0; i < self.count; i++)
+            {
+                nk[i] = self.keys[i];
+                nv[i] = self.vals[i];
+            }
+            if (self.keys != null) dealloc<IrValue*>(self.keys);
+            if (self.vals != null) dealloc<IrValue*>(self.vals);
+            self.keys = nk;
+            self.vals = nv;
+            self.cap = nc;
+        }
+        self.keys[self.count] = k;
+        self.vals[self.count] = v;
+        self.count++;
+    }
+
+    IrValue* get(IrValue* k)
+    {
+        for (u32 i = 0; i < self.count; i++)
+            if (self.keys[i] == k) return self.vals[i];
+        return null;
+    }
+
+    void free()
+    {
+        if (self.keys != null) dealloc<IrValue*>(self.keys);
+        if (self.vals != null) dealloc<IrValue*>(self.vals);
+        self.keys = null;
+        self.vals = null;
+        self.count = 0;
+        self.cap = 0;
+    }
+}
+
+str ownStr(str s)
+{
+    if (s.ptr == null) return "";
+    return String::from(s).asView();
+}
+
+pub struct LoopUnswitchPass
+{
+    IrContext* ctx;
+    u64 unswitches;
+
+    LoopUnswitchPass new(IrContext* ctx)
+    {
+        return LoopUnswitchPass {
+            .ctx = ctx,
+            .unswitches = 0
+        };
+    }
+
+    bool isInLoop(IrLoop* lp, IrBlock* bb)
+    {
+        for (u32 i = 0; i < lp->nblocks; i++)
+            if (lp->blocks[i] == bb) return true;
+        return false;
+    }
+
+    // The condition of an unswitch candidate must be a single value
+    // fixed for the whole loop execution: constants (other than the
+    // ConstInt sccp already owns), arguments, globals and any
+    // instruction defined outside the loop. An in-loop def — even a
+    // provably-invariant one LICM missed — is rejected: it would be
+    // re-executed per iteration in the original and the pinned copies
+    // would diverge if the def were not truly invariant.
+    bool condIsInvariant(IrValue* cond, IrLoop* lp, IrBlock* pre, IrDomTree* dt)
+    {
+        if (cond == null) return false;
+        if (cond->kind == IrValueKind::ConstInt) return false;
+        if (cond->kind == IrValueKind::Block) return false;
+        if (cond->kind != IrValueKind::Inst) return true;
+        IrInst* def = (IrInst*)cond;
+        IrBlock* parent = def->parent;
+        if (parent == null) return false;
+        if (self.isInLoop(lp, parent)) return false;
+        // defensive: the def must dominate the dispatch point. For a
+        // well-formed single-entry loop this is implied by dominance
+        // of the in-loop use, but cheap to verify outright.
+        if (dt != null && !irDomtreeDominates(dt, parent, pre)) return false;
+        return true;
+    }
+
+    // Locate a cond_br inside the loop whose condition is loop-invariant.
+    // Returns the terminator inst, or null.
+    IrInst* findCandidate(IrLoop* lp, IrBlock* pre, IrDomTree* dt)
+    {
+        for (u32 bi = 0; bi < lp->nblocks; bi++)
+        {
+            IrBlock* bb = lp->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst == null || inst->opcode != IrOpcode::CondBr) continue;
+                if (inst->nops < 3) continue;
+                IrValue* cond = inst->ops[0];
+                if (!self.condIsInvariant(cond, lp, pre, dt)) continue;
+                if (cond->type == null) continue;
+                return inst;
+            }
+        }
+        return null;
+    }
+
+    // Shape gate: single-entry natural loop behind a trivial preheader.
+    // Returns the preheader block or null.
+    IrBlock* checkShape(IrLoop* lp, IrFunc* func)
+    {
+        IrBlock* header = lp->header;
+        if (header == null) return null;
+        if (lp->nblocks == 0) return null;
+
+        // exactly one outside predecessor of the header
+        IrBlock* pre = null;
+        u32 nOut = 0;
+        for (u32 i = 0; i < header->npreds; i++)
+        {
+            IrBlock* p = header->preds[i];
+            if (!self.isInLoop(lp, p))
+            {
+                nOut++;
+                pre = p;
+            }
+        }
+        if (nOut != 1 || pre == null) return null;
+
+        // the preheader must be a bare trampoline into the header —
+        // anything richer needs real edge splitting first
+        if (pre->nsuccs != 1) return null;
+        if (pre->ninsts == 0) return null;
+        IrInst* pterm = pre->terminator();
+        if (pterm == null || pterm->opcode != IrOpcode::Br) return null;
+        if (pterm->nops < 1 || pterm->ops[0] != &header->base) return null;
+
+        // single entry: every non-header block's predecessors stay in
+        // the loop, so the preheader dominates the whole body and the
+        // invariant condition is usable at the dispatch point
+        for (u32 bi = 0; bi < lp->nblocks; bi++)
+        {
+            IrBlock* bb = lp->blocks[bi];
+            if (bb == header) continue;
+            for (u32 pi = 0; pi < bb->npreds; pi++)
+                if (!self.isInLoop(lp, bb->preds[pi])) return null;
+        }
+
+        // size guard: cloning is O(loop); refuse pathological bodies
+        u32 totalInsts = 0;
+        for (u32 bi = 0; bi < lp->nblocks; bi++)
+            totalInsts += lp->blocks[bi]->ninsts;
+        if (totalInsts > 400) return null;
+        if (func->nblocks + 2 * lp->nblocks + 2 > 4096) return null;
+
+        return pre;
+    }
+
+    IrValue* remapVal(IrValue* v, UnswitchValMap* vm)
+    {
+        if (v == null) return null;
+        IrValue* m = vm->get(v);
+        return m != null ? m : v;
+    }
+
+    // Append (value, pred) to a phi, growing the operand array like
+    // scalar_evolution does.
+    void phiAppendPair(IrInst* phi, IrValue* v, IrValue* p)
+    {
+        if (phi->nops + 2 > phi->capOps)
+        {
+            u32 nc = phi->capOps ? phi->capOps * 2 : 8;
+            while (nc < phi->nops + 2) nc *= 2;
+            IrValue** no = alloc<IrValue*>((usize)nc);
+            for (u32 q = 0; q < phi->nops; q++) no[q] = phi->ops[q];
+            if (phi->capOps > 0) dealloc<IrValue*>(phi->ops);
+            phi->ops = no;
+            phi->capOps = nc;
+        }
+        phi->ops[phi->nops] = v;
+        phi->ops[phi->nops + 1] = p;
+        phi->nops += 2;
+        if (v != null) v->addUser(phi);
+        if (p != null) p->addUser(phi);
+    }
+
+    bool run(IrFunc* func)
+    {
+        if (func == null) return false;
+        IrLoop** loops = irLoopDetectNatural(func);
+        if (loops == null) return false;
+        IrDomTree* dt = irDomtreeNew(func);
+
+        bool changed = false;
+        for (u32 li = 0; loops[li] != null; li++)
+        {
+            IrLoop* lp = loops[li];
+            IrBlock* pre = self.checkShape(lp, func);
+            if (pre == null) continue;
+            IrInst* cand = self.findCandidate(lp, pre, dt);
+            if (cand == null) continue;
+            if (self.doUnswitch(lp, func, cand, pre))
+            {
+                changed = true;
+                self.unswitches++;
+                break;   // CFG changed — stale loop list, one per run
+            }
+        }
+
+        if (dt != null) irDomtreeFree(dt);
+        irLoopDestroy(loops);
+        return changed;
+    }
+
+    // The transform. `condTerm` is the in-loop cond_br chosen for
+    // specialization; `pre` is the bare preheader block.
+    bool doUnswitch(IrLoop* lp, IrFunc* func, IrInst* condTerm, IrBlock* pre)
+    {
+        IrBlock* header = lp->header;
+        u32 nb = lp->nblocks;
+
+        // dispatch blocks: true arm keeps the original loop, false arm
+        // enters the clone. Created before cloning so phi-pred remapping
+        // can name them.
+        IrBlock* tBlk = self.ctx->createBlock("unsw.t");
+        func->addBlock(tBlk);
+        IrBlock* fBlk = self.ctx->createBlock("unsw.f");
+        func->addBlock(fBlk);
+
+        UnswitchValMap vm;
+        vm.init();
+
+        // pass 1 — clone every block, then every inst as an empty shell,
+        // registering both in the value map. No operands resolved yet:
+        // phis may name latch values "backwards" within the iteration.
+        IrBlock** cblks = alloc<IrBlock*>((usize)nb);
+        for (u32 bi = 0; bi < nb; bi++)
+        {
+            IrBlock* ob = lp->blocks[bi];
+            IrBlock* cb = self.ctx->createBlock(ob->base.name);
+            func->addBlock(cb);
+            cblks[bi] = cb;
+            vm.put(&ob->base, &cb->base);
+        }
+        for (u32 bi = 0; bi < nb; bi++)
+        {
+            IrBlock* ob = lp->blocks[bi];
+            IrBlock* cb = cblks[bi];
+            for (u32 ii = 0; ii < ob->ninsts; ii++)
+            {
+                IrInst* old = ob->insts[ii];
+                IrInst* ni = self.ctx->createInst(old->opcode, old->base.type,
+                                                null, old->nops,
+                                                (u64)old->icmpPred,
+                                                (u64)old->fcmpPred);
+                ni->flags = old->flags;
+                ni->icmpPred = old->icmpPred;
+                ni->fcmpPred = old->fcmpPred;
+                ni->asmNumSideEffects = old->asmNumSideEffects;
+                if (!old->asmString.isEmpty()) ni->asmString = ownStr(old->asmString);
+                if (!old->asmConstraints.isEmpty()) ni->asmConstraints = ownStr(old->asmConstraints);
+                if (!old->asmClobbers.isEmpty()) ni->asmClobbers = ownStr(old->asmClobbers);
+                if (!old->debugLoc.file.isEmpty())
+                    ni->setDebugLoc(old->debugLoc.file, old->debugLoc.line, old->debugLoc.col);
+                for (u32 vi = 0; vi < old->nvarDbg; vi++)
+                    ni->addVarDebug(old->varDbg[vi].varName, old->varDbg[vi].varType,
+                                    old->varDbg[vi].line, old->varDbg[vi].col,
+                                    old->varDbg[vi].argIndex);
+                ni->metadata = old->metadata;
+                cb->addInst(ni);
+                vm.put(&old->base, &ni->base);
+            }
+        }
+
+        // pass 2 — resolve operands through the map; in-loop defs and
+        // blocks become their clones, everything else (including exit
+        // targets and the preheader) stays shared.
+        for (u32 bi = 0; bi < nb; bi++)
+        {
+            IrBlock* ob = lp->blocks[bi];
+            IrBlock* cb = cblks[bi];
+            for (u32 ii = 0; ii < ob->ninsts; ii++)
+            {
+                IrInst* old = ob->insts[ii];
+                IrInst* ni = (IrInst*)vm.get(&old->base);
+                if (ni == null) continue;
+                for (u32 oi = 0; oi < old->nops; oi++)
+                {
+                    IrValue* op = old->ops[oi];
+                    IrValue* r = self.remapVal(op, &vm);
+                    ni->ops[oi] = r;
+                    if (r != null) r->addUser(ni);
+                }
+                // header phis' outside pair named `pre`; in the clone the
+                // incoming edge is fBlk, not pre
+                if (ni->opcode == IrOpcode::Phi)
+                {
+                    for (u32 pi = 1; pi < ni->nops; pi += 2)
+                    {
+                        if (ni->ops[pi] == &pre->base)
+                        {
+                            ni->ops[pi]->removeUser(ni);
+                            ni->ops[pi] = &fBlk->base;
+                            (&fBlk->base)->addUser(ni);
+                        }
+                    }
+                }
+                // register clone terminator edges (block-kind operands
+                // are exactly the branch targets for every terminator
+                // opcode in this IR)
+                if (irOpcodeIsTerminator(ni->opcode))
+                {
+                    for (u32 oi = 0; oi < ni->nops; oi++)
+                    {
+                        IrValue* op = ni->ops[oi];
+                        if (op != null && op->kind == IrValueKind::Block)
+                            cb->addSucc((IrBlock*)op);
+                    }
+                }
+            }
+        }
+
+        IrBlock* cloneHeader = (IrBlock*)vm.get(&header->base);
+        IrInst* cloneCond = (IrInst*)vm.get(&condTerm->base);
+
+        // pin the unswitch test in both copies: original takes the
+        // condition-true arm unconditionally, clone the false arm.
+        IrValue* condV = condTerm->ops[0];
+        IrType* condTy = condV->type;
+        IrValue* tv = self.ctx->constInt(condTy, 1);
+        IrValue* fv = self.ctx->constInt(condTy, 0);
+        condV->removeUser(condTerm);
+        condTerm->ops[0] = tv;
+        tv->addUser(condTerm);
+        if (cloneCond != null)
+        {
+            IrValue* ccv = cloneCond->ops[0];
+            ccv->removeUser(cloneCond);
+            cloneCond->ops[0] = fv;
+            fv->addUser(cloneCond);
+        }
+
+        // dispatch: pre's `br header` becomes `cond_br cond, tBlk, fBlk`
+        IrInst* pterm = pre->terminator();
+        IrValue** dops = alloc<IrValue*>((usize)3);
+        dops[0] = condV;
+        dops[1] = &tBlk->base;
+        dops[2] = &fBlk->base;
+        IrInst* dterm = self.ctx->createInst(IrOpcode::CondBr, self.ctx->tyVoid(),
+                                             dops, 3, 0, 0);
+        dealloc<IrValue*>(dops);
+        condV->addUser(dterm);
+        (&tBlk->base)->addUser(dterm);
+        (&fBlk->base)->addUser(dterm);
+        // erase detaches the br, drops its operand users and frees it
+        pterm->erase();
+        pre->addInst(dterm);
+        // succ list: [header] -> [tBlk, fBlk]  (succs[0] is the true arm)
+        header->removePred(pre);
+        pre->succs[0] = tBlk;
+        pre->succs[1] = fBlk;
+        pre->nsuccs = 2;
+        tBlk->addPred(pre);
+        fBlk->addPred(pre);
+
+        // entry trampolines into each specialization
+        IrValue** bops = alloc<IrValue*>((usize)1);
+        bops[0] = &header->base;
+        IrInst* tbr = self.ctx->createInst(IrOpcode::Br, self.ctx->tyVoid(), bops, 1, 0, 0);
+        dealloc<IrValue*>(bops);
+        (&header->base)->addUser(tbr);
+        tBlk->addInst(tbr);
+        tBlk->addSucc(header);
+
+        bops = alloc<IrValue*>((usize)1);
+        bops[0] = &cloneHeader->base;
+        IrInst* fbr = self.ctx->createInst(IrOpcode::Br, self.ctx->tyVoid(), bops, 1, 0, 0);
+        dealloc<IrValue*>(bops);
+        (&cloneHeader->base)->addUser(fbr);
+        fBlk->addInst(fbr);
+        fBlk->addSucc(cloneHeader);
+
+        // original header phis: the outside incoming edge is now tBlk
+        for (u32 ii = 0; ii < header->ninsts; ii++)
+        {
+            IrInst* phi = header->insts[ii];
+            if (phi->opcode != IrOpcode::Phi) break;
+            for (u32 pi = 1; pi < phi->nops; pi += 2)
+            {
+                if (phi->ops[pi] == &pre->base)
+                {
+                    phi->ops[pi]->removeUser(phi);
+                    phi->ops[pi] = &tBlk->base;
+                    (&tBlk->base)->addUser(phi);
+                }
+            }
+        }
+
+        // exit phis: every (value, pred) pair whose pred is this loop
+        // block gains a matching (remapped-value, clone-pred) pair — the
+        // clone's exit edges carry the same SSA the original edges did,
+        // through clones. The pair's OWN pred names the clone block;
+        // pairing it with any other clone would break dominance.
+        for (u32 bi = 0; bi < nb; bi++)
+        {
+            IrBlock* ob = lp->blocks[bi];
+            for (u32 sj = 0; sj < ob->nsuccs; sj++)
+            {
+                IrBlock* e = ob->succs[sj];
+                if (e == null || self.isInLoop(lp, e)) continue;
+                // dedup: one phi-pair append per original pair, not per
+                // parallel edge listing
+                bool seen = false;
+                for (u32 tj = 0; tj < sj; tj++)
+                    if (ob->succs[tj] == e) { seen = true; break; }
+                if (seen) continue;
+                IrBlock* cp = (IrBlock*)vm.get(&ob->base);
+                if (cp == null) continue;
+                for (u32 ei = 0; ei < e->ninsts; ei++)
+                {
+                    IrInst* phi = e->insts[ei];
+                    if (phi->opcode != IrOpcode::Phi) break;
+                    for (u32 k = 0; k + 1 < phi->nops; k += 2)
+                    {
+                        IrValue* pv = phi->ops[k + 1];
+                        if (pv == null || pv->kind != IrValueKind::Block) continue;
+                        if ((IrBlock*)pv != ob) continue;
+                        IrValue* rv = self.remapVal(phi->ops[k], &vm);
+                        self.phiAppendPair(phi, rv, &cp->base);
+                    }
+                }
+            }
+        }
+
+        vm.free();
+        dealloc<IrBlock*>(cblks);
+        return true;
+    }
+}
+
+pub bool muvmPassLoopUnswitch(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (ctx == null || func == null) return false;
+    LoopUnswitchPass pass = LoopUnswitchPass::new(ctx);
+    return pass.run(func);
+}
