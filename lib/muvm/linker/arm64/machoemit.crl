@@ -19,14 +19,14 @@ use macho {
     S_ATTR_SOME_INSTRUCTIONS, S_ATTR_DEBUG
 };
 use elf {
-    SHT_NOBITS, SHF_EXECINSTR, SHN_UNDEF, SHN_ABS,
-    STB_WEAK, EM_AARCH64, fits, putU16, putU32, putU64, alignUp
+    SHT_NOBITS, SHF_EXECINSTR, SHF_ALLOC, SHN_UNDEF, SHN_ABS, OUT_NONE,
+    STB_LOCAL, STB_WEAK, EM_AARCH64, fits, putU16, putU32, putU64, alignUp
 };
-use object { ObjFile, Section };
-use resolve { GlobalDef };
+use object { ObjFile, Section, Reloc, Sym };
+use resolve { GlobalDef, findDef };
 use layout {
-    Layout, OutSec, Piece, defAddress, machoHeaderSize,
-    SEC_BSS, SEC_INIT, SEC_ALLOC_COUNT
+    Layout, OutSec, Piece, defAddress, machoHeaderSize, pieceOffset,
+    SEC_BSS, SEC_DATA, SEC_GOT, SEC_INIT, SEC_TEXT, SEC_ALLOC_COUNT
 };
 
 void _mName(u8* p, str name)
@@ -148,6 +148,7 @@ usize _wSections(u8* img, usize pos, Layout* L, Vec<usize>* ord,
 // ------------------------------------------------------------------
 struct MExpNode { u64 addr; bool hasTerm; i32 head; i32 tail; }
 struct MExpEdge { str label; i32 child; i32 next; }
+struct MReb { u8 seg; u64 off; }
 
 void _mUleb(Vec<u8>* v, u64 x)
 {
@@ -413,14 +414,158 @@ pub bool emitMachOImage(bool isDll, str installName, Vec<ObjFile>* objs, Vec<Glo
             _mUleb(&bind, slotOff);
             bind.push(0x90); /* DO_BIND */
         }
-        bind.push(0); /* DONE */
     }
+
+    /* rebase locations: every absolute pointer stored in the image —
+     * UNSIGNED 64-bit relocs in alloc sections plus defined-symbol
+     * __got slots. Recorded as (segment index, offset in segment);
+     * dyld adds the slide at load. */
+    Vec<MReb> reb = Vec<MReb>::new();
+    Vec<MReb> bloc = Vec<MReb>::new();
+    Vec<str> blocName = Vec<str>::new();
+    {
+        u64 dataSegVm = base + L->rwOff;
+        for (usize o = 0; o < objs->count(); o++)
+        {
+            ObjFile* obj = objs->atPtr(o);
+            for (usize si = 0; si < obj->secs.count(); si++)
+            {
+                Section* in = obj->secs.atPtr(si);
+                if (in->outIdx == OUT_NONE) continue;
+                OutSec* out = L->secs.atPtr((usize)in->outIdx);
+                if ((out->flags & SHF_ALLOC) == 0) continue;
+                u8 sg;
+                if ((usize)in->outIdx < SEC_INIT) sg = 0;
+                else if ((usize)in->outIdx < SEC_ALLOC_COUNT) sg = 1;
+                else continue;
+                u64 segVm = sg == 0 ? base : dataSegVm;
+                u64 secOff = pieceOffset(L, (usize)in->outIdx, o, si);
+                Vec<Reloc>* bucket = obj->rels.atPtr(si);
+                for (usize k = 0; k < bucket->count(); k++)
+                {
+                    Reloc* r = bucket->atPtr(k);
+                    if (r->fmt != 2) continue;
+                    u32 mt = r->type - 1000;
+                    u32 mrt = mt >> 4;
+                    u32 mrlen = mt & 7;
+                    if (mrt != 0 || mrlen != 3) continue;
+                    u64 loc = out->addr + secOff + r->offset;
+                    if (loc < segVm) continue;
+                    u64 locOff = loc - segVm;
+                    /* imported symbol: this location is pointer-bound by
+                     * dyld (BIND_OPCODE pointer at the slot itself) */
+                    Sym* rs = obj->syms.atPtr((usize)r->sym);
+                    if (rs->bind != STB_LOCAL)
+                    {
+                        i64 di = findDef(defs, rs->name);
+                        if (di >= 0 && defs->atPtr((usize)di)->isImport)
+                        {
+                            MReb e;
+                            e.seg = sg;
+                            e.off = locOff;
+                            bloc.push(e);
+                            blocName.push(rs->name);
+                            continue;
+                        }
+                    }
+                    if (rs->shndx == SHN_ABS) continue;
+                    if (rs->bind != STB_LOCAL)
+                    {
+                        i64 di = findDef(defs, rs->name);
+                        if (di >= 0)
+                        {
+                            GlobalDef* df = defs->atPtr((usize)di);
+                            if (df->isImport || df->shndx == SHN_ABS) continue;
+                        }
+                    }
+                    MReb e;
+                    e.seg = sg;
+                    e.off = locOff;
+                    reb.push(e);
+                }
+            }
+        }
+        /* defined __got slots hold symbol vmaddrs → rebase each */
+        if (L->gotSize > 0 && L->secs.count() > SEC_DATA)
+        {
+            usize nDef = L->machoGotImpOff > 0
+                ? (usize)((L->machoGotImpOff - L->gotOff) / 8)
+                : (usize)(L->gotSize / 8);
+            OutSec* rw = L->secs.atPtr((usize)SEC_DATA);
+            for (usize gi = 0; gi < nDef; gi++)
+            {
+                u64 slot = rw->addr + L->gotOff + (u64)gi * 8;
+                if (slot < dataSegVm) continue;
+                MReb e;
+                e.seg = 1;
+                e.off = slot - dataSegVm;
+                reb.push(e);
+            }
+        }
+    }
+    /* pointer binds for .quad-style references to imports */
+    for (usize i = 0; i < bloc.count(); i++)
+    {
+        str nm = blocName.at(i);
+        bind.push(0x40);
+        for (usize k = 0; k < nm.len; k++) bind.push(nm.ptr[k]);
+        bind.push(0);
+        bind.push(0x51); /* pointer */
+        bind.push(0x3e); /* flat-lookup */
+        bind.push((u8)(0x70 | bloc.at(i).seg));
+        _mUleb(&bind, bloc.at(i).off);
+        bind.push(0x90); /* DO_BIND */
+    }
+    bind.push(0); /* DONE */
+    bloc.dispose();
+    blocName.dispose();
+
+    /* sort by (seg, off) for run grouping */
+    for (usize i = 1; i < reb.count(); i++)
+    {
+        MReb v = reb.at(i);
+        usize j = i;
+        while (j > 0)
+        {
+            MReb p = reb.at(j - 1);
+            if (p.seg < v.seg || (p.seg == v.seg && p.off <= v.off)) break;
+            *reb.atPtr(j) = p;
+            j--;
+        }
+        *reb.atPtr(j) = v;
+    }
+
+    /* encode the rebase stream */
+    Vec<u8> rebase = Vec<u8>::new();
+    if (reb.count() > 0)
+    {
+        rebase.push(0x11); /* SET_TYPE_IMM pointer */
+        usize i = 0;
+        while (i < reb.count())
+        {
+            u8 seg = reb.at(i).seg;
+            u64 off = reb.at(i).off;
+            usize j = i + 1;
+            while (j < reb.count() && reb.at(j).seg == seg &&
+                   reb.at(j).off == off + (u64)(j - i) * 8) j++;
+            u64 n = (u64)(j - i);
+            rebase.push((u8)(0x20 | seg));
+            _mUleb(&rebase, off);
+            if (n <= 15) rebase.push((u8)(0x50 | (u8)n));
+            else { rebase.push(0x60); _mUleb(&rebase, n); }
+            i = j;
+        }
+        rebase.push(0); /* DONE */
+    }
+    reb.dispose();
 
     u64 symOff = linkOff;
     u64 strOff = symOff + (u64)nSyms * 16;
-    u64 bindOff = strOff + strSize;
+    u64 rebaseOff = strOff + strSize;
+    u64 bindOff = rebaseOff + (u64)rebase.count();
     u64 trieOff = bindOff + (u64)bind.count();
-    u64 linkSize = (u64)nSyms * 16 + strSize + (u64)bind.count() + (u64)trie.count();
+    u64 linkSize = (u64)nSyms * 16 + strSize + (u64)rebase.count() +
+                   (u64)bind.count() + (u64)trie.count();
     u64 fileSize = linkOff + linkSize;
     if (fileSize > 0xffffffffu)
     {
@@ -544,8 +689,8 @@ pub bool emitMachOImage(bool isDll, str installName, Vec<ObjFile>* objs, Vec<Glo
      * emitted for defined data yet), lazy is unused (non-lazy binds). */
     putU32(img + cmdPos, 0x80000022);
     putU32(img + cmdPos + 4, 48);
-    putU32(img + cmdPos + 8, 0);             /* rebase off */
-    putU32(img + cmdPos + 12, 0);            /* rebase size */
+    putU32(img + cmdPos + 8, (u32)rebaseOff); /* rebase off */
+    putU32(img + cmdPos + 12, (u32)rebase.count());
     putU32(img + cmdPos + 16, (u32)bindOff); /* bind off */
     putU32(img + cmdPos + 20, (u32)bind.count());
     putU32(img + cmdPos + 24, 0);            /* weak bind off */
@@ -627,6 +772,9 @@ pub bool emitMachOImage(bool isDll, str installName, Vec<ObjFile>* objs, Vec<Glo
             idx++;
         }
     }
+    if (rebase.count() > 0)
+        copy<u8>(img + (usize)rebaseOff, rebase.data, rebase.count());
+    rebase.dispose();
     if (bind.count() > 0)
         copy<u8>(img + (usize)bindOff, bind.data, bind.count());
     bind.dispose();
