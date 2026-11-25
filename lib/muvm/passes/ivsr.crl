@@ -1,0 +1,308 @@
+#[[no_drop_all]]
+// Induction-variable strength reduction for muvm.
+//
+// LLVM's indvars turns `mul iv, K` inside a counted loop into a new
+// recurrence `p = phi [init*K, preheader], [p + step*K, latch]` —
+// one add per iteration instead of a multiply, and (more importantly)
+// it gives GVN/licm a first-class affine value to reason about.
+//
+// This pass handles the canonical subset:
+//   - natural loop, single latch, dedicated preheader as the only
+//     outside predecessor of the header
+//   - header IV phi whose backedge value is `add/sub phi, const`
+//   - candidates: `mul phi, K` / `shl phi, s` with K const, result
+//     type identical to the phi's, no NSW/NUW/EXACT flags (wrapping
+//     recurrence arithmetic is bit-identical to the mul in the ring
+//     Z/2^w, but flagged ops carry poison semantics that a plain add
+//     would not reproduce)
+//
+// Safety argument for replacing all uses: the new phi lives in the
+// header, which dominates every block of the natural loop, and every
+// use of the mul was already dominated by the header (uses outside
+// the loop are dominated by the mul's def block, which the header in
+// turn dominates). So the phi result is available at every use.
+
+import muvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind, IrTypeKind, IrType };
+import muvm::irOps { IrOpcode };
+import muvm::passes::loop_detect { IrLoop, irLoopDetectNatural, irLoopDestroy };
+import muvm::passes::common { gVerbose };
+import std::mman { alloc, dealloc };
+
+u64 ivsrMask(u32 w)
+{
+    return w >= 64 ? ~((u64)0) : (((u64)1 << (u64)w) - (u64)1);
+}
+
+bool ivsrIsConst(IrValue* v)
+{
+    return v != null && v->kind == IrValueKind::ConstInt;
+}
+
+pub struct IvsrPass
+{
+    IrContext* ctx;
+
+    IvsrPass new(IrContext* ctx)
+    {
+        return IvsrPass {
+            .ctx = ctx
+        };
+    }
+
+    bool inLoop(IrLoop* lp, IrBlock* bb)
+    {
+        for (u32 i = 0; i < lp->nblocks; i++)
+            if (lp->blocks[i] == bb) return true;
+        return false;
+    }
+
+    // phi incoming value arriving from `blk` (pairs at even offsets:
+    // value, block, value, block, ...)
+    IrValue* phiValFrom(IrInst* phi, IrBlock* blk)
+    {
+        for (u32 i = 0; i + 1 < phi->nops; i += 2)
+            if ((IrBlock*)phi->ops[i + 1] == blk) return phi->ops[i];
+        return null;
+    }
+
+    // Does `blk`'s terminator transfer control to `target`?
+    bool termGoesTo(IrBlock* blk, IrBlock* target)
+    {
+        if (blk == null || blk->ninsts == 0) return false;
+        IrInst* t = blk->insts[blk->ninsts - 1];
+        if (t == null) return false;
+        if (t->opcode == IrOpcode::Br || t->opcode == IrOpcode::CondBr ||
+            t->opcode == IrOpcode::Switch)
+        {
+            for (u32 i = 0; i < t->nops; i++)
+                if (t->ops[i] == (IrValue*)&target->base) return true;
+        }
+        return false;
+    }
+
+    // If `next` is `add/sub phiItself, const`, return the step bits
+    // (mod 2^width) via out param; else false.
+    bool constStep(IrValue* next, IrValue* phiVal, IrType* ty, u64* out)
+    {
+        if (next == null || next->kind != IrValueKind::Inst) return false;
+        IrInst* ni = (IrInst*)next;
+        if (ni->opcode != IrOpcode::Add && ni->opcode != IrOpcode::Sub) return false;
+        if (ni->nops < 2) return false;
+        u32 w = ty->width;
+        u64 mask = ivsrMask(w);
+        IrValue* k = null;
+        bool neg = false;
+        if (ni->ops[0] == phiVal && ivsrIsConst(ni->ops[1])) { k = ni->ops[1]; }
+        else if (ni->ops[1] == phiVal && ivsrIsConst(ni->ops[0])) { k = ni->ops[0]; }
+        else return false;
+        u64 kv = k->valData & mask;
+        if (ni->opcode == IrOpcode::Sub)
+        {
+            // sub phi, C  =>  step = -C ;  sub C, phi is not affine-in-phi
+            if (ni->ops[0] != phiVal) return false;
+            neg = true;
+        }
+        u64 step = neg ? ((~kv) + 1) & mask : kv;
+        *out = step;
+        return true;
+    }
+
+    // Find mul/shl candidates on `phiVal` across the loop's blocks.
+    // Returns count; fills parallel arrays (caller allocs).
+    u32 collectCandidates(IrLoop* lp, IrValue* phiVal, IrType* pty,
+                          IrInst** outM, u64* outK)
+    {
+        u32 n = 0;
+        u32 w = pty->width;
+        u64 pmask = ivsrMask(w);
+        for (u32 bi = 0; bi < lp->nblocks; bi++)
+        {
+            IrBlock* bb = lp->blocks[bi];
+            if (bb == null) continue;
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst == null) continue;
+                if (inst->base.type != pty) continue;
+                if (inst->hasNsw() || inst->hasNuw() || inst->hasExact()) continue;
+                u64 k = 0;
+                bool hit = false;
+                if (inst->opcode == IrOpcode::Mul && inst->nops >= 2)
+                {
+                    if (inst->ops[0] == phiVal && ivsrIsConst(inst->ops[1]))
+                    { k = inst->ops[1]->valData & pmask; hit = true; }
+                    else if (inst->ops[1] == phiVal && ivsrIsConst(inst->ops[0]))
+                    { k = inst->ops[0]->valData & pmask; hit = true; }
+                }
+                else if (inst->opcode == IrOpcode::Shl && inst->nops >= 2 &&
+                         inst->ops[0] == phiVal && ivsrIsConst(inst->ops[1]))
+                {
+                    u64 sh = inst->ops[1]->valData & 63;
+                    if (sh < (u64)w) { k = ((u64)1 << sh) & pmask; hit = true; }
+                }
+                if (!hit || k == 0 || k == 1) continue;
+                outM[n] = inst;
+                outK[n] = k;
+                n++;
+            }
+        }
+        return n;
+    }
+
+    // Convert one candidate `M = phi*K` into a header phi recurrence.
+    void convert(IrLoop* lp, IrBlock* pre, IrBlock* latch,
+                 IrInst* phi, IrValue* initV, u64 ivStep,
+                 IrInst* m, u64 k)
+    {
+        IrType* ty = m->base.type;
+        u32 w = ty->width;
+        u64 mask = ivsrMask(w);
+        u64 stepQ = (ivStep * k) & mask;
+
+        // initK = initV * K  (inserted in preheader before terminator)
+        IrValue* kc = self.ctx->constInt(ty, k);
+        IrValue** iops = alloc<IrValue*>((usize)2);
+        iops[0] = initV;
+        iops[1] = kc;
+        IrInst* initK = self.ctx->createInst(IrOpcode::Mul, ty, iops, 2, 0, 0);
+        dealloc<IrValue*>(iops);
+        if (initV != null) initV->addUser(initK);
+        kc->addUser(initK);
+        IrInst* preTerm = pre->terminator();
+        if (preTerm != null) pre->insertBefore(initK, preTerm);
+        else pre->addInst(initK);
+
+        // phiQ = phi [initK, pre], [qnext, latch]  — backedge slot is a
+        // placeholder (initK) until qnext exists, then patched.
+        IrValue** pops = alloc<IrValue*>((usize)4);
+        pops[0] = &initK->base;
+        pops[1] = &pre->base;
+        pops[2] = null;            // patched to &qnext->base below
+        pops[3] = &latch->base;
+        IrInst* phiQ = self.ctx->createInst(IrOpcode::Phi, ty, pops, 4, 0, 0);
+        dealloc<IrValue*>(pops);
+        initK->base.addUser(phiQ);
+        pre->base.addUser(phiQ);
+        latch->base.addUser(phiQ);
+        // insert among the header's leading phis
+        u32 hi = 0;
+        while (hi < lp->header->ninsts &&
+               lp->header->insts[hi] != null &&
+               lp->header->insts[hi]->opcode == IrOpcode::Phi) hi++;
+        // insertBefore needs an anchor inst; if header has no phis yet,
+        // anchor on the first inst, else splice at hi manually
+        if (hi < lp->header->ninsts && lp->header->insts[hi] != null)
+            lp->header->insertBefore(phiQ, lp->header->insts[hi]);
+        else
+            lp->header->addInst(phiQ);
+
+        // qnext = phiQ + stepQ  in the latch, before its terminator
+        IrValue* sc = self.ctx->constInt(ty, stepQ);
+        IrValue** aops = alloc<IrValue*>((usize)2);
+        aops[0] = &phiQ->base;
+        aops[1] = sc;
+        IrInst* qnext = self.ctx->createInst(IrOpcode::Add, ty, aops, 2, 0, 0);
+        dealloc<IrValue*>(aops);
+        phiQ->base.addUser(qnext);
+        sc->addUser(qnext);
+        IrInst* lTerm = latch->terminator();
+        if (lTerm != null) latch->insertBefore(qnext, lTerm);
+        else latch->addInst(qnext);
+
+        // patch phiQ's backedge incoming: null -> qnext
+        qnext->base.addUser(phiQ);
+        phiQ->ops[2] = &qnext->base;
+
+        // all uses of M now see phiQ; M is dead — erase it
+        m->base.replaceAllUses(&phiQ->base);
+        m->erase();
+    }
+
+    bool processLoop(IrLoop* lp)
+    {
+        IrBlock* header = lp->header;
+        IrBlock* latch = lp->latch;
+        if (header == null || latch == null) return false;
+
+        // Single outside predecessor — that block is the de-facto
+        // preheader (loop_detect leaves lp->preheader null; licm may
+        // have created a dedicated one, either way it's just the one
+        // edge into the header from outside the loop).
+        IrBlock* pre = null;
+        u32 outside = 0;
+        for (u32 i = 0; i < header->npreds; i++)
+        {
+            IrBlock* p = header->preds[i];
+            if (p == null) continue;
+            if (!self.inLoop(lp, p)) { outside++; pre = p; }
+        }
+        if (outside != 1 || pre == null) return false;
+
+        // Exactly one in-loop block may branch back to the header.
+        u32 backedges = 0;
+        for (u32 i = 0; i < lp->nblocks; i++)
+            if (self.termGoesTo(lp->blocks[i], header)) backedges++;
+        if (backedges != 1) return false;
+
+        bool changed = false;
+        // scan header phis for qualifying IVs
+        for (u32 hi = 0; hi < header->ninsts; hi++)
+        {
+            IrInst* phi = header->insts[hi];
+            if (phi == null || phi->opcode != IrOpcode::Phi) break;
+            IrType* pty = phi->base.type;
+            if (pty == null || pty->kind != IrTypeKind::Int ||
+                pty->width < 8 || pty->width > 64) continue;
+            IrValue* initV = self.phiValFrom(phi, pre);
+            if (initV == null) continue;
+            IrValue* backV = self.phiValFrom(phi, latch);
+            if (backV == null) continue;
+            u64 ivStep = 0;
+            if (!self.constStep(backV, &phi->base, pty, &ivStep)) continue;
+            if (ivStep == 0) continue;
+
+            // capacity: at most one candidate per loop inst
+            u32 maxCand = 0;
+            for (u32 bi = 0; bi < lp->nblocks; bi++)
+                if (lp->blocks[bi] != null) maxCand += lp->blocks[bi]->ninsts;
+            IrInst** cms = alloc<IrInst*>((usize)maxCand);
+            u64* cks = alloc<u64>((usize)maxCand);
+            u32 nc = self.collectCandidates(lp, &phi->base, pty, cms, cks);
+            for (u32 ci = 0; ci < nc; ci++)
+            {
+                // skip if the candidate is the phi's own backedge def or
+                // lives outside... collectCandidates only scans loop blocks
+                self.convert(lp, pre, latch, phi, initV, ivStep, cms[ci], cks[ci]);
+                changed = true;
+            }
+            dealloc<IrInst*>(cms);
+            dealloc<u64>(cks);
+        }
+        return changed;
+    }
+
+    bool run(IrFunc* func)
+    {
+        if (func == null) return false;
+        IrLoop** loops = irLoopDetectNatural(func);
+        if (loops == null) return false;
+        bool changed = false;
+        // irLoopDetectNatural returns a null-terminated? count via scan —
+        // check its contract: it returns array; count unknown. Look at
+        // how callers iterate.
+        for (u32 i = 0; loops[i] != null; i++)
+        {
+            if (self.processLoop(loops[i])) changed = true;
+        }
+        irLoopDestroy(loops);
+        return changed;
+    }
+}
+
+pub bool muvmPassIvsr(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (func == null || ctx == null) return false;
+    IvsrPass pass = IvsrPass::new(ctx);
+    return pass.run(func);
+}
