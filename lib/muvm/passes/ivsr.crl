@@ -6,25 +6,38 @@
 // one add per iteration instead of a multiply, and (more importantly)
 // it gives GVN/licm a first-class affine value to reason about.
 //
-// This pass handles the canonical subset:
-//   - natural loop, single latch, dedicated preheader as the only
-//     outside predecessor of the header
-//   - header IV phi whose backedge value is `add/sub phi, const`
-//   - candidates: `mul phi, K` / `shl phi, s` with K const, result
-//     type identical to the phi's, no NSW/NUW/EXACT flags (wrapping
-//     recurrence arithmetic is bit-identical to the mul in the ring
-//     Z/2^w, but flagged ops carry poison semantics that a plain add
-//     would not reproduce)
+// This pass handles the canonical subset, in three phases per loop:
+//   A) header IV phi whose backedge value is `add/sub phi, const`;
+//      candidates `mul phi, K` / `shl phi, s` become recurrences.
+//   B) `add/sub rec_phi, C` (affine a*iv+b folding) becomes a new
+//      recurrence phi — saves the per-iteration add and exposes the
+//      affine value to GVN/licm. Runs to a bounded fixpoint so chains
+//      like ((iv*K)+C)+D collapse in one call.
+//   C) `gep base, iv` (single index, pointee array/vector of scalar)
+//      becomes a pointer recurrence phiP stepping by
+//      signed(step)*elemSize bytes. On scalar pointees the backend
+//      treats gep indices as raw bytes, so the latch step is an i64
+//      const holding the byte delta (a narrow const would mask the
+//      sign extension of negative steps).
 //
-// Safety argument for replacing all uses: the new phi lives in the
+// Safety argument for replacing all uses: every new phi lives in the
 // header, which dominates every block of the natural loop, and every
-// use of the mul was already dominated by the header (uses outside
-// the loop are dominated by the mul's def block, which the header in
-// turn dominates). So the phi result is available at every use.
+// use of the replaced inst was already dominated by that inst's def
+// block, which the header in turn dominates. So the phi result is
+// available at every use — including loop exits.
+//
+// Recurrence table entries (parallel arrays):
+//   recPhi[i]  — the phi's IrValue (&inst->base), match key
+//   recInit[i] — value incoming on the preheader edge (dominates latch)
+//   recStep[i] — per-iteration delta, mod 2^width
+//   recTy[i]   — the phi's int type
+// `prot` holds insts that must never be folded: the latch-incoming
+// defs of every header phi (the recurrence updates themselves).
 
 import muvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind, IrTypeKind, IrType };
 import muvm::irOps { IrOpcode };
 import muvm::passes::loop_detect { IrLoop, irLoopDetectNatural, irLoopDestroy };
+import muvm::domtree { IrDomTree, irDomtreeNew, irDomtreeFree, irDomtreeDominates };
 import muvm::passes::common { gVerbose };
 import std::mman { alloc, dealloc };
 
@@ -149,76 +162,288 @@ pub struct IvsrPass
         return n;
     }
 
-    // Convert one candidate `M = phi*K` into a header phi recurrence.
-    void convert(IrLoop* lp, IrBlock* pre, IrBlock* latch,
-                 IrInst* phi, IrValue* initV, u64 ivStep,
-                 IrInst* m, u64 k)
+    // sign-extend a w-bit step value to i64 (for pointer byte steps)
+    i64 ivsrSext(u64 v, u32 w)
     {
-        IrType* ty = m->base.type;
-        u32 w = ty->width;
-        u64 mask = ivsrMask(w);
-        u64 stepQ = (ivStep * k) & mask;
+        if (w >= 64) return (i64)v;
+        u64 m = ((u64)1 << (u64)w) - 1;
+        v &= m;
+        if (v & ((u64)1 << (u64)(w - 1)))
+            return (i64)(v | ~m);
+        return (i64)v;
+    }
 
-        // initK = initV * K  (inserted in preheader before terminator)
-        IrValue* kc = self.ctx->constInt(ty, k);
-        IrValue** iops = alloc<IrValue*>((usize)2);
-        iops[0] = initV;
-        iops[1] = kc;
-        IrInst* initK = self.ctx->createInst(IrOpcode::Mul, ty, iops, 2, 0, 0);
-        dealloc<IrValue*>(iops);
-        if (initV != null) initV->addUser(initK);
-        kc->addUser(initK);
-        IrInst* preTerm = pre->terminator();
-        if (preTerm != null) pre->insertBefore(initK, preTerm);
-        else pre->addInst(initK);
+    bool isProtected(IrInst** prot, u32 nprot, IrInst* inst)
+    {
+        for (u32 i = 0; i < nprot; i++)
+            if (prot[i] == inst) return true;
+        return false;
+    }
 
-        // phiQ = phi [initK, pre], [qnext, latch]  — backedge slot is a
-        // placeholder (initK) until qnext exists, then patched.
+    i32 findRec(IrValue** recPhi, u32 nrecs, IrValue* v)
+    {
+        for (u32 i = 0; i < nrecs; i++)
+            if (recPhi[i] == v) return (i32)i;
+        return -1;
+    }
+
+    // Insert a header phi `phi [initV, pre], [?, latch]` — the
+    // backedge slot stays null until the caller patches ops[2].
+    IrInst* insertHeaderPhi(IrLoop* lp, IrBlock* pre, IrBlock* latch,
+                            IrValue* initV, IrType* ty)
+    {
         IrValue** pops = alloc<IrValue*>((usize)4);
-        pops[0] = &initK->base;
+        pops[0] = initV;
         pops[1] = &pre->base;
-        pops[2] = null;            // patched to &qnext->base below
+        pops[2] = null;
         pops[3] = &latch->base;
-        IrInst* phiQ = self.ctx->createInst(IrOpcode::Phi, ty, pops, 4, 0, 0);
+        IrInst* phi = self.ctx->createInst(IrOpcode::Phi, ty, pops, 4, 0, 0);
         dealloc<IrValue*>(pops);
-        initK->base.addUser(phiQ);
-        pre->base.addUser(phiQ);
-        latch->base.addUser(phiQ);
-        // insert among the header's leading phis
+        if (initV != null) initV->addUser(phi);
+        pre->base.addUser(phi);
+        latch->base.addUser(phi);
         u32 hi = 0;
         while (hi < lp->header->ninsts &&
                lp->header->insts[hi] != null &&
                lp->header->insts[hi]->opcode == IrOpcode::Phi) hi++;
-        // insertBefore needs an anchor inst; if header has no phis yet,
-        // anchor on the first inst, else splice at hi manually
         if (hi < lp->header->ninsts && lp->header->insts[hi] != null)
-            lp->header->insertBefore(phiQ, lp->header->insts[hi]);
+            lp->header->insertBefore(phi, lp->header->insts[hi]);
         else
-            lp->header->addInst(phiQ);
-
-        // qnext = phiQ + stepQ  in the latch, before its terminator
-        IrValue* sc = self.ctx->constInt(ty, stepQ);
-        IrValue** aops = alloc<IrValue*>((usize)2);
-        aops[0] = &phiQ->base;
-        aops[1] = sc;
-        IrInst* qnext = self.ctx->createInst(IrOpcode::Add, ty, aops, 2, 0, 0);
-        dealloc<IrValue*>(aops);
-        phiQ->base.addUser(qnext);
-        sc->addUser(qnext);
-        IrInst* lTerm = latch->terminator();
-        if (lTerm != null) latch->insertBefore(qnext, lTerm);
-        else latch->addInst(qnext);
-
-        // patch phiQ's backedge incoming: null -> qnext
-        qnext->base.addUser(phiQ);
-        phiQ->ops[2] = &qnext->base;
-
-        // all uses of M now see phiQ; M is dead — erase it
-        m->base.replaceAllUses(&phiQ->base);
-        m->erase();
+            lp->header->addInst(phi);
+        return phi;
     }
 
-    bool processLoop(IrLoop* lp)
+    // Emit `phi + stepConst` (wrapping add) in the latch and patch it
+    // into phi's backedge slot. Returns the add inst.
+    IrInst* emitLatchStep(IrBlock* latch, IrInst* phi, u64 step, IrType* ty)
+    {
+        IrValue* sc = self.ctx->constInt(ty, step);
+        IrValue** aops = alloc<IrValue*>((usize)2);
+        aops[0] = &phi->base;
+        aops[1] = sc;
+        IrInst* nx = self.ctx->createInst(IrOpcode::Add, ty, aops, 2, 0, 0);
+        dealloc<IrValue*>(aops);
+        phi->base.addUser(nx);
+        sc->addUser(nx);
+        IrInst* t = latch->terminator();
+        if (t != null) latch->insertBefore(nx, t);
+        else latch->addInst(nx);
+        nx->base.addUser(phi);
+        phi->ops[2] = &nx->base;
+        return nx;
+    }
+
+    // Emit a binary op `res = op(a, b)` in the preheader.
+    IrInst* emitPreOp(IrBlock* pre, IrOpcode op, IrValue* a, IrValue* b,
+                      IrType* ty)
+    {
+        IrValue** ops = alloc<IrValue*>((usize)2);
+        ops[0] = a;
+        ops[1] = b;
+        IrInst* ni = self.ctx->createInst(op, ty, ops, 2, 0, 0);
+        dealloc<IrValue*>(ops);
+        if (a != null) a->addUser(ni);
+        if (b != null) b->addUser(ni);
+        IrInst* t = pre->terminator();
+        if (t != null) pre->insertBefore(ni, t);
+        else pre->addInst(ni);
+        return ni;
+    }
+
+    // Phase A: convert `M = phi*K` / `shl phi,s` into a header phi
+    // recurrence. Appends the new recurrence to the rec arrays.
+    // Returns true on conversion.
+    bool convert(IrLoop* lp, IrBlock* pre, IrBlock* latch,
+                 IrInst* phi, IrValue* initV, u64 ivStep,
+                 IrInst* m, u64 k, IrValue** recPhi,
+                 IrValue** recInit, u64* recStep,
+                 IrType** recTy, u32* nrecs, u32 recCap)
+    {
+        IrType* ty = m->base.type;
+        u64 mask = ivsrMask(ty->width);
+        u64 stepQ = (ivStep * k) & mask;
+
+        IrInst* initK = self.emitPreOp(pre, IrOpcode::Mul, initV,
+                                       self.ctx->constInt(ty, k), ty);
+        IrInst* phiQ = self.insertHeaderPhi(lp, pre, latch, &initK->base, ty);
+        IrInst* qnext = self.emitLatchStep(latch, phiQ, stepQ, ty);
+
+        m->base.replaceAllUses(&phiQ->base);
+        m->erase();
+
+        if (*nrecs < recCap)
+        {
+            recPhi[*nrecs] = &phiQ->base;
+            recInit[*nrecs] = &initK->base;
+            recStep[*nrecs] = stepQ;
+            recTy[*nrecs] = ty;
+            (*nrecs)++;
+        }
+        return true;
+    }
+
+    // Phase B: `X +/- C` where X is a known recurrence phi becomes a
+    // new recurrence phiR = phi [initX +/- C, pre], [phiR + step, latch].
+    // Handles X+C, C+X, X-C, C-X. Appends the rec; protects rnext.
+    bool tryAffine(IrLoop* lp, IrBlock* pre, IrBlock* latch,
+                   IrInst* inst, IrValue** recPhi,
+                   IrValue** recInit, u64* recStep,
+                   IrType** recTy, u32 nrecs, u32 recCap,
+                   IrInst** prot, u32* nprot, u32* nrecsOut)
+    {
+        if (inst->opcode != IrOpcode::Add && inst->opcode != IrOpcode::Sub)
+            return false;
+        if (inst->nops < 2 || inst->hasNsw() || inst->hasNuw() ||
+            inst->hasExact()) return false;
+        IrType* ty = inst->base.type;
+        if (ty == null || ty->kind != IrTypeKind::Int ||
+            ty->width < 8 || ty->width > 64) return false;
+        u64 mask = ivsrMask(ty->width);
+
+        // classify: 0 = X+C/C+X, 1 = X-C, 2 = C-X
+        i32 ri = -1;
+        IrValue* cst = null;
+        u32 mode = 0;
+        ri = self.findRec(recPhi, nrecs, inst->ops[0]);
+        if (ri >= 0 && ivsrIsConst(inst->ops[1]))
+        {
+            cst = inst->ops[1];
+            mode = inst->opcode == IrOpcode::Sub ? 1 : 0;
+        }
+        else if (inst->opcode == IrOpcode::Add &&
+                 ivsrIsConst(inst->ops[0]) &&
+                 self.findRec(recPhi, nrecs, inst->ops[1]) >= 0)
+        {
+            ri = self.findRec(recPhi, nrecs, inst->ops[1]);
+            cst = inst->ops[0];
+            mode = 0;
+        }
+        else if (inst->opcode == IrOpcode::Sub &&
+                 ivsrIsConst(inst->ops[0]) &&
+                 self.findRec(recPhi, nrecs, inst->ops[1]) >= 0)
+        {
+            ri = self.findRec(recPhi, nrecs, inst->ops[1]);
+            cst = inst->ops[0];
+            mode = 2;
+        }
+        else return false;
+        if (ri < 0 || cst == null || recTy[ri] != ty) return false;
+        if (nrecs >= recCap) return false;
+
+        IrValue* initX = recInit[ri];
+        IrInst* initR;
+        u64 nstep;
+        if (mode == 0)
+        {
+            initR = self.emitPreOp(pre, IrOpcode::Add, initX, cst, ty);
+            nstep = recStep[ri];
+        }
+        else if (mode == 1)
+        {
+            initR = self.emitPreOp(pre, IrOpcode::Sub, initX, cst, ty);
+            nstep = recStep[ri];
+        }
+        else
+        {
+            initR = self.emitPreOp(pre, IrOpcode::Sub, cst, initX, ty);
+            nstep = ((~recStep[ri]) + 1) & mask;
+        }
+
+        IrInst* phiR = self.insertHeaderPhi(lp, pre, latch, &initR->base, ty);
+        IrInst* rnext = self.emitLatchStep(latch, phiR, nstep, ty);
+
+        inst->base.replaceAllUses(&phiR->base);
+        inst->erase();
+
+        recPhi[nrecs] = &phiR->base;
+        recInit[nrecs] = &initR->base;
+        recStep[nrecs] = nstep;
+        recTy[nrecs] = ty;
+        (*nrecsOut)++;
+        if (*nprot < 256) prot[(*nprot)++] = rnext;
+        return true;
+    }
+
+    // Phase C: `gep base, iv` (single index; result pointee scalar)
+    // becomes a pointer recurrence phiP stepping by
+    // signed(step)*elemSize bytes per iteration.
+    bool tryPtrIV(IrLoop* lp, IrBlock* pre, IrBlock* latch,
+                  IrInst* gep,
+                  IrValue** recPhi, IrValue** recInit, u64* recStep,
+                  IrType** recTy, u32 nrecs,
+                  IrInst** prot, u32* nprot, IrDomTree* dt)
+    {
+        if (gep->opcode != IrOpcode::Gep || gep->nops != 2) return false;
+        IrValue* idx = gep->ops[1];
+        if (idx == null) return false;
+        i32 ri = self.findRec(recPhi, nrecs, idx);
+        if (ri < 0) return false;
+        IrType* pty = recTy[ri];
+        if (pty == null || pty->kind != IrTypeKind::Int ||
+            pty->width < 8 || pty->width > 64) return false;
+
+        IrType* resTy = gep->base.type;
+        if (resTy == null || resTy->kind != IrTypeKind::Ptr ||
+            resTy->elem == null) return false;
+        IrType* elem = resTy->elem;
+        // pointee must be scalar — an aggregate pointee would make the
+        // latch gep a field-index gep rather than a byte step
+        if (elem->kind != IrTypeKind::Int && elem->kind != IrTypeKind::Float)
+            return false;
+        if (elem->width < 8 || elem->width > 64) return false;
+
+        IrValue* base = gep->ops[0];
+        if (base == null) return false;
+        // base must dominate the preheader terminator so the init gep
+        // can live there
+        if (base->kind == IrValueKind::Inst)
+        {
+            IrBlock* bb = ((IrInst*)base)->parent;
+            if (bb == null || self.inLoop(lp, bb)) return false;
+            if (bb != pre && !irDomtreeDominates(dt, bb, pre)) return false;
+        }
+
+        u64 esz = (u64)self.ctx->irTypeSizeOf(elem);
+        if (esz == 0) return false;
+        i64 byteStep = self.ivsrSext(recStep[ri], pty->width) * (i64)esz;
+        if (byteStep == 0) return false;
+
+        // initG = gep base, initIdx in the preheader
+        IrValue* iidx = recInit[ri];
+        IrValue** iops = alloc<IrValue*>((usize)2);
+        iops[0] = base;
+        iops[1] = iidx;
+        IrInst* initG = self.ctx->createInst(IrOpcode::Gep, resTy, iops, 2, 0, 0);
+        dealloc<IrValue*>(iops);
+        if (base != null) base->addUser(initG);
+        if (iidx != null) iidx->addUser(initG);
+        IrInst* pt = pre->terminator();
+        if (pt != null) pre->insertBefore(initG, pt); else pre->addInst(initG);
+
+        IrInst* phiP = self.insertHeaderPhi(lp, pre, latch, &initG->base, resTy);
+
+        // pnext = gep phiP, byteStep — scalar pointee means the index
+        // is a raw byte offset; i64 const preserves negative steps
+        IrValue* sc = self.ctx->constInt(self.ctx->tyInt(64), (u64)byteStep);
+        IrValue** gops = alloc<IrValue*>((usize)2);
+        gops[0] = &phiP->base;
+        gops[1] = sc;
+        IrInst* pnext = self.ctx->createInst(IrOpcode::Gep, resTy, gops, 2, 0, 0);
+        dealloc<IrValue*>(gops);
+        phiP->base.addUser(pnext);
+        sc->addUser(pnext);
+        IrInst* lt = latch->terminator();
+        if (lt != null) latch->insertBefore(pnext, lt); else latch->addInst(pnext);
+        pnext->base.addUser(phiP);
+        phiP->ops[2] = &pnext->base;
+        if (*nprot < 256) prot[(*nprot)++] = pnext;
+
+        gep->base.replaceAllUses(&phiP->base);
+        gep->erase();
+        return true;
+    }
+
+    bool processLoop(IrLoop* lp, IrDomTree* dt)
     {
         IrBlock* header = lp->header;
         IrBlock* latch = lp->latch;
@@ -245,7 +470,19 @@ pub struct IvsrPass
         if (backedges != 1) return false;
 
         bool changed = false;
-        // scan header phis for qualifying IVs
+        u32 maxCand = 1;
+        for (u32 bi = 0; bi < lp->nblocks; bi++)
+            if (lp->blocks[bi] != null) maxCand += lp->blocks[bi]->ninsts;
+        u32 recCap = maxCand + 16;
+        IrValue** recPhi = alloc<IrValue*>((usize)recCap);
+        IrValue** recInit = alloc<IrValue*>((usize)recCap);
+        u64* recStep = alloc<u64>((usize)recCap);
+        IrType** recTy = alloc<IrType*>((usize)recCap);
+        IrInst** prot = alloc<IrInst*>((usize)256);
+        u32 nprot = 0;
+        u32 nrecs = 0;
+
+        // Phase A: scan header phis for qualifying IVs.
         for (u32 hi = 0; hi < header->ninsts; hi++)
         {
             IrInst* phi = header->insts[hi];
@@ -261,40 +498,111 @@ pub struct IvsrPass
             if (!self.constStep(backV, &phi->base, pty, &ivStep)) continue;
             if (ivStep == 0) continue;
 
-            // capacity: at most one candidate per loop inst
-            u32 maxCand = 0;
-            for (u32 bi = 0; bi < lp->nblocks; bi++)
-                if (lp->blocks[bi] != null) maxCand += lp->blocks[bi]->ninsts;
+            // the IV phi itself is a recurrence (a=1 affine base)
+            if (nrecs < recCap)
+            {
+                recPhi[nrecs] = &phi->base;
+                recInit[nrecs] = initV;
+                recStep[nrecs] = ivStep;
+                recTy[nrecs] = pty;
+                nrecs++;
+            }
+
             IrInst** cms = alloc<IrInst*>((usize)maxCand);
             u64* cks = alloc<u64>((usize)maxCand);
             u32 nc = self.collectCandidates(lp, &phi->base, pty, cms, cks);
             for (u32 ci = 0; ci < nc; ci++)
             {
-                // skip if the candidate is the phi's own backedge def or
-                // lives outside... collectCandidates only scans loop blocks
-                self.convert(lp, pre, latch, phi, initV, ivStep, cms[ci], cks[ci]);
+                self.convert(lp, pre, latch, phi, initV, ivStep,
+                             cms[ci], cks[ci],
+                             recPhi, recInit, recStep, recTy,
+                             &nrecs, recCap);
                 changed = true;
             }
             dealloc<IrInst*>(cms);
             dealloc<u64>(cks);
         }
+        if (nrecs == 0)
+        {
+            dealloc<IrValue*>(recPhi); dealloc<IrValue*>(recInit);
+            dealloc<u64>(recStep); dealloc<IrType*>(recTy);
+            dealloc<IrInst*>(prot);
+            return false;
+        }
+
+        // Phases B/C to a bounded fixpoint. Each round rebuilds the
+        // protected set from the header phis' latch incomings (covers
+        // backedge defs created by earlier rounds), snapshots the loop
+        // insts (erase() shifts block arrays), then folds.
+        for (u32 round = 0; round < 8; round++)
+        {
+            nprot = 0;
+            for (u32 hi = 0; hi < header->ninsts; hi++)
+            {
+                IrInst* p = header->insts[hi];
+                if (p == null || p->opcode != IrOpcode::Phi) break;
+                IrValue* bv = self.phiValFrom(p, latch);
+                if (bv != null && bv->kind == IrValueKind::Inst && nprot < 256)
+                    prot[nprot++] = (IrInst*)bv;
+            }
+
+            // snapshot insts — conversions erase entries, which would
+            // shift the block array under a live index
+            IrInst** snap = alloc<IrInst*>((usize)maxCand);
+            u32 nsnap = 0;
+            for (u32 bi = 0; bi < lp->nblocks; bi++)
+            {
+                IrBlock* bb = lp->blocks[bi];
+                if (bb == null) continue;
+                for (u32 ii = 0; ii < bb->ninsts && nsnap < maxCand; ii++)
+                    if (bb->insts[ii] != null) snap[nsnap++] = bb->insts[ii];
+            }
+
+            bool progress = false;
+            for (u32 si = 0; si < nsnap; si++)
+            {
+                IrInst* inst = snap[si];
+                if (inst == null || inst->parent == null) continue;
+                if (self.isProtected(prot, nprot, inst)) continue;
+                if (self.tryAffine(lp, pre, latch, inst,
+                                   recPhi, recInit, recStep, recTy,
+                                   nrecs, recCap, prot, &nprot, &nrecs))
+                {
+                    progress = true; changed = true;
+                    continue;
+                }
+                if (self.tryPtrIV(lp, pre, latch, inst,
+                                  recPhi, recInit, recStep, recTy,
+                                  nrecs, prot, &nprot, dt))
+                {
+                    progress = true; changed = true;
+                }
+            }
+            dealloc<IrInst*>(snap);
+            if (!progress) break;
+        }
+
+        dealloc<IrValue*>(recPhi);
+        dealloc<IrValue*>(recInit);
+        dealloc<u64>(recStep);
+        dealloc<IrType*>(recTy);
+        dealloc<IrInst*>(prot);
         return changed;
     }
 
     bool run(IrFunc* func)
     {
         if (func == null) return false;
+        IrDomTree* dt = irDomtreeNew(func);
         IrLoop** loops = irLoopDetectNatural(func);
-        if (loops == null) return false;
+        if (loops == null) { irDomtreeFree(dt); return false; }
         bool changed = false;
-        // irLoopDetectNatural returns a null-terminated? count via scan —
-        // check its contract: it returns array; count unknown. Look at
-        // how callers iterate.
         for (u32 i = 0; loops[i] != null; i++)
         {
-            if (self.processLoop(loops[i])) changed = true;
+            if (self.processLoop(loops[i], dt)) changed = true;
         }
         irLoopDestroy(loops);
+        irDomtreeFree(dt);
         return changed;
     }
 }
