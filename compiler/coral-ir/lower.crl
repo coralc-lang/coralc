@@ -21,7 +21,7 @@ use ast {
 };
 use common::slice { Slice };
 use build::arena { Arena };
-import std::mman { alloc, dealloc, copy };
+import std::mman { alloc, dealloc, copy, zero };
 import std::string { String };
 
 pub struct MuvDrop
@@ -93,6 +93,7 @@ pub struct Muv
     u32* fnKeys;       // declId.index + 1; 0 = empty slot
     IrFunc** fnVals;
     u32 fnCap;         // power of two
+    u32 fnLen;         // occupied slots (grows at 75%)
 
     /* declId.index → IrGlobal* for names that keep storage: a
      * DeclKind::Constant carrying static/extern storage (file-scope) or
@@ -100,6 +101,7 @@ pub struct Muv
     u32* gKeys;        // declId.index + 1; 0 = empty slot
     IrGlobal** gVals;
     u32 gCap;          // power of two
+    u32 gLen;          // occupied slots (grows at 75%)
 
     /* every IrStructType coral-ir built (muvStructTy), in creation
      * order — field-index lookups resolve names through these because
@@ -121,6 +123,7 @@ pub struct Muv
     IrType** tyVals;
     u8* tyBusy;        // 1 while that Ty is being derived (cycle marker)
     u32 tyCap;         // power of two
+    u32 tyLen;         // occupied slots (grows at 75%)
 
     /* interned type-name → its type decl (muvFindTypeDecl). The merged
      * file's decl list is scanned linearly otherwise — 37% of compile
@@ -128,6 +131,7 @@ pub struct Muv
     u32* tdKeys;       // Str + 1; 0 = empty slot
     u32* tdVals;       // NodeId.index + 1
     u32 tdCap;         // power of two
+    u32 tdLen;         // occupied slots (grows at 75%)
 
     /* monomorphisation substitution for the current instance */
     MonoSubstitution* subs;
@@ -233,6 +237,7 @@ pub struct MuvNames
 {
     MuvNameEnt* ents;
     u32 cap;         // power of two
+    u32 len;         // occupied slots — table grows at 75% load
 }
 
 pub u32 muvHashStr(str s)
@@ -246,6 +251,7 @@ pub u32 muvHashStr(str s)
 pub bool muvNamesInit(MuvNames* t, u32 capPow2)
 {
     t->cap = capPow2;
+    t->len = 0;
     t->ents = alloc<MuvNameEnt>((usize)capPow2);
     if (t->ents == null) { t->cap = 0; return false; }
     u32 i = 0;
@@ -266,10 +272,36 @@ pub MuvNameEnt* muvNamesFind(MuvNames* t, str name)
     return null;
 }
 
+/* double + reinsert every entry; names are stable strs (IrFunc-owned)
+ * so rehashing is a pure copy */
+void muvNamesGrow(MuvNames* t)
+{
+    u32 nc = t->cap * 2;
+    MuvNameEnt* ne = alloc<MuvNameEnt>((usize)nc);
+    if (ne == null) return;
+    u32 i = 0;
+    while (i < nc) { ne[i].name = ""; ne[i].f = null; i++; }
+    i = 0;
+    while (i < t->cap)
+    {
+        if (t->ents[i].name.len != 0)
+        {
+            u32 s = muvHashStr(t->ents[i].name) & (nc - 1);
+            while (ne[s].name.len != 0) s = (s + 1) & (nc - 1);
+            ne[s] = t->ents[i];
+        }
+        i++;
+    }
+    dealloc<MuvNameEnt>(t->ents);
+    t->ents = ne;
+    t->cap = nc;
+}
+
 /* claim a slot for a new name; returns the entry */
 pub MuvNameEnt* muvNamesInsert(MuvNames* t, str name)
 {
     if (t == null || t->cap == 0) return null;
+    if ((t->len + 1) * 4 > t->cap * 3) muvNamesGrow(t);
     u32 slot = muvHashStr(name) & (t->cap - 1);
     while (t->ents[slot].name.len != 0)
     {
@@ -277,7 +309,10 @@ pub MuvNameEnt* muvNamesInsert(MuvNames* t, str name)
         slot = (slot + 1) & (t->cap - 1);
     }
     t->ents[slot].name = name;
+    t->len++;
     return t->ents + slot;
+}
+
 /* one translation unit's emitted asm (multi-TU partition) */
 pub struct MuvmTu
 {
@@ -695,6 +730,7 @@ pub str muvMbStr(Muv* w) { return w->mb.asView(); }
 pub void muvFnMapInit(Muv* w, u32 capPow2)
 {
     w->fnCap = capPow2;
+    w->fnLen = 0;
     w->fnKeys = alloc<u32>((usize)capPow2);
     w->fnVals = alloc<IrFunc*>((usize)capPow2);
     if (w->fnKeys == null || w->fnVals == null)
@@ -709,6 +745,35 @@ pub void muvFnMapInit(Muv* w, u32 capPow2)
 pub void muvFnMapPut(Muv* w, u32 declIdx, IrFunc* f)
 {
     if (w->fnCap == 0 || declIdx == 0xffffffff) return;
+    /* grow at 75% load — the table must never fill completely or the
+     * probe below never terminates (self-host exceeds 1024 decls) */
+    if ((w->fnLen + 1) * 4 > w->fnCap * 3)
+    {
+        u32 nc = w->fnCap * 2;
+        u32* nk = alloc<u32>((usize)nc);
+        IrFunc** nv = alloc<IrFunc*>((usize)nc);
+        if (nk != null && nv != null)
+        {
+            zero<u32>(nk, (usize)nc);
+            u32 ri = 0;
+            while (ri < w->fnCap)
+            {
+                if (w->fnKeys[ri] != 0)
+                {
+                    u32 s = (w->fnKeys[ri] - 1) & (nc - 1);
+                    while (nk[s] != 0) s = (s + 1) & (nc - 1);
+                    nk[s] = w->fnKeys[ri];
+                    nv[s] = w->fnVals[ri];
+                }
+                ri++;
+            }
+            dealloc<u32>(w->fnKeys);
+            dealloc<IrFunc*>(w->fnVals);
+            w->fnKeys = nk;
+            w->fnVals = nv;
+            w->fnCap = nc;
+        }
+    }
     u32 slot = declIdx & (w->fnCap - 1);
     while (w->fnKeys[slot] != 0)
     {
@@ -717,6 +782,7 @@ pub void muvFnMapPut(Muv* w, u32 declIdx, IrFunc* f)
     }
     w->fnKeys[slot] = declIdx + 1;
     w->fnVals[slot] = f;
+    w->fnLen++;
 }
 
 pub IrFunc* muvFnMapGet(Muv* w, u32 declIdx)
@@ -736,6 +802,7 @@ pub IrFunc* muvFnMapGet(Muv* w, u32 declIdx)
 pub void muvGMapInit(Muv* w, u32 capPow2)
 {
     w->gCap = capPow2;
+    w->gLen = 0;
     w->gKeys = alloc<u32>((usize)capPow2);
     w->gVals = alloc<IrGlobal*>((usize)capPow2);
     if (w->gKeys == null || w->gVals == null)
@@ -750,6 +817,33 @@ pub void muvGMapInit(Muv* w, u32 capPow2)
 pub void muvGMapPut(Muv* w, u32 declIdx, IrGlobal* g)
 {
     if (w->gCap == 0 || declIdx == 0xffffffff) return;
+    if ((w->gLen + 1) * 4 > w->gCap * 3)
+    {
+        u32 nc = w->gCap * 2;
+        u32* nk = alloc<u32>((usize)nc);
+        IrGlobal** nv = alloc<IrGlobal*>((usize)nc);
+        if (nk != null && nv != null)
+        {
+            zero<u32>(nk, (usize)nc);
+            u32 ri = 0;
+            while (ri < w->gCap)
+            {
+                if (w->gKeys[ri] != 0)
+                {
+                    u32 s = (w->gKeys[ri] - 1) & (nc - 1);
+                    while (nk[s] != 0) s = (s + 1) & (nc - 1);
+                    nk[s] = w->gKeys[ri];
+                    nv[s] = w->gVals[ri];
+                }
+                ri++;
+            }
+            dealloc<u32>(w->gKeys);
+            dealloc<IrGlobal*>(w->gVals);
+            w->gKeys = nk;
+            w->gVals = nv;
+            w->gCap = nc;
+        }
+    }
     u32 slot = declIdx & (w->gCap - 1);
     while (w->gKeys[slot] != 0)
     {
@@ -758,6 +852,7 @@ pub void muvGMapPut(Muv* w, u32 declIdx, IrGlobal* g)
     }
     w->gKeys[slot] = declIdx + 1;
     w->gVals[slot] = g;
+    w->gLen++;
 }
 
 pub IrGlobal* muvGMapGet(Muv* w, u32 declIdx)
@@ -780,6 +875,7 @@ pub str muvMangle(Muv* w, NodeId declId, Str name);
 pub void muvTyMapInit(Muv* w, u32 capPow2)
 {
     w->tyCap = capPow2;
+    w->tyLen = 0;
     w->tyKeys = alloc<u32>((usize)capPow2);
     w->tyVals = alloc<IrType*>((usize)capPow2);
     w->tyBusy = alloc<u8>((usize)capPow2);
@@ -815,6 +911,38 @@ pub bool muvTyMapFind(Muv* w, Ty t, u8* busy, IrType** val)
 pub void muvTyMapSet(Muv* w, Ty t, u8 b, IrType* v)
 {
     if (w->tyCap == 0) return;
+    if ((w->tyLen + 1) * 4 > w->tyCap * 3)
+    {
+        u32 nc = w->tyCap * 2;
+        u32* nk = alloc<u32>((usize)nc);
+        IrType** nv = alloc<IrType*>((usize)nc);
+        u8* nb = alloc<u8>((usize)nc);
+        if (nk != null && nv != null && nb != null)
+        {
+            zero<u32>(nk, (usize)nc);
+            zero<u8>(nb, (usize)nc);
+            u32 ri = 0;
+            while (ri < w->tyCap)
+            {
+                if (w->tyKeys[ri] != 0)
+                {
+                    u32 s = (w->tyKeys[ri] - 1) & (nc - 1);
+                    while (nk[s] != 0) s = (s + 1) & (nc - 1);
+                    nk[s] = w->tyKeys[ri];
+                    nv[s] = w->tyVals[ri];
+                    nb[s] = w->tyBusy[ri];
+                }
+                ri++;
+            }
+            dealloc<u32>(w->tyKeys);
+            dealloc<IrType*>(w->tyVals);
+            dealloc<u8>(w->tyBusy);
+            w->tyKeys = nk;
+            w->tyVals = nv;
+            w->tyBusy = nb;
+            w->tyCap = nc;
+        }
+    }
     u32 slot = ((u32)t) & (w->tyCap - 1);
     while (w->tyKeys[slot] != 0)
     {
@@ -829,6 +957,7 @@ pub void muvTyMapSet(Muv* w, Ty t, u8 b, IrType* v)
     w->tyKeys[slot] = (u32)t + 1;
     w->tyVals[slot] = v;
     w->tyBusy[slot] = b;
+    w->tyLen++;
 }
 
 /* ── type-name → decl memo (see Muv.tdKeys) ─────────────────────────────── */
@@ -836,6 +965,7 @@ pub void muvTyMapSet(Muv* w, Ty t, u8 b, IrType* v)
 pub void muvTdMapInit(Muv* w, u32 capPow2)
 {
     w->tdCap = capPow2;
+    w->tdLen = 0;
     w->tdKeys = alloc<u32>((usize)capPow2);
     w->tdVals = alloc<u32>((usize)capPow2);
     if (w->tdKeys == null || w->tdVals == null)
@@ -869,6 +999,33 @@ pub u32 muvTdMapGet(Muv* w, Str name, bool* found)
 pub void muvTdMapPut(Muv* w, Str name, u32 v)
 {
     if (w->tdCap == 0) return;
+    if ((w->tdLen + 1) * 4 > w->tdCap * 3)
+    {
+        u32 nc = w->tdCap * 2;
+        u32* nk = alloc<u32>((usize)nc);
+        u32* nv = alloc<u32>((usize)nc);
+        if (nk != null && nv != null)
+        {
+            zero<u32>(nk, (usize)nc);
+            u32 ri = 0;
+            while (ri < w->tdCap)
+            {
+                if (w->tdKeys[ri] != 0)
+                {
+                    u32 s = (w->tdKeys[ri] - 1) & (nc - 1);
+                    while (nk[s] != 0) s = (s + 1) & (nc - 1);
+                    nk[s] = w->tdKeys[ri];
+                    nv[s] = w->tdVals[ri];
+                }
+                ri++;
+            }
+            dealloc<u32>(w->tdKeys);
+            dealloc<u32>(w->tdVals);
+            w->tdKeys = nk;
+            w->tdVals = nv;
+            w->tdCap = nc;
+        }
+    }
     u32 slot = ((u32)name) & (w->tdCap - 1);
     while (w->tdKeys[slot] != 0)
     {
@@ -877,6 +1034,7 @@ pub void muvTdMapPut(Muv* w, Str name, u32 v)
     }
     w->tdKeys[slot] = (u32)name + 1;
     w->tdVals[slot] = v;
+    w->tdLen++;
 }
 
 /* write v as lowercase hex into the mangle buffer */
