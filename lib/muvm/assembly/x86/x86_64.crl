@@ -9,12 +9,12 @@
 // assembleText (whole unit into an AsmObject with symbols + relocs).
 import muvm::assembly::common { AsmLine, AsmOperand, AsmOpKind, AsmParseError, AsmLexer, parseAttLine, asmOperandEmpty, asmLineEmpty };
 import muvm::assembly::x86::common { X86Reg, X86RegClass, lookupReg, isVectorReg, AsmBytes, X86Rex, X86Vex, encodeMem, encodeRegReg };
-import muvm::assembly::x86::obj { AsmObject, AsmSection, AsmSymbol, AsmRelocKind, asmAddReloc, asmFindOrAddSym, asmFindSym, asmSecData, asmSecSize, asmSecNobits, asmSecZero, asmSecBumpAlign, asmSecAlignPtr, asmSecExec, asmSecName, asmSecShf, asmFindXSection, asmAddXSection, asmAddPendingDiff, AsmPendingDiff, asmLebAddPend, asmLebFindKey, asmLebSetKey, AsmLebCtx, AsmLebPend, asmLebCtxNew, asmLebCtxDeinit, asmObjectNew, asmObjectDeinit };
-import muvm::assembly::x86::x86_avx { EncodeCtx, ctxNew, tryVecTable };
+import muvm::assembly::x86::obj { AsmObject, AsmSection, AsmSymbol, AsmReloc, AsmRelocKind, asmAddReloc, asmFindOrAddSym, asmFindSym, asmSecData, asmSecSize, asmSecNobits, asmSecZero, asmSecBumpAlign, asmSecAlignPtr, asmSecExec, asmSecName, asmSecShf, asmFindXSection, asmAddXSection, asmAddPendingDiff, AsmPendingDiff, asmLebAddPend, asmLebFindKey, asmLebSetKey, AsmLebCtx, AsmLebPend, asmLebCtxNew, asmLebCtxDeinit, asmObjectNew, asmObjectDeinit };
+import muvm::assembly::x86::x86_avx { EncodeCtx, ctxNew, tryVecTable, X86Relax, X86RelaxSite, X86RelaxPatch };
 import muvm::assembly::x86::x86_sse { trySseTable };
 import muvm::assembly::x86::dwarfline { asmLineFile, asmLineLoc, asmLineEndProc, asmLineFlush, asmCfiProc, asmCfiDir };
 import core::char_util { isAlpha, isDigit, isSpace };
-import platform::libc { free };
+import platform::libc { free, malloc, realloc };
 
 // operand-size suffixes
 u8 sizeOfSuffix(str s)
@@ -1493,7 +1493,8 @@ pub bool matchAndEncode(AsmLine* line, EncodeCtx* ctx, AsmParseError* err)
                     return out->u8b((u8)(i8)sr);
                 }
             }
-            // near form + PC32 reloc (forward or external)
+            // forward/external: relaxable short form or near + PC32 reloc
+            if (relaxTryShort(ctx, nm, t->imm, (u8)(0x70 + cc), 4, 6, 2)) return true;
             if (!out->u8b(0x0F)) return false;
             if (!out->u8b((u8)(0x80 + cc))) return false;
             return emitSymRel(ctx, nm, t->imm, (u8)AsmRelocKind::RelPc32, err);
@@ -1710,6 +1711,7 @@ pub bool matchAndEncode(AsmLine* line, EncodeCtx* ctx, AsmParseError* err)
                     return out->u8b((u8)(i8)sr);
                 }
             }
+            if (relaxTryShort(ctx, nm, t->imm, 0xEB, 3, 5, 1)) return true;
             if (!out->u8b(0xE9)) return false;
             return emitSymRel(ctx, nm, t->imm, (u8)AsmRelocKind::RelPc32, err);
         }
@@ -2896,7 +2898,234 @@ bool atAssignmentLine(str ln)
 // assemble a whole source unit: labels bind at the current section
 // offset, directives steer sections and emit data, everything else goes
 // through the encoder into the current section.
-bool assemblePassOnce(str text, AsmObject* obj, AsmParseError* err)
+// ---- forward branch relaxation (jcc/jmp short forms) ----
+// assembleText re-runs passes until the leb128 fixpoint converges; the
+// same loop carries branch relaxation. Each pass records the symbolic
+// jcc/jmp sites that reached the near form, relaxCompute recomputes the
+// maximal short-form set from the final symbol offsets, and the next
+// pass emits it. relaxApply patches the disp8 bytes once layout is final.
+
+bool relaxGrowSites(X86Relax* r)
+{
+    usize nc = r->capsites == 0 ? 32 : r->capsites * 2;
+    X86RelaxSite* ns = (X86RelaxSite*)realloc((rawptr)r->sites, nc * @sizeof(X86RelaxSite));
+    if (ns == null) { r->oom = true; return false; }
+    r->sites = ns;
+    r->capsites = nc;
+    return true;
+}
+
+bool relaxGrowPatches(X86Relax* r)
+{
+    usize nc = r->cappatches == 0 ? 32 : r->cappatches * 2;
+    X86RelaxPatch* np = (X86RelaxPatch*)realloc((rawptr)r->patches, nc * @sizeof(X86RelaxPatch));
+    if (np == null) { r->oom = true; return false; }
+    r->patches = np;
+    r->cappatches = nc;
+    return true;
+}
+
+// encoder hook: every symbolic jcc/jmp that is not already resolved to a
+// fitting backward short form lands here. Records the site (in encounter
+// order — the ordinal indexes relax->state) and emits the 2-byte short
+// form with a zero disp8 when the current state calls for it. Near-form
+// sites also get a patch record so relaxApply can resolve same-section
+// targets at assembly time (GAS parity: no reloc for local branches).
+bool relaxTryShort(EncodeCtx* ctx, str nm, i64 addend, u8 op, u8 shrink, u8 nearLen, u8 dispOff)
+{
+    X86Relax* r = ctx->relax;
+    if (r == null) return false;
+    usize idx = r->next;
+    r->next++;
+    u64 off = ctx->base + (u64)ctx->out->len;
+    if (r->nsites == r->capsites && !relaxGrowSites(r)) return false;
+    r->sites[r->nsites] = X86RelaxSite { .sym = nm, .addend = addend, .sec = ctx->sec, .off = off, .shrink = shrink };
+    r->nsites++;
+    bool shortForm = idx < r->nstate && r->state[idx] == 1;
+    u8 nl = shortForm ? (u8)0 : nearLen;
+    u8 df = shortForm ? (u8)0 : dispOff;
+    if (r->npatches == r->cappatches && !relaxGrowPatches(r)) return false;
+    r->patches[r->npatches] = X86RelaxPatch { .sec = ctx->sec, .off = off, .sym = nm, .addend = addend,
+        .op = op, .nlen = nl, .doff = df };
+    r->npatches++;
+    if (!shortForm) return false;
+    AsmBytes* out = ctx->out;
+    if (!out->u8b(op)) return false;
+    if (!out->u8b(0)) return false;
+    return true;
+}
+
+// recompute the short/near decision after a pass. Sites whose symbol is
+// not a defined same-section non-view symbol can never relax (external or
+// cross-section → reloc stays). Candidates are normalized back to the
+// all-near layout, then demoted until every kept short fits rel8.
+// Sets *dirty when the decision changed (another pass required).
+bool relaxCompute(AsmObject* obj, X86Relax* r, bool* dirty)
+{
+    *dirty = false;
+    if (r->oom) return false;
+    usize n = r->nsites;
+    if (n == 0)
+    {
+        r->hasState = true;
+        return true;
+    }
+    u8* cand = (u8*)malloc(n);
+    i64* no = (i64*)malloc(n * @sizeof(i64));
+    i64* nl = (i64*)malloc(n * @sizeof(i64));
+    u8* ns = (u8*)malloc(n);
+    if (cand == null || no == null || nl == null || ns == null)
+    {
+        if (cand != null) free((rawptr)cand);
+        if (no != null) free((rawptr)no);
+        if (nl != null) free((rawptr)nl);
+        if (ns != null) free((rawptr)ns);
+        return false;
+    }
+    for (usize i = 0; i < n; i++)
+    {
+        X86RelaxSite* s = &r->sites[i];
+        i32 si = asmFindSym(obj, s->sym);
+        cand[i] = 0;
+        no[i] = 0;
+        nl[i] = 0;
+        ns[i] = 0;
+        if (si < 0) continue;
+        AsmSymbol* sym = &obj->syms[si];
+        if (!sym->defined || sym->section != s->sec || sym->isView) continue;
+        cand[i] = 1;
+        i64 L = (i64)sym->value + s->addend;
+        // normalize to the all-near layout: add back the shrink of every
+        // currently-short site positioned before the point in question
+        i64 adjO = 0;
+        i64 adjL = 0;
+        for (usize j = 0; j < n; j++)
+        {
+            if (j >= r->nstate || r->state[j] != 1) continue;
+            u64 jo = r->sites[j].off;
+            i64 sh = (i64)r->sites[j].shrink;
+            if (jo < s->off) adjO += sh;
+            if ((i64)jo < L) adjL += sh;
+        }
+        no[i] = (i64)s->off + adjO;
+        nl[i] = L + adjL;
+    }
+    // seed every candidate short, then demote until all fit
+    for (usize i = 0; i < n; i++) ns[i] = cand[i];
+    bool changed = true;
+    while (changed)
+    {
+        changed = false;
+        for (usize i = 0; i < n; i++)
+        {
+            if (ns[i] != 1) continue;
+            i64 between = 0;
+            for (usize j = 0; j < n; j++)
+            {
+                // j==i is included on purpose: a forward target sits after
+                // the insn, so the site's own shrink also shortens the hop
+                if (ns[j] != 1) continue;
+                if (no[j] >= no[i] && no[j] < nl[i]) between += (i64)r->sites[j].shrink;
+            }
+            i64 disp = (nl[i] - no[i] - 2) - between;
+            if (disp < -128 || disp > 127)
+            {
+                ns[i] = 0;
+                changed = true;
+            }
+        }
+    }
+    // grow state to n (zeroed) so every slot has a defined current value
+    if (r->nstate < n)
+    {
+        usize old = r->nstate;
+        u8* grown = (u8*)realloc((rawptr)r->state, n);
+        if (grown == null) { free((rawptr)cand); free((rawptr)no); free((rawptr)nl); free((rawptr)ns); r->oom = true; return false; }
+        for (usize i = old; i < n; i++) grown[i] = 0;
+        r->state = grown;
+        r->nstate = n;
+    }
+    bool differ = !r->hasState;
+    for (usize i = 0; i < n; i++)
+    {
+        if (ns[i] != r->state[i])
+        {
+            differ = true;
+            r->state[i] = ns[i];
+        }
+    }
+    free((rawptr)cand);
+    free((rawptr)no);
+    free((rawptr)nl);
+    free((rawptr)ns);
+    r->hasState = true;
+    *dirty = differ;
+    return true;
+}
+
+// write the displacement of every emitted short/near branch now that
+// symbol values are final. A miss here means the fixpoint math disagreed
+// with the layout — fail loudly rather than emit a wrong displacement.
+// Near patches targeting a defined same-section symbol also drop their
+// PC32 reloc: GAS resolves local branch displacements at assembly time.
+bool relaxApply(AsmObject* obj, X86Relax* r, AsmParseError* err)
+{
+    for (usize k = 0; k < r->npatches; k++)
+    {
+        X86RelaxPatch* p = &r->patches[k];
+        i32 si = asmFindSym(obj, p->sym);
+        if (si < 0) continue;
+        AsmSymbol* sym = &obj->syms[si];
+        if (!sym->defined || sym->section != p->sec || sym->isView) continue;
+        AsmBytes* d = asmSecData(obj, p->sec);
+        if (d == null) continue;
+        if (p->nlen == 0)
+        {
+            i64 disp = (i64)sym->value + p->addend - (i64)p->off - 2;
+            if (disp < -128 || disp > 127)
+            {
+                err->msg = "relaxed branch target out of range";
+                return false;
+            }
+            if ((u64)p->off + 1 >= (u64)d->len) continue;
+            d->data[(usize)(p->off + 1)] = (u8)(i8)disp;
+        }
+        else
+        {
+            i64 disp = (i64)sym->value + p->addend - (i64)p->off - (i64)p->nlen;
+            u64 fp = p->off + (u64)p->doff;
+            if (fp + 4 > (u64)d->len) continue;
+            d->data[(usize)fp] = (u8)(disp & 0xFF);
+            d->data[(usize)fp + 1] = (u8)((disp >> 8) & 0xFF);
+            d->data[(usize)fp + 2] = (u8)((disp >> 16) & 0xFF);
+            d->data[(usize)fp + 3] = (u8)((disp >> 24) & 0xFF);
+            // drop the PC32 reloc emitSymRel recorded at the disp field
+            for (u32 ri = 0; ri < obj->nrelocs; ri++)
+            {
+                AsmReloc* rr = &obj->relocs[ri];
+                if (rr->offset == fp && rr->section == p->sec && rr->symbol.equals(p->sym))
+                {
+                    obj->relocs[ri] = obj->relocs[obj->nrelocs - 1];
+                    obj->nrelocs--;
+                    break;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+void relaxFree(X86Relax* r)
+{
+    if (r->sites != null) free((rawptr)r->sites);
+    if (r->patches != null) free((rawptr)r->patches);
+    if (r->state != null) free((rawptr)r->state);
+    r->sites = null;
+    r->patches = null;
+    r->state = null;
+}
+
+bool assemblePassOnce(str text, AsmObject* obj, AsmParseError* err, X86Relax* relax)
 {
     u32 lineNo = 0;
     usize i = 0;
@@ -2948,6 +3177,7 @@ bool assemblePassOnce(str text, AsmObject* obj, AsmParseError* err)
         AsmBytes* dst = asmSectionData(obj, sec);
         EncodeCtx ctx = ctxNew(&tmp, obj, sec);
         ctx.base = (u64)dst->len;
+        ctx.relax = relax;
         if (!matchAndEncode(&line, &ctx, err))
         {
             tmp.deinit();
@@ -3046,12 +3276,18 @@ pub bool assembleText(str text, AsmObject* obj, AsmParseError* err)
 {
     AsmLebCtx* ctx = asmLebCtxNew();
     if (ctx == null) { err->msg = "out of memory"; return false; }
+    X86Relax relax = X86Relax { .sites = null, .nsites = 0, .capsites = 0,
+        .patches = null, .npatches = 0, .cappatches = 0,
+        .state = null, .nstate = 0, .next = 0, .hasState = false, .oom = false };
     bool ok = false;
     for (u32 pass = 0; pass < 20; pass++)
     {
         AsmObject tmp = asmObjectNew();
         tmp.lebctx = ctx;
-        if (!assemblePassOnce(text, &tmp, err))
+        relax.nsites = 0;
+        relax.npatches = 0;
+        relax.next = 0;
+        if (!assemblePassOnce(text, &tmp, err, &relax))
         {
             asmObjectDeinit(&tmp);
             break;
@@ -3062,16 +3298,30 @@ pub bool assembleText(str text, AsmObject* obj, AsmParseError* err)
             asmObjectDeinit(&tmp);
             break;
         }
+        bool rdirty = false;
+        if (!relaxCompute(&tmp, &relax, &rdirty))
+        {
+            if (err->msg.isEmpty()) err->msg = "out of memory";
+            asmObjectDeinit(&tmp);
+            break;
+        }
+        dirty = dirty || rdirty;
         ctx->npend = 0;
         if (!dirty)
         {
+            if (!relaxApply(&tmp, &relax, err))
+            {
+                asmObjectDeinit(&tmp);
+                break;
+            }
             *obj = tmp;
             ok = true;
             break;
         }
         asmObjectDeinit(&tmp);
     }
+    relaxFree(&relax);
     asmLebCtxDeinit(ctx);
-    if (!ok && err->msg.isEmpty()) err->msg = "leb128 fixpoint did not converge";
+    if (!ok && err->msg.isEmpty()) err->msg = "fixpoint did not converge";
     return ok;
 }
