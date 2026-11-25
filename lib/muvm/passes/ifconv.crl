@@ -1,0 +1,277 @@
+#[[no_drop_all]]
+// If-conversion for muvm — folds cheap two-arm diamonds into selects.
+//
+// LLVM's SimplifyCFG does this as FoldTwoEntryPHINode plus
+// speculation: when a block T ends in `cond_br %c, A, B`, both arms
+// rejoin at J, and everything the arms compute is speculatable, the
+// arms can execute unconditionally on the T path and the phi merge
+// becomes a select.
+//
+// Pattern required (all checked):
+//   T: ... cond_br %c, A, B          (last inst, A = true arm)
+//   A: <speculatable insts> br J     (single pred T, single succ J)
+//   B: <speculatable insts> br J     (single pred T, single succ J)
+//   J: phi [%va, A], [%vb, B], ...   (preds exactly {A, B})
+//
+// Transform:
+//   1. move every non-terminator inst of A then B into T, before the
+//      terminator (speculatability makes executing both sides on
+//      either path safe; operand dominance is preserved because A and
+//      B each had T as their only pred)
+//   2. for each phi in J emit `select %c, v-from-A, v-from-B` in T
+//   3. T's cond_br becomes `br J`; phi uses move to the selects
+//   4. A and B are removed
+//
+// Loads/stores/calls/div/rem are NOT speculated in v1 — LLVM speculates
+// dereferenceable loads too, but that needs alias info; revisit later.
+
+import muvm::passes::common { gVerbose };
+import muvm::irOps { IrOpcode };
+import muvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrType, IrTypeKind };
+import std::mman { alloc, dealloc };
+
+pub struct IfConvPass
+{
+    IrContext* ctx;
+
+    IfConvPass new(IrContext* ctx)
+    {
+        return IfConvPass {
+            .ctx = ctx
+        };
+    }
+
+    // Pure, non-trapping ops only. Div/rem families trap on zero;
+    // memory ops, calls, atomics, fences, EH and GC ops all excluded.
+    // FP div/rem are fine — IEEE gives inf/NaN, no trap.
+    bool isSpeculatable(IrInst* inst)
+    {
+        switch (inst->opcode)
+        {
+            IrOpcode::Neg | IrOpcode::Not |
+            IrOpcode::Add | IrOpcode::Sub | IrOpcode::Mul |
+            IrOpcode::MulHi | IrOpcode::SMulHi |
+            IrOpcode::And | IrOpcode::Or | IrOpcode::Xor |
+            IrOpcode::Shl | IrOpcode::Ashr | IrOpcode::Lshr |
+            IrOpcode::Rotl | IrOpcode::Rotr |
+            IrOpcode::Gep |
+            IrOpcode::Trunc | IrOpcode::Zext | IrOpcode::Sext |
+            IrOpcode::FpTrunc | IrOpcode::FpExt |
+            IrOpcode::FpToSi | IrOpcode::SiToFp |
+            IrOpcode::FpToUi | IrOpcode::UiToFp |
+            IrOpcode::Bitcast |
+            IrOpcode::ICmp | IrOpcode::FCmp |
+            IrOpcode::CtPop | IrOpcode::CtLz | IrOpcode::CtTz |
+            IrOpcode::Bswap |
+            IrOpcode::SMin | IrOpcode::SMax | IrOpcode::UMin | IrOpcode::UMax |
+            IrOpcode::Abs |
+            IrOpcode::FAdd | IrOpcode::FSub | IrOpcode::FMul |
+            IrOpcode::FDiv | IrOpcode::Fma | IrOpcode::FAbs | IrOpcode::FSqrt |
+            IrOpcode::VecAdd | IrOpcode::VecSub | IrOpcode::VecMul |
+            IrOpcode::VecDiv | IrOpcode::VecFAdd | IrOpcode::VecFSub |
+            IrOpcode::VecFMul | IrOpcode::VecFDiv |
+            IrOpcode::VecMin | IrOpcode::VecMax |
+            IrOpcode::VecBroadcast | IrOpcode::ShuffleVector |
+            IrOpcode::ExtractElement | IrOpcode::InsertElement |
+            IrOpcode::ExtractValue | IrOpcode::InsertValue |
+            IrOpcode::Select => { return true; },
+            else => { return false; }
+        }
+    }
+
+    // Every inst in bb except the terminator must be movable: no phis
+    // (single-pred blocks shouldn't have them anyway) and speculatable.
+    bool armMovable(IrBlock* bb)
+    {
+        if (bb == null) return false;
+        for (u32 i = 0; i + 1 < bb->ninsts; i++)
+        {
+            IrInst* inst = bb->insts[i];
+            if (inst == null) continue;
+            if (inst->opcode == IrOpcode::Phi) return false;
+            if (!self.isSpeculatable(inst)) return false;
+        }
+        return true;
+    }
+
+    // J's phis must each carry exactly the {A, B} incoming pair.
+    bool joinPhisMatch(IrBlock* join, IrBlock* a, IrBlock* b)
+    {
+        bool sawPhi = false;
+        for (u32 i = 0; i < join->ninsts; i++)
+        {
+            IrInst* inst = join->insts[i];
+            if (inst == null || inst->opcode != IrOpcode::Phi) break;
+            sawPhi = true;
+            if (inst->nops != 4) return false;
+            IrType* pt = inst->base.type;
+            if (pt == null) return false;
+            switch (pt->kind)
+            {
+                IrTypeKind::Int | IrTypeKind::Float | IrTypeKind::Ptr |
+                IrTypeKind::Vector => { },
+                else => { return false; }
+            }
+            IrBlock* b0 = (IrBlock*)inst->ops[1];
+            IrBlock* b1 = (IrBlock*)inst->ops[3];
+            if (!((b0 == a && b1 == b) || (b0 == b && b1 == a))) return false;
+        }
+        return sawPhi;
+    }
+
+    IrValue* phiValFrom(IrInst* phi, IrBlock* blk)
+    {
+        for (u32 i = 0; i + 1 < phi->nops; i += 2)
+            if ((IrBlock*)phi->ops[i + 1] == blk) return phi->ops[i];
+        return null;
+    }
+
+    // Try to fold the diamond headed by T's terminator. Returns true on
+    // conversion. Caller rescans from scratch after a change.
+    bool tryBlock(IrFunc* func, IrBlock* t)
+    {
+        if (t == null || t->ninsts == 0) return false;
+        IrInst* term = t->insts[t->ninsts - 1];
+        if (term == null || term->opcode != IrOpcode::CondBr) return false;
+        if (term->nops < 3) return false;
+        IrValue* cond = term->ops[0];
+        IrBlock* a = (IrBlock*)term->ops[1];
+        IrBlock* b = (IrBlock*)term->ops[2];
+        if (a == null || b == null || a == b || a == t || b == t) return false;
+
+        // Arms: single pred (T), single succ, terminator is plain br.
+        if (a->npreds != 1 || a->preds[0] != t) return false;
+        if (b->npreds != 1 || b->preds[0] != t) return false;
+        if (a->nsuccs != 1 || b->nsuccs != 1) return false;
+        if (a->ninsts == 0 || b->ninsts == 0) return false;
+        IrInst* ta = a->insts[a->ninsts - 1];
+        IrInst* tb = b->insts[b->ninsts - 1];
+        if (ta == null || ta->opcode != IrOpcode::Br || ta->nops < 1) return false;
+        if (tb == null || tb->opcode != IrOpcode::Br || tb->nops < 1) return false;
+        IrBlock* join = (IrBlock*)ta->ops[0];
+        if (join == null || join != (IrBlock*)tb->ops[0]) return false;
+        if (join == t || join == a || join == b) return false;
+
+        // Join: exactly the two arm preds, and every phi is the A/B pair.
+        if (join->npreds != 2) return false;
+        bool pa = false;
+        bool pb = false;
+        for (u32 i = 0; i < join->npreds; i++)
+        {
+            if (join->preds[i] == a) pa = true;
+            else if (join->preds[i] == b) pb = true;
+            else return false;
+        }
+        if (!pa || !pb) return false;
+        if (!self.joinPhisMatch(join, a, b)) return false;
+        for (u32 i = 0; i < join->ninsts; i++)
+        {
+            IrInst* phi = join->insts[i];
+            if (phi == null || phi->opcode != IrOpcode::Phi) break;
+            if (self.phiValFrom(phi, a) == null || self.phiValFrom(phi, b) == null)
+                return false;
+        }
+
+        // Arms must be pure speculation candidates.
+        if (!self.armMovable(a) || !self.armMovable(b)) return false;
+
+        // 1. Move arm insts into T before the terminator.
+        for (u32 arm = 0; arm < 2; arm++)
+        {
+            IrBlock* src = arm == 0 ? a : b;
+            while (src->ninsts > 1)
+            {
+                IrInst* mv = src->insts[0];
+                mv->detach();
+                t->insertBefore(mv, term);
+            }
+        }
+
+        // 2. One select per join phi; phi uses move to the select.
+        u32 ji = 0;
+        while (ji < join->ninsts)
+        {
+            IrInst* phi = join->insts[ji];
+            if (phi == null || phi->opcode != IrOpcode::Phi) break;
+            IrValue* va = self.phiValFrom(phi, a);
+            IrValue* vb = self.phiValFrom(phi, b);
+            IrValue** ops = alloc<IrValue*>((usize)3);
+            ops[0] = cond;
+            ops[1] = va;
+            ops[2] = vb;
+            IrInst* sel = self.ctx->createInst(IrOpcode::Select, phi->base.type, ops, 3, 0, 0);
+            dealloc<IrValue*>(ops);
+            t->insertBefore(sel, term);
+            phi->base.replaceAllUses(&sel->base);
+            phi->erase();
+            // erase() shifts join->insts — insts[ji] is now the next phi
+        }
+
+        // 3. T: cond_br -> br join. Fix succ/pred lists by hand —
+        //    removeSucc does not maintain the reverse edge.
+        IrValue** bops = alloc<IrValue*>((usize)1);
+        bops[0] = &join->base;
+        IrInst* br = self.ctx->createInst(IrOpcode::Br, self.ctx->tyVoid(), bops, 1, 0, 0);
+        dealloc<IrValue*>(bops);
+        term->detach();
+        term->erase();
+        t->addInst(br);
+        for (u32 arm = 0; arm < 2; arm++)
+        {
+            IrBlock* src = arm == 0 ? a : b;
+            t->removeSucc(src);
+            src->removePred(t);
+            src->removeSucc(join);
+            join->removePred(src);
+        }
+        t->addSucc(join);
+
+        // 4. Drop the now-empty arm blocks.
+        for (u32 u = 0; u < func->nblocks; u++)
+        {
+            if (func->blocks[u] == a)
+            {
+                for (u32 j = 0; j < a->ninsts; j++)
+                    if (a->insts[j] != null) a->insts[j]->erase();
+                func->removeBlock(a);
+                break;
+            }
+        }
+        for (u32 u = 0; u < func->nblocks; u++)
+        {
+            if (func->blocks[u] == b)
+            {
+                for (u32 j = 0; j < b->ninsts; j++)
+                    if (b->insts[j] != null) b->insts[j]->erase();
+                func->removeBlock(b);
+                break;
+            }
+        }
+        return true;
+    }
+
+    bool run(IrFunc* func)
+    {
+        if (func == null) return false;
+        bool changed = false;
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            if (bb == null) continue;
+            if (self.tryBlock(func, bb))
+            {
+                changed = true;
+                bi = 0;   // block array shifted — restart
+            }
+        }
+        return changed;
+    }
+}
+
+pub bool muvmPassIfConv(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (func == null || ctx == null) return false;
+    IfConvPass pass = IfConvPass::new(ctx);
+    return pass.run(func);
+}
