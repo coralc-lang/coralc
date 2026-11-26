@@ -70,7 +70,10 @@ pub struct AliasAnalysis
             .numObjects = 0,
             .capObjects = 0,
             .valToObject = null,
-            .valToObjectCap = 0
+            .valToObjectCap = 0,
+            .valSetBits = null,
+            .valSetState = null,
+            .valSetCap = 0
         };
     }
 
@@ -78,6 +81,8 @@ pub struct AliasAnalysis
     {
         if (self.objects != null) dealloc<MemoryObject>(self.objects);
         if (self.valToObject != null) dealloc<u32>(self.valToObject);
+        if (self.valSetBits != null) dealloc<u64>(self.valSetBits);
+        if (self.valSetState != null) dealloc<u8>(self.valSetState);
     }
 
     void ensureObjects(u32 needed)
@@ -241,6 +246,10 @@ pub struct AliasAnalysis
         // would otherwise leak into this run.
         for (u32 i = 0; i < self.valToObjectCap; i++)
             self.valToObject[i] = OBJECT_UNKNOWN;
+        // Points-to sets are per-analyze too: stale entries would answer
+        // queries about values that no longer exist or moved objects.
+        for (u32 i = 0; i < self.valSetCap; i++)
+            self.valSetState[i] = 0;
 
         // Pass 1 — Create objects for all allocas
         for (u32 bi = 0; bi < func->nblocks; bi++)
@@ -459,6 +468,116 @@ pub struct AliasAnalysis
         return obj;
     }
 
+    // --- points-to sets -------------------------------------------------
+    // walkAddr answers a single object id and gives up (UNKNOWN) when a
+    // phi's arms disagree. Sets keep every candidate: a phi unions its
+    // arms' sets, unknown producers fill all bits (may-alias anything).
+    // 256 objects = 4 u64 words per value, allocated lazily per value id.
+
+    u64* valSetBits;    // valId*4 words — object bitsets
+    u8* valSetState;    // 0 = uncomputed, 1 = in-progress, 2 = done
+    u32 valSetCap;
+
+    void ensureValSets(u32 needed)
+    {
+        if (needed <= self.valSetCap) return;
+        u32 newCap = self.valSetCap ? self.valSetCap * 2 : 256;
+        while (newCap <= needed) newCap *= 2;
+        u64* nb = alloc<u64>((usize)newCap * 4);
+        u8* ns = alloc<u8>((usize)newCap);
+        if (self.valSetBits != null)
+        {
+            for (usize i = 0; i < (usize)self.valSetCap * 4; i++)
+                nb[i] = self.valSetBits[i];
+            dealloc<u64>(self.valSetBits);
+        }
+        if (self.valSetState != null)
+        {
+            for (u32 i = 0; i < self.valSetCap; i++)
+                ns[i] = self.valSetState[i];
+            dealloc<u8>(self.valSetState);
+        }
+        for (u64 i = (u64)self.valSetCap * 4; i < (u64)newCap * 4; i++)
+            nb[i] = 0;
+        for (u32 i = self.valSetCap; i < newCap; i++)
+            ns[i] = 0;
+        self.valSetBits = nb;
+        self.valSetState = ns;
+        self.valSetCap = newCap;
+    }
+
+    void setAllBits(u64* bits)
+    {
+        for (u32 i = 0; i < 4; i++) bits[i] = ~((u64)0);
+    }
+
+    void setBit(u64* bits, u32 objId)
+    {
+        if (objId == 0 || objId > OBJECT_MAX) { self.setAllBits(bits); return; }
+        bits[(usize)((objId - 1) >> 6)] |= ((u64)1 << (u64)((objId - 1) & 63));
+    }
+
+    bool setsDisjoint(const u64* a, const u64* b)
+    {
+        for (u32 i = 0; i < 4; i++)
+            if ((a[i] & b[i]) != 0) return false;
+        return true;
+    }
+
+    // Fill `bits` with v's points-to set. Recursive over gep/bitcast/
+    // phi; OBJECT_INPROGRESS-style cut on cycles (state==1 → empty,
+    // the cycle contributes nothing new beyond its other arms).
+    void collectSet(IrValue* v, u64* bits)
+    {
+        if (v == null) { self.setAllBits(bits); return; }
+        if (v->kind == IrValueKind::Inst)
+        {
+            IrInst* inst = (IrInst*)v;
+            if (inst->opcode == IrOpcode::Phi)
+            {
+                self.ensureValSets(v->id + 1);
+                if (self.valSetState[v->id] == 1)
+                {
+                    // phi cycle: this arm adds nothing
+                    for (u32 i = 0; i < 4; i++) bits[i] = 0;
+                    return;
+                }
+                if (self.valSetState[v->id] == 2)
+                {
+                    for (u32 i = 0; i < 4; i++) bits[i] = self.valSetBits[v->id * 4 + i];
+                    return;
+                }
+                self.valSetState[v->id] = 1;
+                for (u32 i = 0; i < 4; i++) bits[i] = 0;
+                for (u32 j = 0; j + 1 < inst->nops; j += 2)
+                {
+                    u64[4] tmp;
+                    self.collectSet(inst->ops[j], tmp);
+                    for (u32 i = 0; i < 4; i++) bits[i] |= tmp[i];
+                }
+                for (u32 i = 0; i < 4; i++)
+                    self.valSetBits[v->id * 4 + i] = bits[i];
+                self.valSetState[v->id] = 2;
+                return;
+            }
+            if ((inst->opcode == IrOpcode::Gep ||
+                 inst->opcode == IrOpcode::Bitcast) && inst->nops > 0)
+            {
+                self.collectSet(inst->ops[0], bits);
+                return;
+            }
+            // other insts (call results, loads): unknown producer
+            u32 o = self.walkAddr(v);
+            if (o == OBJECT_UNKNOWN) self.setAllBits(bits);
+            else { for (u32 i = 0; i < 4; i++) bits[i] = 0; self.setBit(bits, o); }
+            return;
+        }
+        // globals, args, consts: single object or unknown
+        u32 o = self.walkAddr(v);
+        if (o == OBJECT_UNKNOWN) self.setAllBits(bits);
+        else { for (u32 i = 0; i < 4; i++) bits[i] = 0; self.setBit(bits, o); }
+    }
+
     // Query — do two values definitely not alias?
     bool isNoAlias(IrValue* a, IrValue* b)
     {
@@ -471,7 +590,13 @@ pub struct AliasAnalysis
         if (objA != OBJECT_UNKNOWN && objB != OBJECT_UNKNOWN && objA != objB)
             return true;
 
-        return false;
+        // points-to sets: disjoint candidate objects prove no-alias even
+        // when either side is a phi over several objects
+        u64[4] sa;
+        u64[4] sb;
+        self.collectSet(a, sa);
+        self.collectSet(b, sb);
+        return self.setsDisjoint(sa, sb);
     }
 
     // Query — do two values definitely alias?
@@ -503,7 +628,16 @@ pub struct AliasAnalysis
         u32 li = self.decomposeAddr(loadAddr, &lo);
         u32 si = self.decomposeAddr(storeAddr, &so);
         if (li == OBJECT_UNKNOWN || si == OBJECT_UNKNOWN) return true;
-        if (li != si) return false;
+        if (li != si)
+        {
+            // different resolved objects can't clobber — but a phi may
+            // still carry the other side's object in its set
+            u64[4] sl;
+            u64[4] ss;
+            self.collectSet(loadAddr, sl);
+            self.collectSet(storeAddr, ss);
+            return !self.setsDisjoint(sl, ss);
+        }
         if (lo == OFFSET_UNKNOWN || so == OFFSET_UNKNOWN) return true;
         if (loadSize == 0 || storeSize == 0) return true;
         // [off, off+size) overlap test
@@ -518,9 +652,23 @@ pub struct AliasAnalysis
         u32 loadObj = self.walkAddr(loadAddr);
         u32 storeObj = self.walkAddr(storeAddr);
 
-        if (loadObj == OBJECT_UNKNOWN || storeObj == OBJECT_UNKNOWN) return true;
+        if (loadObj == OBJECT_UNKNOWN || storeObj == OBJECT_UNKNOWN)
+        {
+            // unknown single-object answers may still be provable via
+            // points-to sets (phi over a fixed object set)
+            u64[4] sl;
+            u64[4] ss;
+            self.collectSet(loadAddr, sl);
+            self.collectSet(storeAddr, ss);
+            return !self.setsDisjoint(sl, ss);
+        }
         if (loadObj == storeObj) return true;
-        return false;
+        // different objects: phi sets could still overlap
+        u64[4] sl;
+        u64[4] ss;
+        self.collectSet(loadAddr, sl);
+        self.collectSet(storeAddr, ss);
+        return !self.setsDisjoint(sl, ss);
     }
 
     // Query — does a store to 'storeAddr' kill a prior load from 'loadAddr'?
