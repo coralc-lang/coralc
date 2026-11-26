@@ -28,6 +28,37 @@ import muvm::passes::common { gVerbose };
 import std::mman { alloc, dealloc };
 import std::ios { eprintln };
 
+// Classify a Call's memory effects. Returns a bitmask:
+//   bit0 = may read, bit1 = may write, bit2 = fixpoint edge to *calleeOut
+// (an unannotated, non-extern, in-module callee whose effects the
+// fixpoint must propagate). Declared attrs fold to local bits; foreign
+// or indirect callees stay fully conservative.
+u32 classifyCall(IrInst* inst, IrModule* m, IrFunc** calleeOut)
+{
+    *calleeOut = null;
+    IrValue* cv = inst->nops > 0 ? inst->ops[0] : null;
+    if (cv == null || cv->kind != IrValueKind::Func)
+        return 3; // indirect — unknown callee does everything
+    IrFunc* callee = (IrFunc*)cv;
+    bool rn = funcIsReadNone(callee);
+    bool ro = funcIsReadOnly(callee);
+    bool wo = funcIsWriteOnly(callee);
+    if (rn || ro || wo)
+    {
+        // declared attr is the contract — fold its effects locally
+        u32 mask = 0;
+        if (!wo) mask |= 1;
+        if (!rn && !ro) mask |= 2;
+        return mask;
+    }
+    if (callee->parent == m && !callee->isExtern)
+    {
+        *calleeOut = callee;
+        return 4;
+    }
+    return 3; // foreign/extern without attr — unknown
+}
+
 pub bool muvmPassInferMemAttrs(IrFunc* func, rawptr userdata)
 {
     IrModule* m = func->parent;
@@ -41,15 +72,17 @@ pub bool muvmPassInferMemAttrs(IrFunc* func, rawptr userdata)
     bool* fixed = alloc<bool>((usize)n);   // declared attr → effects frozen
     bool* effRead = alloc<bool>((usize)n);
     bool* effWrite = alloc<bool>((usize)n);
-    // callee edges: for each func, list of callee indices needing the
-    // fixpoint (unannotated, analyzable, in-module, non-extern)
-    u32* callees = alloc<u32>((usize)n * 16);
+    // callee edges as a flat (start,count) range per func — sized exactly
+    // so no call is ever dropped (a capped table made inference
+    // order-dependent: run 2 sees run 1's printed attrs and diverges)
+    u32* edgeStart = alloc<u32>((usize)n + 1);
     u32* nCallees = alloc<u32>((usize)n);
     for (u32 i = 0; i < n; i++)
     {
         localRead[i] = false;
         localWrite[i] = false;
         nCallees[i] = 0;
+        edgeStart[i] = 0;
         IrFunc* f = m->funcs[i];
         bool hasMemAttr = f != null &&
             (funcIsReadNone(f) || funcIsReadOnly(f) || funcIsWriteOnly(f));
@@ -64,8 +97,10 @@ pub bool muvmPassInferMemAttrs(IrFunc* func, rawptr userdata)
             effWrite[i] = !funcIsReadNone(f) && !funcIsReadOnly(f);
         }
     }
+    edgeStart[n] = 0;
 
-    // Pass 1 — local effects + callee edges
+    // Scan A — local effects + edge counts. classifyCall is pure, so a
+    // second scan below can refill the same edges into exact storage.
     for (u32 fi = 0; fi < n; fi++)
     {
         IrFunc* f = m->funcs[fi];
@@ -88,57 +123,11 @@ pub bool muvmPassInferMemAttrs(IrFunc* func, rawptr userdata)
                     { localRead[fi] = true; localWrite[fi] = true; },
                     IrOpcode::Call =>
                     {
-                        IrValue* cv = inst->nops > 0 ? inst->ops[0] : null;
-                        if (cv != null && cv->kind == IrValueKind::Func)
-                        {
-                            IrFunc* callee = (IrFunc*)cv;
-                            bool calleeHasAttr = funcIsReadNone(callee) ||
-                                funcIsReadOnly(callee) || funcIsWriteOnly(callee);
-                            if (calleeHasAttr)
-                            {
-                                // declared attr is the contract — fold its
-                                // effects into this function's locals
-                                if (!funcIsWriteOnly(callee)) localRead[fi] = true;
-                                if (!funcIsReadNone(callee) && !funcIsReadOnly(callee))
-                                    localWrite[fi] = true;
-                            }
-                            else if (callee->parent == m && !callee->isExtern)
-                            {
-                                // unannotated in-module callee: fixpoint edge
-                                if (nCallees[fi] < 16)
-                                {
-                                    for (u32 ci = 0; ci < n; ci++)
-                                    {
-                                        if (m->funcs[ci] == callee)
-                                        {
-                                            callees[fi * 16 + nCallees[fi]] = ci;
-                                            nCallees[fi]++;
-                                            break;
-                                        }
-                                    }
-                                }
-                                else
-                                {
-                                    // edge table full — can't prove, stay
-                                    // conservative rather than drop the call
-                                    localRead[fi] = true;
-                                    localWrite[fi] = true;
-                                }
-                            }
-                            else
-                            {
-                                // foreign module or extern without attr:
-                                // unknown callee does everything
-                                localRead[fi] = true;
-                                localWrite[fi] = true;
-                            }
-                        }
-                        else
-                        {
-                            // indirect call — unknown callee
-                            localRead[fi] = true;
-                            localWrite[fi] = true;
-                        }
+                        IrFunc* callee = null;
+                        u32 cm = classifyCall(inst, m, &callee);
+                        if ((cm & 1) != 0) localRead[fi] = true;
+                        if ((cm & 2) != 0) localWrite[fi] = true;
+                        if ((cm & 4) != 0) nCallees[fi]++;
                     },
                     IrOpcode::Fence | IrOpcode::InlineAsm |
                     IrOpcode::GcWriteBarrier | IrOpcode::GcSafepoint |
@@ -149,6 +138,47 @@ pub bool muvmPassInferMemAttrs(IrFunc* func, rawptr userdata)
             }
         }
     }
+
+    // Prefix-sum edge ranges, then scan B fills callee indices.
+    u32 totalEdges = 0;
+    for (u32 fi = 0; fi < n; fi++)
+    {
+        edgeStart[fi] = totalEdges;
+        totalEdges += nCallees[fi];
+    }
+    edgeStart[n] = totalEdges;
+    u32* callees = alloc<u32>((usize)(totalEdges == 0 ? 1 : totalEdges));
+    u32* fill = alloc<u32>((usize)n);
+    for (u32 fi = 0; fi < n; fi++) fill[fi] = 0;
+    for (u32 fi = 0; fi < n; fi++)
+    {
+        IrFunc* f = m->funcs[fi];
+        if (f == null || f->isExtern || nCallees[fi] == 0) continue;
+        for (u32 bi = 0; bi < f->nblocks; bi++)
+        {
+            IrBlock* bb = f->blocks[bi];
+            if (bb == null) continue;
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst == null || inst->opcode != IrOpcode::Call) continue;
+                IrFunc* callee = null;
+                u32 cm = classifyCall(inst, m, &callee);
+                if ((cm & 4) == 0 || callee == null) continue;
+                // resolve callee to its module index
+                for (u32 ci = 0; ci < n; ci++)
+                {
+                    if (m->funcs[ci] == callee)
+                    {
+                        callees[edgeStart[fi] + fill[fi]] = ci;
+                        fill[fi]++;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    dealloc<u32>(fill);
 
     // Pass 2 — fixpoint. Effects only shrink from the pessimistic top.
     bool changed = true;
@@ -162,9 +192,9 @@ pub bool muvmPassInferMemAttrs(IrFunc* func, rawptr userdata)
             if (fixed[fi]) continue;
             bool r = localRead[fi];
             bool w = localWrite[fi];
-            for (u32 cj = 0; cj < nCallees[fi]; cj++)
+            for (u32 ei = edgeStart[fi]; ei < edgeStart[fi + 1]; ei++)
             {
-                u32 ci = callees[fi * 16 + cj];
+                u32 ci = callees[ei];
                 if (effRead[ci]) r = true;
                 if (effWrite[ci]) w = true;
             }
@@ -198,5 +228,6 @@ pub bool muvmPassInferMemAttrs(IrFunc* func, rawptr userdata)
     dealloc<bool>(effWrite);
     dealloc<u32>(callees);
     dealloc<u32>(nCallees);
+    dealloc<u32>(edgeStart);
     return false;
 }
