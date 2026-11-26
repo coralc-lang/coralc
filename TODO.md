@@ -159,5 +159,5 @@ Pending (in order):
 - [ ] Printer: further stylization if wanted
 - [x] loop_cse invariant-load "gap" — VERIFIED CORRECT: isSafeToSpeculate requires alloca/global-rooted addrs; arg-derived phi ptr can't be proven non-faulting on zero-trip (LLVM identical). Unblocks only with dereferenceable param attr (below)
 - [ ] loop idiom: inner counted loop `sum += a[iv]` per outer iter → mul strength reduction (indvars territory)
-- [ ] noalias/dereferenceable param attributes (IR syntax + parser + AA)
+- [~] noalias/dereferenceable param attributes — noalias func attr DONE (56940f7: arg-arg NoAlias in isNoAlias); dereferenceable still needs per-param attr scheme (IR syntax decision)
 - [ ] printer further stylization if wanted
