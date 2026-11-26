@@ -19,10 +19,11 @@
 // Runs once per module — guarded on func == module->funcs[0] since the
 // pass driver invokes every pipeline entry once per function.
 
-import muvm::irtypes { IrContext, IrFunc, IrModule, IrBlock, IrInst, IrValue, IrValueKind };
+import muvm::irtypes { IrContext, IrFunc, IrModule, IrBlock, IrInst, IrValue, IrValueKind, IrTypeKind };
 import muvm::irOps { IrOpcode };
 import muvm::irMetadata {
     hasFuncAttr, funcIsReadOnly, funcIsReadNone, funcIsWriteOnly,
+    funcIsArgMemOnly, setFuncArgMemOnly,
     setFuncReadOnly, setFuncReadNone, setFuncWriteOnly };
 import muvm::passes::common { gVerbose };
 import std::mman { alloc, dealloc };
@@ -57,6 +58,38 @@ u32 classifyCall(IrInst* inst, IrModule* m, IrFunc** calleeOut)
         return 4;
     }
     return 3; // foreign/extern without attr — unknown
+}
+
+// argmemonly support: an address "derives OK" for function f when its
+// def chain bottoms out at a pointer-typed argument or an alloca owned
+// by f — the only sources a callee's memory effects can legitimately
+// reach. Globals, call results, loads and anything else fail.
+// Depth-capped: phi cycles just fail conservative.
+bool addrDerivesOK(IrValue* addr, IrFunc* f, u32 depth)
+{
+    if (addr == null || depth > 32) return false;
+    if (addr->kind == IrValueKind::Arg)
+        return addr->type != null && addr->type->kind == IrTypeKind::Ptr;
+    if (addr->kind != IrValueKind::Inst) return false;
+    IrInst* inst = (IrInst*)addr;
+    if (inst->opcode == IrOpcode::Alloca)
+        return inst->parent != null && inst->parent->parent == f;
+    if (inst->opcode == IrOpcode::Gep || inst->opcode == IrOpcode::Bitcast)
+    {
+        if (inst->nops < 1 || inst->ops[0] == null) return false;
+        return addrDerivesOK(inst->ops[0], f, depth + 1);
+    }
+    if (inst->opcode == IrOpcode::Phi)
+    {
+        for (u32 j = 0; j + 1 < inst->nops; j += 2)
+        {
+            IrValue* inc = inst->ops[j];
+            if (inc == null || inc == &inst->base) continue;
+            if (!addrDerivesOK(inc, f, depth + 1)) return false;
+        }
+        return true;
+    }
+    return false;
 }
 
 pub bool muvmPassInferMemAttrs(IrFunc* func, rawptr userdata)
@@ -207,8 +240,121 @@ pub bool muvmPassInferMemAttrs(IrFunc* func, rawptr userdata)
         }
     }
 
-    // Pass 3 — attach the strongest proven attribute to functions that
-    // declared none. Externs have no body to prove anything about.
+    // Pass 3 — argmemonly lattice. A function is argmemonly when every
+    // memory access it performs reaches memory through its own pointer
+    // args or its own allocas, and every call it makes either touches
+    // nothing (readnone) or is itself argmemonly. Same top-down shrink
+    // fixpoint as the read/write lattice; edges reuse the callee table.
+    bool* argmem = alloc<bool>((usize)n);
+    bool* argmemLocal = alloc<bool>((usize)n);
+    for (u32 fi = 0; fi < n; fi++)
+    {
+        argmem[fi] = true;
+        argmemLocal[fi] = true;
+        IrFunc* f = m->funcs[fi];
+        if (f == null || f->isExtern) { argmemLocal[fi] = false; continue; }
+        for (u32 bi = 0; bi < f->nblocks && argmemLocal[fi]; bi++)
+        {
+            IrBlock* bb = f->blocks[bi];
+            if (bb == null) continue;
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst == null) continue;
+                switch (inst->opcode)
+                {
+                    IrOpcode::Load | IrOpcode::AtomicLoad |
+                    IrOpcode::AtomicStore =>
+                    {
+                        if (inst->nops < 1 || inst->ops[0] == null ||
+                            !addrDerivesOK(inst->ops[0], f, 0))
+                            argmemLocal[fi] = false;
+                    },
+                    IrOpcode::Store =>
+                    {
+                        if (inst->nops < 2 || inst->ops[1] == null ||
+                            !addrDerivesOK(inst->ops[1], f, 0))
+                            argmemLocal[fi] = false;
+                    },
+                    IrOpcode::AtomicRmw | IrOpcode::AtomicCmpXchg =>
+                    {
+                        if (inst->nops < 1 || inst->ops[0] == null ||
+                            !addrDerivesOK(inst->ops[0], f, 0))
+                            argmemLocal[fi] = false;
+                    },
+                    IrOpcode::Call =>
+                    {
+                        // pointer args must themselves derive OK, and the
+                        // callee must be argmemonly/readnone — resolved
+                        // via attr now or via the fixpoint edge below
+                        IrFunc* callee = null;
+                        u32 cm = classifyCall(inst, m, &callee);
+                        for (u32 ai = 1; ai < inst->nops; ai++)
+                        {
+                            IrValue* av = inst->ops[ai];
+                            if (av != null && av->type != null &&
+                                av->type->kind == IrTypeKind::Ptr &&
+                                !addrDerivesOK(av, f, 0))
+                                argmemLocal[fi] = false;
+                        }
+                        if ((cm & 4) != 0)
+                        {
+                            // edge callee: argmem propagates through the
+                            // fixpoint — nothing to do locally
+                        }
+                        else if (callee != null)
+                        {
+                            if (!(funcIsReadNone(callee) || funcIsArgMemOnly(callee)))
+                                argmemLocal[fi] = false;
+                        }
+                        else
+                        {
+                            // indirect/foreign callee: can't prove
+                            argmemLocal[fi] = false;
+                        }
+                    },
+                    else => {}
+                }
+                if (!argmemLocal[fi]) break;
+            }
+        }
+    }
+    // functions with a declared memory attr that isn't argmemonly/readnone
+    // can't grow the attr — freeze them false
+    for (u32 fi = 0; fi < n; fi++)
+    {
+        IrFunc* f = m->funcs[fi];
+        if (f == null || f->isExtern) continue;
+        if (funcIsReadNone(f)) { argmem[fi] = true; continue; } // touches nothing
+        if ((funcIsReadOnly(f) || funcIsWriteOnly(f)) && !funcIsArgMemOnly(f))
+        { argmemLocal[fi] = false; argmem[fi] = false; }
+        if (funcIsArgMemOnly(f)) { argmem[fi] = true; argmemLocal[fi] = true; }
+    }
+    changed = true;
+    rounds = 0;
+    while (changed && rounds <= n + 1)
+    {
+        changed = false;
+        rounds++;
+        for (u32 fi = 0; fi < n; fi++)
+        {
+            IrFunc* f = m->funcs[fi];
+            if (f == null || f->isExtern || funcIsArgMemOnly(f)) continue;
+            if (funcIsReadNone(f)) continue;
+            if (!argmemLocal[fi]) { if (argmem[fi]) { argmem[fi] = false; changed = true; } continue; }
+            bool am = true;
+            for (u32 ei = edgeStart[fi]; ei < edgeStart[fi + 1]; ei++)
+            {
+                u32 ci = callees[ei];
+                IrFunc* cf = m->funcs[ci];
+                if (cf != null && funcIsReadNone(cf)) continue;
+                if (!argmem[ci]) { am = false; break; }
+            }
+            if (am != argmem[fi]) { argmem[fi] = am; changed = true; }
+        }
+    }
+
+    // Pass 4 — attach attrs: read/write effects first, then argmemonly.
     for (u32 fi = 0; fi < n; fi++)
     {
         IrFunc* f = m->funcs[fi];
@@ -216,6 +362,8 @@ pub bool muvmPassInferMemAttrs(IrFunc* func, rawptr userdata)
         if (!effRead[fi] && !effWrite[fi]) setFuncReadNone(f);
         else if (!effWrite[fi]) setFuncReadOnly(f);
         else if (!effRead[fi]) setFuncWriteOnly(f);
+        if (argmem[fi] && !funcIsReadNone(f) && !funcIsArgMemOnly(f))
+            setFuncArgMemOnly(f);
     }
 
     if (gVerbose)
@@ -226,6 +374,8 @@ pub bool muvmPassInferMemAttrs(IrFunc* func, rawptr userdata)
     dealloc<bool>(fixed);
     dealloc<bool>(effRead);
     dealloc<bool>(effWrite);
+    dealloc<bool>(argmem);
+    dealloc<bool>(argmemLocal);
     dealloc<u32>(callees);
     dealloc<u32>(nCallees);
     dealloc<u32>(edgeStart);
