@@ -159,5 +159,7 @@ Pending (in order):
 - [ ] Printer: further stylization if wanted
 - [x] loop_cse invariant-load "gap" — VERIFIED CORRECT: isSafeToSpeculate requires alloca/global-rooted addrs; arg-derived phi ptr can't be proven non-faulting on zero-trip (LLVM identical). Unblocks only with dereferenceable param attr (below)
 - [ ] loop idiom: inner counted loop `sum += a[iv]` per outer iter → mul strength reduction (indvars territory)
-- [~] noalias/dereferenceable param attributes — noalias func attr DONE (56940f7: arg-arg NoAlias in isNoAlias); dereferenceable still needs per-param attr scheme (IR syntax decision)
+- [ ] PER-PARAM ATTRS (deref/noalias) — syntax: `func @f(%p: ptr !dereferenceable(8), %q: ptr !noalias)` param-suffix form (NOT type qualifier — keeps IrType clean). Storage: per-arg metadata on IrFunc args (IrValue metadata slot or parallel argMeta array). Consumers: loop_cse isSafeToSpeculate + ifconv dereferenceability proof + vectorizer alignment + GVN forwarding; noalias per-param for memcpy-style mixed cases (func-level noalias already gives arg-arg pairs). IPA inference later (callers pass alloca/global → param dereferenceable). Unblocks verified-correct rejections like @nested_loop inner invariant load.
+- [ ] counted-loop idiom: inner loop `sum += a[iv]` (invariant load + accumulator phi + provable trip count) → `sum += a[iv]*trip`. Needs SCEV-lite trip proof from ivsr affine recurrences; single-block inner loop; no side effects. No IR changes — pure mid-end transform.
+- [ ] printer stylization round 2 (optional): phi-pair column alignment, aligned branch targets, section grouping — cosmetic only, goldens regen
 - [ ] printer further stylization if wanted
