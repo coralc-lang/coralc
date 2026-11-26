@@ -1,0 +1,302 @@
+#[[no_drop_all]]
+// Closed-form additive recurrence: a single-block counted loop of the
+// shape
+//
+//   loop:
+//     %i   = phi [c0, pre], [%i2, loop]
+//     %acc = phi [a0, pre], [%a2, loop]
+//     %i2  = add %i, K
+//     %a2  = add %acc, X        ; X loop-invariant
+//     %c   = icmp slt/ult %i, B ; B const
+//     cond_br %c, loop, exit
+//
+// computes acc_final = a0 + T*X where T is the (constant) trip count,
+// letting the whole loop collapse to mul+add in the preheader.
+//
+// Deliberately narrow v1: exactly these six insts, K>0, slt/ult only,
+// const bounds, single outside predecessor. Everything else stays —
+// licm/loop_cse hoist the invariant load first so X is usually the
+// preheader-defined load result by the time this runs.
+
+import muvm::passes::common { gVerbose };
+import muvm::irOps { IrOpcode, IrICmpPred };
+import muvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind, IrType, IrTypeKind };
+import muvm::passes::loop_detect { IrLoop, irLoopDetectNatural, irLoopDestroy };
+import std::mman { alloc, dealloc };
+import std::ios { eprintln };
+
+pub struct LoopIdiomPass
+{
+    IrContext* ctx;
+
+    LoopIdiomPass new(IrContext* ctx)
+    {
+        return LoopIdiomPass { .ctx = ctx };
+    }
+
+    // value incoming to phi from pred block (pairs are [val, pred])
+    IrValue* phiValFrom(IrInst* phi, IrBlock* pred)
+    {
+        for (u32 i = 0; i + 1 < phi->nops; i += 2)
+            if (phi->ops[i + 1] == (IrValue*)pred) return phi->ops[i];
+        return null;
+    }
+
+    // X is loop-invariant: const/arg, or an inst defined outside lp
+    bool isInvariant(IrLoop* lp, IrValue* v)
+    {
+        if (v == null) return false;
+        if (v->kind == IrValueKind::ConstInt ||
+            v->kind == IrValueKind::ConstFloat ||
+            v->kind == IrValueKind::Arg ||
+            v->kind == IrValueKind::Global) return true;
+        if (v->kind != IrValueKind::Inst) return false;
+        IrInst* d = (IrInst*)v;
+        if (d->parent == null || d->parent->parent == null) return true;
+        for (u32 bi = 0; bi < lp->nblocks; bi++)
+            if (lp->blocks[bi] == d->parent) return false;
+        return true;
+    }
+
+    // const int value or -1
+    i64 constI64(IrValue* v)
+    {
+        if (v == null || v->kind != IrValueKind::ConstInt) return -1;
+        return (i64)v->valData;
+    }
+
+    bool tryLoop(IrLoop* lp, IrFunc* func)
+    {
+        if (lp->nblocks != 1) return false;
+        IrBlock* header = lp->header;
+        if (header == null || header->ninsts < 3) return false;
+
+        // classify insts: expect exactly 2 phis + add + add + icmp + cond_br
+        IrInst* ivPhi = null;
+        IrInst* accPhi = null;
+        IrInst* i2add = null;
+        IrInst* a2add = null;
+        IrInst* icmp = null;
+        IrInst* cbr = null;
+        for (u32 i = 0; i < header->ninsts; i++)
+        {
+            IrInst* inst = header->insts[i];
+            if (inst == null) continue;
+            switch (inst->opcode)
+            {
+                IrOpcode::Phi =>
+                {
+                    // distinguish iv vs acc by backedge update shape later
+                    if (ivPhi == null) ivPhi = inst;
+                    else if (accPhi == null) accPhi = inst;
+                    else return false;
+                },
+                IrOpcode::Add =>
+                {
+                    if (i2add == null) i2add = inst;
+                    else if (a2add == null) a2add = inst;
+                    else return false;
+                },
+                IrOpcode::ICmp =>
+                {
+                    if (icmp != null) return false;
+                    icmp = inst;
+                },
+                IrOpcode::CondBr =>
+                {
+                    if (cbr != null) return false;
+                    cbr = inst;
+                },
+                else => { return false; }
+            }
+        }
+        if (ivPhi == null || accPhi == null || i2add == null ||
+            a2add == null || icmp == null || cbr == null) return false;
+        // terminator must be last
+        if (header->insts[header->ninsts - 1] != cbr) return false;
+
+        // Match each phi to the add that produces its backedge value —
+        // inst order doesn't guarantee iv before acc.
+        IrValue* ivBack = self.phiValFrom(ivPhi, header);
+        IrValue* accBack = self.phiValFrom(accPhi, header);
+        if (ivBack == null || accBack == null) return false;
+        IrInst* ivUpd = (IrValue*)i2add == ivBack ? i2add
+                        : ((IrValue*)a2add == ivBack ? a2add : null);
+        IrInst* accUpd = (IrValue*)a2add == accBack ? a2add
+                         : ((IrValue*)i2add == accBack ? i2add : null);
+        if (ivUpd == null || accUpd == null || ivUpd == accUpd) return false;
+        i2add = ivUpd;
+        a2add = accUpd;
+
+        // --- IV shape: i2 = add iv, K ; K const > 0
+        if (i2add->nops < 2) return false;
+        IrValue* iAddA = i2add->ops[0];
+        IrValue* iAddB = i2add->ops[1];
+        i64 K = -1;
+        if (iAddA == (IrValue*)ivPhi && iAddB != null &&
+            iAddB->kind == IrValueKind::ConstInt)
+        { K = (i64)iAddB->valData; }
+        else if (iAddB == (IrValue*)ivPhi && iAddA != null &&
+                 iAddA->kind == IrValueKind::ConstInt)
+        { K = (i64)iAddA->valData; }
+        if (K <= 0) return false;
+
+        // --- acc shape: a2 = add acc, X ; X loop-invariant
+        if (a2add->nops < 2) return false;
+        IrValue* X = null;
+        if (a2add->ops[0] == (IrValue*)accPhi) X = a2add->ops[1];
+        else if (a2add->ops[1] == (IrValue*)accPhi) X = a2add->ops[0];
+        else return false;
+        if (!self.isInvariant(lp, X)) return false;
+
+        // --- icmp: slt/ult iv, B(const) — only iv on the left
+        if (icmp->nops < 2) return false;
+        if (icmp->ops[0] != (IrValue*)ivPhi) return false;
+        if (icmp->ops[1] == null || icmp->ops[1]->kind != IrValueKind::ConstInt)
+            return false;
+        i64 B = (i64)icmp->ops[1]->valData;
+        bool signedPred = icmp->icmpPred == IrICmpPred::Slt ||
+                          icmp->icmpPred == IrICmpPred::Sle;
+        bool ultPred = icmp->icmpPred == IrICmpPred::Ult ||
+                       icmp->icmpPred == IrICmpPred::Ule;
+        if (!signedPred && !ultPred) return false;
+        // sle/ule mean "continue while i<=B" → effective bound B+1
+        if (icmp->icmpPred == IrICmpPred::Sle ||
+            icmp->icmpPred == IrICmpPred::Ule) B = B + 1;
+
+        // --- cond_br: true→header(self), false→exit
+        if (cbr->nops < 3) return false;
+        if (cbr->ops[0] != (IrValue*)icmp) return false;
+        IrBlock* exitBlk = (IrBlock*)cbr->ops[2];
+        if (exitBlk == null || exitBlk == header) return false;
+        // ops[1] must be the loop back-edge target
+        if ((IrBlock*)cbr->ops[1] != header) return false;
+
+        // --- IV init from the outside pred
+        // find the single outside predecessor
+        IrBlock* pre = null;
+        u32 nOut = 0;
+        for (u32 pi = 0; pi < header->npreds; pi++)
+        {
+            IrBlock* p = header->preds[pi];
+            if (p == header) continue;
+            nOut++;
+            pre = p;
+        }
+        if (nOut != 1 || pre == null) return false;
+        IrValue* c0v = self.phiValFrom(ivPhi, pre);
+        IrValue* a0v = self.phiValFrom(accPhi, pre);
+        if (c0v == null || a0v == null) return false;
+        if (c0v->kind != IrValueKind::ConstInt) return false;
+        i64 c0 = (i64)c0v->valData;
+
+        // --- trip count: while i < B step K>0 → T = ceil((B-c0)/K), 0 if B<=c0
+        if (B <= c0) return false;   // zero-trip — nothing to gain
+        i64 diff = B - c0;
+        if (diff <= 0 || diff > 0x40000000) return false;
+        i64 T = (diff + K - 1) / K;
+        if (T <= 0) return false;
+
+        // --- build: in pre, before terminator:
+        //   %prod = mul X_ty, X, T
+        //   %accf = add acc_ty, a0, %prod
+        // validate pre's terminator BEFORE any mutation — it must be an
+        // unconditional Br to header or we can't retarget the edge
+        if (pre->ninsts == 0) return false;
+        IrInst* pterm = pre->insts[pre->ninsts - 1];
+        if (pterm == null || pterm->opcode != IrOpcode::Br ||
+            pterm->nops < 1 || (IrBlock*)pterm->ops[0] != header)
+            return false;
+
+        IrType* xTy = X->type;
+        IrType* accTy = accPhi->base.type;
+        IrType* ivTy = ivPhi->base.type;
+        if (xTy == null || accTy == null || ivTy == null) return false;
+        if (xTy->kind != accTy->kind) return false;
+
+        // closed forms: accf = a0 + T*X ; ivf = c0 + T*K (i64 math,
+        // wraps identically to the repeated adds it replaces)
+        IrValue* tConst = self.ctx->constInt(xTy, (u64)T);
+        IrValue** mulOps = alloc<IrValue*>((usize)2);
+        mulOps[0] = X; mulOps[1] = tConst;
+        IrInst* prod = self.ctx->createInst(IrOpcode::Mul, xTy, mulOps, 2, 0, 0);
+        dealloc<IrValue*>(mulOps);
+        if (prod == null) return false;
+
+        IrValue** addOps = alloc<IrValue*>((usize)2);
+        addOps[0] = a0v; addOps[1] = (IrValue*)prod;
+        IrInst* accf = self.ctx->createInst(IrOpcode::Add, accTy, addOps, 2, 0, 0);
+        dealloc<IrValue*>(addOps);
+        if (accf == null) return false;
+
+        IrValue* kConst = self.ctx->constInt(ivTy, (u64)(c0 + T * K));
+
+        // insert both before pre's terminator
+        IrInst* anchor = pre->insts[pre->ninsts - 1];
+        pre->insertBefore(prod, anchor);
+        pre->insertBefore(accf, anchor);
+
+        // replace every use of both phis — exit blocks may use them
+        // directly (ret %acc) or through phis; in-loop uses die with
+        // the block. Then repoint phi incoming preds header→pre.
+        accPhi->base.replaceAllUses(&accf->base);
+        ivPhi->base.replaceAllUses(kConst);
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            if (bb == null || bb == header) continue;
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* ephi = bb->insts[ii];
+                if (ephi == null || ephi->opcode != IrOpcode::Phi) break;
+                for (u32 pi = 0; pi + 1 < ephi->nops; pi += 2)
+                    if (ephi->ops[pi + 1] == (IrValue*)header)
+                        ephi->ops[pi + 1] = (IrValue*)pre;
+            }
+        }
+
+        // retarget pre's terminator edge header→exit, drop the loop
+        pterm->ops[0] = (IrValue*)exitBlk;
+
+        // fix succ/pred links: pre succ header→exit; exit pred header→pre
+        for (u32 sj = 0; sj < pre->nsuccs; sj++)
+            if (pre->succs[sj] == header) pre->succs[sj] = exitBlk;
+        for (u32 pj = 0; pj < exitBlk->npreds; pj++)
+            if (exitBlk->preds[pj] == header) exitBlk->preds[pj] = pre;
+        header->nsuccs = 0;
+        // remove header from func blocks
+        func->removeBlock(header);
+
+        if (gVerbose)
+            eprintln("loop_idiom: collapsed single-block loop (T={})", (u64)T);
+        return true;
+    }
+
+    bool processFunc(IrFunc* func)
+    {
+        IrLoop** loops = irLoopDetectNatural(func);
+        if (loops == null) return false;
+        bool changed = false;
+        for (u32 i = 0; loops[i] != null; i++)
+        {
+            if (self.tryLoop(loops[i], func)) changed = true;
+        }
+        irLoopDestroy(loops);
+        return changed;
+    }
+
+    bool run(IrFunc* func)
+    {
+        if (func == null) return false;
+        return self.processFunc(func);
+    }
+}
+
+pub bool muvmPassLoopIdiom(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (func == null || ctx == null) return false;
+    LoopIdiomPass pass = LoopIdiomPass::new(ctx);
+    bool r = pass.run(func);
+    return r;
+}
