@@ -1,0 +1,228 @@
+#[[no_drop_all]]
+// graph.crl: tiny interference-graph register allocator.
+//
+// Pipeline: live intervals in -> overlap graph -> greedy coloring
+// (degree order) -> phys reg or spill slot out.
+//
+// Caller responsibilities (same contract as the old linear scan):
+//   - number instructions 0..npos-1 in emission order
+//   - a use "before" its def (loop back edge) must be extended to
+//     npos by the caller
+//   - klass: 0 = gpr pool, 1 = xmm pool (independent graphs)
+//   - phys = backend encoding, -1 when spilled
+//   - slot = spill slot index, -1 when in a register
+//   - `reserved` bit i marks encoding i unavailable
+//   - results written into `out` at the same index as `ranges`
+//
+// Intervals are treated as closed [start,end]; touching endpoints
+// interfere (conservative, always correct).
+
+import std::vec { Vec };
+import std::mman { alloc, dealloc };
+
+pub struct LiveRange
+{
+    u32 start;    /* def position */
+    u32 end;      /* last use position (inclusive) */
+    u8 klass;     /* 0 gpr, 1 xmm */
+    u32 size;     /* spill slot size in bytes (>=8 recommended) */
+}
+
+pub struct AllocResult
+{
+    i32 phys;
+    i32 slot;
+}
+
+/* adjacency bitset row helpers */
+fn bitSet(u64* bits, u32 words, u32 i, u32 j)
+{
+    bits[(usize)i * words + (j >> 6)] |= (u64)1 << (j & 63);
+}
+fn bitGet(const u64* bits, u32 words, u32 i, u32 j) -> bool
+{
+    return ((bits[(usize)i * words + (j >> 6)] >> (j & 63)) & 1) != 0;
+}
+
+/* color one interference graph.
+ * nodes: indices into `idx` (0..nr-1 local numbering)
+ * adj: nr x words bitset
+ * colors: preference-ordered phys regs available, k of them
+ * deg: precomputed degrees
+ * colored: out, local node -> color index or -1
+ * returns number spilled */
+u32 colorGraph(u32 nr, u32 words, u64* adj, const u8* colors, u32 k,
+               const u32* deg, i32* colored)
+{
+    /* order nodes by degree desc, then wider range first */
+    u32* ord = alloc<u32>((usize)(nr > 0 ? nr : 1));
+    for (u32 i = 0; i < nr; i++) ord[i] = i;
+    for (u32 i = 1; i < nr; i++)
+    {
+        u32 key = ord[i];
+        u32 j = i;
+        while (j > 0)
+        {
+            u32 a = ord[j-1];
+            if (deg[a] > deg[key] ||
+                (deg[a] == deg[key] && a < key)) break;
+            ord[j] = ord[j-1]; j--;
+        }
+        ord[j] = key;
+    }
+
+    u32 nspill = 0;
+    for (u32 oi = 0; oi < nr; oi++)
+    {
+        u32 n = ord[oi];
+        /* colors used by already-colored neighbors */
+        u32 forbid = 0;
+        u64* row = &adj[(usize)n * words];
+        for (u32 w = 0; w < words; w++)
+        {
+            u64 bits = row[w];
+            while (bits != 0)
+            {
+                /* find lowest set bit */
+                u32 b = 0;
+                u64 t = bits;
+                while ((t & 1) == 0) { t >>= 1; b++; }
+                u32 nb = (w << 6) + b;
+                bits &= bits - 1;
+                if (nb < nr && colored[nb] >= 0 && colored[nb] < 32)
+                    forbid |= (u32)1 << colored[nb];
+            }
+        }
+        i32 pick = -1;
+        for (u32 c = 0; c < k && c < 32; c++)
+            if (((forbid >> c) & 1) == 0) { pick = (i32)c; break; }
+        colored[n] = pick;
+        if (pick < 0) nspill++;
+    }
+    dealloc<u32>(ord);
+    return nspill;
+}
+
+pub void graphAssign(Vec<LiveRange>* ranges, Vec<AllocResult>* out,
+                     const u8* orderGpr, u32 nGpr,
+                     const u8* orderXmm, u32 nXmm,
+                     u64 reserved, i32* nslots)
+{
+    /* out must be pre-sized to ranges->count() by the caller */
+    *nslots = 0;
+    for (u32 pass = 0; pass < 2; pass++)
+    {
+        u8 want = (u8)pass;
+        const u8* ord = want == 0 ? orderGpr : orderXmm;
+        u32 nord = want == 0 ? nGpr : nXmm;
+
+        /* available colors = order entries not reserved, in order */
+        u8 colors[32];
+        u32 k = 0;
+        for (u32 i = 0; i < nord && k < 32; i++)
+        {
+            u8 cand = ord[i];
+            if (((u64)1 << cand) & reserved) continue;
+            colors[k++] = cand;
+        }
+        if (k == 0)
+        {
+            /* no registers: spill every range of this class */
+            for (usize i = 0; i < ranges->count(); i++)
+            {
+                LiveRange* r = ranges->atPtr(i);
+                if (r->klass != want) continue;
+                out->atPtr(i)->phys = -1;
+                out->atPtr(i)->slot = *nslots;
+                *nslots = *nslots + 1;
+            }
+            continue;
+        }
+
+        /* collect this class's node indices, sorted by (start,end) */
+        usize nr = 0;
+        for (usize i = 0; i < ranges->count(); i++)
+            if (ranges->atPtr(i)->klass == want) nr++;
+        usize* idx = alloc<usize>((usize)(nr > 0 ? nr : 1));
+        usize w = 0;
+        for (usize i = 0; i < ranges->count(); i++)
+            if (ranges->atPtr(i)->klass == want) idx[w++] = i;
+        for (usize i = 1; i < nr; i++)
+        {
+            usize key = idx[i];
+            LiveRange* kr = ranges->atPtr(key);
+            usize j = i;
+            while (j > 0)
+            {
+                LiveRange* pr = ranges->atPtr(idx[j-1]);
+                if (pr->start < kr->start ||
+                    (pr->start == kr->start && pr->end <= kr->end)) break;
+                idx[j] = idx[j-1]; j--;
+            }
+            idx[j] = key;
+        }
+
+        u32 n = (u32)nr;
+        u32 words = (n + 63) >> 6;
+        u64* adj = alloc<u64>((usize)(n * words > 0 ? n * words : 1));
+        for (u32 i = 0; i < n * words; i++) adj[i] = 0;
+        u32* deg = alloc<u32>((usize)(n > 0 ? n : 1));
+        for (u32 i = 0; i < n; i++) deg[i] = 0;
+
+        /* build overlap graph: sweep intervals sorted by start, keep the
+         * set of still-live (active) nodes; every active node overlaps
+         * the new one, so add edges both ways. */
+        usize* active = alloc<usize>((usize)(n > 0 ? n : 1));
+        u32 nact = 0;
+        for (u32 ii = 0; ii < n; ii++)
+        {
+            usize ri = idx[ii];
+            LiveRange* r = ranges->atPtr(ri);
+            u32 wp = 0;
+            for (u32 a = 0; a < nact; a++)
+            {
+                LiveRange* ar = ranges->atPtr(idx[active[a]]);
+                if (ar->end >= r->start) active[wp++] = active[a];
+            }
+            nact = wp;
+            for (u32 a = 0; a < nact; a++)
+            {
+                u32 aj = active[a];
+                if (!bitGet(adj, words, ii, aj))
+                {
+                    bitSet(adj, words, ii, aj);
+                    bitSet(adj, words, aj, ii);
+                    deg[ii]++; deg[aj]++;
+                }
+            }
+            active[nact] = ii;
+            nact++;
+        }
+        dealloc<usize>(active);
+
+        i32* colored = alloc<i32>((usize)(n > 0 ? n : 1));
+        for (u32 i = 0; i < n; i++) colored[i] = -1;
+        colorGraph(n, words, adj, colors, k, deg, colored);
+
+        for (u32 i = 0; i < n; i++)
+        {
+            usize ri = idx[i];
+            if (colored[i] >= 0)
+            {
+                out->atPtr(ri)->phys = (i32)colors[colored[i]];
+                out->atPtr(ri)->slot = -1;
+            }
+            else
+            {
+                out->atPtr(ri)->phys = -1;
+                out->atPtr(ri)->slot = *nslots;
+                *nslots = *nslots + 1;
+            }
+        }
+
+        dealloc<i32>(colored);
+        dealloc<u32>(deg);
+        dealloc<u64>(adj);
+        dealloc<usize>(idx);
+    }
+}
