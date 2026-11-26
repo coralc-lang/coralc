@@ -1,7 +1,7 @@
 #[[no_drop_all]]
 import std::ios { eprintln };
 import muvm::passes::common { gVerbose };
-import muvm::irtypes { IrContext, IrValue, IrInst, IrBlock, IrFunc, IrValueKind, FunctionAnalysisCache };
+import muvm::irtypes { IrContext, IrValue, IrInst, IrBlock, IrFunc, IrValueKind, IrType, IrTypeKind, FunctionAnalysisCache };
 import muvm::irOps { IrOpcode };
 import std::mman { alloc, dealloc };
 
@@ -26,6 +26,8 @@ import std::mman { alloc, dealloc };
 // on top of this analysis and never consumed those arrays.
 
 pub const u32 OBJECT_UNKNOWN = 0;
+// decomposeAddr sentinel: object id resolved but byte offset not provable
+pub const i64 OFFSET_UNKNOWN = 0x7FFFFFFFFFFFFFFF;
 const u32 OBJECT_MAX = 256;
 // Walk marker: a value whose object is being computed right now. Re-entering
 // it means the def graph has a cycle (phi -> phi), which cuts to UNKNOWN
@@ -383,6 +385,80 @@ pub struct AliasAnalysis
         }
     }
 
+    // Byte offset of "address = base + constant" decomposition.
+    // OFFSET_UNKNOWN marks "offset not provable" — the object id is
+    // still valid, only the offset is unknown. Struct/union field
+    // geps and any dynamic index poison the offset (conservative).
+
+    u32 decomposeAddr(IrValue* addr, i64* outOff)
+    {
+        *outOff = 0;
+        if (addr == null) { *outOff = OFFSET_UNKNOWN; return OBJECT_UNKNOWN; }
+        if (addr->kind == IrValueKind::Global)
+        {
+            u32 o = self.walkAddr(addr);
+            if (o == OBJECT_UNKNOWN) *outOff = OFFSET_UNKNOWN;
+            return o;
+        }
+        if (addr->kind != IrValueKind::Inst)
+        { *outOff = OFFSET_UNKNOWN; return OBJECT_UNKNOWN; }
+        IrInst* inst = (IrInst*)addr;
+        if (inst->opcode == IrOpcode::Bitcast && inst->nops > 0)
+            return self.decomposeAddr(inst->ops[0], outOff);
+        if (inst->opcode == IrOpcode::Gep && inst->nops >= 2)
+        {
+            i64 baseOff = 0;
+            u32 obj = self.decomposeAddr(inst->ops[0], &baseOff);
+            // accumulate each index's byte contribution; any dynamic
+            // index poisons the whole offset
+            i64 total = baseOff;
+            bool ok = baseOff != OFFSET_UNKNOWN;
+            // walk the type descent once, pricing every index
+            IrType* cur = null;
+            if (inst->ops[0] != null && inst->ops[0]->type != null)
+            {
+                cur = inst->ops[0]->type;
+                if (cur->kind == IrTypeKind::Ptr) cur = cur->elem;
+            }
+            for (u32 gi = 1; gi < inst->nops && ok; gi++)
+            {
+                IrValue* ix = inst->ops[gi];
+                if (ix == null || ix->kind != IrValueKind::ConstInt)
+                { ok = false; break; }
+                if (cur != null &&
+                    (cur->kind == IrTypeKind::Struct ||
+                     cur->kind == IrTypeKind::Union))
+                {
+                    // field offsets aren't tracked on IrType — poison
+                    // the offset rather than guess
+                    ok = false;
+                    break;
+                }
+                else
+                {
+                    IrType* et = null;
+                    u64 esz = 1;
+                    if (cur != null &&
+                        (cur->kind == IrTypeKind::Array ||
+                         cur->kind == IrTypeKind::Vector))
+                        et = cur->elem;
+                    else if (cur != null && cur->kind == IrTypeKind::Ptr)
+                        et = cur->elem;
+                    if (et != null) esz = (u64)self.ctx->irTypeSizeOf(et);
+                    total += (i64)ix->valData * (i64)esz;
+                    cur = et;
+                }
+            }
+            *outOff = ok ? total : OFFSET_UNKNOWN;
+            return obj;
+        }
+        // phi / call / load / anything else: object may still resolve
+        // through walkAddr, but per-arm offsets differ — unknown offset
+        u32 obj = self.walkAddr(addr);
+        *outOff = OFFSET_UNKNOWN;
+        return obj;
+    }
+
     // Query — do two values definitely not alias?
     bool isNoAlias(IrValue* a, IrValue* b)
     {
@@ -399,14 +475,39 @@ pub struct AliasAnalysis
     }
 
     // Query — do two values definitely alias?
-    // Conservative: only identical SSA values qualify. Two distinct GEPs
-    // into the same object may still differ by offset, so same-object is
-    // not sufficient for must-alias.
+    // Same object + identical constant byte offset is a must-alias:
+    // two distinct SSA geps computing the same address are the same
+    // memory location. Dynamic/unknown offsets stay conservative.
     bool isMustAlias(IrValue* a, IrValue* b)
     {
         if (a == null || b == null) return false;
         if (a->id == b->id) return true;
-        return false;
+        i64 oa = 0;
+        i64 ob = 0;
+        u32 ia = self.decomposeAddr(a, &oa);
+        u32 ib = self.decomposeAddr(b, &ob);
+        if (ia == OBJECT_UNKNOWN || ia != ib) return false;
+        if (oa == OFFSET_UNKNOWN || ob == OFFSET_UNKNOWN) return false;
+        return oa == ob;
+    }
+
+    // Sized clobber query: proves a store can't reach the load when
+    // both decompose to the same object with known, disjoint byte
+    // ranges. Sizes of 0 mean "unknown extent" → conservative overlap.
+    bool mayClobberSized(IrValue* loadAddr, u64 loadSize,
+                         IrValue* storeAddr, u64 storeSize)
+    {
+        if (loadAddr == null || storeAddr == null) return true;
+        i64 lo = 0;
+        i64 so = 0;
+        u32 li = self.decomposeAddr(loadAddr, &lo);
+        u32 si = self.decomposeAddr(storeAddr, &so);
+        if (li == OBJECT_UNKNOWN || si == OBJECT_UNKNOWN) return true;
+        if (li != si) return false;
+        if (lo == OFFSET_UNKNOWN || so == OFFSET_UNKNOWN) return true;
+        if (loadSize == 0 || storeSize == 0) return true;
+        // [off, off+size) overlap test
+        return lo < so + (i64)storeSize && so < lo + (i64)loadSize;
     }
 
     // Query — can a load at address 'loadAddr' be clobbered by a store at address 'storeAddr'?
