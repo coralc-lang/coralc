@@ -19,11 +19,11 @@
 // Runs once per module — guarded on func == module->funcs[0] since the
 // pass driver invokes every pipeline entry once per function.
 
-import muvm::irtypes { IrContext, IrFunc, IrModule, IrBlock, IrInst, IrValue, IrValueKind, IrTypeKind };
+import muvm::irtypes { IrContext, IrFunc, IrModule, IrBlock, IrInst, IrValue, IrValueKind, IrType, IrTypeKind };
 import muvm::irOps { IrOpcode };
 import muvm::irMetadata {
     hasFuncAttr, funcIsReadOnly, funcIsReadNone, funcIsWriteOnly,
-    funcIsArgMemOnly, setFuncArgMemOnly,
+    funcIsArgMemOnly, setFuncArgMemOnly, funcParamDerefBytes, setFuncParamDeref,
     setFuncReadOnly, setFuncReadNone, setFuncWriteOnly };
 import muvm::passes::common { gVerbose };
 import std::mman { alloc, dealloc };
@@ -90,6 +90,77 @@ bool addrDerivesOK(IrValue* addr, IrFunc* f, u32 depth)
         return true;
     }
     return false;
+}
+
+// Bytes guaranteed valid starting at v's base — used by the IPA
+// dereferenceable inference. Zero means unproven. gep offsets subtract
+// from the base guarantee; dynamic indices poison it.
+i64 provableDerefSize(IrValue* v, IrFunc* caller, IrContext* ctx, u32 depth)
+{
+    if (v == null || depth > 32 || ctx == null) return 0;
+    if (v->kind == IrValueKind::Arg)
+    {
+        for (u32 ai = 0; ai < caller->nargs; ai++)
+            if (caller->args[ai] == v)
+                return funcParamDerefBytes(caller, ai);
+        return 0;
+    }
+    if (v->kind == IrValueKind::Global)
+    {
+        IrType* t = v->type;
+        if (t == null) return 0;
+        if (t->kind == IrTypeKind::Ptr) t = t->elem;
+        return (i64)ctx->irTypeSizeOf(t);
+    }
+    if (v->kind != IrValueKind::Inst) return 0;
+    IrInst* d = (IrInst*)v;
+    if (d->opcode == IrOpcode::Bitcast || d->opcode == IrOpcode::Zext ||
+        d->opcode == IrOpcode::Sext)
+    {
+        if (d->nops < 1) return 0;
+        return provableDerefSize(d->ops[0], caller, ctx, depth + 1);
+    }
+    if (d->opcode == IrOpcode::Alloca)
+    {
+        IrType* t = d->base.type;
+        if (t == null || t->kind != IrTypeKind::Ptr || t->elem == null)
+            return 0;
+        return (i64)ctx->irTypeSizeOf(t->elem);
+    }
+    if (d->opcode == IrOpcode::Gep && d->nops >= 2)
+    {
+        i64 base = provableDerefSize(d->ops[0], caller, ctx, depth + 1);
+        if (base <= 0) return 0;
+        // price constant indices; any dynamic index poisons
+        IrType* cur = null;
+        if (d->ops[0] != null && d->ops[0]->type != null)
+        {
+            cur = d->ops[0]->type;
+            if (cur->kind == IrTypeKind::Ptr) cur = cur->elem;
+        }
+        i64 off = 0;
+        for (u32 oi = 1; oi < d->nops; oi++)
+        {
+            IrValue* iv = d->ops[oi];
+            if (iv == null || iv->kind != IrValueKind::ConstInt) return 0;
+            if (cur != null &&
+                (cur->kind == IrTypeKind::Struct ||
+                 cur->kind == IrTypeKind::Union)) return 0;
+            IrType* et = null;
+            u64 esz = 1;
+            if (cur != null &&
+                (cur->kind == IrTypeKind::Array ||
+                 cur->kind == IrTypeKind::Vector)) et = cur->elem;
+            else if (cur != null && cur->kind == IrTypeKind::Ptr)
+                et = cur->elem;
+            if (et != null) esz = (u64)ctx->irTypeSizeOf(et);
+            off += (i64)iv->valData * (i64)esz;
+            cur = et;
+        }
+        i64 rem = base - off;
+        return rem > 0 ? rem : 0;
+    }
+    return 0;
 }
 
 pub bool muvmPassInferMemAttrs(IrFunc* func, rawptr userdata)
@@ -351,6 +422,84 @@ pub bool muvmPassInferMemAttrs(IrFunc* func, rawptr userdata)
                 if (!argmem[ci]) { am = false; break; }
             }
             if (am != argmem[fi]) { argmem[fi] = am; changed = true; }
+        }
+    }
+
+    // Pass 3b — IPA dereferenceable inference. For each pointer param
+    // with no declared attr, compute the minimum size every direct call
+    // site can already prove valid; if all callers guarantee >= N
+    // bytes, the param gets !dereferenceable(N). Functions whose value
+    // escapes (used anywhere but a direct call callee slot) are skipped
+    // — indirect calls give no argument guarantees.
+    //
+    // provableDerefSize(v, caller): bytes guaranteed valid starting at
+    // v's base address — arg attrs, alloca/global object sizes, minus
+    // priced constant gep offsets. Zero means unproven.
+    for (u32 fi = 0; fi < n; fi++)
+    {
+        IrFunc* f = m->funcs[fi];
+        if (f == null || f->isExtern) continue;
+        // escape check: func value used outside call ops[0]?
+        bool escaped = false;
+        for (u32 ei = 0; ei < n && !escaped; ei++)
+        {
+            IrFunc* ef = m->funcs[ei];
+            if (ef == null) continue;
+            for (u32 bi = 0; bi < ef->nblocks && !escaped; bi++)
+            {
+                IrBlock* bb = ef->blocks[bi];
+                if (bb == null) continue;
+                for (u32 ii = 0; ii < bb->ninsts && !escaped; ii++)
+                {
+                    IrInst* einst = bb->insts[ii];
+                    if (einst == null) continue;
+                    for (u32 oi = 0; oi < einst->nops; oi++)
+                    {
+                        IrValue* ov = einst->ops[oi];
+                        if (ov == null || ov->kind != IrValueKind::Func ||
+                            (IrFunc*)ov != f) continue;
+                        bool isCallee = einst->opcode == IrOpcode::Call && oi == 0;
+                        if (!isCallee) { escaped = true; break; }
+                    }
+                }
+            }
+        }
+        if (escaped) continue;
+
+        for (u32 pi = 0; pi < f->nargs; pi++)
+        {
+            IrValue* pv = f->args[pi];
+            if (pv == null || pv->type == null ||
+                pv->type->kind != IrTypeKind::Ptr) continue;
+            if (funcParamDerefBytes(f, pi) > 0) continue; // declared wins
+            u64 guaranteed = 0xFFFFFFFFFFFFFFFFULL;
+            u32 nsites = 0;
+            for (u32 ei = 0; ei < n; ei++)
+            {
+                IrFunc* ef = m->funcs[ei];
+                if (ef == null || ef->isExtern) continue;
+                for (u32 bi = 0; bi < ef->nblocks; bi++)
+                {
+                    IrBlock* bb = ef->blocks[bi];
+                    if (bb == null) continue;
+                    for (u32 ii = 0; ii < bb->ninsts; ii++)
+                    {
+                        IrInst* einst = bb->insts[ii];
+                        if (einst == null || einst->opcode != IrOpcode::Call ||
+                            einst->nops <= (u32)(pi + 1)) continue;
+                        IrValue* cv = einst->ops[0];
+                        if (cv == null || cv->kind != IrValueKind::Func ||
+                            (IrFunc*)cv != f) continue;
+                        IrValue* arg = einst->ops[pi + 1];
+                        i64 sz = provableDerefSize(arg, ef, m->ctx, 0);
+                        nsites++;
+                        if (sz <= 0) { guaranteed = 0; }
+                        else if ((u64)sz < guaranteed) guaranteed = (u64)sz;
+                    }
+                }
+            }
+            if (nsites > 0 && guaranteed > 0 && guaranteed < 0xFFFFFFFFFFFFFFFFULL)
+                setFuncParamDeref(f, pi, (i64)guaranteed);
         }
     }
 
