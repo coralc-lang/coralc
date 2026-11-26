@@ -153,7 +153,7 @@ Pending (in order):
 - [ ] Wire mayClobberSized into memory_ssa defMayAliasLoad/findNearestDefForLoad (needs load/store type sizes plumbed through)
 - [x] Fold gaps: select c,x,x→x (fold.crl:395); icmp eq/ne x,x→const (821bcd0); mul x,-1→neg (algebraic.crl allOnes→Neg, pre-existing); gep base,0 (idempotent.crl Pattern 4) — ALL DONE
 - [ ] AA depth: points-to SETS for phis (currently same-object-only merge → UNKNOWN on disagreement)
-- [ ] Function attributes so calls stop being blanket memory barriers: readonly/readnone/writeonly/argmemonly exist in irMetadata (funcIsReadOnly/funcIsReadNone/hasFuncAttr) but NO pass consults them — wire into gvn load-cache flush, memory_ssa defMayAliasLoad Call barrier, dse, loop_cse, licm. Call ops[0] = callee func value (IrValueKind::Func); need IrFunc* back-pointer or module lookup to read attrs. THIS IS LAST per user instruction
-- [ ] Interprocedural points-to (argmemonly-style summary)
+- [x] Function attributes — DONE: infer_memattrs pass (O1/O2/O3 head) computes readnone/readonly/writeonly/argmemonly via fixpoint; callMayWriteMemory/callMayReadMemory/funcIsArgMemOnly/mayCallClobber wired into gvn (surgical flush), memory_ssa, dse, loop_cse
+- [x] Interprocedural points-to — DONE as infer_memattrs (read/write lattice + argmemonly lattice + callMayClobber/mayCallClobber queries wired into gvn/memory_ssa/dse/loop_cse)
 - [ ] noalias/dereferenceable param attributes
 - [ ] Printer: further stylization if wanted
