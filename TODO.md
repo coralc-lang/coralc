@@ -137,3 +137,23 @@
 ref: ""test a lot more edge cases, even references as arguments during declaratiopn. then reference supports in the ir. then the parts of the ir backend of the compiler specifically said to not be supported, and search for things not even supported at all. make sure you run far too many tests. to catch secretly failing or unreported cases. error issues. beatify and structure the error report for all error cases, not some looking trashy and otehr lookig good and reported well. make sure errors are more understandable and less generic("expected an expression alwasy" kind of generic) and more. then the cascading error, then, the build system, there are many issus with it and parts of it's docs not covered. then after that. polishing of the fromtend and args passing. polishng of the args. then running the compiler under asan. also, you may look around the docs and other text or markdown files for things that are reported as failing cases. then also, making the ir backend for projects not work as a single transation unit, but in actual modules. also the test that are marked as hsould work but fail, make them work. then later on, strippig of the static keyword completely, and in it's use sites. we check if self is in a methid alreasdy, so methods with we can jsut mark methods that don't use self as static. and the ones that do as methods. then you'll be free to do any quality of life polishes. and other stuff. " add thses to a todo file and implement one by one, in order." 
 - [x] Generic-fn println picks wrong pack instance — FIXED: generic-pass collect of a generic body enqueued `println<str>` with `tailTypes=[TypeParam]` (T binds from the fmt literal = concrete str while the pack arg stays a type param); the instance-pass recollect's concrete `[i32]` tail was then discarded by `enqueueInstance`'s name+args+valueKey dedup, and codegen resolved the TypeParam tail through println's own T→str sub → `_coral_str _varg0`. Fix: `enqueueVal` now skips work items whose tailTypes aren't concrete (same deferred-recollect rule as arguments), and `isConcreteType` recurses through `Reference`. Verified: `dump<i32>`/`dump<i32&>`/`dump<str>`/`dump<f32>` all print correctly; 35/35 works tests pass.
 - [ ] `println("rest={}", args)` — forwarding a whole comptime pack as a call arg gives G0002 "no unique mono instance" (pack splicing edge; `dump<T>(T v, ... args)` forwarding needs a look).
+
+## muvm optimizer tightening (Devin work queue — ordered)
+
+Done:
+- [x] ifconv — diamond→select (O2/O3); v2 load speculation via alloca/global bounds proof
+- [x] ivsr — phases A (mul/shl iv,K→recurrence) + B (affine a*iv+b fold) early; phase C pointer-IV (`gep base,iv`→ptr phi) LATE only (post-vectorizers — early placement killed SLP/unroll gep patterns)
+- [x] loop_unswitch (O3) — invariant cond_br in loop → two specialized loops
+- [x] div/rem by pow2 → shifts (algebraic.crl)
+- [x] GVN cross-block load-cache miscompile fix; ifconv operand user-registration fix
+- [x] AA constant-offset decomposition: decomposeAddr → (obj, byteOff); isMustAlias same-obj+same-offset; mayClobberSized range query
+- [x] irPrinter: per-block `=` column alignment + func brace spacing
+
+Pending (in order):
+- [ ] Wire mayClobberSized into memory_ssa defMayAliasLoad/findNearestDefForLoad (needs load/store type sizes plumbed through)
+- [ ] Fold gaps: select c,x,x→x; icmp eq/ne x,x→const; mul x,-1→neg; redundant gep base,0
+- [ ] AA depth: points-to SETS for phis (currently same-object-only merge → UNKNOWN on disagreement)
+- [ ] Function attributes so calls stop being blanket memory barriers: readonly/readnone/writeonly/argmemonly exist in irMetadata (funcIsReadOnly/funcIsReadNone/hasFuncAttr) but NO pass consults them — wire into gvn load-cache flush, memory_ssa defMayAliasLoad Call barrier, dse, loop_cse, licm. Call ops[0] = callee func value (IrValueKind::Func); need IrFunc* back-pointer or module lookup to read attrs. THIS IS LAST per user instruction
+- [ ] Interprocedural points-to (argmemonly-style summary)
+- [ ] noalias/dereferenceable param attributes
+- [ ] Printer: further stylization if wanted
