@@ -130,6 +130,10 @@ pub struct Layout
     Vec<u64> tlsGot;
     u64 relaPltOff;
     u64 relaPltSize;
+    u64 dynUndefOff;
+    u64 dynUndefSize;
+    u64 jmpRelOff;
+    u64 jmpRelSize;
     u64 ipltOff;
     Vec<u32> ipltSlots;
     Vec<u64> ipltKeys;
@@ -188,6 +192,10 @@ pub struct Layout
             .tlsGot = Vec<u64>::new(),
             .relaPltOff = 0,
             .relaPltSize = 0,
+            .dynUndefOff = 0,
+            .dynUndefSize = 0,
+            .jmpRelOff = 0,
+            .jmpRelSize = 0,
             .ipltOff = 0,
             .ipltSlots = Vec<u32>::new(),
             .ipltKeys = Vec<u64>::new(),
@@ -295,6 +303,13 @@ pub bool defAddress(Vec<ObjFile>* objs, Layout* L, GlobalDef* def, u64* out, Str
     if (def->isImport)
     {
         *out = def->viaImp ? def->iatAddr : def->value;
+        return true;
+    }
+    /* loader-resolved undef: canonical-PLT — every reference resolves
+     * to the synthesized PLT stub (def->value, assigned in layout) */
+    if (def->isDynUndef)
+    {
+        *out = def->value;
         return true;
     }
     if (def->shndx == SHN_ABS)
@@ -681,13 +696,24 @@ pub bool computeLayout(u16 machine, u8 outFmt, u64 imageBase, str entry, u64 ent
 
     usize nImp = imps == null ? 0 : imps->count();
 
+    /* loader-resolved undefineds (allowDynUndef): each gets a PLT
+     * stub, a .got.plt slot and a JUMP_SLOT entry. */
+    usize nDynUndef = 0;
+    for (usize d = 0; d < defs->count(); d++)
+        if (defs->atPtr(d)->isDynUndef) nDynUndef++;
+    if (nDynUndef > 0 && outFmt != FMT_ELF_DYN)
+    {
+        err->pushView("linker: allowDynUndef is only supported for ELF shared object output");
+        return false;
+    }
+
     /* PE: jump thunks appended to .text for every use record */
     if (isPE && nImp > 0)
     {
         OutSec* text = L->secs.atPtr((usize)SEC_TEXT);
-        u64 t = alignUp(text->size, 8);
+        u64 t = alignUp(text->size, 16);
         L->thunkOff = t;
-        text->size = t + (u64)nImp * 8;
+        text->size = t + (u64)nImp * 12; /* adrp/ldr/br thunk */
     }
 
     /* ELF dyn: reserve dynamic metadata inside .rodata and .dynamic
@@ -708,21 +734,42 @@ pub bool computeLayout(u16 machine, u8 outFmt, u64 imageBase, str entry, u64 ent
         u64 hashSz = (nbucket + 2 + (u64)nDyn) * 4;
         u64 relEnt = is64 ? 24 : 8;
         u64 relSz = (u64)_countAbs(machine, outFmt, objs) * relEnt;
+        u64 jmpRelSz = (u64)nDynUndef * relEnt;
+
+        /* .plt stubs appended to .text, .got.plt slots in .data,
+         * .rela.plt JUMP_SLOT entries after .rela.dyn in .rodata */
+        if (nDynUndef > 0)
+        {
+            OutSec* text = L->secs.atPtr((usize)SEC_TEXT);
+            OutSec* rw0 = L->secs.atPtr((usize)SEC_DATA);
+            u64 plt = alignUp(text->size, 16);
+            L->pltOff = plt;
+            L->pltSize = (u64)nDynUndef * 16;
+            text->size = plt + L->pltSize;
+
+            u64 got = alignUp(rw0->size, 8);
+            L->gotOff = got;
+            L->gotSize = (u64)nDynUndef * 8;
+            rw0->size = got + L->gotSize;
+        }
 
         u64 m = alignUp(ro->size, 8);
         L->dynMetaOff = m;
         u64 dynsymRel = alignUp(m + dynstrSz, 8);
         u64 hashRel = alignUp(dynsymRel + dynsymSz, 8);
         u64 relRel = alignUp(hashRel + hashSz, 8);
-        ro->size = relRel + relSz;
+        u64 jmpRel = alignUp(relRel + relSz, 8);
+        ro->size = jmpRel + jmpRelSz;
         L->dynstrSz = dynstrSz;
         L->dynsymSz = dynsymSz;
         L->hashSz = hashSz;
         L->relOff = relRel;
         L->relSize = relSz;
+        L->jmpRelOff = jmpRel;
+        L->jmpRelSize = jmpRelSz;
 
         u64 dynEnt = is64 ? 16 : 8;
-        u64 nDt = 9;
+        u64 nDt = nDynUndef > 0 ? 14 : 9;
         u64 d = alignUp(rw->size, 8);
         L->dynOff = d;
         rw->size = d + nDt * dynEnt;
@@ -1046,7 +1093,7 @@ pub bool computeLayout(u16 machine, u8 outFmt, u64 imageBase, str entry, u64 ent
             {
                 ImportRec* r = imps->recs.atPtr(i);
                 r->iatAddr = L->idataAddr + r->iatAddr;
-                r->thunkAddr = L->secs.at((usize)SEC_TEXT).addr + L->thunkOff + (u64)i * 8;
+                r->thunkAddr = L->secs.at((usize)SEC_TEXT).addr + L->thunkOff + (u64)i * 12;
             }
             for (usize d = 0; d < defs->count(); d++)
             {
@@ -1103,6 +1150,23 @@ pub bool computeLayout(u16 machine, u8 outFmt, u64 imageBase, str entry, u64 ent
             i64 si = L->machoStub.at(d);
             def->iatAddr = si >= 0 ? text->addr + L->machoStubOff + (u64)si * 12 : 0;
             def->size = 0;
+        }
+    }
+
+    /* loader-resolved undefs: def->value = PLT stub vaddr (canonical
+     * target for every static reloc), def->iatAddr = .got.plt slot */
+    if (outFmt == FMT_ELF_DYN && L->jmpRelSize > 0)
+    {
+        u64 pltBase = L->secs.at((usize)SEC_TEXT).addr + L->pltOff;
+        u64 gotBase = L->secs.at((usize)SEC_DATA).addr + L->gotOff;
+        u64 di = 0;
+        for (usize d = 0; d < defs->count(); d++)
+        {
+            GlobalDef* def = defs->atPtr(d);
+            if (!def->isDynUndef) continue;
+            def->value = pltBase + di * 16;
+            def->iatAddr = gotBase + di * 8;
+            di++;
         }
     }
 
