@@ -15,8 +15,8 @@
 
 import muvm::passes::common { gVerbose };
 import muvm::irOps { IrOpcode, irOpcodeIsTerminator };
-import muvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind };
-import muvm::irMetadata { callMayWriteMemory };
+import muvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind, IrType, IrTypeKind };
+import muvm::irMetadata { callMayWriteMemory, funcParamDerefBytes };
 import muvm::passes::loop_detect { IrLoop, irLoopDetectNatural, irLoopDestroy };
 import muvm::domtree { IrDomTree, irDomtreeNew, irDomtreeFree, irDomtreeDominates };
 import std::mman { alloc, dealloc };
@@ -93,22 +93,40 @@ pub struct LoopCsePass
     bool isHoistableLoad(IrFunc* func, bool* inLoop, u32 nfn, IrInst* inst)
     {
         if (inst->opcode != IrOpcode::Load) return false;
-        if (!self.isSafeToSpeculate(inst)) return false;
+        if (!self.isSafeToSpeculate(func, inst)) return false;
         return self.isInvariantChain(func, inLoop, nfn, inst);
     }
 
     // Hoisting executes the load once even on a zero-trip loop, so the
-    // pointer must be provably non-faulting: a chain of GEPs with constant
-    // indices and bitcasts rooted at an alloca or a global. Anything else
-    // (args, call/load results, phis) may be an invalid address.
-    bool isSafeToSpeculate(IrInst* load)
+    // pointer must be provably non-faulting: a chain of GEPs with
+    // priced constant indices and bitcasts rooted at an alloca, a
+    // global, or an argument carrying !dereferenceable(N) large enough
+    // to cover offset+access size. Anything else (call/load results,
+    // phis, under-provisioned args) may be an invalid address.
+    bool isSafeToSpeculate(IrFunc* func, IrInst* load)
     {
         IrValue* p = load->nops > 0 ? load->ops[0] : null;
+        i64 off = 0;
+        bool offOk = true;
         u32 depth = 0;
         while (p != null && depth < 64)
         {
             depth++;
             if (p->kind == IrValueKind::Global) return true;
+            if (p->kind == IrValueKind::Arg)
+            {
+                // dereferenceable param: the guarantee covers the first
+                // N bytes from the arg itself, so the accumulated const
+                // offset plus the access size must fit
+                if (!offOk) return false;
+                for (u32 ai = 0; ai < func->nargs; ai++)
+                {
+                    if (func->args[ai] != p) continue;
+                    i64 need = off + (i64)self.ctx->irTypeSizeOf(load->base.type);
+                    return funcParamDerefBytes(func, ai) >= need;
+                }
+                return false;
+            }
             if (p->kind != IrValueKind::Inst) return false;
             IrInst* d = (IrInst*)p;
             if (d->opcode == IrOpcode::Alloca) return true;
@@ -119,17 +137,38 @@ pub struct LoopCsePass
             }
             if (d->opcode == IrOpcode::Gep && d->nops >= 2)
             {
-                bool constIdx = true;
+                // price each constant index into the byte offset; a
+                // dynamic index or unpriceable field poisons it — the
+                // arg terminal then fails safe while alloca/global
+                // terminals are unaffected (always mapped anyway)
+                IrType* cur = null;
+                if (d->ops[0] != null && d->ops[0]->type != null)
+                {
+                    cur = d->ops[0]->type;
+                    if (cur->kind == IrTypeKind::Ptr) cur = cur->elem;
+                }
                 for (u32 oi = 1; oi < d->nops; oi++)
                 {
                     IrValue* iv = d->ops[oi];
                     if (iv == null || iv->kind != IrValueKind::ConstInt)
-                    {
-                        constIdx = false;
-                        break;
-                    }
+                    { offOk = false; break; }
+                    if (cur != null &&
+                        (cur->kind == IrTypeKind::Struct ||
+                         cur->kind == IrTypeKind::Union))
+                    { offOk = false; break; }
+                    IrType* et = null;
+                    u64 esz = 1;
+                    if (cur != null &&
+                        (cur->kind == IrTypeKind::Array ||
+                         cur->kind == IrTypeKind::Vector))
+                        et = cur->elem;
+                    else if (cur != null && cur->kind == IrTypeKind::Ptr)
+                        et = cur->elem;
+                    if (et != null) esz = (u64)self.ctx->irTypeSizeOf(et);
+                    off += (i64)iv->valData * (i64)esz;
+                    cur = et;
                 }
-                if (!constIdx) return false;
+                if (!offOk) return false;
                 p = d->ops[0];
                 continue;
             }
