@@ -163,3 +163,6 @@ Pending (in order):
 - [x] counted-loop idiom: DONE as loop_idiom pass (abdbb90) — single-block const-trip acc+=invariant → mul+add; strict whitelist, verified on idiom3 inner loop `sum += a[iv]` (invariant load + accumulator phi + provable trip count) → `sum += a[iv]*trip`. Needs SCEV-lite trip proof from ivsr affine recurrences; single-block inner loop; no side effects. No IR changes — pure mid-end transform.
 - [ ] printer stylization round 2 (optional): phi-pair column alignment, aligned branch targets, section grouping — cosmetic only, goldens regen
 - [ ] printer further stylization if wanted
+- [ ] PERF: blockIndex() is O(nblocks) linear scan called per-operand-per-inst in licm/loop_cse/loop_canon/jump_thread/alias_analysis isInvariantChain → quadratic on large funcs. Fix: per-func block→index map built once per pass run, or compare def->parent directly against lp->blocks (loop-local membership, usually tiny) in isInvariantChain.
+- [ ] PERF: infer_memattrs callee-index lookup is O(nfuncs) per call edge → O(edges×funcs); build func→index map once.
+- [ ] GCC-vs-LLVM gap audit: candidates — tail merging (crossjumping), store-motion/GIMPLE store merging, phiopt (both have), loop header copying, hot/cold splitting, computed-goto vs switch lowering, shrink-wrapping, sibling-call coverage check.
