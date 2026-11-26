@@ -4,6 +4,8 @@
  * generateMuvm: analyzed AST → muvm IR → pipeline → asm. Mirrors
  * generateC's shape but builds IR directly (no text streams). Phase 1:
  * one collection pass that mangles each symbol exactly once, detects
+ * raw-name collisions at compile time, declares IrFunc shells (externs
+ * + definitions), then lowers definition bodies. */
 use lower { Muv, MuvmResult, MuvmTu, MuvNameEnt, MuvNames, muvNode, muvErr, muvStr, muvResolved,
                muvPushLocal, muvBlock, muvSetBlock, muvTerm, muvPos, muvFnMapInit, muvFnMapPut,
                muvTyMapInit, muvTdMapInit, muvGMapInit, muvHashStr, muvNamesInit, muvNamesFind,
@@ -27,13 +29,17 @@ use ast {
     expr { Expr, ExprKind },
     stmt { Stmt, StmtKind },
     decl { Decl, DeclKind, File, Param, ATTR_FREESTANDING }
+};
+use common::slice { Slice };
 import muvm::irtypes { IrContext, IrModule, IrFunc, IrBlock, IrValue, IrValueKind, IrType, IrTypeKind, IrGlobal, irCtxCreate, irCtxDestroy };
 import muvm::irOps { IrICmpPred };
 import muvm::irBuilder { IrBuilder };
 import muvm::irPrinter { IrPrinter };
 import muvm::passes::diagnostics::verify { muvmPassVerify };
 import muvm::passes::diagnostics::safety { muvmPassSafety };
+import muvm::muvm { muvmCompileAsm, muvmOptions, MuvmOptions, OptLevel, CallingConvention, muvmCCId };
 import std::mman { alloc, dealloc, zero };
+import platform::libc { printf };
 import std::string { String };
 
 /* ── opt-level mapping (mirror of runGcc's C flags) ─────────── */
@@ -333,6 +339,8 @@ IrFunc* muvRegisterFunc(Muv* w, MuvNames* names, NodeId declId, Decl* d, str nam
     }
 
     /* new name: declare the shell, claim the slot, register for calls */
+    IrFunc* f = muvDeclareMethod(w, declId, d, name, selfTy);
+    if (f == null) return null;
     muvAddFunc(w, f);
     if (names != null && name.len != 0)
     {
@@ -372,6 +380,8 @@ struct MuvBodyEnt
 {
     IrFunc* f;
     NodeId decl;
+    NodeId body;
+    u32 inst;
     u32 tu;         // partition TU (instance hash shard)
     u8 self;
 }
@@ -417,8 +427,9 @@ void muvQueueInstMethod(Muv* w, NodeId mdef, Decl* md, Str iown, IrType* selfPt,
     }
     if ((flags & 8) != 0 && (flags & 2) == 0 && ents != null && qlen != null && *qlen < qcap)
     {
-                                  .inst = ii, .tu = w->curTu,
-                                  .self = sk == 1 ? 1 : 0 };
+        ents[*qlen] = MuvBodyEnt { .f = f, .decl = mdef,
+                                  .body = md->kind.payload.Func.body,
+                                  .inst = ii, .self = sk == 1 ? 1 : 0 };
         *qlen = *qlen + 1;
     }
 }
@@ -443,6 +454,7 @@ void muvQueueInstMethods(Muv* w, NodeId* methods, u32 mlen, Str iown, IrType* se
         }
         k++;
     }
+}
 /* ── multi-TU partition (Rust-CGU model) ───────────────────────
  * decls group by home file (locFile); a file owning more than 400
  * code decls sub-shards by decl hash (
@@ -637,6 +649,7 @@ pub MuvmResult generateMuvm(AstContext* ctx, File* file, MonoContext* mono, Diag
                                  pinst->argumentsLen, 0);
             pj++;
         }
+    }
     /* ── partition: count code-owning decls per file, derive shard
      * counts and the flat TU list (file-major order). tuCount stays
      * 1 for small units — the single-module path then runs unchanged. */
@@ -801,6 +814,8 @@ pub MuvmResult generateMuvm(AstContext* ctx, File* file, MonoContext* mono, Diag
         NodeId did = file->decls[i];
         Node* n = muvNode(&w, did);
         if (n->kind.tag == NodeKind::Decl)
+        {
+            Decl* d = &n->kind.payload.Decl.value;
             w.curTu = muvTuOfDecl(&w, did);
             if (d->kind.tag == DeclKind::Func)
             {
@@ -846,6 +861,8 @@ pub MuvmResult generateMuvm(AstContext* ctx, File* file, MonoContext* mono, Diag
                                 (w.mono == null || w.mono->genericCount(mdef) == 0))
                             {
                                 w.curTu = muvTuOfDecl(&w, mdef);
+                                u8 sk = muvMethodSelfKind(&w, mdef);
+                                str msym = muvMethodMangle(&w, mdef, owner, md->kind.payload.Func.name);
                                 IrFunc* f = muvRegisterFunc(&w, &names, mdef, md, msym,
                                                            sk == 1 ? selfPt : null);
                                 if (f != null && bodiesLen < bodiesCap)
@@ -918,6 +935,8 @@ pub MuvmResult generateMuvm(AstContext* ctx, File* file, MonoContext* mono, Diag
                                 w.sema->semaErrorNode(ErrorCode::CodegenInternal, inst->declaration,
                                                      "cannot declare the function instance");
                             }
+                            else
+                            {
                                 w.curTu = muvInstTu(&w, isym);
                                 muvAddFunc(&w, f);
                                 /* key from the IrFunc's own copy: isym is
@@ -932,9 +951,12 @@ pub MuvmResult generateMuvm(AstContext* ctx, File* file, MonoContext* mono, Diag
                                     ent->f = f;
                                 }
                                 w.instFns[ii] = f;
-                                iEnts[iBodiesLen] = MuvBodyEnt { .f = f,
-                                                                .inst = ii, .tu = w.curTu,
-                                                                .self = 0 };
+                                iEnts[iBodiesLen] = MuvBodyEnt {
+                                    .f = f,
+                                    .inst = ii,
+                                    .tu = w.curTu,
+                                    .self = 0
+                                };
                                 iBodiesLen++;
                             }
                         }
@@ -958,6 +980,8 @@ pub MuvmResult generateMuvm(AstContext* ctx, File* file, MonoContext* mono, Diag
                     muvErr(&w, inst->declaration, "cannot build the instance type for its methods");
                 else
                 {
+                    Str iown = muvTypeInstanceName(&w, inst->name, inst->arguments,
+                                                  inst->argumentsLen);
                     w.curTu = muvInstTu(&w, muvStr(&w, iown));
                     IrType* selfPt = w.ir->tyPtr(w.instTys[ii]);
                     Node* pn = muvNode(&w, inst->declaration);
@@ -966,12 +990,14 @@ pub MuvmResult generateMuvm(AstContext* ctx, File* file, MonoContext* mono, Diag
                         Decl* pd = &pn->kind.payload.Decl.value;
                         NodeId* im = null;
                         u32 iml = 0;
-                        if (pd->kind.tag == DeclKind::Struct)
-                            { im = pd->kind.payload.Struct.methods; iml = pd->kind.payload.Struct.methodsLen; }
-                        else if (pd->kind.tag == DeclKind::Union)
-                            { im = pd->kind.payload.Union.methods; iml = pd->kind.payload.Union.methodsLen; }
-                        else if (pd->kind.tag == DeclKind::Variant)
-                            { im = pd->kind.payload.Variant.methods; iml = pd->kind.payload.Variant.methodsLen; }
+                        if (pd->kind.tag == DeclKind::Struct) {
+                            im = pd->kind.payload.Struct.methods; iml = pd->kind.payload.Struct.methodsLen;
+                        }
+                        else if (pd->kind.tag == DeclKind::Union) { 
+                            im = pd->kind.payload.Union.methods; iml = pd->kind.payload.Union.methodsLen; }
+                        else if (pd->kind.tag == DeclKind::Variant) {
+                            im = pd->kind.payload.Variant.methods; iml = pd->kind.payload.Variant.methodsLen;
+                        }
                         muvQueueInstMethods(&w, im, iml, iown, selfPt, inst, ii,
                                            iEnts, &iBodiesLen, iQCap);
                     }
@@ -986,12 +1012,14 @@ pub MuvmResult generateMuvm(AstContext* ctx, File* file, MonoContext* mono, Diag
                             u32 eml = 0;
                             if (xd->kind.tag == DeclKind::Extend &&
                                 muvSelfTyMatches(&w, xd->kind.payload.Extend.selfType,
-                                                inst->name, inst->arguments, inst->argumentsLen))
-                                { em = xd->kind.payload.Extend.methods; eml = xd->kind.payload.Extend.methodsLen; }
+                                                inst->name, inst->arguments, inst->argumentsLen)) {
+                                em = xd->kind.payload.Extend.methods; eml = xd->kind.payload.Extend.methodsLen;
+                            }
                             else if (xd->kind.tag == DeclKind::ExtendTrait &&
                                      muvSelfTyMatches(&w, xd->kind.payload.ExtendTrait.selfType,
-                                                     inst->name, inst->arguments, inst->argumentsLen))
-                                { em = xd->kind.payload.ExtendTrait.methods; eml = xd->kind.payload.ExtendTrait.methodsLen; }
+                                                     inst->name, inst->arguments, inst->argumentsLen)) {
+                                em = xd->kind.payload.ExtendTrait.methods; eml = xd->kind.payload.ExtendTrait.methodsLen;
+                            }
                             muvQueueInstMethods(&w, em, eml, iown, selfPt, inst, ii,
                                                iEnts, &iBodiesLen, iQCap);
                         }
@@ -1007,6 +1035,8 @@ pub MuvmResult generateMuvm(AstContext* ctx, File* file, MonoContext* mono, Diag
     i = 0;
     while (i < bodiesLen && w.errors == 0)
     {
+        Node* n = muvNode(&w, bodyDecls[i]);
+        Decl* d = &n->kind.payload.Decl.value;
         w.curTu = muvTuOfDecl(&w, bodyDecls[i]);
         muvLowerBody(&w, bodyDecls[i], d, bodies[i], bodySelf != null ? bodySelf[i] : 0,
                     d->kind.payload.Func.body, null);
@@ -1089,6 +1119,7 @@ pub MuvmResult generateMuvm(AstContext* ctx, File* file, MonoContext* mono, Diag
                 muvmPassSafety(f, w.ir, muvTrapName());
             fi++;
         }
+    }
     /* compile to asm — one IrModule per TU when the partition
      * produced several; per-TU modules share the IrContext and
      * replicate the read-only tables (struct types are layout-only,

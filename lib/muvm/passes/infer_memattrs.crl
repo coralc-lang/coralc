@@ -1,0 +1,202 @@
+#[[no_drop_all]]
+// Infer per-function memory-effect attributes (readnone / readonly /
+// writeonly) so call sites stop treating every call as a full memory
+// barrier. gvn's load cache, memory_ssa's clobber query, dse's store
+// tracking and loop_cse's writer check all consult callMayWriteMemory /
+// callMayReadMemory, which read these attributes.
+//
+// Algorithm — pessimistic top-down fixpoint over the module call graph:
+//   effRead[f]  = localReads[f]  OR any callee's effRead
+//   effWrite[f] = localWrites[f] OR any callee's effWrite
+// Both start TRUE (unknown = may do everything) and only shrink, so the
+// iteration converges to the greatest fixpoint. Recursive cycles keep
+// whatever their bodies can't disprove — conservative and safe.
+//
+// Functions that already carry a memory attribute are authoritative:
+// their declared effects are used for callers but the function itself
+// is never re-inferred or overwritten (an attr is a contract).
+//
+// Runs once per module — guarded on func == module->funcs[0] since the
+// pass driver invokes every pipeline entry once per function.
+
+import muvm::irtypes { IrContext, IrFunc, IrModule, IrBlock, IrInst, IrValue, IrValueKind };
+import muvm::irOps { IrOpcode };
+import muvm::irMetadata {
+    hasFuncAttr, funcIsReadOnly, funcIsReadNone, funcIsWriteOnly,
+    setFuncReadOnly, setFuncReadNone, setFuncWriteOnly };
+import muvm::passes::common { gVerbose };
+import std::mman { alloc, dealloc };
+import std::ios { eprintln };
+
+pub bool muvmPassInferMemAttrs(IrFunc* func, rawptr userdata)
+{
+    IrModule* m = func->parent;
+    if (m == null || m->nfuncs == 0) return false;
+    // once per module: only the first function triggers the whole scan
+    if (func != m->funcs[0]) return false;
+
+    u32 n = m->nfuncs;
+    bool* localRead = alloc<bool>((usize)n);
+    bool* localWrite = alloc<bool>((usize)n);
+    bool* fixed = alloc<bool>((usize)n);   // declared attr → effects frozen
+    bool* effRead = alloc<bool>((usize)n);
+    bool* effWrite = alloc<bool>((usize)n);
+    // callee edges: for each func, list of callee indices needing the
+    // fixpoint (unannotated, analyzable, in-module, non-extern)
+    u32* callees = alloc<u32>((usize)n * 16);
+    u32* nCallees = alloc<u32>((usize)n);
+    for (u32 i = 0; i < n; i++)
+    {
+        localRead[i] = false;
+        localWrite[i] = false;
+        nCallees[i] = 0;
+        IrFunc* f = m->funcs[i];
+        bool hasMemAttr = f != null &&
+            (funcIsReadNone(f) || funcIsReadOnly(f) || funcIsWriteOnly(f));
+        fixed[i] = hasMemAttr;
+        // pessimistic top: unknown does everything until proven less
+        effRead[i] = true;
+        effWrite[i] = true;
+        if (hasMemAttr)
+        {
+            // declared effects are the contract — freeze them
+            effRead[i] = !funcIsWriteOnly(f);
+            effWrite[i] = !funcIsReadNone(f) && !funcIsReadOnly(f);
+        }
+    }
+
+    // Pass 1 — local effects + callee edges
+    for (u32 fi = 0; fi < n; fi++)
+    {
+        IrFunc* f = m->funcs[fi];
+        if (f == null || f->isExtern) continue;
+        for (u32 bi = 0; bi < f->nblocks; bi++)
+        {
+            IrBlock* bb = f->blocks[bi];
+            if (bb == null) continue;
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst == null) continue;
+                switch (inst->opcode)
+                {
+                    IrOpcode::Load | IrOpcode::AtomicLoad =>
+                    { localRead[fi] = true; },
+                    IrOpcode::Store | IrOpcode::AtomicStore =>
+                    { localWrite[fi] = true; },
+                    IrOpcode::AtomicRmw | IrOpcode::AtomicCmpXchg =>
+                    { localRead[fi] = true; localWrite[fi] = true; },
+                    IrOpcode::Call =>
+                    {
+                        IrValue* cv = inst->nops > 0 ? inst->ops[0] : null;
+                        if (cv != null && cv->kind == IrValueKind::Func)
+                        {
+                            IrFunc* callee = (IrFunc*)cv;
+                            bool calleeHasAttr = funcIsReadNone(callee) ||
+                                funcIsReadOnly(callee) || funcIsWriteOnly(callee);
+                            if (calleeHasAttr)
+                            {
+                                // declared attr is the contract — fold its
+                                // effects into this function's locals
+                                if (!funcIsWriteOnly(callee)) localRead[fi] = true;
+                                if (!funcIsReadNone(callee) && !funcIsReadOnly(callee))
+                                    localWrite[fi] = true;
+                            }
+                            else if (callee->parent == m && !callee->isExtern)
+                            {
+                                // unannotated in-module callee: fixpoint edge
+                                if (nCallees[fi] < 16)
+                                {
+                                    for (u32 ci = 0; ci < n; ci++)
+                                    {
+                                        if (m->funcs[ci] == callee)
+                                        {
+                                            callees[fi * 16 + nCallees[fi]] = ci;
+                                            nCallees[fi]++;
+                                            break;
+                                        }
+                                    }
+                                }
+                                else
+                                {
+                                    // edge table full — can't prove, stay
+                                    // conservative rather than drop the call
+                                    localRead[fi] = true;
+                                    localWrite[fi] = true;
+                                }
+                            }
+                            else
+                            {
+                                // foreign module or extern without attr:
+                                // unknown callee does everything
+                                localRead[fi] = true;
+                                localWrite[fi] = true;
+                            }
+                        }
+                        else
+                        {
+                            // indirect call — unknown callee
+                            localRead[fi] = true;
+                            localWrite[fi] = true;
+                        }
+                    },
+                    IrOpcode::Fence | IrOpcode::InlineAsm |
+                    IrOpcode::GcWriteBarrier | IrOpcode::GcSafepoint |
+                    IrOpcode::LandingPad =>
+                    { localRead[fi] = true; localWrite[fi] = true; },
+                    else => {}
+                }
+            }
+        }
+    }
+
+    // Pass 2 — fixpoint. Effects only shrink from the pessimistic top.
+    bool changed = true;
+    u32 rounds = 0;
+    while (changed && rounds <= n + 1)
+    {
+        changed = false;
+        rounds++;
+        for (u32 fi = 0; fi < n; fi++)
+        {
+            if (fixed[fi]) continue;
+            bool r = localRead[fi];
+            bool w = localWrite[fi];
+            for (u32 cj = 0; cj < nCallees[fi]; cj++)
+            {
+                u32 ci = callees[fi * 16 + cj];
+                if (effRead[ci]) r = true;
+                if (effWrite[ci]) w = true;
+            }
+            if (r != effRead[fi] || w != effWrite[fi])
+            {
+                effRead[fi] = r;
+                effWrite[fi] = w;
+                changed = true;
+            }
+        }
+    }
+
+    // Pass 3 — attach the strongest proven attribute to functions that
+    // declared none. Externs have no body to prove anything about.
+    for (u32 fi = 0; fi < n; fi++)
+    {
+        IrFunc* f = m->funcs[fi];
+        if (f == null || f->isExtern || fixed[fi]) continue;
+        if (!effRead[fi] && !effWrite[fi]) setFuncReadNone(f);
+        else if (!effWrite[fi]) setFuncReadOnly(f);
+        else if (!effRead[fi]) setFuncWriteOnly(f);
+    }
+
+    if (gVerbose)
+        eprintln("infer_memattrs: {} funcs, {} rounds", (u64)n, (u64)rounds);
+
+    dealloc<bool>(localRead);
+    dealloc<bool>(localWrite);
+    dealloc<bool>(fixed);
+    dealloc<bool>(effRead);
+    dealloc<bool>(effWrite);
+    dealloc<u32>(callees);
+    dealloc<u32>(nCallees);
+    return false;
+}
