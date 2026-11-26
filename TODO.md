@@ -157,7 +157,7 @@ Pending (in order):
 - [x] Interprocedural points-to — DONE as infer_memattrs (read/write lattice + argmemonly lattice + callMayClobber/mayCallClobber queries wired into gvn/memory_ssa/dse/loop_cse)
 - [ ] noalias/dereferenceable param attributes
 - [ ] Printer: further stylization if wanted
-- [ ] loop_cse gap observed: inner loop `jbody` reloads invariant `%5` (outer ptr-IV phi) every iteration — invariant-load hoist didn't fire; investigate whether loop_cse's writer check or invariance chain rejects ptr-phi addresses
+- [x] loop_cse invariant-load "gap" — VERIFIED CORRECT: isSafeToSpeculate requires alloca/global-rooted addrs; arg-derived phi ptr can't be proven non-faulting on zero-trip (LLVM identical). Unblocks only with dereferenceable param attr (below)
 - [ ] loop idiom: inner counted loop `sum += a[iv]` per outer iter → mul strength reduction (indvars territory)
 - [ ] noalias/dereferenceable param attributes (IR syntax + parser + AA)
 - [ ] printer further stylization if wanted
