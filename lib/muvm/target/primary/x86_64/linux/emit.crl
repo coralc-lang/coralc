@@ -1,13 +1,15 @@
 #[[no_drop_all]]
 // emit.crl: instruction selection + text emission for x86_64 linux.
-// Pipeline per function: collect defs -> build live intervals ->
-// linear-scan assign (regalloc/) -> emit blocks in order -> prologue.
+// Pipeline per function: collect defs -> dense vreg map ->
+// block liveness -> live intervals -> interference-graph coloring
+// (regalloc/graph) -> emit blocks in order -> prologue.
 
 import muvm::irtypes {
     IrModule, IrFunc, IrBlock, IrInst, IrValue, IrValueKind,
     IrType, IrTypeKind, IrContext
 };
 import muvm::irOps { IrOpcode, IrICmpPred, irOpcodeStr };
+import muvm::regalloc::graph { LiveRange, AllocResult, graphAssign };
 import std::string { String };
 import std::mman { alloc, dealloc, copy };
 import std::vec { Vec };
@@ -17,16 +19,96 @@ use muvm::target::primary::x86_64::linux::regs;
 use muvm::target::primary::x86_64::linux::linux { ArgClass, classifyArg, typeSizeBytes, typeIsSse, INT_ARG_REGS, SSE_ARG_REGS };
 use muvm::target::primary::x86_64::linux::prologue;
 
-/* vreg: virtual register. phys = assigned hardware reg or -1
- * (spilled -> stack slot). kind distinguishes gpr vs xmm. */
+/* vreg: virtual register, densely numbered per function.
+ * phys = assigned hardware reg or -1 (spilled -> stack slot).
+ * klass distinguishes gpr vs xmm. */
 pub struct VReg
 {
     i32 phys;      /* regs:: encoding or -1 */
-    i32 slot;      /* frame offset when spilled, -1 otherwise */
+    i32 slot;      /* spill slot index, -1 otherwise */
     u8 klass;      /* 0 = gpr, 1 = xmm */
     bool isConst;
     u64 constVal;
     IrType* type;
+}
+
+/* open-addressing IrValue* -> dense vreg index map */
+struct VRegMap
+{
+    usize* keys;   /* (usize)IrValue*, 0 = empty */
+    u32* vals;
+    u32 cap;       /* power of two */
+    u32 count;
+}
+
+u64 vmapHash(IrValue* v)
+{
+    return (((u64)(usize)v) >> 4) * 11400714819323198485;
+}
+
+void vmapInit(VRegMap* m, u32 cap)
+{
+    m->cap = cap;
+    m->count = 0;
+    m->keys = alloc<usize>((usize)cap);
+    m->vals = alloc<u32>((usize)cap);
+    for (u32 i = 0; i < cap; i++) { m->keys[i] = 0; m->vals[i] = 0; }
+}
+
+void vmapFree(VRegMap* m)
+{
+    if (m->keys != null) dealloc<usize>(m->keys);
+    if (m->vals != null) dealloc<u32>(m->vals);
+    m->keys = null;
+    m->vals = null;
+}
+
+i32 vmapFind(VRegMap* m, IrValue* v)
+{
+    u64 h = vmapHash(v);
+    u32 i = (u32)(h & (u64)(m->cap - 1));
+    for (u32 probe = 0; probe < m->cap; probe++)
+    {
+        usize k = m->keys[i];
+        if (k == 0) return -1;
+        if ((IrValue*)(usize)k == v) return (i32)m->vals[i];
+        i = (i + 1) & (m->cap - 1);
+    }
+    return -1;
+}
+
+void vmapInsertRaw(VRegMap* m, IrValue* v, u32 idx)
+{
+    u64 h = vmapHash(v);
+    u32 i = (u32)(h & (u64)(m->cap - 1));
+    while (m->keys[i] != 0) i = (i + 1) & (m->cap - 1);
+    m->keys[i] = (usize)v;
+    m->vals[i] = idx;
+    m->count++;
+}
+
+void vmapGrow(VRegMap* m)
+{
+    usize* ok = m->keys;
+    u32* ov = m->vals;
+    u32 oc = m->cap;
+    vmapInit(m, oc * 2);
+    for (u32 i = 0; i < oc; i++)
+        if (ok[i] != 0) vmapInsertRaw(m, (IrValue*)(usize)ok[i], ov[i]);
+    dealloc<usize>(ok);
+    dealloc<u32>(ov);
+}
+
+void vmapPut(VRegMap* m, IrValue* v, u32 idx)
+{
+    if ((m->count + 1) * 4 >= m->cap * 3) vmapGrow(m);
+    /* absent guaranteed by caller */
+    u64 h = vmapHash(v);
+    u32 i = (u32)(h & (u64)(m->cap - 1));
+    while (m->keys[i] != 0) i = (i + 1) & (m->cap - 1);
+    m->keys[i] = (usize)v;
+    m->vals[i] = idx;
+    m->count++;
 }
 
 pub struct EmitCtx
@@ -34,52 +116,51 @@ pub struct EmitCtx
     String out;
     IrFunc* func;
     IrContext* ictx;
-    VReg* vregs;      /* indexed by IrValue.id */
+    VReg* vregs;      /* indexed by dense vreg id */
     u32 nvregs;
     u32 capVregs;
-    Vec<u8> usedCallee; /* bitmap-ish: which callee-saved got assigned */
+    VRegMap vmap;
+    Vec<u8> usedCallee; /* which callee-saved phys regs got assigned */
     i32 frameSize;
     str labelPrefix;
 
     EmitCtx new()
     {
-        return EmitCtx {
+        EmitCtx c = {
             .out = String::new(),
             .func = null,
             .ictx = null,
             .vregs = null,
             .nvregs = 0,
             .capVregs = 0,
+            .vmap = VRegMap { .keys = null, .vals = null, .cap = 0, .count = 0 },
             .usedCallee = Vec<u8>::new(),
             .frameSize = 0,
             .labelPrefix = str::empty()
         };
+        vmapInit(&c.vmap, 256);
+        return c;
     }
 
     void destroy()
     {
         if (self.vregs != null) dealloc<VReg>(self.vregs);
+        vmapFree(&self.vmap);
         self.out.free();
         self.usedCallee.dispose();
     }
 
     u32 vregFor(IrValue* v)
     {
-        u32 id = v->id;
+        i32 f = vmapFind(&self.vmap, v);
+        if (f >= 0) return (u32)f;
+        u32 id = self.nvregs;
+        self.nvregs = id + 1;
         if (id >= self.capVregs)
         {
             u32 nc = self.capVregs ? self.capVregs * 2 : 64;
             while (nc <= id) nc *= 2;
             VReg* nv = alloc<VReg>((usize)nc);
-            for (u32 i = 0; i < nc; i++)
-            {
-                nv[i].phys = -1;
-                nv[i].slot = -1;
-                nv[i].klass = 0;
-                nv[i].isConst = false;
-                nv[i].constVal = 0;
-                nv[i].type = null;
-            }
             if (self.vregs != null)
             {
                 copy<VReg>(nv, self.vregs, (usize)self.capVregs);
@@ -88,9 +169,14 @@ pub struct EmitCtx
             self.vregs = nv;
             self.capVregs = nc;
         }
-        if (id >= self.nvregs) self.nvregs = id + 1;
         VReg* r = &self.vregs[id];
-        if (r->type == null) r->type = v->type;
+        r->phys = -1;
+        r->slot = -1;
+        r->klass = 0;
+        r->isConst = false;
+        r->constVal = 0;
+        r->type = v->type;
+        vmapPut(&self.vmap, v, id);
         return id;
     }
 
@@ -150,12 +236,37 @@ pub str regForWidth(u8 r, u32 w)
     return regName(r);
 }
 
+bool isVRegOperand(IrValue* v)
+{
+    if (v == null) return false;
+    return v->kind == IrValueKind::Inst || v->kind == IrValueKind::Arg ||
+           v->kind == IrValueKind::ConstInt || v->kind == IrValueKind::ConstFloat;
+}
+
+/* does this inst produce an SSA value (has a def)? */
+bool instHasDef(IrInst* inst)
+{
+    if (inst->base.type == null) return false;
+    switch (inst->opcode)
+    {
+        IrOpcode::Store | IrOpcode::Br | IrOpcode::CondBr |
+        IrOpcode::Switch | IrOpcode::Ret | IrOpcode::Unreachable |
+        IrOpcode::Noret => { return false; },
+        else => { return true; },
+    }
+}
+
+i32 blockIndexOf(IrFunc* func, IrBlock* b)
+{
+    for (u32 i = 0; i < func->nblocks; i++)
+        if (func->blocks[i] == b) return (i32)i;
+    return -1;
+}
+
 u32 operandVReg(EmitCtx* ctx, IrValue* v)
 {
     if (v == null) return 0;
-    if (v->kind != IrValueKind::Inst && v->kind != IrValueKind::Arg &&
-        v->kind != IrValueKind::ConstInt && v->kind != IrValueKind::ConstFloat)
-        return 0;
+    if (!isVRegOperand(v)) return 0;
     if (v->kind == IrValueKind::ConstInt)
     {
         u32 id = ctx->vregFor(v);
@@ -222,6 +333,194 @@ bool emitInst(EmitCtx* ctx, IrInst* inst, String* err)
     }
     return false;
 }
+
+/* build live intervals and run the interference-graph allocator.
+ * Fills vregs[].phys/.slot and usedCallee/frameSize. */
+void runRegAlloc(EmitCtx* ctx, String* err)
+{
+    IrFunc* func = ctx->func;
+    u32 n = ctx->nvregs;
+    u32 nb = func->nblocks;
+    if (n == 0 || nb == 0) return;
+    u32 words = (n + 63) >> 6;
+    usize nbits = (usize)nb * (usize)words;
+
+    /* per-block instruction position range */
+    u32* bstart = alloc<u32>((usize)nb);
+    u32* bend = alloc<u32>((usize)nb);
+    /* successor index lists (CSR over func->blocks order) */
+    u32* succOff = alloc<u32>((usize)nb + 1);
+    u32 totalSucc = 0;
+    for (u32 b = 0; b < nb; b++)
+    {
+        succOff[b] = totalSucc;
+        IrBlock* bb = func->blocks[b];
+        totalSucc += bb != null ? bb->nsuccs : 0;
+    }
+    succOff[nb] = totalSucc;
+    u32* succIdx = alloc<u32>((usize)(totalSucc > 0 ? totalSucc : 1));
+    {
+        u32 sp = 0;
+        for (u32 b = 0; b < nb; b++)
+        {
+            IrBlock* bb = func->blocks[b];
+            if (bb == null) continue;
+            for (u32 s = 0; s < bb->nsuccs; s++)
+            {
+                i32 si = blockIndexOf(func, bb->succs[s]);
+                succIdx[sp++] = si >= 0 ? (u32)si : b; /* self-edge fallback */
+            }
+        }
+    }
+
+    u64* useB = alloc<u64>(nbits);
+    u64* defB = alloc<u64>(nbits);
+    u64* liveIn = alloc<u64>(nbits);
+    u64* liveOut = alloc<u64>(nbits);
+    for (usize i = 0; i < nbits; i++)
+    { useB[i] = 0; defB[i] = 0; liveIn[i] = 0; liveOut[i] = 0; }
+
+    u32* defPos = alloc<u32>((usize)n);
+    u32* lastUse = alloc<u32>((usize)n);
+    for (u32 i = 0; i < n; i++) { defPos[i] = 0xFFFFFFFFu; lastUse[i] = 0xFFFFFFFFu; }
+
+    /* walk blocks: record positions, upward-exposed uses, defs */
+    u32 pos = 0;
+    for (u32 b = 0; b < nb; b++)
+    {
+        IrBlock* bb = func->blocks[b];
+        bstart[b] = pos;
+        if (bb == null) { bend[b] = pos; continue; }
+        for (u32 ii = 0; ii < bb->ninsts; ii++)
+        {
+            IrInst* inst = bb->insts[ii];
+            if (inst == null) { pos++; continue; }
+            for (u32 k = 0; k < inst->nops; k++)
+            {
+                IrValue* ov = inst->ops[k];
+                if (!isVRegOperand(ov)) continue;
+                i32 vid = vmapFind(&ctx->vmap, ov);
+                if (vid < 0 || (u32)vid >= n) continue;
+                u32 v = (u32)vid;
+                u64 m = (u64)1 << (u64)(v & 63);
+                u32 w = v >> 6;
+                if ((defB[(usize)b * (usize)words + (usize)w] & m) == 0)
+                    useB[(usize)b * (usize)words + (usize)w] |= m;
+                if (lastUse[v] == 0xFFFFFFFFu || pos > lastUse[v])
+                    lastUse[v] = pos;
+            }
+            if (instHasDef(inst))
+            {
+                i32 did = vmapFind(&ctx->vmap, &inst->base);
+                if (did >= 0 && (u32)did < n)
+                {
+                    u32 v = (u32)did;
+                    defB[(usize)b * (usize)words + ((usize)v >> 6)] |= (u64)1 << (u64)(v & 63);
+                    if (defPos[v] == 0xFFFFFFFFu) defPos[v] = pos;
+                }
+            }
+            pos++;
+        }
+        bend[b] = pos;
+    }
+
+    /* dataflow: liveIn/liveOut to fixpoint */
+    bool changed = true;
+    while (changed)
+    {
+        changed = false;
+        for (u32 bi = nb; bi > 0; bi--)
+        {
+            u32 b = bi - 1;
+            /* newOut = union liveIn[succ] */
+            bool outDiff = false;
+            for (u32 s = succOff[b]; s < succOff[b + 1]; s++)
+            {
+                u32 si = succIdx[s];
+                for (u32 w = 0; w < words; w++)
+                {
+                    u64 add = liveIn[(usize)si * (usize)words + (usize)w] & ~liveOut[(usize)b * (usize)words + (usize)w];
+                    if (add != 0) { liveOut[(usize)b * (usize)words + (usize)w] |= add; outDiff = true; }
+                }
+            }
+            /* newIn = useB | (liveOut & ~defB) */
+            for (u32 w = 0; w < words; w++)
+            {
+                u64 nw = useB[(usize)b * (usize)words + (usize)w] |
+                         (liveOut[(usize)b * (usize)words + (usize)w] & ~defB[(usize)b * (usize)words + (usize)w]);
+                if (nw != liveIn[(usize)b * (usize)words + (usize)w])
+                { liveIn[(usize)b * (usize)words + (usize)w] = nw; changed = true; }
+            }
+            if (outDiff) changed = true;
+        }
+    }
+
+    /* intervals */
+    Vec<LiveRange> ranges = Vec<LiveRange>::new();
+    Vec<AllocResult> results = Vec<AllocResult>::new();
+    const u32 INF = 0xFFFFFFFFu;
+    for (u32 v = 0; v < n; v++)
+    {
+        u32 start = INF;
+        u32 end = 0;
+        bool live = false;
+        if (defPos[v] != INF) { start = defPos[v]; live = true; }
+        if (lastUse[v] != INF) { end = lastUse[v]; live = true; }
+        for (u32 b = 0; b < nb; b++)
+        {
+            u64 m = (u64)1 << (u64)(v & 63);
+            u32 w = v >> 6;
+            if ((liveIn[(usize)b * (usize)words + (usize)w] & m) != 0)
+            { if (bstart[b] < start) start = bstart[b]; live = true; }
+            if ((liveOut[(usize)b * (usize)words + (usize)w] & m) != 0)
+            { if (bend[b] > end) end = bend[b]; live = true; }
+        }
+        u32 rklass = (u32)ctx->vregs[v].klass;
+        u32 rsize = 8;
+        if (ctx->vregs[v].type != null)
+        {
+            if (typeIsSse(ctx->vregs[v].type)) rklass = 1;
+            u32 sz = typeSizeBytes(ctx->vregs[v].type);
+            if (sz > 8) rsize = sz;
+        }
+        ranges.push(LiveRange {
+            .start = live ? start : 0,
+            .end = live ? (end >= start ? end : start) : 0,
+            .klass = (u8)rklass,
+            .size = rsize
+        });
+        results.push(AllocResult { .phys = -1, .slot = -1 });
+    }
+
+    i32 nslots = 0;
+    graphAssign(&ranges, &results,
+                &regs::ALLOC_ORDER[0], regs::ALLOC_ORDER_LEN,
+                &regs::XMM_ALLOC_ORDER[0], regs::XMM_ALLOC_LEN,
+                0, &nslots);
+
+    /* fold results back into vregs; track callee-saved use + frame */
+    for (u32 v = 0; v < n; v++)
+    {
+        AllocResult* ar = results.atPtr((usize)v);
+        ctx->vregs[v].phys = ar->phys;
+        ctx->vregs[v].slot = ar->slot;
+        if (ar->phys >= 0 && regs::regIsCalleeSaved((u8)ar->phys))
+        {
+            while (ctx->usedCallee.count() < 16) ctx->usedCallee.push((u8)0);
+            ctx->usedCallee.atPtr((usize)ar->phys)[0] = 1;
+        }
+    }
+    ctx->frameSize = (i32)nslots * 8;
+
+    ranges.dispose();
+    results.dispose();
+    dealloc<u32>(bstart); dealloc<u32>(bend);
+    dealloc<u32>(succOff); dealloc<u32>(succIdx);
+    dealloc<u64>(useB); dealloc<u64>(defB);
+    dealloc<u64>(liveIn); dealloc<u64>(liveOut);
+    dealloc<u32>(defPos); dealloc<u32>(lastUse);
+}
+
 pub str emitFuncAsm(IrFunc* func, IrContext* ctx)
 {
     if (func == null || ctx == null) return "";
@@ -238,24 +537,22 @@ pub str emitFuncAsm(IrFunc* func, IrContext* ctx)
         {
             IrInst* inst = bb->insts[i];
             if (inst == null) continue;
-            if (inst->base.type != null &&
-                inst->opcode != IrOpcode::Store &&
-                inst->opcode != IrOpcode::Br && inst->opcode != IrOpcode::CondBr &&
-                inst->opcode != IrOpcode::Switch && inst->opcode != IrOpcode::Ret)
-                ec.vregFor(&inst->base);
+            if (instHasDef(inst)) ec.vregFor(&inst->base);
             for (u32 k = 0; k < inst->nops; k++)
             {
                 IrValue* ov = inst->ops[k];
-                if (ov == null) continue;
-                if (ov->kind != IrValueKind::Inst && ov->kind != IrValueKind::Arg &&
-                    ov->kind != IrValueKind::ConstInt && ov->kind != IrValueKind::ConstFloat)
-                    continue;
+                if (ov == null || !isVRegOperand(ov)) continue;
                 ec.vregFor(ov);
             }
         }
     }
     for (u32 a = 0; a < func->nargs; a++)
         if (func->args != null && func->args[a] != null) ec.vregFor(func->args[a]);
+
+    /* liveness + interference-graph register allocation */
+    String aerr = String::new();
+    runRegAlloc(&ec, &aerr);
+    aerr.free();
 
     for (u32 b = 0; b < func->nblocks; b++)
     {
@@ -277,8 +574,14 @@ pub str emitFuncAsm(IrFunc* func, IrContext* ctx)
         }
     }
 
-    eprintln("emitFuncAsm {} out.len={}", func->base.name, ec.out.len);
-    return str::fromParts(ec.out.ptr, ec.out.len);
+    eprintln("emitFuncAsm {} out.len={} nvregs={}", func->base.name, ec.out.len, ec.nvregs);
+    /* out buffer intentionally not freed — the returned str views it
+     * (same ownership model as target/fast) */
+    str result = ec.out.asView();
+    if (ec.vregs != null) dealloc<VReg>(ec.vregs);
+    vmapFree(&ec.vmap);
+    ec.usedCallee.dispose();
+    return result;
 }
 pub str emitModuleAsm(IrModule* modd, IrContext* ctx)
 {
