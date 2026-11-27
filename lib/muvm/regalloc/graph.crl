@@ -26,6 +26,7 @@ pub struct LiveRange
     u32 end;      /* last use position (inclusive) */
     u8 klass;     /* 0 gpr, 1 xmm */
     u32 size;     /* spill slot size in bytes (>=8 recommended) */
+    i32 prefer;   /* ranges[] index of copy-source vreg, -1 none */
 }
 
 pub struct AllocResult
@@ -45,6 +46,13 @@ bool bitGet(u64* bits, u32 words, u32 i, u32 j)
     return ((bits[(usize)i * (usize)words + ((usize)j >> 6)] >> (u64)(j & 63)) & 1) != 0;
 }
 
+u32 bitCount64(u64 x)
+{
+    u32 n = 0;
+    while (x != 0) { n += (u32)(x & 1); x >>= 1; }
+    return n;
+}
+
 /* color one interference graph.
  * nodes: indices into `idx` (0..nr-1 local numbering)
  * adj: nr x words bitset
@@ -53,7 +61,7 @@ bool bitGet(u64* bits, u32 words, u32 i, u32 j)
  * colored: out, local node -> color index or -1
  * returns number spilled */
 u32 colorGraph(u32 nr, u32 words, u64* adj, const u8* colors, u32 k,
-               const u32* deg, i32* colored)
+               const u32* deg, const i32* preferLocal, i32* colored)
 {
     /* order nodes by degree desc, then wider range first */
     u32* ord = alloc<u32>((usize)(nr > 0 ? nr : 1));
@@ -72,10 +80,44 @@ u32 colorGraph(u32 nr, u32 words, u64* adj, const u8* colors, u32 k,
         ord[j] = key;
     }
 
+    /* forward decl via nested ordering: color prefer-source first */
     u32 nspill = 0;
     for (u32 oi = 0; oi < nr; oi++)
     {
-        u32 n = ord[oi];
+        /* resolve prefer chain: ensure source colored before us */
+        u32 n0 = ord[oi];
+        u32 guard = 0;
+        while (guard++ < nr)
+        {
+            i32 pl = preferLocal != null ? preferLocal[n0] : -1;
+            if (pl < 0 || colored[(usize)pl] >= 0) break;
+            /* color the prefer target now (it will pick its own
+             * lowest free color; we then prefer it below) */
+            u32 pt = (u32)pl;
+            /* inline-color pt: compute forbid & pick lowest */
+            u32 forbid0 = 0;
+            u64* row0 = &adj[(usize)pt * (usize)words];
+            for (u32 w = 0; w < words; w++)
+            {
+                u64 bits = row0[w];
+                while (bits != 0)
+                {
+                    u32 b = 0; u64 t = bits;
+                    while ((t & 1) == 0) { t >>= 1; b++; }
+                    u32 nb = (w << 6) + b;
+                    bits &= bits - 1;
+                    if (nb < nr && colored[nb] >= 0 && colored[nb] < 32)
+                        forbid0 |= (u32)1 << (u32)colored[nb];
+                }
+            }
+            i32 pk = -1;
+            for (u32 c = 0; c < k && c < 32; c++)
+                if (((forbid0 >> c) & 1) == 0) { pk = (i32)c; break; }
+            colored[pt] = pk;
+            if (pk < 0) nspill++;
+        }
+        u32 n = n0;
+        if (colored[n] >= 0) continue;
         /* colors used by already-colored neighbors */
         u32 forbid = 0;
         u64* row = &adj[(usize)n * (usize)words];
@@ -95,7 +137,13 @@ u32 colorGraph(u32 nr, u32 words, u64* adj, const u8* colors, u32 k,
             }
         }
         i32 pick = -1;
-        for (u32 c = 0; c < k && c < 32; c++)
+        /* coalescing: prefer the color of the copy-source node when free */
+        i32 pl = preferLocal != null ? preferLocal[n] : -1;
+        if (pl >= 0 && pl < (i32)nr && colored[(usize)pl] >= 0 &&
+            colored[(usize)pl] < (i32)k &&
+            ((forbid >> (u32)colored[(usize)pl]) & 1) == 0)
+            pick = colored[(usize)pl];
+        for (u32 c = 0; c < k && c < 32 && pick < 0; c++)
             if (((forbid >> c) & 1) == 0) { pick = (i32)c; break; }
         colored[n] = pick;
         if (pick < 0) nspill++;
@@ -105,9 +153,8 @@ u32 colorGraph(u32 nr, u32 words, u64* adj, const u8* colors, u32 k,
 }
 
 pub void graphAssign(Vec<LiveRange>* ranges, Vec<AllocResult>* out,
-                     const u8* orderGpr, u32 nGpr,
-                     const u8* orderXmm, u32 nXmm,
-                     u64 reserved, i32* nslots)
+                     const u8* orderGpr, u32 nGpr,  const u8* orderXmm, 
+                     u32 nXmm, u64 reserved, i32* nslots)
 {
     /* out must be pre-sized to ranges->count() by the caller.
      * klass 0/1 = gpr/xmm coloring; klass 2 = forced spill (used for
@@ -203,9 +250,22 @@ pub void graphAssign(Vec<LiveRange>* ranges, Vec<AllocResult>* out,
         }
         dealloc<u32>(active);
 
+        /* global ranges index -> local node, for prefer resolution */
+        i32* g2l = alloc<i32>((usize)ranges->count());
+        for (usize gi = 0; gi < ranges->count(); gi++) g2l[gi] = -1;
+        for (u32 i = 0; i < n; i++) g2l[idx[i]] = (i32)i;
+        i32* preferLocal = alloc<i32>((usize)(n > 0 ? n : 1));
+        for (u32 i = 0; i < n; i++)
+        {
+            i32 pg = ranges->atPtr(idx[i])->prefer;
+            preferLocal[i] = (pg >= 0 && (usize)pg < ranges->count())
+                             ? g2l[(usize)pg] : -1;
+        }
         i32* colored = alloc<i32>((usize)(n > 0 ? n : 1));
         for (u32 i = 0; i < n; i++) colored[i] = -1;
-        colorGraph(n, words, adj, colors, k, deg, colored);
+        colorGraph(n, words, adj, colors, k, deg, preferLocal, colored);
+        dealloc<i32>(preferLocal);
+        dealloc<i32>(g2l);
 
         for (u32 i = 0; i < n; i++)
         {
@@ -227,5 +287,189 @@ pub void graphAssign(Vec<LiveRange>* ranges, Vec<AllocResult>* out,
         dealloc<u32>(deg);
         dealloc<u64>(adj);
         dealloc<usize>(idx);
+    }
+}
+
+/* Prebuilt interference: adj is nr x words bitset over ALL nodes.
+ * klass[i]: 0 gpr / 1 xmm / 2 spill-only. prefer[i]: node index of
+ * copy-source or -1. Fills physOut/slotOut (nr entries). */
+pub void graphAssignNodes(u32 nr, u32 words, u64* adj,
+    const u8* klass, const u32* size,
+    const i32* prefer,
+    const u8* orderGpr, u32 nkGpr,
+    const u8* orderXmm, u32 nkXmm,
+    i32* physOut, i32* slotOut)
+{
+    for (u32 i = 0; i < nr; i++) { physOut[i] = -1; slotOut[i] = -1; }
+    u32 nslots = 0;
+    for (u32 want = 0; want < 3; want++)
+    {
+        u32 k = want == 0 ? nkGpr : (want == 1 ? nkXmm : 0);
+        if (want < 2 && k == 0) continue;
+        u32* idx = alloc<u32>((usize)(nr > 0 ? nr : 1));
+        u32 n = 0;
+        for (u32 i = 0; i < nr; i++)
+            if ((u32)klass[i] == want) idx[n++] = i;
+        if (n == 0) { dealloc<u32>(idx); continue; }
+
+        /* global -> local map */
+        i32* g2l = alloc<i32>((usize)nr);
+        for (u32 i = 0; i < nr; i++) g2l[i] = -1;
+        for (u32 i = 0; i < n; i++) g2l[idx[i]] = (i32)i;
+
+        /* compact adjacency to local ids */
+        u64* sub = alloc<u64>((usize)n * (usize)words);
+        for (u32 i = 0; i < n * words; i++) sub[i] = 0;
+        for (u32 i = 0; i < n; i++)
+        {
+            u32 grow = idx[i];
+            for (u32 w = 0; w < words; w++)
+            {
+                u64 bits = adj[(usize)grow * (usize)words + (usize)w];
+                while (bits != 0)
+                {
+                    u32 bit = 0; u64 t = bits;
+                    while ((t & 1) == 0) { t >>= 1; bit++; }
+                    bits &= bits - 1;
+                    u32 gn = (w << 6) + bit;
+                    if (gn < nr && g2l[gn] >= 0)
+                    {
+                        u32 ln = (u32)g2l[gn];
+                        sub[(usize)i * (usize)words + ((usize)ln >> 6)] |=
+                            (u64)1 << (u64)(ln & 63);
+                    }
+                }
+            }
+        }
+
+        /* degree order (desc) */
+        u32* deg = alloc<u32>((usize)n);
+        for (u32 i = 0; i < n; i++)
+        {
+            u32 d = 0;
+            for (u32 w = 0; w < words; w++)
+                d += bitCount64(sub[(usize)i * (usize)words + (usize)w]);
+            deg[i] = d;
+        }
+        u32* ord = alloc<u32>((usize)n);
+        for (u32 i = 0; i < n; i++) ord[i] = i;
+        for (u32 i = 1; i < n; i++)
+        {
+            u32 t = ord[i]; u32 j = i;
+            while (j > 0 && deg[ord[j-1]] < deg[t]) { ord[j] = ord[j-1]; j--; }
+            ord[j] = t;
+        }
+
+        /* prefer: global node id -> local */
+        i32* plocal = alloc<i32>((usize)n);
+        for (u32 i = 0; i < n; i++)
+        {
+            i32 pg = prefer[idx[i]];
+            plocal[i] = (pg >= 0 && (u32)pg < nr) ? g2l[(u32)pg] : -1;
+        }
+
+        /* color with prefer-source-first */
+        i32* colored = alloc<i32>((usize)n);
+        for (u32 i = 0; i < n; i++) colored[i] = -1;
+        for (u32 oi = 0; oi < n; oi++)
+        {
+            /* color prefer chain first */
+            u32 n0 = ord[oi];
+            u32 guard = 0;
+            while (guard++ < n)
+            {
+                i32 pl = plocal[n0];
+                if (pl < 0 || colored[(usize)pl] >= 0) break;
+                u32 pt = (u32)pl;
+                u32 forbid0 = 0;
+                for (u32 w = 0; w < words; w++)
+                {
+                    u64 bits = sub[(usize)pt * (usize)words + (usize)w];
+                    while (bits != 0)
+                    {
+                        u32 b = 0; u64 t = bits;
+                        while ((t & 1) == 0) { t >>= 1; b++; }
+                        bits &= bits - 1;
+                        u32 nb = (w << 6) + b;
+                        if (nb < n && colored[nb] >= 0 && colored[nb] < 32)
+                            forbid0 |= (u32)1 << (u32)colored[nb];
+                    }
+                }
+                i32 pk = -1;
+                for (u32 c = 0; c < k && c < 32; c++)
+                    if (((forbid0 >> c) & 1) == 0) { pk = (i32)c; break; }
+                colored[pt] = pk;
+                if (pk < 0) nslots++;
+            }
+            u32 nn = n0;
+            if (colored[nn] >= 0) continue;
+            u32 forbid = 0;
+            for (u32 w = 0; w < words; w++)
+            {
+                u64 bits = sub[(usize)nn * (usize)words + (usize)w];
+                while (bits != 0)
+                {
+                    u32 b = 0; u64 t = bits;
+                    while ((t & 1) == 0) { t >>= 1; b++; }
+                    bits &= bits - 1;
+                    u32 nb = (w << 6) + b;
+                    if (nb < n && colored[nb] >= 0 && colored[nb] < 32)
+                        forbid |= (u32)1 << (u32)colored[nb];
+                }
+            }
+            i32 pick = -1;
+            i32 pl2 = plocal[nn];
+            if (pl2 >= 0 && colored[(usize)pl2] >= 0 &&
+                colored[(usize)pl2] < (i32)k &&
+                ((forbid >> (u32)colored[(usize)pl2]) & 1) == 0)
+                pick = colored[(usize)pl2];
+            for (u32 c = 0; c < k && c < 32 && pick < 0; c++)
+                if (((forbid >> c) & 1) == 0) { pick = (i32)c; break; }
+            colored[nn] = pick;
+            if (pick < 0) nslots++;
+        }
+
+        const u8* ord2 = want == 0 ? orderGpr : orderXmm;
+        for (u32 i = 0; i < n; i++)
+        {
+            u32 g = idx[i];
+            if (colored[i] >= 0)
+                physOut[g] = (i32)ord2[(u32)colored[i]];
+        }
+        dealloc<i32>(plocal);
+        dealloc<i32>(colored);
+        dealloc<u32>(ord);
+        dealloc<u32>(deg);
+        dealloc<i32>(g2l);
+        dealloc<u64>(sub);
+        dealloc<u32>(idx);
+    }
+    /* second pass for spill slots: count spilled per class order */
+    /* NOTE: slot assignment above is approximate; spills get unique
+     * slots via a final sweep */
+    u32 slot = 0;
+    for (u32 i = 0; i < nr; i++)
+    {
+        if (physOut[i] < 0 && slotOut[i] < 0 && klass[i] != 0)
+        {
+            /* klass 2 spill-only or failed color: assign slot */
+        }
+        if (physOut[i] < 0 && klass[i] == 2)
+        {
+            slotOut[i] = (i32)slot;
+            u32 sz = size[i] > 8 ? size[i] : 8;
+            slot += (sz + 7) / 8;
+        }
+    }
+    (void)nslots;
+    /* failed-color spills (klass 0/1, phys -1) get slots too */
+    for (u32 i = 0; i < nr; i++)
+    {
+        if (physOut[i] < 0 && slotOut[i] < 0)
+        {
+            slotOut[i] = (i32)slot;
+            u32 sz = size[i] > 8 ? size[i] : 8;
+            slot += (sz + 7) / 8;
+        }
     }
 }
