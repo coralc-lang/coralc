@@ -1,37 +1,38 @@
-    .text
-.globl main
-.type main, @function
-main:
-    pushq %rbp
-    movq %rsp, %rbp
-    pushq %rbx
-    pushq %r12
-    subq $32, %rsp
-.Lmain_BB2:
-    leaq -32(%rbp), %rdi
-    leaq -48(%rbp), %rbx
-    movq %rdi, %r8
-    movq %rdi, %r12
-    addq $1, %r12
-    movq %rbx, %rsi
-    movq $1, (%r8)
-    movq $2, (%r12)
-    movq $3, (%rsi)
-    movq (%r8), %r9
-    movq (%rsi), %r8
-    movq %rdi, %rsi
-    movq (%rsi), %rdi
-    movq %r9, %rsi
-    addq %r8, %rsi
-    movq %rsi, %r8
-    addq %rdi, %r8
-    movq %r8, %rdi
-    movl %edi, %eax
-    leaq -16(%rbp), %rsp
-    pop %r12
-    pop %rbx
-    popq %rbp
-    ret
-    .size main, . - main
+	.att_syntax
+	.file "muvm"
 
+	.text
+	.globl	main                            # -- Begin function main
+	.p2align	4
+	.type	main,@function
+main:                                   # @main
+	.cfi_startproc
+	pushq %rbp
+	.cfi_def_cfa_offset 16
+	.cfi_offset %rbp, -16
+	movq %rsp, %rbp
+	.cfi_def_cfa_register %rbp
+	subq $16, %rsp
+.LBB1_2:
+	leaq -16(%rbp), %rdi
+	leaq 8(%rdi), %rsi
+	movq $1, (%rdi)
+	movq $2, (%rsi)
+	movq (%rdi), %rsi
+	movq %rsi, %rdi
+	addq $3, %rdi
+	addq %rdi, %rsi
+	movl %esi, %eax
+	movq %rbp, %rsp
+	popq %rbp
+	.cfi_restore %rbp
+	.cfi_def_cfa %rsp, 8
+	ret
+.Lfunc_end1:
+	.size	main, .Lfunc_end1-main
+	.cfi_endproc
+                                        # -- End function
+
+
+	.section .note.GNU-stack,"",@progbits
 

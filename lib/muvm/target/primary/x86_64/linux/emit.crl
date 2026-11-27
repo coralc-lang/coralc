@@ -16,14 +16,14 @@
 
 import muvm::irtypes {
     IrModule, IrFunc, IrBlock, IrInst, IrValue, IrValueKind,
-    IrType, IrTypeKind, IrContext
+    IrType, IrTypeKind, IrContext, IrGlobal, IrStringConst,
+    IrArrayConst, IrStructConst, IrStructType
 };
 import muvm::irOps { IrOpcode, IrICmpPred, IrFCmpPred, irOpcodeStr };
 import muvm::regalloc::graph { graphAssignNodes };
 import std::string { String };
 import std::mman { alloc, dealloc, copy };
 import std::vec { Vec };
-import std::ios { eprintln };
 import platform::libc { snprintf };
 import core::cchar { cchar };
 
@@ -136,15 +136,24 @@ pub struct EmitCtx
     i32 allocaCursor;   /* bytes of alloca area already assigned */
     u8[8] calleeList;
     u32 ncallee;
+    bool forceFrame;    /* calls, stack args, or other rbp-frame needs */
     IrValue** allocaVals;
     i32* allocaOffs;
     u32 nallocas;
     u32 capAllocas;
+    IrValue** cseFrom;
+    IrValue** cseTo;
+    u32 ncse;
+    u32 capCse;
+    usize[32] memAddr;
+    usize[32] memVal;
+    u32[32] memW;
+    u32 nmem;
     str labelPrefix;
 
     EmitCtx new()
     {
-        EmitCtx c = EmitCtx {
+        EmitCtx c = {
             .out = String::new(),
             .func = null,
             .ictx = null,
@@ -159,10 +168,16 @@ pub struct EmitCtx
             .allocaCursor = 0,
             .calleeList = { 0 },
             .ncallee = 0,
+            .forceFrame = false,
             .allocaVals = null,
             .allocaOffs = null,
             .nallocas = 0,
             .capAllocas = 0,
+            .cseFrom = null,
+            .cseTo = null,
+            .ncse = 0,
+            .capCse = 0,
+            .nmem = 0,
             .labelPrefix = str::empty()
         };
         for (u32 i = 0; i < 8; i++) c.calleeList[i] = 0;
@@ -175,6 +190,8 @@ pub struct EmitCtx
         if (self.vregs != null) dealloc<VReg>(self.vregs);
         if (self.allocaVals != null) dealloc<IrValue*>(self.allocaVals);
         if (self.allocaOffs != null) dealloc<i32>(self.allocaOffs);
+        if (self.cseFrom != null) dealloc<IrValue*>(self.cseFrom);
+        if (self.cseTo != null) dealloc<IrValue*>(self.cseTo);
         vmapFree(&self.vmap);
         self.out.free();
         self.usedCallee.dispose();
@@ -182,14 +199,31 @@ pub struct EmitCtx
 
     u32 vregFor(IrValue* v)
     {
+        /* load CSE: a redundant load aliases to the first load's vreg */
+        if (v != null && v->kind == IrValueKind::Inst &&
+            ((IrInst*)v)->opcode == IrOpcode::Load)
+        {
+            for (u32 ci = 0; ci < self.ncse; ci++)
+                if (self.cseFrom[ci] == v)
+                {
+                    u32 r = self.vregFor(self.cseTo[ci]);
+                    vmapPut(&self.vmap, v, r);
+                    return r;
+                }
+        }
         /* identity ops alias to source: bitcast, trunc, gep-with-no-indices.
          * dst uses read the source vreg directly — zero-cost copy. */
         if (v != null && v->kind == IrValueKind::Inst)
         {
             IrInst* ii = (IrInst*)v;
             bool ident = ii->opcode == IrOpcode::Bitcast ||
-                         ii->opcode == IrOpcode::Trunc ||
-                         (ii->opcode == IrOpcode::Gep && ii->nops <= 1);
+                         ii->opcode == IrOpcode::Trunc;
+            if (!ident && ii->opcode == IrOpcode::Gep)
+            {
+                bool gok = false;
+                i64 goff = gepConstOffset(self, ii, &gok);
+                ident = gok && goff == 0;
+            }
             if (ident && ii->nops > 0 && isVRegOperand(ii->ops[0]))
             {
                 i32 sid = vmapFind(&self.vmap, ii->ops[0]);
@@ -228,6 +262,56 @@ pub struct EmitCtx
         return id;
     }
 
+    void cseAdd(IrValue* from, IrValue* to)
+    {
+        if (self.ncse >= self.capCse)
+        {
+            u32 nc = self.capCse ? self.capCse * 2 : 16;
+            IrValue** nf = alloc<IrValue*>((usize)nc);
+            IrValue** nt = alloc<IrValue*>((usize)nc);
+            if (self.cseFrom != null)
+            {
+                copy<IrValue*>(nf, self.cseFrom, (usize)self.ncse);
+                dealloc<IrValue*>(self.cseFrom);
+            }
+            if (self.cseTo != null)
+            {
+                copy<IrValue*>(nt, self.cseTo, (usize)self.ncse);
+                dealloc<IrValue*>(self.cseTo);
+            }
+            self.cseFrom = nf; self.cseTo = nt; self.capCse = nc;
+        }
+        self.cseFrom[self.ncse] = from;
+        self.cseTo[self.ncse] = to;
+        self.ncse++;
+    }
+
+    IrValue* cseFind(IrValue* v)
+    {
+        for (u32 ci = 0; ci < self.ncse; ci++)
+            if (self.cseFrom[ci] == v) return self.cseTo[ci];
+        return null;
+    }
+
+    void memClear() { self.nmem = 0; }
+
+    void memRecord(IrValue* addr, IrValue* val, u32 w)
+    {
+        if (self.nmem >= 32) self.nmem = 0;
+        self.memAddr[self.nmem] = (usize)addr;
+        self.memVal[self.nmem] = (usize)val;
+        self.memW[self.nmem] = w;
+        self.nmem++;
+    }
+
+    IrValue* memLookup(IrValue* addr, u32 w)
+    {
+        for (u32 i = 0; i < self.nmem; i++)
+            if (self.memAddr[i] == (usize)addr && self.memW[i] == w)
+                return (IrValue*)(usize)self.memVal[i];
+        return null;
+    }
+
     void emit(str s) { self.out.appendView(s); }
     void emitLine(str s) { self.out.appendView(s); self.out.pushChar('\n'); }
 
@@ -250,23 +334,26 @@ pub struct EmitCtx
 
 pub str regName(u8 r)
 {
-    if (r == 0) return "%rax";
-    if (r == 1) return "%rcx";
-    if (r == 2) return "%rdx";
-    if (r == 3) return "%rbx";
-    if (r == 4) return "%rsp";
-    if (r == 5) return "%rbp";
-    if (r == 6) return "%rsi";
-    if (r == 7) return "%rdi";
-    if (r == 8) return "%r8";
-    if (r == 9) return "%r9";
-    if (r == 10) return "%r10";
-    if (r == 11) return "%r11";
-    if (r == 12) return "%r12";
-    if (r == 13) return "%r13";
-    if (r == 14) return "%r14";
-    if (r == 15) return "%r15";
-    return "%r?";
+    switch (r)
+    {
+        0 => { return "%rax"; },
+        1 => { return "%rcx"; },
+        2 => { return "%rdx"; },
+        3 => { return "%rbx"; },
+        4 => { return "%rsp"; },
+        5 => { return "%rbp"; },
+        6 => { return "%rsi"; },
+        7 => { return "%rdi"; },
+        8 => { return "%r8"; },
+        9 => { return "%r9"; },
+        10 => { return "%r10"; },
+        11 => { return "%r11"; },
+        12 => { return "%r12"; },
+        13 => { return "%r13"; },
+        14 => { return "%r14"; },
+        15 => { return "%r15"; },
+        else => { return "%r?"; }
+    }
 }
 
 pub str intSfx(u32 w)
@@ -285,64 +372,131 @@ pub str regForWidth(u8 r, u32 w)
 {
     if (w <= 32)
     {
-        if (r == 0) return "%eax";
-        if (r == 1) return "%ecx";
-        if (r == 2) return "%edx";
-        if (r == 3) return "%ebx";
-        if (r == 6) return "%esi";
-        if (r == 7) return "%edi";
-        if (r == 8) return "%r8d";
-        if (r == 9) return "%r9d";
-        if (r == 10) return "%r10d";
-        if (r == 11) return "%r11d";
-        if (r == 12) return "%r12d";
-        if (r == 13) return "%r13d";
-        if (r == 14) return "%r14d";
-        if (r == 15) return "%r15d";
-        return regName(r);
+        switch (r)
+        {
+            0 => { return "%eax"; },
+            1 => { return "%ecx"; },
+            2 => { return "%edx"; },
+            3 => { return "%ebx"; },
+            6 => { return "%esi"; },
+            7 => { return "%edi"; },
+            8 => { return "%r8d"; },
+            9 => { return "%r9d"; },
+            10 => { return "%r10d"; },
+            11 => { return "%r11d"; },
+            12 => { return "%r12d"; },
+            13 => { return "%r13d"; },
+            14 => { return "%r14d"; },
+            15 => { return "%r15d"; },
+            else => { return regName(r); }
+        }
     }
     return regName(r);
 }
 
 void emitByteReg(EmitCtx* c, u8 r)
 {
-    if (r == 0) { c->emit("%al"); return; }
-    if (r == 1) { c->emit("%cl"); return; }
-    if (r == 2) { c->emit("%dl"); return; }
-    if (r == 3) { c->emit("%bl"); return; }
-    if (r == 4) { c->emit("%spl"); return; }
-    if (r == 5) { c->emit("%bpl"); return; }
-    if (r == 6) { c->emit("%sil"); return; }
-    if (r == 7) { c->emit("%dil"); return; }
-    c->emit("%r"); c->emitU64((u64)r); c->emit("b");
+    switch (r)
+    {
+        0 => { c->emit("%al"); },
+        1 => { c->emit("%cl"); },
+        2 => { c->emit("%dl"); },
+        3 => { c->emit("%bl"); },
+        4 => { c->emit("%spl"); },
+        5 => { c->emit("%bpl"); },
+        6 => { c->emit("%sil"); },
+        7 => { c->emit("%dil"); },
+        else => {
+            c->emit("%r");
+            c->emitU64((u64)r);
+            c->emit("b");
+        }
+    }
 }
 
 void emitWordReg(EmitCtx* c, u8 r)
 {
-    if (r == 0) { c->emit("%ax"); return; }
-    if (r == 1) { c->emit("%cx"); return; }
-    if (r == 2) { c->emit("%dx"); return; }
-    if (r == 3) { c->emit("%bx"); return; }
-    if (r == 4) { c->emit("%sp"); return; }
-    if (r == 5) { c->emit("%bp"); return; }
-    if (r == 6) { c->emit("%si"); return; }
-    if (r == 7) { c->emit("%di"); return; }
-    c->emit("%r"); c->emitU64((u64)r); c->emit("w");
+    switch (r)
+    {
+        0 => { c->emit("%ax"); },
+        1 => { c->emit("%cx"); },
+        2 => { c->emit("%dx"); },
+        3 => { c->emit("%bx"); },
+        4 => { c->emit("%sp"); },
+        5 => { c->emit("%bp"); },
+        6 => { c->emit("%si"); },
+        7 => { c->emit("%di"); },
+        else => {
+            c->emit("%r");
+            c->emitU64((u64)r);
+            c->emit("w");
+        }
+    }
 }
 
 u8 argRegPhys(u8 i)
 {
-    if (i == 0) return regs::RDI;
-    if (i == 1) return regs::RSI;
-    if (i == 2) return regs::RDX;
-    if (i == 3) return regs::RCX;
-    if (i == 4) return regs::R8;
-    return regs::R9;
+    switch (i)
+    {
+        0 => { return regs::RDI; },
+        1 => { return regs::RSI; },
+        2 => { return regs::RDX; },
+        3 => { return regs::RCX; },
+        4 => { return regs::R8; },
+        else => { return regs::R9; }
+    }
 }
 
 void emitXmmReg(EmitCtx* c, u8 r)
 {
     c->emit("%xmm"); c->emitU64((u64)r);
+}
+
+/* clang-style trailing comments: pad the current line to `col`, then
+ * emit `# comment`. Columns count bytes; tabs count as one byte, which
+ * is close enough for our directive layout. */
+usize asmCol(EmitCtx* c)
+{
+    usize col = 0;
+    usize i = c->out.len;
+    while (i > 0)
+    {
+        u8 ch = c->out.ptr[i - 1];
+        if (ch == '\n') break;
+        i--;
+        col++;
+    }
+    return col;
+}
+
+void emitPadTo(EmitCtx* c, u32 col)
+{
+    while (asmCol(c) < (usize)col) c->emit(" ");
+}
+
+void emitAsmComment(EmitCtx* c, str comment, u32 col)
+{
+    if (asmCol(c) < (usize)col) emitPadTo(c, col);
+    else c->emit(" ");
+    c->emit("# "); c->emit(comment); c->emitLine("");
+}
+
+void emitFuncBeginComment(EmitCtx* c, str fname)
+{
+    emitPadTo(c, 40);
+    c->emit("# -- Begin function "); c->emit(fname); c->emitLine("");
+}
+
+void emitFuncEndComment(EmitCtx* c)
+{
+    emitPadTo(c, 40);
+    c->emit("# -- End function"); c->emitLine("");
+}
+
+void emitFuncLabelComment(EmitCtx* c, str fname)
+{
+    emitPadTo(c, 40);
+    c->emit("# @"); c->emit(fname); c->emitLine("");
 }
 
 /* ================= isel: operand shapes & type classes ================= */
@@ -382,11 +536,32 @@ TyClass tyClassOf(IrType* t)
     }
 }
 
+/* resolve an address operand through identity ops (bitcast/trunc/
+ * gep+0) so CSE sees the canonical pointer value */
+IrValue* canonAddr(EmitCtx* c, IrValue* v)
+{
+    u32 guard = 0;
+    while (v != null && v->kind == IrValueKind::Inst && guard++ < 32)
+    {
+        IrInst* i2 = (IrInst*)v;
+        if ((i2->opcode == IrOpcode::Bitcast || i2->opcode == IrOpcode::Trunc) &&
+            i2->nops > 0)
+        { v = i2->ops[0]; continue; }
+        if (i2->opcode == IrOpcode::Gep && i2->nops > 0)
+        {
+            bool ok = false;
+            i64 o = gepConstOffset(c, i2, &ok);
+            if (ok && o == 0) { v = i2->ops[0]; continue; }
+        }
+        break;
+    }
+    return v;
+}
+
 bool isVRegOperand(IrValue* v)
 {
     if (v == null) return false;
-    return v->kind == IrValueKind::Inst || v->kind == IrValueKind::Arg ||
-           v->kind == IrValueKind::ConstInt || v->kind == IrValueKind::ConstFloat;
+    return v->kind == IrValueKind::Inst || v->kind == IrValueKind::Arg;
 }
 
 bool instHasDef(IrInst* inst)
@@ -497,6 +672,17 @@ i32 allocaSlotFor(EmitCtx* c, IrValue* v, u32 size)
     return off;
 }
 
+/* object-file symbol for a value: extern funcs bind externSym when set */
+str asmSymName(IrValue* v)
+{
+    if (v != null && v->kind == IrValueKind::Func)
+    {
+        IrFunc* f = (IrFunc*)v;
+        if (f->isExtern && !f->externSym.isEmpty()) return f->externSym;
+    }
+    return v != null ? v->name : str::empty();
+}
+
 /* load an IR operand into phys gpr `dphys` at width w (bits).
  * Handles const / vreg-in-reg / spilled / global-lea. */
 void loadToReg(EmitCtx* c, IrValue* src, u8 dphys, u32 w)
@@ -512,14 +698,27 @@ void loadToReg(EmitCtx* c, IrValue* src, u8 dphys, u32 w)
     if (src->kind == IrValueKind::ConstInt)
     {
         u64 v = src->valData;
+        if (v == 0)
+        {
+            c->emit("\txorl "); c->emit(regForWidth(dphys, 32));
+            c->emit(", "); c->emit(regForWidth(dphys, 32)); c->emitLine("");
+            return;
+        }
         c->emit("\tmov"); c->emit(intSfx(rw)); c->emit(" $");
         c->emitU64(v); c->emit(", "); c->emit(dreg); c->emitLine("");
         return;
     }
-    if (src->kind == IrValueKind::Global || src->kind == IrValueKind::Func)
+    if (src->kind == IrValueKind::Global || src->kind == IrValueKind::Func ||
+        src->kind == IrValueKind::StringConst)
     {
         c->emit("\tleaq ");
-        c->emit(src->kind == IrValueKind::Func ? ((IrFunc*)src)->base.name : src->name);
+        if (src->kind == IrValueKind::StringConst)
+        {
+            IrStringConst* sc = (IrStringConst*)src;
+            if (!sc->base.name.isEmpty()) c->emit(sc->base.name);
+            else { c->emit(".Lstr_"); c->emitU64((u64)sc->base.id); }
+        }
+        else c->emit(asmSymName(src));
         c->emit("(%rip), "); c->emit(dreg); c->emitLine("");
         return;
     }
@@ -631,7 +830,15 @@ void iselAlu(EmitCtx* c, IrInst* inst, str sop)
     if (b != null && b->kind == IrValueKind::ConstInt &&
         (bshape & (u32)Shape::SH_CONST) != 0)
     {
-        emitOpImm(c, sop, w, b->valData, useR);
+        /* add/sub/or/xor/shift by 0 are no-ops (imul $0/$1 handled
+         * by caller rarely; keep emitting for safety) */
+        bool identOp = inst->opcode == IrOpcode::Add ||
+                       inst->opcode == IrOpcode::Sub ||
+                       inst->opcode == IrOpcode::And ||
+                       inst->opcode == IrOpcode::Or ||
+                       inst->opcode == IrOpcode::Xor;
+        if (!(identOp && b->valData == 0))
+            emitOpImm(c, sop, w, b->valData, useR);
     }
     else
     {
@@ -791,6 +998,19 @@ void iselAlloca(EmitCtx* c, IrInst* inst)
 
 void iselLoad(EmitCtx* c, IrInst* inst)
 {
+    /* redundant load: dst vreg already holds the value — emit nothing */
+    if (c->cseFind(&inst->base) != null && inst->nops > 0)
+    {
+        IrValue* addr = canonAddr(c, inst->ops[0]);
+        u32 w = inst->base.type != null ? inst->base.type->width : 64;
+        IrValue* prev = c->memLookup(addr, w);
+        if (prev != null)
+        {
+            IrValue* canon = c->cseFind(&inst->base);
+            c->memRecord(addr, canon != null ? canon : &inst->base, w);
+            return;
+        }
+    }
     IrType* rt = inst->base.type;
     if (rt != null && (rt->kind == IrTypeKind::Vector ||
         rt->kind == IrTypeKind::Struct || rt->kind == IrTypeKind::Array ||
@@ -823,10 +1043,16 @@ void iselLoad(EmitCtx* c, IrInst* inst)
     c->emit("("); c->emit(regName(addrR)); c->emit("), ");
     c->emit(regForWidth(useR, w <= 32 ? 32 : 64)); c->emitLine("");
     if (dp < 0) storeToVReg(c, dvid, useR, w);
+    if (inst->nops > 0)
+    {
+        IrValue* canon = c->cseFind(&inst->base);
+        c->memRecord(canonAddr(c, inst->ops[0]), canon != null ? canon : &inst->base, w);
+    }
 }
 
 void iselStore(EmitCtx* c, IrInst* inst)
 {
+    c->memClear();
     IrValue* val = inst->nops > 0 ? inst->ops[0] : null;
     IrValue* addr = inst->nops > 1 ? inst->ops[1] : null;
     u32 w = val != null && val->type != null ? val->type->width : 64;
@@ -921,6 +1147,10 @@ i64 gepConstOffset(EmitCtx* c, IrInst* inst, bool* ok)
                                 cur->kind == IrTypeKind::Vector)) et = cur->elem;
             else if (cur != null && cur->kind == IrTypeKind::Ptr) et = cur->elem;
             if (et != null) esz = (u64)c->ictx->irTypeSizeOf(et);
+            else if (cur != null &&
+                     (cur->kind == IrTypeKind::Int ||
+                      cur->kind == IrTypeKind::Float))
+                esz = (u64)c->ictx->irTypeSizeOf(cur);
             if (esz == 0) esz = 1;
             cOff += (i64)ix->valData * (i64)esz;
             cur = et;
@@ -935,6 +1165,12 @@ void iselGep(EmitCtx* c, IrInst* inst)
      * dynamic indices scale by elem size and add. */
     IrValue* base = inst->nops > 0 ? inst->ops[0] : null;
     u32 dvid = c->vregFor(&inst->base);
+    /* gep+0 is a vreg alias; same-vid dst needs no code */
+    if (isVRegOperand(base))
+    {
+        i32 bv = vmapFind(&c->vmap, base);
+        if (bv >= 0 && (u32)bv == dvid) return;
+    }
     i32 dp = (i32)c->vregs[(usize)dvid].phys;
     u8 useR = dp >= 0 ? (u8)dp : regs::SCRATCH_A;
 
@@ -1023,6 +1259,10 @@ void iselGep(EmitCtx* c, IrInst* inst)
                                 cur->kind == IrTypeKind::Vector)) et = cur->elem;
             else if (cur != null && cur->kind == IrTypeKind::Ptr) et = cur->elem;
             if (et != null) esz = (u64)c->ictx->irTypeSizeOf(et);
+            else if (cur != null &&
+                     (cur->kind == IrTypeKind::Int ||
+                      cur->kind == IrTypeKind::Float))
+                esz = (u64)c->ictx->irTypeSizeOf(cur);
             if (esz == 0) esz = 1;
             if (isConst)
                 cOff += (i64)ix->valData * (i64)esz;
@@ -1047,19 +1287,32 @@ void iselGep(EmitCtx* c, IrInst* inst)
     if (dp < 0) storeToVReg(c, dvid, useR, 64);
 }
 
+void emitBBLabelName(EmitCtx* c, IrValue* bv)
+{
+    c->emit(".LBB"); c->emitU64((u64)c->func->base.id); c->emit("_");
+    c->emitU64(bv != null ? (u64)bv->id : (u64)0);
+}
+
 void emitBBLabelFor(EmitCtx* c, IrValue* bv)
 {
-    c->emit(".L"); c->emit(c->func->base.name); c->emit("_BB");
-    c->emitU64(bv != null ? (u64)bv->id : (u64)0); c->emit(":");
+    emitBBLabelName(c, bv);
+    c->emitLine(":");
+}
+
+void emitJmpToBB(EmitCtx* c, IrValue* target)
+{
+    c->emit("\tjmp "); emitBBLabelName(c, target); c->emitLine("");
+}
+
+void emitJccToBB(EmitCtx* c, str jcc, IrValue* target)
+{
+    c->emit("\t"); c->emit(jcc); c->emit(" ");
+    emitBBLabelName(c, target); c->emitLine("");
 }
 
 void iselBr(EmitCtx* c, IrInst* inst)
 {
-    if (inst->nops > 0 && inst->ops[0] != null)
-    {
-        c->emit("\tjmp .L"); c->emit(c->func->base.name); c->emit("_BB");
-        c->emitU64((u64)inst->ops[0]->id); c->emitLine("");
-    }
+    if (inst->nops > 0 && inst->ops[0] != null) emitJmpToBB(c, inst->ops[0]);
 }
 
 /* jcc mnemonic for an ICmp pred (used by condbr fusion) */
@@ -1120,19 +1373,15 @@ void iselCondBr(EmitCtx* c, IrInst* inst)
                 c->emit(", "); c->emit(creg); c->emitLine("");
             }
         }
-        c->emit("\t"); c->emit(jccFor(ic->icmpPred)); c->emit(" .L");
-        c->emit(c->func->base.name); c->emit("_BB");
-        c->emitU64((u64)tb->id); c->emitLine("");
-        c->emit("\tjmp .L"); c->emit(c->func->base.name); c->emit("_BB");
-        c->emitU64((u64)fb->id); c->emitLine("");
+        emitJccToBB(c, jccFor(ic->icmpPred), tb);
+        emitJmpToBB(c, fb);
         return;
     }
     /* generic: test cond, jcc */
     if (cond != null && cond->kind == IrValueKind::ConstInt)
     {
         IrValue* tgt = cond->valData != 0 ? tb : fb;
-        c->emit("\tjmp .L"); c->emit(c->func->base.name); c->emit("_BB");
-        c->emitU64((u64)tgt->id); c->emitLine("");
+        emitJmpToBB(c, tgt);
         return;
     }
     u32 w = cond != null && cond->type != null ? regW(cond->type->width) : 64;
@@ -1155,16 +1404,14 @@ void iselCondBr(EmitCtx* c, IrInst* inst)
         c->emit("\t# isel: unsupported condbr operand\n");
         return;
     }
-    c->emit("\tje .L"); c->emit(c->func->base.name); c->emit("_BB");
-    c->emitU64((u64)fb->id); c->emitLine("");
-    c->emit("\tjmp .L"); c->emit(c->func->base.name); c->emit("_BB");
-    c->emitU64((u64)tb->id); c->emitLine("");
+    emitJccToBB(c, "je", fb);
+    emitJmpToBB(c, tb);
 }
 
 /* epilogue: restore callee-saved (reverse), rbp, ret */
 void emitEpilogue(EmitCtx* c)
 {
-    bool frame = c->ncallee > 0 || c->frameSize > 0 || c->allocaBytes > 0;
+    bool frame = c->forceFrame || c->ncallee > 0 || c->frameSize > 0 || c->allocaBytes > 0;
     if (frame)
     {
         /* rsp -> just below callee pushes, then pop in reverse */
@@ -1178,9 +1425,12 @@ void emitEpilogue(EmitCtx* c)
         for (u32 i = c->ncallee; i > 0; i--)
         {
             c->emit("\tpop "); c->emit(regName(c->calleeList[i-1])); c->emitLine("");
+            c->emit("\t.cfi_restore "); c->emit(regName(c->calleeList[i-1])); c->emitLine("");
         }
         c->emitLine("\tpopq %rbp");
+        c->emitLine("\t.cfi_restore %rbp");
     }
+    c->emitLine("\t.cfi_def_cfa %rsp, 8");
     c->emitLine("\tret");
 }
 
@@ -1202,6 +1452,46 @@ void iselRet(EmitCtx* c, IrInst* inst)
         }
     }
     emitEpilogue(c);
+}
+
+/* div/rem: dst = a / b or a % b. x86 needs rax=dividend (rdx sign/zero
+ * extended), divisor in a non-rax/rdx reg; result rax(quot)/rdx(rem). */
+void iselDivRem(EmitCtx* c, IrInst* inst, bool isSigned, bool wantRem)
+{
+    IrValue* a = inst->nops > 0 ? inst->ops[0] : null;
+    IrValue* b = inst->nops > 1 ? inst->ops[1] : null;
+    u32 w = a != null && a->type != null ? a->type->width : 64;
+    u32 rw = regW(w);
+    /* dividend -> rax */
+    loadToReg(c, a, regs::RAX, w);
+    /* sign/zero extend into rdx */
+    if (isSigned)
+    {
+        c->emit("\t"); c->emit(w <= 32 ? "cltd" : "cqo"); c->emitLine("");
+    }
+    else
+    {
+        c->emit("\txor"); c->emit(intSfx(rw)); c->emit(" %edx, %edx\n");
+    }
+    /* divisor -> scratch (never rax/rdx) */
+    loadToReg(c, b, regs::SCRATCH_A, w);
+    str dreg = regForWidth(regs::SCRATCH_A, rw);
+    c->emit("\t"); c->emit(isSigned ? "idiv" : "div"); c->emit(intSfx(rw));
+    c->emit(" "); c->emit(dreg); c->emitLine("");
+    /* result: quot in rax, rem in rdx */
+    u32 dvid = c->vregFor(&inst->base);
+    i32 dp = (i32)c->vregs[(usize)dvid].phys;
+    u8 srcR = wantRem ? regs::RDX : regs::RAX;
+    if (dp >= 0)
+    {
+        if ((i32)srcR != dp)
+        {
+            c->emit("\tmov"); c->emit(intSfx(rw)); c->emit(" ");
+            c->emit(regForWidth(srcR, rw)); c->emit(", ");
+            c->emit(regForWidth((u8)dp, rw)); c->emitLine("");
+        }
+    }
+    else storeToVReg(c, dvid, srcR, w);
 }
 
 void iselSelect(EmitCtx* c, IrInst* inst)
@@ -1253,6 +1543,13 @@ void iselCast(EmitCtx* c, IrInst* inst)
         return; /* (void)x bitcast — pure no-op */
     u32 dvid = c->vregFor(&inst->base);
     i32 dp = (i32)c->vregs[(usize)dvid].phys;
+    /* bitcast/trunc are vreg aliases; a same-vid dst needs no code */
+    if ((inst->opcode == IrOpcode::Bitcast || inst->opcode == IrOpcode::Trunc) &&
+        isVRegOperand(src))
+    {
+        i32 sv = vmapFind(&c->vmap, src);
+        if (sv >= 0 && (u32)sv == dvid) return;
+    }
     u8 useR = dp >= 0 ? (u8)dp : regs::SCRATCH_A;
     loadToReg(c, src, useR, sw);
 
@@ -1277,15 +1574,66 @@ void iselCast(EmitCtx* c, IrInst* inst)
     if (dp < 0) storeToVReg(c, dvid, useR, dw);
 }
 
+/* phys reg currently holding `av`, or -1 for const/mem/global/unmapped */
+i32 callArgSrcPhys(EmitCtx* c, IrValue* av)
+{
+    if (av == null || !isVRegOperand(av)) return -1;
+    i32 vid = vmapFind(&c->vmap, av);
+    if (vid < 0) return -1;
+    return c->vregs[(usize)vid].phys;
+}
+
+/* store one integer stack arg at `off(%rsp)` (off already final) */
+void emitIntStackArg(EmitCtx* c, IrValue* av, u32 off)
+{
+    if (av != null && av->kind == IrValueKind::ConstInt &&
+        (av->valData >> 32) == 0)
+    {
+        c->emit("\tmovq $"); c->emitU64(av->valData); c->emit(", ");
+        c->emitI64((i64)off); c->emit("(%rsp)\n");
+        return;
+    }
+    loadToReg(c, av, regs::SCRATCH_A, 64);
+    c->emit("\tmovq %r10, "); c->emitI64((i64)off); c->emit("(%rsp)\n");
+}
+
+/* move the call result (rax/xmm0) into the dst vreg */
+void emitCallResult(EmitCtx* c, IrInst* inst)
+{
+    if (inst->base.type == null || inst->base.type->kind == IrTypeKind::Void)
+        return;
+    if (typeIsSse(inst->base.type))
+    {
+        u32 dvid = c->vregFor(&inst->base);
+        i32 dp = (i32)c->vregs[(usize)dvid].phys;
+        if (dp >= 0 && c->vregs[(usize)dvid].klass == 1)
+        {
+            c->emit("\tmovaps "); emitXmmReg(c, 0); c->emit(", ");
+            emitXmmReg(c, (u8)dp); c->emitLine("");
+        }
+        else if (dp < 0)
+        {
+            c->emit("\tmovups "); emitXmmReg(c, 0); c->emit(", -");
+            c->emitI64((i64)spillOff(c, c->vregs[(usize)dvid].slot));
+            c->emit("(%rbp)\n");
+        }
+        return;
+    }
+    u32 dvid = c->vregFor(&inst->base);
+    u32 w = inst->base.type->kind == IrTypeKind::Int ? inst->base.type->width : 64;
+    storeToVReg(c, dvid, regs::RAX, w);
+}
+
 void iselCall(EmitCtx* c, IrInst* inst)
 {
+    c->memClear();
     IrValue* fv = inst->nops > 0 ? inst->ops[0] : null;
     if (fv == null || (fv->kind != IrValueKind::Func && fv->kind != IrValueKind::Global))
     {
         c->emit("\t# isel: indirect/unsupported call target\n");
         return;
     }
-    str fname = fv->kind == IrValueKind::Func ? ((IrFunc*)fv)->base.name : fv->name;
+    str fname = asmSymName(fv);
     u32 nargs = inst->nops > 1 ? inst->nops - 1 : 0;
     if (nargs > 32)
     {
@@ -1316,6 +1664,84 @@ void iselCall(EmitCtx* c, IrInst* inst)
             else { dstK[i] = 2; dstI[i] = (u8)nStack; nStack++; }
         }
         else { dstK[i] = 2; dstI[i] = (u8)nStack; nStack++; }
+    }
+
+    /* fast path: no SSE args -> store stack args first, then move the
+     * <=6 integer arg regs directly in a parallel-copy-safe order.
+     * Falls back to the temp-stack path if the order has a cycle. */
+    bool direct = (nXmm == 0);
+    u8[6] dOrder;
+    u32 dN = 0;
+    u8[6] emDst;
+    IrValue*[6] emSrc;
+    if (direct)
+    {
+        u8[6] dmDst;
+        i32[6] dmPhys;
+        u8[6] dmDone;
+        u32 dn = 0;
+        u32 en = 0;
+        for (u32 i = 0; i < nargs; i++)
+        {
+            if (dstK[i] != 0) continue;
+            u8 dp2 = argRegPhys(dstI[i]);
+            IrValue* av = inst->ops[i + 1];
+            emDst[en] = dp2;
+            emSrc[en] = av;
+            en++;
+            if (dn < 6)
+            {
+                dmDst[dn] = dp2;
+                dmPhys[dn] = callArgSrcPhys(c, av);
+                dmDone[dn] = 0;
+                dn++;
+            }
+        }
+        u32 dRem = dn;
+        bool ok = true;
+        while (dRem > 0 && ok)
+        {
+            bool prog = false;
+            for (u32 t = 0; t < dn; t++)
+            {
+                if (dmDone[t]) continue;
+                if ((i32)dmDst[t] == dmPhys[t]) { dmDone[t] = 1; dRem--; prog = true; continue; }
+                bool blocked = false;
+                for (u32 u = 0; u < dn; u++)
+                    if (!dmDone[u] && dmPhys[u] == (i32)dmDst[t]) { blocked = true; break; }
+                if (!blocked) { dOrder[dN++] = (u8)t; dmDone[t] = 1; dRem--; prog = true; }
+            }
+            if (!prog) ok = false;
+        }
+        if (!ok || en != dn) direct = false;
+        else
+        {
+            u32 dSub = nStack * 8;
+            if (dSub > 0 && (dSub % 16) == 8) dSub += 8;
+            if (dSub > 0)
+            {
+                c->emit("\tsubq $"); c->emitI64((i64)dSub); c->emit(", %rsp\n");
+            }
+            for (u32 i = 0; i < nargs; i++)
+                if (dstK[i] == 2) emitIntStackArg(c, inst->ops[i + 1], (u32)dstI[i] * 8);
+            for (u32 oi = 0; oi < dN; oi++)
+                loadToReg(c, emSrc[dOrder[oi]], emDst[dOrder[oi]], 64);
+            IrType* fty2 = fv->kind == IrValueKind::Func ? ((IrFunc*)fv)->base.type : null;
+            if (fty2 != null && fty2->isVararg)
+            {
+                c->emit("\tmovb $0, %al\n");
+            }
+            c->emit("\tcall "); c->emit(fname); c->emitLine("");
+            if (dSub > 0)
+            {
+                c->emit("\taddq $"); c->emitI64((i64)dSub); c->emit(", %rsp\n");
+            }
+            emitCallResult(c, inst);
+            dealloc<ArgClass>(cls);
+            dealloc<u8>(dstK);
+            dealloc<u8>(dstI);
+            return;
+        }
     }
 
     /* temp slots for reg-class args live above the stack args:
@@ -1399,7 +1825,7 @@ void iselCall(EmitCtx* c, IrInst* inst)
 
     /* varargs: AL = number of vector regs used */
     IrType* fty = fv->kind == IrValueKind::Func ? ((IrFunc*)fv)->base.type : null;
-    if (fty != null && fty->isVararg && nXmm > 0)
+    if (fty != null && fty->isVararg)
     {
         c->emit("\tmovb $"); c->emitU64((u64)nXmm); c->emitLine(", %al");
     }
@@ -1409,32 +1835,7 @@ void iselCall(EmitCtx* c, IrInst* inst)
     {
         c->emit("\taddq $"); c->emitI64((i64)subBytes); c->emit(", %rsp\n");
     }
-    if (inst->base.type != null && inst->base.type->kind != IrTypeKind::Void)
-    {
-        if (typeIsSse(inst->base.type))
-        {
-            /* float/vector result in xmm0 */
-            u32 dvid = c->vregFor(&inst->base);
-            i32 dp = (i32)c->vregs[(usize)dvid].phys;
-            if (dp >= 0 && c->vregs[(usize)dvid].klass == 1)
-            {
-                c->emit("\tmovaps "); emitXmmReg(c, 0); c->emit(", ");
-                emitXmmReg(c, (u8)dp); c->emitLine("");
-            }
-            else if (dp < 0)
-            {
-                c->emit("\tmovups "); emitXmmReg(c, 0); c->emit(", -");
-                c->emitI64((i64)spillOff(c, c->vregs[(usize)dvid].slot));
-                c->emit("(%rbp)\n");
-            }
-        }
-        else
-        {
-            u32 dvid = c->vregFor(&inst->base);
-            u32 w = inst->base.type->kind == IrTypeKind::Int ? inst->base.type->width : 64;
-            storeToVReg(c, dvid, regs::RAX, w);
-        }
-    }
+    emitCallResult(c, inst);
     dealloc<ArgClass>(cls);
     dealloc<u8>(dstK);
     dealloc<u8>(dstI);
@@ -1588,6 +1989,10 @@ bool emitInst(EmitCtx* ctx, IrInst* inst, String* err)
             return true;
         },
         IrOpcode::ICmp => { iselICmp(ctx, inst); return true; },
+        IrOpcode::UDiv => { iselDivRem(ctx, inst, false, false); return true; },
+        IrOpcode::SDiv => { iselDivRem(ctx, inst, true, false); return true; },
+        IrOpcode::URem => { iselDivRem(ctx, inst, false, true); return true; },
+        IrOpcode::SRem => { iselDivRem(ctx, inst, true, true); return true; },
         IrOpcode::Alloca => { iselAlloca(ctx, inst); return true; },
         IrOpcode::Load => { iselLoad(ctx, inst); return true; },
         IrOpcode::Store => { iselStore(ctx, inst); return true; },
@@ -1603,6 +2008,7 @@ bool emitInst(EmitCtx* ctx, IrInst* inst, String* err)
             ctx->emitLine("\tud2"); return true;
         },
         IrOpcode::Call => { iselCall(ctx, inst); return true; },
+        IrOpcode::Phi => { return true; }, /* copies emitted on edges */
         else => {
             emitUnimplemented(ctx, inst, err);
             return false;
@@ -1826,6 +2232,31 @@ void runRegAlloc(EmitCtx* ctx)
                     }
                 }
             }
+            /* operands used by the same inst are simultaneously live at
+             * its input; distinct SSA values must not share a phys reg
+             * (store val/addr, add a/b, call args, ...). Phi operands are
+             * per-edge and handled by edge copies, so skip them. */
+            if (inst->opcode != IrOpcode::Phi)
+            {
+                for (u32 k = 0; k < inst->nops; k++)
+                {
+                    IrValue* ov = inst->ops[k];
+                    if (!isVRegOperand(ov)) continue;
+                    i32 av = vmapFind(&ctx->vmap, ov);
+                    if (av < 0 || (u32)av >= n) continue;
+                    for (u32 l = k + 1; l < inst->nops; l++)
+                    {
+                        IrValue* ow = inst->ops[l];
+                        if (!isVRegOperand(ow)) continue;
+                        i32 bv2 = vmapFind(&ctx->vmap, ow);
+                        if (bv2 < 0 || (u32)bv2 >= n || bv2 == av) continue;
+                        u32 x = (u32)av;
+                        u32 y = (u32)bv2;
+                        adj[(usize)x * (usize)words + ((usize)y >> 6)] |= (u64)1 << (u64)(y & 63);
+                        adj[(usize)y * (usize)words + ((usize)x >> 6)] |= (u64)1 << (u64)(x & 63);
+                    }
+                }
+            }
             /* update live set: remove def, add uses */
             if (did >= 0 && (u32)did < n)
             {
@@ -1861,13 +2292,17 @@ void runRegAlloc(EmitCtx* ctx)
             u32 tsz = typeSizeBytes(ctx->vregs[v].type);
             if (tsz > 8) szs[v] = tsz;
         }
-        /* forced spill across calls */
+        /* values live across calls: gpr -> callee-saved class (3),
+         * xmm -> spill (caller-saved on SysV) */
         if (klass[v] != 2)
         {
             for (u32 ci = 0; ci < ncall; ci++)
             {
                 if (callPos[ci] > defPos[v] && callPos[ci] < lastUse[v])
-                { klass[v] = 2; break; }
+                {
+                    klass[v] = (klass[v] == 1) ? (u8)2 : (u8)3;
+                    break;
+                }
             }
         }
         prefer[v] = -1;
@@ -1881,6 +2316,7 @@ void runRegAlloc(EmitCtx* ctx)
     graphAssignNodes(n, words, adj, klass, szs, prefer,
                      &regs::ALLOC_ORDER[0], regs::ALLOC_ORDER_LEN,
                      &regs::XMM_ALLOC_ORDER[0], regs::XMM_ALLOC_LEN,
+                     &regs::CS_ALLOC_ORDER[0], regs::CS_ALLOC_LEN,
                      physOut, slotOut);
 
     for (u32 v = 0; v < n; v++)
@@ -1929,15 +2365,51 @@ void runRegAlloc(EmitCtx* ctx)
 
 /* ================= prologue & arg moves ================= */
 
+/* rbp frame is required for calls (stack alignment), incoming stack
+ * args, and the usual spill/alloca/callee-save cases. */
+bool funcNeedsFrame(IrFunc* f)
+{
+    if (f == null) return false;
+    u32 ii = 0;
+    u32 xi = 0;
+    for (u32 a = 0; a < f->nargs; a++)
+    {
+        IrValue* av = f->args != null ? f->args[a] : null;
+        if (av == null) continue;
+        ArgClass cl = classifyArg(av);
+        if (cl == ArgClass::INTEGER) { if (ii < 6) ii++; else return true; }
+        else if (cl == ArgClass::SSE) { if (xi < 8) xi++; else return true; }
+        else return true;
+    }
+    for (u32 b = 0; b < f->nblocks; b++)
+    {
+        IrBlock* bb = f->blocks[b];
+        if (bb == null) continue;
+        for (u32 i = 0; i < bb->ninsts; i++)
+        {
+            IrInst* inst = bb->insts[i];
+            if (inst == null) continue;
+            if (inst->opcode == IrOpcode::Call || inst->opcode == IrOpcode::InlineAsm)
+                return true;
+        }
+    }
+    return false;
+}
+
 void emitPrologue(EmitCtx* c)
 {
-    bool frame = c->ncallee > 0 || c->frameSize > 0 || c->allocaBytes > 0;
+    bool frame = c->forceFrame || c->ncallee > 0 || c->frameSize > 0 || c->allocaBytes > 0;
     if (!frame) return;
     c->emitLine("\tpushq %rbp");
+    c->emitLine("\t.cfi_def_cfa_offset 16");
+    c->emitLine("\t.cfi_offset %rbp, -16");
     c->emitLine("\tmovq %rsp, %rbp");
+    c->emitLine("\t.cfi_def_cfa_register %rbp");
     for (u32 i = 0; i < c->ncallee; i++)
     {
         c->emit("\tpushq "); c->emit(regName(c->calleeList[i])); c->emitLine("");
+        c->emit("\t.cfi_offset "); c->emit(regName(c->calleeList[i])); c->emit(", -");
+        c->emitI64((i64)(24 + 8 * (i32)i)); c->emitLine("");
     }
     /* frameTotal = spill + alloca, padded so rsp stays 16-aligned.
      * entry rsp%16==8; after push rbp + ncallee pushes rsp%16 ==
@@ -2076,6 +2548,39 @@ pub str emitFuncAsm(IrFunc* func, IrContext* ctx)
     ec.func = func;
     ec.ictx = ctx;
 
+    /* load-CSE pre-pass: pair redundant loads before vreg sizing so
+     * aliases are consistent through liveness and emission */
+    for (u32 b = 0; b < func->nblocks; b++)
+    {
+        IrBlock* bb = func->blocks[b];
+        if (bb == null) continue;
+        usize[32] caddr; usize[32] cval; u32[32] cw; u32 cn = 0;
+        for (u32 i = 0; i < bb->ninsts; i++)
+        {
+            IrInst* inst = bb->insts[i];
+            if (inst == null) continue;
+            if (inst->opcode == IrOpcode::Store || inst->opcode == IrOpcode::Call ||
+                inst->opcode == IrOpcode::InlineAsm)
+            { cn = 0; continue; }
+            if (inst->opcode != IrOpcode::Load || inst->nops < 1) continue;
+            IrValue* addr = canonAddr(&ec, inst->ops[0]);
+            u32 w = inst->base.type != null ? inst->base.type->width : 64;
+            IrValue* hit = null;
+            for (u32 k = 0; k < cn; k++)
+                if (caddr[k] == (usize)addr && cw[k] == w) { hit = (IrValue*)(usize)cval[k]; break; }
+            if (hit != null)
+            {
+                /* canonical: follow existing alias chain */
+                IrValue* canon = ec.cseFind(hit);
+                ec.cseAdd(&inst->base, canon != null ? canon : hit);
+            }
+            else if (cn < 32)
+            {
+                caddr[cn] = (usize)addr; cval[cn] = (usize)&inst->base; cw[cn] = w; cn++;
+            }
+        }
+    }
+
     /* args first: identity-op aliasing in vregFor needs them mapped */
     for (u32 a = 0; a < func->nargs; a++)
         if (func->args != null && func->args[a] != null) ec.vregFor(func->args[a]);
@@ -2117,12 +2622,18 @@ pub str emitFuncAsm(IrFunc* func, IrContext* ctx)
         }
     }
 
-    /* header + prologue */
-    ec.emitLine(".text");
-    ec.emitLine(".p2align 4,,15");
-    ec.emit(".globl "); ec.emitLine(func->base.name);
-    ec.emit(".type "); ec.emit(func->base.name); ec.emitLine(", @function");
-    ec.emit(func->base.name); ec.emitLine(":");
+    ec.forceFrame = funcNeedsFrame(func);
+
+    /* header + prologue, clang-style layout */
+    u64 fid = (u64)func->base.id;
+    ec.emitLine("\t.text");
+    ec.emit("\t.globl\t"); ec.emit(func->base.name);
+    emitFuncBeginComment(&ec, func->base.name);
+    ec.emit("\t.p2align\t4\n");
+    ec.emit("\t.type\t"); ec.emit(func->base.name); ec.emit(",@function\n");
+    ec.emit(func->base.name); ec.emit(":");
+    emitFuncLabelComment(&ec, func->base.name);
+    ec.emitLine("\t.cfi_startproc");
     emitPrologue(&ec);
     emitArgMoves(&ec);
 
@@ -2131,7 +2642,6 @@ pub str emitFuncAsm(IrFunc* func, IrContext* ctx)
         IrBlock* bb = func->blocks[b];
         if (bb == null) continue;
         emitBBLabelFor(&ec, &bb->base);
-        ec.emitLine("");
         for (u32 i = 0; i < bb->ninsts; i++)
         {
             IrInst* inst = bb->insts[i];
@@ -2150,10 +2660,12 @@ pub str emitFuncAsm(IrFunc* func, IrContext* ctx)
             }
         }
     }
-    ec.emit(".size "); ec.emit(func->base.name); ec.emit(",.-");
-    ec.emit(func->base.name); ec.emitLine("");
+    ec.emit(".Lfunc_end"); ec.emitU64(fid); ec.emitLine(":");
+    ec.emit("\t.size\t"); ec.emit(func->base.name); ec.emit(", .Lfunc_end");
+    ec.emitU64(fid); ec.emit("-"); ec.emit(func->base.name); ec.emitLine("");
+    ec.emitLine("\t.cfi_endproc");
+    emitFuncEndComment(&ec);
 
-    eprintln("emitFuncAsm {} out.len={} nvregs={}", func->base.name, ec.out.len, ec.nvregs);
     str result = ec.out.asView();
     if (ec.vregs != null) dealloc<VReg>(ec.vregs);
     if (ec.allocaVals != null) dealloc<IrValue*>(ec.allocaVals);
@@ -2163,11 +2675,225 @@ pub str emitFuncAsm(IrFunc* func, IrContext* ctx)
     return result;
 }
 
+/* ================= data emission ================= */
+
+void dataEmit(String* out, str s) { out->appendView(s); }
+
+void dataEmitLine(String* out, str s)
+{
+    out->appendView(s);
+    out->pushChar('\n');
+}
+
+void dataEmitI64(String* out, i64 v)
+{
+    cchar[32] buf;
+    i32 n = snprintf(buf, 32, C"%lld", v);
+    if (n > 0) out->appendView(str::fromParts((const u8*)buf, (usize)n));
+}
+
+void dataEmitU64(String* out, u64 v)
+{
+    cchar[32] buf;
+    i32 n = snprintf(buf, 32, C"%llu", v);
+    if (n > 0) out->appendView(str::fromParts((const u8*)buf, (usize)n));
+}
+
+void emitEscapedAscizData(String* out, const u8* data, u32 len)
+{
+    out->appendView("\t.asciz \"");
+    for (u32 i = 0; i < len; i++)
+    {
+        u8 ch = data[i];
+        if (ch == 10) out->appendView("\\n");
+        else if (ch == 9) out->appendView("\\t");
+        else if (ch == 13) out->appendView("\\r");
+        else if (ch == 34) out->appendView("\\\"");
+        else if (ch == 92) out->appendView("\\\\");
+        else if (ch >= 32 && ch <= 126)
+        {
+            u8[1] one;
+            one[0] = ch;
+            out->appendView(str::fromParts((const u8*)one, 1));
+        }
+        else
+        {
+            cchar[8] oct;
+            snprintf(oct, 8, C"\\%03o", (u32)ch);
+            out->appendView(str::fromCstr((cchar*)oct));
+        }
+    }
+    out->appendView("\"\n");
+}
+
+void emitDataValue(String* out, IrModule* modd, IrContext* ctx, IrValue* v)
+{
+    if (v == null)
+    {
+        dataEmitLine(out, "\t.quad 0");
+        return;
+    }
+    switch (v->kind)
+    {
+        IrValueKind::ConstInt => {
+            u32 w = v->type != null ? v->type->width : 64;
+            if (w <= 8)
+            {
+                dataEmit(out, "\t.byte "); dataEmitI64(out, (i64)(u8)v->valData); dataEmitLine(out, "");
+            }
+            else if (w <= 16)
+            {
+                dataEmit(out, "\t.short "); dataEmitI64(out, (i64)(u16)v->valData); dataEmitLine(out, "");
+            }
+            else if (w <= 32)
+            {
+                dataEmit(out, "\t.long "); dataEmitI64(out, (i64)(i32)v->valData); dataEmitLine(out, "");
+            }
+            else
+            {
+                dataEmit(out, "\t.quad "); dataEmitI64(out, (i64)v->valData); dataEmitLine(out, "");
+            }
+        },
+        IrValueKind::ConstFloat => {
+            u32 w = v->type != null ? v->type->width : 64;
+            if (w <= 32)
+            {
+                dataEmit(out, "\t.long "); dataEmitU64(out, (u64)(u32)v->valData); dataEmitLine(out, "");
+            }
+            else
+            {
+                dataEmit(out, "\t.quad "); dataEmitU64(out, v->valData); dataEmitLine(out, "");
+            }
+        },
+        IrValueKind::StringConst => {
+            IrStringConst* sc = (IrStringConst*)v;
+            emitEscapedAscizData(out, sc->data, sc->length);
+        },
+        IrValueKind::ConstArray => {
+            IrArrayConst* ac = (IrArrayConst*)v;
+            for (u32 i = 0; i < ac->nelems; i++)
+                emitDataValue(out, modd, ctx, ac->elems[i]);
+        },
+        IrValueKind::StructConst => {
+            IrStructConst* st = (IrStructConst*)v;
+            IrStructType* sst = null;
+            if (modd != null)
+            {
+                for (u32 si = 0; si < modd->nstructs; si++)
+                {
+                    IrStructType* cand = modd->structs[si];
+                    if (cand != null && cand->irType == v->type) { sst = cand; break; }
+                }
+            }
+            u32 run = 0;
+            for (u32 i = 0; i < st->nelems; i++)
+            {
+                IrValue* fv = st->elems[i];
+                u32 fo = sst != null && sst->offsets != null && i < sst->nfields
+                    ? sst->offsets[i] : run;
+                if (fo > run)
+                {
+                    dataEmit(out, "\t.zero "); dataEmitU64(out, (u64)(fo - run)); dataEmitLine(out, "");
+                    run = fo;
+                }
+                emitDataValue(out, modd, ctx, fv);
+                u32 fsz = fv != null && fv->type != null && ctx != null
+                    ? ctx->irTypeSizeOf(fv->type) : 0;
+                run = fo + fsz;
+            }
+            if (sst != null && sst->size > run)
+            {
+                dataEmit(out, "\t.zero "); dataEmitU64(out, (u64)(sst->size - run)); dataEmitLine(out, "");
+            }
+        },
+        IrValueKind::Global | IrValueKind::Func => {
+            dataEmit(out, "\t.quad "); dataEmitLine(out, asmSymName(v));
+        },
+        else => {
+            dataEmitLine(out, "\t.quad 0");
+        }
+    }
+}
+
+u32 dataAlignExp(u32 align)
+{
+    if (align <= 1) return 0;
+    u32 e = 0;
+    while (((u32)1 << e) < align && e < 16) e++;
+    return ((u32)1 << e) == align ? e : 0;
+}
+
+void emitDataAlign(String* out, u32 align)
+{
+    u32 e = dataAlignExp(align);
+    if (align > 1 && e != 0)
+    {
+        out->appendView("\t.p2align\t");
+        dataEmitU64(out, (u64)e);
+        out->appendView(", 0x0\n");
+    }
+    else if (align > 1)
+    {
+        out->appendView("\t.balign\t");
+        dataEmitU64(out, (u64)align);
+        out->pushChar('\n');
+    }
+}
+
+void emitDataAsm(String* out, IrModule* modd, IrContext* ctx)
+{
+    if (modd == null) return;
+    if (modd->nconstStrings > 0)
+    {
+        out->appendView("\t.section .rodata\n");
+        for (u32 i = 0; i < modd->nconstStrings; i++)
+        {
+            IrStringConst* sc = modd->constStrings[i];
+            if (sc == null) continue;
+            emitDataAlign(out, 1);
+            if (!sc->base.name.isEmpty())
+            {
+                out->appendView(sc->base.name); out->pushChar(':'); out->pushChar('\n');
+            }
+            else
+            {
+                out->appendView(".Lstr_"); dataEmitU64(out, (u64)sc->base.id); out->appendView(":\n");
+            }
+            emitEscapedAscizData(out, sc->data, sc->length);
+        }
+        out->pushChar('\n');
+    }
+    for (u32 gi = 0; gi < modd->nglobals; gi++)
+    {
+        IrGlobal* g = modd->globals[gi];
+        if (g == null || g->isExtern) continue;
+        out->appendView(g->isConst ? "\t.section .rodata\n" : "\t.data\n");
+        u32 align = g->alignment != 0 ? g->alignment : 8;
+        emitDataAlign(out, align);
+        out->appendView("\t.type\t"); out->appendView(g->base.name); out->appendView(",@object\n");
+        out->appendView("\t.globl\t"); out->appendView(g->base.name); out->pushChar('\n');
+        out->appendView(g->base.name); out->appendView(":\n");
+        if (g->initVal != null)
+            emitDataValue(out, modd, ctx, g->initVal);
+        else
+        {
+            u32 sz = 8;
+            if (ctx != null && g->base.type != null)
+                sz = ctx->irTypeSizeOf(g->base.type);
+            if (sz == 0) sz = 8;
+            out->appendView("\t.zero "); dataEmitU64(out, (u64)sz); out->pushChar('\n');
+        }
+        out->appendView("\t.size\t"); out->appendView(g->base.name);
+        out->appendView(", .-"); out->appendView(g->base.name); out->pushChar('\n');
+        out->pushChar('\n');
+    }
+}
+
 pub str emitModuleAsm(IrModule* modd, IrContext* ctx)
 {
     if (modd == null || ctx == null) return "";
     String out = String::new();
-    out.appendView("# primary/x86_64/linux\n\n");
+    out.appendView("\t.att_syntax\n\t.file \"muvm\"\n\n");
     for (u32 fi = 0; fi < modd->nfuncs; fi++)
     {
         IrFunc* func = modd->funcs[fi];
@@ -2175,6 +2901,8 @@ pub str emitModuleAsm(IrModule* modd, IrContext* ctx)
         str s = emitFuncAsm(func, ctx);
         if (s.len > 0) { out.appendView(s); out.pushChar('\n'); }
     }
+    emitDataAsm(&out, modd, ctx);
+    out.appendView("\n\t.section .note.GNU-stack,\"\",@progbits\n");
     return out.asView();
 }
 

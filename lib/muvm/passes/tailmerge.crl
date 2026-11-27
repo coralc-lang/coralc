@@ -1,0 +1,296 @@
+#[[no_drop_all]]
+// TailMerge — GCC crossjumping / LLVM tail-merging equivalent.
+//
+// When two blocks end with an identical instruction suffix — same
+// opcodes, literally the same operands (SSA values, equal constants),
+// same unconditional `br` target — the shared tail is split out into
+// a new block both predecessors jump to. One copy of the tail executes
+// per dynamic path either way, so merging is semantics-preserving for
+// ANY instruction kind (calls, stores, atomics included): each run
+// still performs the tail exactly once.
+//
+// Conservative v1 restrictions:
+//   - terminator must be unconditional Br to the SAME dest in both
+//   - dest block must contain no Phi nodes (phi translation is the
+//     hard part of crossjumping — skipped entirely here)
+//   - every non-terminator suffix inst must have ZERO users — its
+//     result can't be observed off-path, so deleting the duplicate
+//     copy can't break an external use
+//   - operands must be literally identical IrValue* (or equal
+//     ConstInt/ConstFloat valData) — no equivalence reasoning
+//   - suffix must be at least 2 insts (terminator + one real inst)
+//
+// Operand safety: an operand used by the shared tail dominated both
+// original tail positions (same SSA value, two uses) — after the
+// merge it dominates the new block on both incoming edges.
+
+import muvm::irtypes { IrContext, IrFunc, IrModule, IrBlock, IrInst, IrValue, IrValueKind, IrType };
+import muvm::irOps { IrOpcode };
+import muvm::passes::common { gVerbose };
+import std::mman { alloc, dealloc };
+import std::ios { eprintln };
+
+struct TailMerge
+{
+    IrContext* ctx;
+    IrModule* mod;
+    u32 changes;
+    u32 tmCounter;
+
+    TailMerge new(IrContext* c, IrModule* m, u32 ch)
+    {
+        return TailMerge { .ctx = c, .mod = m, .changes = ch, .tmCounter = 0 };
+    }
+
+    // unique block name per merge — createBlock does not dedupe
+    IrBlock* newTailBlock(IrFunc* f)
+    {
+        u8[24] buf;
+        usize n = 0;
+        const u8[2] prefix = { 116, 109 }; // "tm"
+        buf[n++] = prefix[0];
+        buf[n++] = prefix[1];
+        u32 id = self.tmCounter++;
+        u8[10] digits;
+        u32 nd = 0;
+        if (id == 0) digits[nd++] = 48;
+        else
+        {
+            u32 v = id;
+            while (v > 0) { digits[nd++] = (u8)(48 + (v % 10)); v /= 10; }
+        }
+        while (nd > 0) { nd--; buf[n++] = digits[nd]; }
+        str name = str::fromParts((const u8*)buf, n);
+        IrBlock* bb = self.ctx->createBlock(name);
+        f->addBlock(bb);
+        return bb;
+    }
+
+    // literal operand identity: same value pointer, or equal const data
+    bool opEq(IrValue* a, IrValue* b)
+    {
+        if (a == b) return true;
+        if (a == null || b == null) return false;
+        if (a->kind != b->kind) return false;
+        if (a->kind == IrValueKind::ConstInt || a->kind == IrValueKind::ConstFloat)
+            return a->valData == b->valData;
+        return false;
+    }
+
+    // index of inst within its block's insts array, or ~0
+    u32 instIndex(IrBlock* bb, IrInst* target)
+    {
+        for (u32 i = 0; i < bb->ninsts; i++)
+            if (bb->insts[i] == target) return i;
+        return 0xFFFFFFFFu;
+    }
+
+    // operand correspondence under suffix-positional mapping: literal
+    // equality, OR both operands are results of suffix insts at the
+    // SAME relative offset (victim suffix[k] ↔ donor suffix[k])
+    bool opMapped(IrBlock* vb, u32 sV, IrBlock* db, u32 sD, IrValue* a, IrValue* b)
+    {
+        if (self.opEq(a, b)) return true;
+        if (a == null || b == null) return false;
+        if (a->kind != IrValueKind::Inst || b->kind != IrValueKind::Inst)
+            return false;
+        IrInst* da = (IrInst*)a;
+        IrInst* dbi = (IrInst*)b;
+        u32 ia = self.instIndex(vb, da);
+        u32 ib = self.instIndex(db, dbi);
+        if (ia == 0xFFFFFFFFu || ib == 0xFFFFFFFFu) return false;
+        // both defs must live inside their own suffix at the same
+        // relative position
+        if (ia < sV || ib < sD) return false;
+        return (ia - sV) == (ib - sD);
+    }
+
+    // insts match under positional operand mapping
+    bool instMapped(IrBlock* vb, u32 sV, IrBlock* db, u32 sD, IrInst* a, IrInst* b)
+    {
+        if (a == null || b == null) return false;
+        if (a->opcode != b->opcode || a->nops != b->nops) return false;
+        if (a->base.type != b->base.type) return false;
+        for (u32 i = 0; i < a->nops; i++)
+            if (!self.opMapped(vb, sV, db, sD, a->ops[i], b->ops[i]))
+                return false;
+        return true;
+    }
+
+    // length of common suffix (incl. terminator) between two blocks;
+    // both must end in unconditional Br to the same dest
+    u32 commonTail(IrBlock* a, IrBlock* b, IrBlock** destOut)
+    {
+        if (a == b || a->ninsts == 0 || b->ninsts == 0) return 0;
+        IrInst* ta = a->insts[a->ninsts - 1];
+        IrInst* tb = b->insts[b->ninsts - 1];
+        if (ta == null || tb == null) return 0;
+        if (ta->opcode != IrOpcode::Br || tb->opcode != IrOpcode::Br) return 0;
+        if (ta->nops < 1 || tb->nops < 1) return 0;
+        if (ta->ops[0] != tb->ops[0]) return 0; // same dest block value
+        IrBlock* d = (IrBlock*)ta->ops[0];
+        if (d == null || d == a || d == b) return 0;
+        *destOut = d;
+        // dest must be phi-free
+        for (u32 i = 0; i < d->ninsts; i++)
+        {
+            IrInst* di = d->insts[i];
+            if (di != null && di->opcode == IrOpcode::Phi) return 0;
+            if (di != null && di->opcode != IrOpcode::Phi) break;
+        }
+        // candidate length by opcode+nops+type only (operand check after)
+        u32 la = a->ninsts;
+        u32 lb = b->ninsts;
+        u32 l = 0;
+        while (l < la && l < lb)
+        {
+            IrInst* ia = a->insts[la - 1 - l];
+            IrInst* ib = b->insts[lb - 1 - l];
+            if (ia == null || ib == null) break;
+            if (ia->opcode != ib->opcode || ia->nops != ib->nops ||
+                ia->base.type != ib->base.type) break;
+            l++;
+        }
+        // verify operands under positional mapping for the whole suffix
+        u32 sA = la - l;
+        u32 sB = lb - l;
+        for (u32 k = 0; k < l; k++)
+        {
+            IrInst* ia = a->insts[sA + k];
+            IrInst* ib = b->insts[sB + k];
+            if (!self.instMapped(a, sA, b, sB, ia, ib)) return 0;
+        }
+        return l;
+    }
+
+    // every non-terminator suffix inst's users must stay inside the
+    // suffix — external uses would break when the duplicate is deleted
+    bool suffixUserless(IrBlock* bb, u32 start)
+    {
+        for (u32 i = start; i + 1 < bb->ninsts; i++)
+        {
+            IrInst* in = bb->insts[i];
+            if (in == null) continue;
+            for (u32 ui = 0; ui < in->base.nusers; ui++)
+            {
+                IrInst* user = in->base.users[ui];
+                if (user == null || user->parent != bb) return false;
+                u32 ui2 = self.instIndex(bb, user);
+                if (ui2 == 0xFFFFFFFFu || ui2 < start) return false;
+            }
+        }
+        return true;
+    }
+
+    bool tryMerge(IrFunc* f, IrBlock* a, IrBlock* b, u32 tailLen, IrBlock* dest)
+    {
+        if (tailLen < 2) return false;
+        u32 sa = a->ninsts - tailLen;
+        u32 sb = b->ninsts - tailLen;
+        if (!self.suffixUserless(a, sa) || !self.suffixUserless(b, sb))
+            return false;
+
+        // donor = b keeps the shared tail; a's copy is deleted
+        IrBlock* donor = b;
+        IrBlock* victim = a;
+        u32 sDonor = sb;
+        u32 sVictim = sa;
+
+        // 1. split donor: move insts[sDonor..end) into new block T
+        IrBlock* T = self.newTailBlock(f);
+        // detach() shifts the array — always take index sDonor so no
+        // inst is skipped; order is preserved by appending in sequence
+        while (donor->ninsts > sDonor)
+        {
+            IrInst* in = donor->insts[sDonor];
+            if (in == null) { donor->ninsts = sDonor; break; }
+            in->detach();
+            T->addInst(in);
+        }
+        // donor prefix gets `br T`
+        IrValue** ops = alloc<IrValue*>((usize)1);
+        ops[0] = &T->base;
+        IrInst* dbr = self.ctx->createInst(IrOpcode::Br, self.ctx->tyVoid(), ops, 1, 0, 0);
+        dealloc<IrValue*>(ops);
+        (&T->base)->addUser(dbr);
+        donor->addInst(dbr);
+
+        // 2. victim: delete its tail copy, jump to T
+        // same detach-shift hazard — kill() detaches too
+        while (victim->ninsts > sVictim)
+        {
+            IrInst* in = victim->insts[sVictim];
+            if (in == null) { victim->ninsts = sVictim; break; }
+            in->kill();
+        }
+        ops = alloc<IrValue*>((usize)1);
+        ops[0] = &T->base;
+        IrInst* vbr = self.ctx->createInst(IrOpcode::Br, self.ctx->tyVoid(), ops, 1, 0, 0);
+        dealloc<IrValue*>(ops);
+        (&T->base)->addUser(vbr);
+        victim->addInst(vbr);
+
+        // 3. CFG links. addSucc auto-backlinks the pred list — calling
+        // addPred as well would double-count and leave npreds stale
+        // (simplifycfg's merge pass requires exact pred counts).
+        donor->removeSucc(dest);
+        donor->addSucc(T);
+        victim->removeSucc(dest);
+        victim->addSucc(T);
+        T->addSucc(dest);
+        dest->removePred(donor);
+        dest->removePred(victim);
+
+        // 4. T is already registered by newTailBlock
+        self.changes++;
+        if (gVerbose) eprintln("tailmerge: {} + {} share {}-inst tail in {}", a->base.name, b->base.name, (u64)tailLen, f->base.name);
+        return true;
+    }
+
+    bool runFunc(IrFunc* f)
+    {
+        if (f == null || f->isExtern) return false;
+        bool changed = false;
+        // O(n²) pairwise — funcs are small; bail on huge ones
+        u64 total = 0;
+        for (u32 i = 0; i < f->nblocks; i++)
+            total += f->blocks[i] != null ? (u64)f->blocks[i]->ninsts : 0;
+        if (total > 4000) return false;
+        for (u32 i = 0; i < f->nblocks; i++)
+        {
+            IrBlock* a = f->blocks[i];
+            if (a == null || a->ninsts < 3) continue;
+            for (u32 j = i + 1; j < f->nblocks; j++)
+            {
+                IrBlock* b = f->blocks[j];
+                if (b == null || b->ninsts < 3) continue;
+                IrBlock* dest = null;
+                u32 tl = self.commonTail(a, b, &dest);
+                if (tl < 2) continue;
+                if (self.tryMerge(f, a, b, tl, dest))
+                {
+                    changed = true;
+                    break; // a's shape changed — rescan pairs next round
+                }
+            }
+        }
+        return changed;
+    }
+
+    bool run()
+    {
+        IrModule* m = self.mod;
+        if (m == null) return false;
+        for (u32 fi = 0; fi < m->nfuncs; fi++)
+            self.runFunc(m->funcs[fi]);
+        return self.changes > 0;
+    }
+}
+
+pub bool muvmPassTailMerge(IrFunc* func, rawptr userdata)
+{
+    IrModule* m = func != null ? func->parent : null;
+    if (m == null || m->nfuncs == 0 || func != m->funcs[0]) return false;
+    TailMerge st = TailMerge::new(m->ctx, m, 0);
+    return st.run();
+}
