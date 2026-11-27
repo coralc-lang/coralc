@@ -1,0 +1,200 @@
+#[[no_drop_all]]
+// ArgPromotion — LLVM argpromotion-lite / GCC ipa-sra territory.
+//
+// A pointer parameter that is ONLY ever used as the address of Load
+// instructions (same result type throughout) carries no pointer
+// semantics the caller needs — promote it to a by-value scalar: the
+// parameter's type becomes the load type, the loads inside the
+// function are replaced by the parameter itself, and every direct
+// call site inserts `load T %ptrarg` before the call.
+//
+// Soundness constraints (v1, deliberately narrow):
+//   - the function must have exactly ONE block — every load of the
+//     param executes unconditionally on every call, so hoisting the
+//     load into the caller cannot introduce a fault the callee
+//     wouldn't already take on that path
+//   - every use of the param must be a Load with the SAME result type
+//     (stores, geps, calls, ptrtoint, address-of all disqualify)
+//   - the param must carry no !dereferenceable/!noalias attrs (they
+//     are pointer contracts; clearing them silently is unsound)
+//   - the function must not escape — its value may only appear as a
+//     direct call callee, so every use is a rewritable call site
+//   - non-extern, non-variadic-skipped: vararg flag is preserved, but
+//     funcs with pointer params under varargs still promote fine
+//
+// Runs once per module on the first function's turn (callers may sit
+// anywhere in the module — the rewrite is position-independent).
+
+import muvm::irtypes { IrContext, IrFunc, IrModule, IrBlock, IrInst, IrValue, IrValueKind, IrType, IrTypeKind };
+import muvm::irOps { IrOpcode };
+import muvm::irMetadata { funcParamDerefBytes, funcParamNoAlias, funcClearParamAttrs };
+import muvm::passes::common { gVerbose };
+import std::mman { alloc, dealloc };
+import std::ios { eprintln };
+
+struct ArgPromo
+{
+    IrContext* ctx;
+    IrModule* mod;
+    u32 changes;
+
+    ArgPromo new(IrContext* c, IrModule* m, u32 ch)
+    {
+        return ArgPromo { .ctx = c, .mod = m, .changes = ch };
+    }
+
+    // func value must only appear as a call callee operand
+    bool funcEscapes(IrFunc* f)
+    {
+        IrModule* m = self.mod;
+        for (u32 ei = 0; ei < m->nfuncs; ei++)
+        {
+            IrFunc* ef = m->funcs[ei];
+            if (ef == null) continue;
+            for (u32 bi = 0; bi < ef->nblocks; bi++)
+            {
+                IrBlock* bb = ef->blocks[bi];
+                if (bb == null) continue;
+                for (u32 ii = 0; ii < bb->ninsts; ii++)
+                {
+                    IrInst* einst = bb->insts[ii];
+                    if (einst == null) continue;
+                    for (u32 oi = 0; oi < einst->nops; oi++)
+                    {
+                        IrValue* ov = einst->ops[oi];
+                        if (ov == null || ov->kind != IrValueKind::Func ||
+                            (IrFunc*)ov != f) continue;
+                        bool isCallee = einst->opcode == IrOpcode::Call && oi == 0;
+                        if (!isCallee) return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    // every user of arg must be a Load; returns the common result type
+    // or null. Loads collected into out (may be null).
+    IrType* allLoadUses(IrValue* arg, IrInst** out, u32* nout)
+    {
+        IrType* t = null;
+        u32 n = 0;
+        for (u32 ui = 0; ui < arg->nusers; ui++)
+        {
+            IrInst* u = arg->users[ui];
+            if (u == null || u->opcode != IrOpcode::Load) return null;
+            if (u->nops < 1 || u->ops[0] != arg) return null;
+            IrType* lt = u->base.type;
+            if (lt == null) return null;
+            if (t == null) t = lt;
+            else if (t != lt) return null; // mixed load types — skip
+            if (out != null) out[n] = u;
+            n++;
+        }
+        if (nout != null) *nout = n;
+        return n > 0 ? t : null;
+    }
+
+    bool tryPromote(IrFunc* f, u32 pi)
+    {
+        if (f == null || f->isExtern || f->nblocks != 1) return false;
+        if (pi >= f->nargs || f->args == null) return false;
+        IrValue* arg = f->args[pi];
+        if (arg == null || arg->type == null ||
+            arg->type->kind != IrTypeKind::Ptr) return false;
+        if (self.funcEscapes(f)) return false;
+
+        u32 nloads = 0;
+        IrInst** loads = alloc<IrInst*>((usize)(arg->nusers > 0 ? arg->nusers : 1));
+        IrType* t = self.allLoadUses(arg, loads, &nloads);
+        if (t == null || nloads == 0)
+        {
+            dealloc<IrInst*>(loads);
+            return false;
+        }
+
+        // 1. param becomes the scalar type; loads collapse into it
+        arg->type = t;
+        for (u32 li = 0; li < nloads; li++)
+        {
+            IrInst* ld = loads[li];
+            if (ld == null) continue;
+            ld->base.replaceAllUses(arg);
+            ld->kill();
+        }
+        dealloc<IrInst*>(loads);
+
+        // 2. signature: paramTypes[pi] = T, pointer attrs on this param
+        // are meaningless once it is a scalar — drop them
+        funcClearParamAttrs(f, pi);
+        if (pi < f->nparams && f->paramTypes != null) f->paramTypes[pi] = t;
+        bool va = f->base.type != null && f->base.type->isVararg;
+        IrType* nt = self.ctx->tyFunc(f->retType, f->paramTypes, f->nparams, va);
+        f->base.type = nt;
+
+        // 3. rewrite every direct call site: load T %ptrarg before call
+        IrModule* m = self.mod;
+        for (u32 ei = 0; ei < m->nfuncs; ei++)
+        {
+            IrFunc* ef = m->funcs[ei];
+            if (ef == null) continue;
+            for (u32 bi = 0; bi < ef->nblocks; bi++)
+            {
+                IrBlock* bb = ef->blocks[bi];
+                if (bb == null) continue;
+                for (u32 ii = 0; ii < bb->ninsts; ii++)
+                {
+                    IrInst* c = bb->insts[ii];
+                    if (c == null || c->opcode != IrOpcode::Call ||
+                        c->nops <= (u32)(pi + 1)) continue;
+                    IrValue* cv = c->ops[0];
+                    if (cv == null || cv->kind != IrValueKind::Func ||
+                        (IrFunc*)cv != f) continue;
+                    IrValue* ptrArg = c->ops[pi + 1];
+                    if (ptrArg == null) continue;
+                    IrValue** lops = alloc<IrValue*>((usize)1);
+                    lops[0] = ptrArg;
+                    IrInst* ld = self.ctx->createInst(IrOpcode::Load, t, lops, 1, 0, 0);
+                    dealloc<IrValue*>(lops);
+                    if (ld == null) continue;
+                    ptrArg->addUser(ld);
+                    bb->insertBefore(ld, c);
+                    // swap the call operand ptr→loaded value
+                    ptrArg->removeUser(c);
+                    c->ops[pi + 1] = &ld->base;
+                    (&ld->base)->addUser(c);
+                    // insertBefore shifted c to ii+1 — skip it so the
+                    // scan doesn't reprocess the same call forever
+                    ii++;
+                }
+            }
+        }
+
+        self.changes++;
+        if (gVerbose) eprintln("argpromo: @{} param {} ptr->{}", f->base.name, (u64)pi, "scalar");
+        return true;
+    }
+
+    bool run()
+    {
+        IrModule* m = self.mod;
+        if (m == null || m->nfuncs == 0) return false;
+        for (u32 fi = 0; fi < m->nfuncs; fi++)
+        {
+            IrFunc* f = m->funcs[fi];
+            if (f == null || f->isExtern) continue;
+            // retry per param — promotion of one doesn't affect others
+            for (u32 pi = 0; pi < f->nargs; pi++)
+                self.tryPromote(f, pi);
+        }
+        return self.changes > 0;
+    }
+}
+
+pub bool muvmPassArgPromo(IrFunc* func, rawptr userdata)
+{
+    IrModule* m = func != null ? func->parent : null;
+    if (m == null || m->nfuncs == 0 || func != m->funcs[0]) return false;
+    ArgPromo st = ArgPromo::new(m->ctx, m, 0);
+    return st.run();
+}
