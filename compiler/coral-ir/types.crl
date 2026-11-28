@@ -17,7 +17,7 @@
  * alignment, reorder = sort fields by descending alignment. */
 
 use lower { Muv, muvArr, muvTrackStruct, muvTyMapFind, muvTyMapSet, muvTdMapGet, muvTdMapPut, muvSubstTy, muvSubstDeep,
-               muvTypeInstanceName, muvErr };
+               muvDeclTyMapFind, muvDeclTyMapSet, muvTypeInstanceName, muvErr, muvPatchSite, muvDegTy };
 use sem { scope { Symbol } };
 use ast::id { Str, NodeId, SourceLoc, locFile };
 use ast::types { Ty, TypeEntry, TypeKind };
@@ -278,6 +278,9 @@ pub IrType* muvStructTy(Muv* w, Decl* dd, u32 depth)
     IrType** fts = (IrType**)muvArr(w, (usize)n, 8);
     str* fns = (str*)muvArr(w, (usize)n, 16);
     u32* perm = (u32*)muvArr(w, (usize)n, 4);
+    u32* pidx = (u32*)muvArr(w, (usize)n, 4);
+    Ty* pty = (Ty*)muvArr(w, (usize)n, 4);
+    u32 pn = 0;
     if (fts == null || fns == null || perm == null) return ir->tyInt(8);
     u32 k = 0;
     u32 actual = 0;
@@ -287,7 +290,48 @@ pub IrType* muvStructTy(Muv* w, Decl* dd, u32 depth)
         if (fn->kind.tag == NodeKind::Field)
         {
             Field* f = &fn->kind.payload.Field.value;
-            fts[actual] = muvTy(w, f->typeNode, depth + 1);
+            /* field types resolve names in the DECLARING file's scope —
+             * the struct's IrType may be built lazily from any use site,
+             * so curFileId must follow the field node, not the trigger */
+            u32 saveFid = w->curFileId;
+            w->curFileId = locFile(fn->loc);
+            Ty fty = f->typeNode;
+            /* by-value field whose type is mid-construction: the busy
+             * placeholder would bake a wrong layout, so abort this
+             * struct's build — pointer-edge requesters degrade+patch,
+             * and this decl rebuilds on the next request */
+            if (muvTypeBlocked(w, fty, depth + 1) && !muvPtrWrapped(w, fty))
+            {
+                w->curFileId = saveFid;
+                w->buildBlocked = true;
+                return null;
+            }
+            bool savePH = w->placeholderHit;
+            w->placeholderHit = false;
+            IrType* ft = muvTy(w, fty, depth + 1);
+            bool fdeg = w->placeholderHit;
+            w->placeholderHit = savePH;
+            if (w->buildBlocked)
+            {
+                if (muvPtrWrapped(w, fty))
+                {
+                    /* pointer field tolerates the abort: opaque elem,
+                     * patched to the real pointee type at settle */
+                    w->buildBlocked = false;
+                    ft = muvOpaquePtrTy(w, fty);
+                    fdeg = true;
+                }
+                else
+                {
+                    w->curFileId = saveFid;
+                    return null;
+                }
+            }
+            if (ft == null) { w->curFileId = saveFid; return null; }
+            if (fdeg && pidx != null)
+            { pidx[pn] = actual; pty[pn] = fty; pn++; }
+            fts[actual] = ft;
+            w->curFileId = saveFid;
             fns[actual] = muvStr(ctx, f->name);
             perm[actual] = actual;
             actual++;
@@ -390,10 +434,170 @@ pub IrType* muvStructTy(Muv* w, Decl* dd, u32 depth)
                                                  packed ? 1 : 0,
                                                  alignAs);
     muvTrackStruct(w, st);
+    if (pn != 0 && st != null && st->irType != null)
+    {
+        /* degraded pointer fields: record (final index, source Ty) so
+         * muvSettleTypes rewrites the elem once the pointee publishes.
+         * Map the pre-permutation slot through perm to the stored
+         * position. */
+        u32 pi = 0;
+        while (pi < pn)
+        {
+            u32 a = pidx[pi];
+            u32 fidx = a;
+            if (reorder)
+            {
+                u32 q = 0;
+                while (q < actual) { if (perm[q] == a) { fidx = q; break; } q++; }
+            }
+            muvPatchSite(w, st->irType, st->fieldTypes, fidx, pty[pi]);
+            pi++;
+        }
+    }
     return st->irType;
 }
 
 pub IrType* muvTy(Muv* w, Ty t, u32 depth);
+
+/* true when `t`'s top level (after Const/Comptime unwrapping) is a
+ * pointer/reference — pointer fields tolerate a blocked pointee build
+ * by degrading to opaque ptr(i8) + a patch site; by-value fields must
+ * abort the enclosing aggregate build instead. */
+pub bool muvPtrWrapped(Muv* w, Ty t)
+{
+    u32 guard = 0;
+    while (t != 0 && guard++ < 16)
+    {
+        TypeEntry* e = w->ctx->types + t;
+        if (e->kind.tag == TypeKind::Const) { t = e->kind.payload.Const.base; continue; }
+        if (e->kind.tag == TypeKind::Comptime) { t = e->kind.payload.Comptime.base; continue; }
+        return e->kind.tag == TypeKind::Pointer || e->kind.tag == TypeKind::Reference;
+    }
+    return false;
+}
+
+/* opaque stand-in for a pointer-wrapped type whose pointee build was
+ * blocked: ptr^depth(i8) keeps the indirection depth (IrInst** stays a
+ * pointer-to-pointer) so indexing/GEP shape survives until the patch
+ * site rewrites the real elem type. */
+pub IrType* muvOpaquePtrTy(Muv* w, Ty t)
+{
+    IrContext* ir = w->ir;
+    u32 depth = 0;
+    u32 guard = 0;
+    while (t != 0 && guard++ < 16)
+    {
+        TypeEntry* e = w->ctx->types + t;
+        if (e->kind.tag == TypeKind::Const) { t = e->kind.payload.Const.base; continue; }
+        if (e->kind.tag == TypeKind::Comptime) { t = e->kind.payload.Comptime.base; continue; }
+        if (e->kind.tag == TypeKind::Pointer) { depth++; t = e->kind.payload.Pointer.base; continue; }
+        if (e->kind.tag == TypeKind::Reference) { depth++; t = e->kind.payload.Reference.base; continue; }
+        break;
+    }
+    IrType* r = ir->tyInt(8);
+    while (depth != 0) { r = ir->tyPtr(r); depth--; }
+    return r;
+}
+
+/* true when building `t` BY VALUE would hit a decl/ty still being
+ * derived — the busy placeholder is only safe behind a pointer, so
+ * aggregate field lowering aborts on this instead of baking ptr(i8)
+ * into a struct layout. Pointer/slice/fn positions return false: their
+ * size never depends on the pointee. */
+pub bool muvTypeBlocked(Muv* w, Ty t, u32 depth)
+{
+    if (t == 0 || depth > 32 || w->ctx == null) return false;
+    TypeEntry* e = w->ctx->types + t;
+    switch (e->kind.tag)
+    {
+        TypeKind::Const => { return muvTypeBlocked(w, e->kind.payload.Const.base, depth + 1); },
+        TypeKind::Comptime => { return muvTypeBlocked(w, e->kind.payload.Comptime.base, depth + 1); },
+        TypeKind::Pointer | TypeKind::Reference | TypeKind::Slice | TypeKind::FnPtr => { return false; },
+        TypeKind::Named => {
+            if (e->kind.payload.Named.genericArgsLen != 0) return false;
+            u8 busy = 0;
+            IrType* hit = null;
+            if (muvTyMapFind(w, t, &busy, &hit) && busy != 0) return true;
+            NodeId td = muvFindTypeDeclRef(w, e->kind.payload.Named.name, e->loc);
+            if (td.index == 0) return false;
+            Node* dn = w->ctx->nodes + td.index;
+            if (dn->kind.tag != NodeKind::Decl) return false;
+            if (!muvDeclTyMapFind(w, &dn->kind.payload.Decl.value, &busy, &hit)) return false;
+            return busy != 0;
+        },
+        TypeKind::Array => { return muvTypeBlocked(w, e->kind.payload.Array.base, depth + 1); },
+        TypeKind::Tuple => {
+            u32 i = 0;
+            while (i < e->kind.payload.Tuple.elemsLen)
+            {
+                if (muvTypeBlocked(w, e->kind.payload.Tuple.elems[i], depth + 1)) return true;
+                i++;
+            }
+            return false;
+        },
+        else => { return false; }
+    }
+}
+
+IrType* muvTyBuild(Muv* w, Ty t, u32 depth);
+
+/* recompute every degraded cached type and upgrade recorded aggregate
+ * fields. Degradations are pointer-elem substitutions (ptr(i8) for a
+ * not-yet-built pointee), which never change layout — owner->width and
+ * offsets stay valid. Runs before each function body lowers, the point
+ * where types start being consumed by emitted IR. */
+pub void muvSettleTypes(Muv* w)
+{
+    if (w->settling) return;
+    w->settling = true;
+    w->buildBlocked = false;
+    u32 round = 0;
+    while (round < 8 && (w->degLen != 0 || w->patchLen != 0))
+    {
+        round++;
+        u32 di = 0;
+        while (di < w->degLen)
+        {
+            Ty t = w->degTys[di];
+            w->degTys[di] = w->degTys[w->degLen - 1];
+            w->degLen--;
+            if (w->buildBlocked) { w->buildBlocked = false; continue; }
+            u8 busy = 0;
+            IrType* old = null;
+            if (muvTyMapFind(w, t, &busy, &old) && busy == 0 && old != null)
+            {
+                IrType* nt = muvTyBuild(w, t, 0);
+                if (nt != null && nt != old) muvTyMapSet(w, t, 0, nt);
+            }
+            di++;
+        }
+        u32 pi = 0;
+        while (pi < w->patchLen)
+        {
+            IrType* owner = w->patchOwners[pi];
+            IrType** arr = w->patchArrs[pi];
+            u32 idx = w->patchIdxs[pi];
+            Ty ty = w->patchTys[pi];
+            w->patchOwners[pi] = w->patchOwners[w->patchLen - 1];
+            w->patchArrs[pi] = w->patchArrs[w->patchLen - 1];
+            w->patchIdxs[pi] = w->patchIdxs[w->patchLen - 1];
+            w->patchTys[pi] = w->patchTys[w->patchLen - 1];
+            w->patchLen--;
+            u32 nf = owner != null ? owner->nparams : 0;
+            if (nf == 0 || idx >= nf) continue;
+            if (w->buildBlocked) { w->buildBlocked = false; continue; }
+            IrType* nt = muvTy(w, ty, 0);
+            if (nt == null) continue;
+            if (owner->params != null && owner->params[idx] != nt)
+                owner->params[idx] = nt;
+            if (arr != null && arr[idx] != nt)
+                arr[idx] = nt;
+            pi++;
+        }
+        if (w->degLen == 0 && w->patchLen == 0) break;
+    }
+    w->settling = false;
+}
 
 /* the uncached Ty→IrType derivation; muvTy wraps this with the memo */
 IrType* muvTyBuild(Muv* w, Ty t, u32 depth)
@@ -451,7 +655,23 @@ IrType* muvTyBuild(Muv* w, Ty t, u32 depth)
             return st->irType;
         },
         TypeKind::Array => {
-            IrType* elem = muvTy(w, e->kind.payload.Array.base, depth + 1);
+            Ty ety = e->kind.payload.Array.base;
+            if (muvTypeBlocked(w, ety, depth + 1) && !muvPtrWrapped(w, ety))
+            { w->buildBlocked = true; return null; }
+            IrType* elem = muvTy(w, ety, depth + 1);
+            if (w->buildBlocked)
+            {
+                if (muvPtrWrapped(w, ety))
+                {
+                    /* pointer elem tolerates: opaque elem, whole array
+                     * Ty marked degraded so settle recomputes it */
+                    w->buildBlocked = false;
+                    elem = muvOpaquePtrTy(w, ety);
+                    w->placeholderHit = true;
+                }
+                else return null;
+            }
+            if (elem == null) return null;
             return ir->tyArray(elem, e->kind.payload.Array.len);
         },
         TypeKind::FnPtr => {
@@ -470,10 +690,44 @@ IrType* muvTyBuild(Muv* w, Ty t, u32 depth)
             if (np == 0) return ir->tyInt(8);
             IrType** ps = (IrType**)muvArr(w, (usize)np, 8);
             str* pns = (str*)muvArr(w, (usize)np, 16);
+            u32* pidx = (u32*)muvArr(w, (usize)np, 4);
+            Ty* pty = (Ty*)muvArr(w, (usize)np, 4);
             if (ps == null || pns == null) return ir->tyInt(8);
+            u32 pn = 0;
             u32 i = 0;
-            while (i < np) { ps[i] = muvTy(w, e->kind.payload.Tuple.elems[i], depth + 1); pns[i] = "_"; i++; }
+            while (i < np)
+            {
+                Ty ety = e->kind.payload.Tuple.elems[i];
+                if (muvTypeBlocked(w, ety, depth + 1) && !muvPtrWrapped(w, ety))
+                { w->buildBlocked = true; return null; }
+                bool savePH = w->placeholderHit;
+                w->placeholderHit = false;
+                IrType* et = muvTy(w, ety, depth + 1);
+                bool edeg = w->placeholderHit;
+                w->placeholderHit = savePH;
+                if (w->buildBlocked)
+                {
+                    if (muvPtrWrapped(w, ety))
+                    {
+                        w->buildBlocked = false;
+                        et = muvOpaquePtrTy(w, ety);
+                        edeg = true;
+                    }
+                    else return null;
+                }
+                if (et == null) return null;
+                if (edeg && pidx != null) { pidx[pn] = i; pty[pn] = ety; pn++; }
+                ps[i] = et;
+                pns[i] = "_";
+                i++;
+            }
             IrStructType* st = ir->createStructType("coral_tuple", ps, pns, np);
+            if (pn != 0 && st != null && st->irType != null)
+            {
+                u32 pi = 0;
+                while (pi < pn)
+                { muvPatchSite(w, st->irType, st->fieldTypes, pidx[pi], pty[pi]); pi++; }
+            }
             return st->irType;
         },
         TypeKind::Named => {
@@ -573,20 +827,53 @@ pub IrType* muvUnionBlobTy(Muv* w, Decl* ud, u32 depth)
     u32 alignAs = muvAlignAsAttr(w, ud);
     if (n == 0) return alignAs > 1 ? ir->tyUnionAlign(null, 0, alignAs) : ir->tyUnion(null, 0);
     IrType** fts = (IrType**)muvArr(w, (usize)n, 8);
+    u32* pidx = (u32*)muvArr(w, (usize)n, 4);
+    Ty* pty = (Ty*)muvArr(w, (usize)n, 4);
     if (fts == null) return ir->tyInt(8);
     u32 k = 0;
     u32 m = 0;
+    u32 pn = 0;
     while (k < n)
     {
         Node* fn = ctx->nodes + ud->kind.payload.Union.fields[k].index;
         if (fn->kind.tag == NodeKind::Field)
         {
-            fts[m] = muvTy(w, fn->kind.payload.Field.value.typeNode, depth + 1);
+            Ty fty = fn->kind.payload.Field.value.typeNode;
+            if (muvTypeBlocked(w, fty, depth + 1) && !muvPtrWrapped(w, fty))
+            {
+                w->buildBlocked = true;
+                return null;
+            }
+            bool savePH = w->placeholderHit;
+            w->placeholderHit = false;
+            IrType* ft = muvTy(w, fty, depth + 1);
+            bool fdeg = w->placeholderHit;
+            w->placeholderHit = savePH;
+            if (w->buildBlocked)
+            {
+                if (muvPtrWrapped(w, fty))
+                {
+                    w->buildBlocked = false;
+                    ft = muvOpaquePtrTy(w, fty);
+                    fdeg = true;
+                }
+                else return null;
+            }
+            if (ft == null) return null;
+            if (fdeg && pidx != null) { pidx[pn] = m; pty[pn] = fty; pn++; }
+            fts[m] = ft;
             m++;
         }
         k++;
     }
-    return alignAs > 1 ? ir->tyUnionAlign(fts, m, alignAs) : ir->tyUnion(fts, m);
+    IrType* ut = alignAs > 1 ? ir->tyUnionAlign(fts, m, alignAs) : ir->tyUnion(fts, m);
+    if (pn != 0 && ut != null)
+    {
+        u32 pi = 0;
+        while (pi < pn)
+        { muvPatchSite(w, ut, fts, pidx[pi], pty[pi]); pi++; }
+    }
+    return ut;
 }
 
 /* the IrType of one union field by name; null when absent */
@@ -756,21 +1043,53 @@ pub IrStructType* muvVariantCaseStructTy(Muv* w, Decl* vd, u32 cidx, u32 depth)
     if (n == 0) n = 1;
     IrType** fts = (IrType**)muvArr(w, (usize)n, 8);
     str* fns = (str*)muvArr(w, (usize)n, 16);
+    u32* pidx = (u32*)muvArr(w, (usize)n, 4);
+    Ty* pty = (Ty*)muvArr(w, (usize)n, 4);
     if (fts == null || fns == null) return null;
     AstContext* ctx = w->ctx;
     u32 i = 0;
+    u32 pn = 0;
     while (i < n)
     {
         if (vv->fieldsLen == 0) { fts[i] = w->ir->tyInt(8); fns[i] = "_e"; }
         else
         {
-            fts[i] = muvTy(w, vv->fieldTypes[i], depth + 1);
+            Ty fty = vv->fieldTypes[i];
+            if (muvTypeBlocked(w, fty, depth + 1) && !muvPtrWrapped(w, fty))
+            {
+                w->buildBlocked = true;
+                return null;
+            }
+            bool savePH = w->placeholderHit;
+            w->placeholderHit = false;
+            IrType* ft = muvTy(w, fty, depth + 1);
+            bool fdeg = w->placeholderHit;
+            w->placeholderHit = savePH;
+            if (w->buildBlocked)
+            {
+                if (muvPtrWrapped(w, fty))
+                {
+                    w->buildBlocked = false;
+                    ft = muvOpaquePtrTy(w, fty);
+                    fdeg = true;
+                }
+                else return null;
+            }
+            if (ft == null) return null;
+            if (fdeg && pidx != null) { pidx[pn] = i; pty[pn] = fty; pn++; }
+            fts[i] = ft;
             fns[i] = muvStr(ctx, vv->fieldNames[i]);
         }
         i++;
     }
     IrStructType* st = w->ir->createStructType("muv_vcase", fts, fns, n);
     muvTrackStruct(w, st);
+    if (pn != 0 && st != null && st->irType != null)
+    {
+        u32 pi = 0;
+        while (pi < pn)
+        { muvPatchSite(w, st->irType, st->fieldTypes, pidx[pi], pty[pi]); pi++; }
+    }
     return st;
 }
 
@@ -878,6 +1197,37 @@ pub IrStructType* muvVariantCaseStructTyFor(Muv* w, Ty vt, u32 cidx, u32 depth)
  * collection composes the self parameter's pointee) can reuse it. */
 pub IrType* muvDeclTy(Muv* w, Decl* dd, u32 depth)
 {
+    /* one IrType per decl: recursive decl graphs (IrValue<->IrInst)
+     * otherwise rebuild with whatever the busy markers happened to
+     * return, yielding sibling layouts that fail irTypeEqual. Under
+     * active substitutions the same decl denotes different types per
+     * instance, so the memo only applies to the unsubstituted view. */
+    if (w->subsLen == 0)
+    {
+        u8 busy = 0;
+        IrType* hit = null;
+        if (muvDeclTyMapFind(w, dd, &busy, &hit))
+        {
+            if (busy != 0) { w->placeholderHit = true; return w->ir->tyPtr(w->ir->tyInt(8)); }
+            if (hit != null) return hit;
+        }
+        muvDeclTyMapSet(w, dd, 1, null);
+        IrType* r = muvDeclTyBuild(w, dd, depth);
+        if (w->buildBlocked)
+        {
+            /* aborted: empty slot retries on next request */
+            muvDeclTyMapSet(w, dd, 0, null);
+            return w->ir->tyInt(8);
+        }
+        if (r == null) r = w->ir->tyInt(32);
+        muvDeclTyMapSet(w, dd, 0, r);
+        return r;
+    }
+    return muvDeclTyBuild(w, dd, depth);
+}
+
+IrType* muvDeclTyBuild(Muv* w, Decl* dd, u32 depth)
+{
     AstContext* ctx = w->ctx;
     IrContext* ir = w->ir;
     switch (dd->kind.tag)
@@ -902,6 +1252,7 @@ pub IrType* muvDeclTy(Muv* w, Decl* dd, u32 depth)
              * naming the blob so x.tag / x.payload resolve as ordinary
              * struct fields */
             IrType* blob = muvVariantBlobTy(w, dd, depth + 1);
+            if (blob == null) return null;
             IrType** fts = (IrType**)muvArr(w, 2, 8);
             str* fns = (str*)muvArr(w, 2, 16);
             if (fts == null || fns == null) return ir->tyInt(8);
@@ -1103,13 +1454,25 @@ pub IrType* muvTy(Muv* w, Ty t, u32 depth)
     IrType* hit = null;
     if (muvTyMapFind(w, t, &busy, &hit))
     {
-        if (busy != 0) return ir->tyPtr(ir->tyInt(8));
+        if (busy != 0) { w->placeholderHit = true; return ir->tyPtr(ir->tyInt(8)); }
         if (hit != null) return hit;
     }
     if (depth > 32) return ir->tyInt(32);
     muvTyMapSet(w, t, 1, null);
+    bool savePH = w->placeholderHit;
+    w->placeholderHit = false;
     IrType* r = muvTyBuild(w, t, depth);
+    bool deg = w->placeholderHit;
+    w->placeholderHit = savePH || deg;
+    if (w->buildBlocked)
+    {
+        /* aborted by-value build: leave the slot empty so the next
+         * request retries once the blocker publishes */
+        muvTyMapSet(w, t, 0, null);
+        return ir->tyInt(8);
+    }
     if (r == null) r = ir->tyInt(32);
     muvTyMapSet(w, t, 0, r);
+    if (deg) muvDegTy(w, t);
     return r;
 }

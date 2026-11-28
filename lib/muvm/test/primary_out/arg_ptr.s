@@ -7,14 +7,16 @@
 	.type	write,@function
 write:                                  # @write
 	.cfi_startproc
+# %bb.0:
 .LBB1_4:
-	movq %rsi, (%rdi)
+	movq	%rsi, (%rdi)
 	.cfi_def_cfa %rsp, 8
-	ret
+	retq
 .Lfunc_end1:
 	.size	write, .Lfunc_end1-write
 	.cfi_endproc
                                         # -- End function
+
 
 	.text
 	.globl	main                            # -- Begin function main
@@ -22,15 +24,18 @@ write:                                  # @write
 	.type	main,@function
 main:                                   # @main
 	.cfi_startproc
+# %bb.0:
 .LBB7_8:
-	movl $5, %eax
+	movl	$5, %eax
 	.cfi_def_cfa %rsp, 8
-	ret
+	retq
 .Lfunc_end7:
 	.size	main, .Lfunc_end7-main
 	.cfi_endproc
                                         # -- End function
 
 
-	.section .note.GNU-stack,"",@progbits
+
+	.ident	"muvm"
+	.section	".note.GNU-stack","",@progbits
 

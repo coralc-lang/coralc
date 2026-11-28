@@ -7,15 +7,18 @@
 	.type	main,@function
 main:                                   # @main
 	.cfi_startproc
+# %bb.0:
 .LBB1_2:
-	movl $1, %eax
+	movl	$1, %eax
 	.cfi_def_cfa %rsp, 8
-	ret
+	retq
 .Lfunc_end1:
 	.size	main, .Lfunc_end1-main
 	.cfi_endproc
                                         # -- End function
 
 
-	.section .note.GNU-stack,"",@progbits
+
+	.ident	"muvm"
+	.section	".note.GNU-stack","",@progbits
 

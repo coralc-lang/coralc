@@ -1,0 +1,276 @@
+#[[no_drop_all]]
+// Hoist — GCC tree-code-hoisting equivalent. LLVM has no mid-end
+// counterpart (it only sinks); this is the speculative dual of
+// tailmerge.
+//
+// Diamond: P --cond_br--> A,B --br--> J. When A and B begin with an
+// identical run of speculatable instructions — same opcodes, operands
+// either literally equal or defined at the same index inside the
+// matched prefix — the shared prefix moves into P before the branch:
+// one copy executes per path either way.
+//
+// Conservative v1 restrictions:
+//   - A and B must be SOLE-predecessor successors of P — the hoisted
+//     value must dominate every use it replaces
+//   - both arms end in unconditional Br to the same J (J != P)
+//   - prefix insts must be safe-to-speculate: pure ops only — no
+//     memory, calls, atomics, terminators, phis, or div/rem (trap)
+//   - operands must be literally equal (same IrValue*) or prefix defs
+//     at the same index — no equivalence reasoning
+//   - prefix length >= 1
+//
+// Operand safety: an operand used by the hoisted inst dominated both
+// arm positions; since P is the arms' sole predecessor, it dominates
+// P's terminator — the insertion point.
+
+import muvm::irtypes { IrContext, IrFunc, IrModule, IrBlock, IrInst, IrValue, IrValueKind, IrType };
+import muvm::irOps { IrOpcode };
+import muvm::passes::common { gVerbose };
+import std::ios { eprintln };
+import std::mman { alloc, dealloc };
+
+struct Hoist
+{
+    IrContext* ctx;
+    IrModule* mod;
+    u32 changes;
+
+    Hoist new(IrContext* c, IrModule* m, u32 ch)
+    {
+        return Hoist { .ctx = c, .mod = m, .changes = ch };
+    }
+
+    // literal operand identity: same value pointer, or equal const data
+    bool opEq(IrValue* a, IrValue* b)
+    {
+        if (a == b) return true;
+        if (a == null || b == null) return false;
+        if (a->kind != b->kind) return false;
+        if (a->kind == IrValueKind::ConstInt || a->kind == IrValueKind::ConstFloat)
+            return a->valData == b->valData;
+        return false;
+    }
+
+    // index of inst within its block's insts array, or ~0
+    u32 instIndex(IrBlock* bb, IrInst* target)
+    {
+        for (u32 i = 0; i < bb->ninsts; i++)
+            if (bb->insts[i] == target) return i;
+        return 0xFFFFFFFFu;
+    }
+
+    // operand correspondence for prefix position `cur`: literal
+    // equality, OR both operands are insts defined in their own arm
+    // at the SAME index which is < cur (inside the already-matched
+    // prefix — it will have been hoisted already)
+    bool opMapped(IrBlock* a, IrBlock* b, u32 cur, IrValue* x, IrValue* y)
+    {
+        if (self.opEq(x, y)) return true;
+        if (x == null || y == null) return false;
+        if (x->kind != IrValueKind::Inst || y->kind != IrValueKind::Inst)
+            return false;
+        IrInst* xi = (IrInst*)x;
+        IrInst* yi = (IrInst*)y;
+        u32 ix = self.instIndex(a, xi);
+        u32 iy = self.instIndex(b, yi);
+        if (ix == 0xFFFFFFFFu || iy == 0xFFFFFFFFu) return false;
+        return ix == iy && ix < cur;
+    }
+
+    // safe to speculate: pure, non-trapping, no side effects
+    bool isSpeculatable(IrInst* in)
+    {
+        if (in == null) return false;
+        switch (in->opcode)
+        {
+            IrOpcode::Neg | IrOpcode::Not | IrOpcode::Abs |
+            IrOpcode::Add | IrOpcode::Sub | IrOpcode::Mul |
+            IrOpcode::MulHi | IrOpcode::SMulHi |
+            IrOpcode::And | IrOpcode::Or | IrOpcode::Xor |
+            IrOpcode::Shl | IrOpcode::Ashr | IrOpcode::Lshr |
+            IrOpcode::ICmp | IrOpcode::FCmp |
+            IrOpcode::Trunc | IrOpcode::Zext | IrOpcode::Sext |
+            IrOpcode::FpTrunc | IrOpcode::FpExt | IrOpcode::FpToSi |
+            IrOpcode::SiToFp | IrOpcode::FpToUi | IrOpcode::UiToFp |
+            IrOpcode::Bitcast |
+            IrOpcode::SMin | IrOpcode::SMax | IrOpcode::UMin | IrOpcode::UMax |
+            IrOpcode::CtPop | IrOpcode::CtLz | IrOpcode::CtTz |
+            IrOpcode::Rotl | IrOpcode::Rotr | IrOpcode::Bswap |
+            IrOpcode::FAdd | IrOpcode::FSub | IrOpcode::FMul | IrOpcode::Fma | IrOpcode::FAbs |
+            IrOpcode::VecAdd | IrOpcode::VecSub | IrOpcode::VecMul |
+            IrOpcode::VecFAdd | IrOpcode::VecFSub | IrOpcode::VecFMul |
+            IrOpcode::VecMin | IrOpcode::VecMax | IrOpcode::VecBroadcast |
+            IrOpcode::ShuffleVector | IrOpcode::ExtractElement | IrOpcode::InsertElement |
+            IrOpcode::Select | IrOpcode::ExtractValue | IrOpcode::Gep => { return true; },
+            else => { return false; }
+        }
+    }
+
+    // insts match under positional operand mapping at prefix index cur
+    bool instMapped(IrBlock* a, IrBlock* b, u32 cur, IrInst* x, IrInst* y)
+    {
+        if (x == null || y == null) return false;
+        if (x->opcode != y->opcode || x->nops != y->nops) return false;
+        if (x->base.type != y->base.type) return false;
+        for (u32 i = 0; i < x->nops; i++)
+            if (!self.opMapped(a, b, cur, x->ops[i], y->ops[i]))
+                return false;
+        return true;
+    }
+
+    // length of common speculatable prefix (excluding terminators);
+    // both arms must end in unconditional Br to the same J
+    u32 commonPrefix(IrBlock* a, IrBlock* b, IrBlock** joinOut)
+    {
+        if (a == b || a->ninsts < 2 || b->ninsts < 2) return 0;
+        IrInst* ta = a->insts[a->ninsts - 1];
+        IrInst* tb = b->insts[b->ninsts - 1];
+        if (ta == null || tb == null) return 0;
+        if (ta->opcode != IrOpcode::Br || tb->opcode != IrOpcode::Br) return 0;
+        if (ta->nops < 1 || tb->nops < 1) return 0;
+        if (ta->ops[0] != tb->ops[0]) return 0;
+        IrBlock* j = (IrBlock*)ta->ops[0];
+        if (j == null) return 0;
+        // candidate length by shape only (operand check after)
+        u32 la = a->ninsts - 1;
+        u32 lb = b->ninsts - 1;
+        u32 l = 0;
+        while (l < la && l < lb)
+        {
+            IrInst* ia = a->insts[l];
+            IrInst* ib = b->insts[l];
+            if (ia == null || ib == null) break;
+            if (ia->opcode != ib->opcode || ia->nops != ib->nops ||
+                ia->base.type != ib->base.type) break;
+            l++;
+        }
+        if (l < 1) return 0;
+        // verify operands + speculatability for the whole prefix
+        for (u32 k = 0; k < l; k++)
+        {
+            IrInst* ia = a->insts[k];
+            IrInst* ib = b->insts[k];
+            if (!self.isSpeculatable(ia) || !self.isSpeculatable(ib)) return 0;
+            if (!self.instMapped(a, b, k, ia, ib)) return 0;
+        }
+        *joinOut = j;
+        return l;
+    }
+
+    bool tryHoist(IrFunc* f, IrBlock* p, IrBlock* a, IrBlock* b, u32 len, IrBlock* join)
+    {
+        if (p == null || p->ninsts == 0 || join == p) return false;
+        IrInst* pterm = p->insts[p->ninsts - 1];
+        if (pterm == null) return false;
+
+        // build the hoisted copies in order; prefix-def operands map
+        // to the already-created hoisted value at the same index
+        IrInst** hs = alloc<IrInst*>((usize)len);
+        for (u32 k = 0; k < len; k++)
+        {
+            IrInst* src = a->insts[k];
+            IrValue** ops = null;
+            if (src->nops > 0)
+            {
+                ops = alloc<IrValue*>((usize)src->nops);
+                for (u32 i = 0; i < src->nops; i++)
+                {
+                    IrValue* v = src->ops[i];
+                    if (v != null && v->kind == IrValueKind::Inst)
+                    {
+                        u32 vi = self.instIndex(a, (IrInst*)v);
+                        if (vi != 0xFFFFFFFFu && vi < len && hs[vi] != null)
+                            v = &hs[vi]->base;
+                    }
+                    ops[i] = v;
+                }
+            }
+            IrInst* h = self.ctx->createInst(src->opcode, src->base.type,
+                ops, src->nops, (u64)src->icmpPred, (u64)src->fcmpPred);
+            if (ops != null) dealloc<IrValue*>(ops);
+            if (h == null) { dealloc<IrInst*>(hs); return false; }
+            h->flags = src->flags;
+            // register operand users — createInst does not
+            for (u32 i = 0; i < h->nops; i++)
+                if (h->ops[i] != null) h->ops[i]->addUser(h);
+            p->insertBefore(h, pterm);
+            hs[k] = h;
+        }
+
+        // redirect every use of the arm copies to the hoisted value,
+        // then drop the arm copies. kill() detaches and shifts the
+        // insts array — walk the prefix BACKWARDS so earlier indices
+        // stay valid.
+        for (u32 k = len; k-- > 0; )
+        {
+            if (a->insts[k] != null)
+            {
+                a->insts[k]->base.replaceAllUses(&hs[k]->base);
+                a->insts[k]->kill();
+            }
+            if (b->insts[k] != null)
+            {
+                b->insts[k]->base.replaceAllUses(&hs[k]->base);
+                b->insts[k]->kill();
+            }
+        }
+        dealloc<IrInst*>(hs);
+        self.changes++;
+        if (gVerbose) eprintln("hoist: {} insts from {}+{} into {}", (u64)len, a->base.name, b->base.name, p->base.name);
+        return true;
+    }
+
+    bool runFunc(IrFunc* f)
+    {
+        if (f == null || f->isExtern) return false;
+        bool changed = false;
+        u64 total = 0;
+        for (u32 i = 0; i < f->nblocks; i++)
+            total += f->blocks[i] != null ? (u64)f->blocks[i]->ninsts : 0;
+        if (total > 4000) return false;
+        for (u32 bi = 0; bi < f->nblocks; bi++)
+        {
+            IrBlock* p = f->blocks[bi];
+            if (p == null || p->ninsts == 0) continue;
+            IrInst* term = p->insts[p->ninsts - 1];
+            if (term == null || term->opcode != IrOpcode::CondBr || term->nops < 3)
+                continue;
+            if (term->ops[1] == null || term->ops[2] == null) continue;
+            if (term->ops[1]->kind != IrValueKind::Block ||
+                term->ops[2]->kind != IrValueKind::Block) continue;
+            IrBlock* a = (IrBlock*)term->ops[1];
+            IrBlock* b = (IrBlock*)term->ops[2];
+            if (a == b || a == p || b == p) continue;
+            // arms must be reached ONLY through p — otherwise the
+            // hoisted value wouldn't dominate their remaining uses
+            if (a->npreds != 1 || a->preds[0] != p) continue;
+            if (b->npreds != 1 || b->preds[0] != p) continue;
+            IrBlock* join = null;
+            u32 len = self.commonPrefix(a, b, &join);
+            if (len < 1 || join == p) continue;
+            if (self.tryHoist(f, p, a, b, len, join))
+            {
+                changed = true;
+                // p gained insts; its index is unchanged — keep scanning
+            }
+        }
+        return changed;
+    }
+
+    bool run()
+    {
+        IrModule* m = self.mod;
+        if (m == null) return false;
+        for (u32 fi = 0; fi < m->nfuncs; fi++)
+            self.runFunc(m->funcs[fi]);
+        return self.changes > 0;
+    }
+}
+
+pub bool muvmPassHoist(IrFunc* func, rawptr userdata)
+{
+    IrModule* m = func != null ? func->parent : null;
+    if (m == null || m->nfuncs == 0 || func != m->funcs[0]) return false;
+    Hoist st = Hoist::new(m->ctx, m, 0);
+    return st.run();
+}

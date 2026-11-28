@@ -7,18 +7,19 @@
 	.type	main,@function
 main:                                   # @main
 	.cfi_startproc
+# %bb.0:
 .LBB3_4:
-	leaq g(%rip), %r11
-	movq $9, (%r11)
-	movl $9, %eax
+	movq	$9, g(%rip)
+	movl	$9, %eax
 	.cfi_def_cfa %rsp, 8
-	ret
+	retq
 .Lfunc_end3:
 	.size	main, .Lfunc_end3-main
 	.cfi_endproc
                                         # -- End function
 
-	.data
+
+	.section	.data
 	.p2align	3, 0x0
 	.type	g,@object
 	.globl	g
@@ -27,5 +28,6 @@ g:
 	.size	g, .-g
 
 
-	.section .note.GNU-stack,"",@progbits
+	.ident	"muvm"
+	.section	".note.GNU-stack","",@progbits
 

@@ -7,28 +7,29 @@
 	.type	main,@function
 main:                                   # @main
 	.cfi_startproc
-	pushq %rbp
+	pushq	%rbp
 	.cfi_def_cfa_offset 16
 	.cfi_offset %rbp, -16
-	movq %rsp, %rbp
+	movq	%rsp, %rbp
 	.cfi_def_cfa_register %rbp
-	subq $32, %rsp
+	subq	$32, %rsp
+# %bb.0:
 .LBB1_2:
-	leaq -32(%rbp), %rdi
-	leaq 16(%rdi), %rdi
-	leaq 8(%rdi), %rdi
-	movq $42, (%rdi)
-	movl $42, %eax
-	movq %rbp, %rsp
-	popq %rbp
+	leaq	-8(%rbp), %rdi
+	movq	$42, (%rdi)
+	movl	$42, %eax
+	movq	%rbp, %rsp
+	popq	%rbp
 	.cfi_restore %rbp
 	.cfi_def_cfa %rsp, 8
-	ret
+	retq
 .Lfunc_end1:
 	.size	main, .Lfunc_end1-main
 	.cfi_endproc
                                         # -- End function
 
 
-	.section .note.GNU-stack,"",@progbits
+
+	.ident	"muvm"
+	.section	".note.GNU-stack","",@progbits
 

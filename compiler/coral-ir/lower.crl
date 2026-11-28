@@ -135,6 +135,39 @@ pub struct Muv
     u32 tdCap;         // power of two
     u32 tdLen;         // occupied slots (grows at 75%)
 
+    /* Decl* → IrType* memo for muvDeclTy. Struct decls were rebuilt on
+     * every reference, and recursive decl graphs (IrValue↔IrInst) made
+     * the result depend on build order — two different interned layouts
+     * for one decl, which then failed irTypeEqual at call boundaries.
+     * Keyed by the Decl* itself: nodes live in a stable arena. */
+    u64* dtKeys;       // Decl* + 1; 0 = empty slot
+    IrType** dtVals;
+    u8* dtBusy;        // 1 while that decl's type is being derived
+    u32 dtCap;         // power of two
+    u32 dtLen;         // occupied slots (grows at 75%)
+
+    /* recursive-type abort/patch state. A by-value field whose type
+     * hits a busy decl cannot take the ptr(i8) busy placeholder (that
+     * would bake a wrong layout); instead the enclosing aggregate build
+     * aborts (buildBlocked), pointer-wrapped fields degrade to opaque
+     * ptr(i8) and record a patch site, and aborted decls rebuild on
+     * demand once their blocker publishes. degradedTys lists Ty ids
+     * whose cached IrType consumed a placeholder so muvSettleTypes can
+     * recompute them. */
+    bool buildBlocked;
+    bool placeholderHit;
+    bool settling;
+    IrType** patchOwners;  // struct/union IrType owning the field
+    IrType*** patchArrs;   // the fieldTypes array to rewrite (may differ
+                           // from owner->params on intern dedup)
+    u32* patchIdxs;        // field index inside the arrays
+    Ty* patchTys;          // field's source Ty to recompute
+    u32 patchLen;
+    u32 patchCap;
+    Ty* degTys;            // Ty ids with degraded cached IrTypes
+    u32 degLen;
+    u32 degCap;
+
     /* monomorphisation substitution for the current instance */
     MonoSubstitution* subs;
     u32 subsLen;
@@ -875,6 +908,99 @@ pub IrGlobal* muvGMapGet(Muv* w, u32 declIdx)
 }
 
 /* the decl→muvm entry, defined in decl.crl */
+/* ── Decl* → IrType* memo (see Muv.dtKeys) ────────────────────────────── */
+
+pub void muvDeclTyMapInit(Muv* w, u32 capPow2)
+{
+    w->dtCap = capPow2;
+    w->dtLen = 0;
+    w->dtKeys = alloc<u64>((usize)capPow2);
+    w->dtVals = alloc<IrType*>((usize)capPow2);
+    w->dtBusy = alloc<u8>((usize)capPow2);
+    if (w->dtKeys == null || w->dtVals == null || w->dtBusy == null)
+    {
+        w->dtCap = 0;
+        return;
+    }
+    u32 i = 0;
+    while (i < capPow2) { w->dtKeys[i] = 0; w->dtVals[i] = null; w->dtBusy[i] = 0; i++; }
+}
+
+/* found: fills busy (1 = still being derived) and val (null while busy) */
+pub bool muvDeclTyMapFind(Muv* w, Decl* dd, u8* busy, IrType** val)
+{
+    if (w->dtCap == 0 || dd == null) return false;
+    u64 key = (u64)(usize)dd + 1;
+    u32 slot = (u32)(key ^ (key >> 32)) & (w->dtCap - 1);
+    while (w->dtKeys[slot] != 0)
+    {
+        if (w->dtKeys[slot] == key)
+        {
+            *busy = w->dtBusy[slot];
+            *val = w->dtVals[slot];
+            return true;
+        }
+        slot = (slot + 1) & (w->dtCap - 1);
+    }
+    return false;
+}
+
+/* claim the slot for derivation (busy=1) or publish a finished type
+ * (busy=0, v!=null) */
+pub void muvDeclTyMapSet(Muv* w, Decl* dd, u8 b, IrType* v)
+{
+    if (w->dtCap == 0 || dd == null) return;
+    if ((w->dtLen + 1) * 4 > w->dtCap * 3)
+    {
+        u32 nc = w->dtCap * 2;
+        u64* nk = alloc<u64>((usize)nc);
+        IrType** nv = alloc<IrType*>((usize)nc);
+        u8* nb = alloc<u8>((usize)nc);
+        if (nk != null && nv != null && nb != null)
+        {
+            zero<u64>(nk, (usize)nc);
+            zero<u8>(nb, (usize)nc);
+            u32 ri = 0;
+            while (ri < w->dtCap)
+            {
+                if (w->dtKeys[ri] != 0)
+                {
+                    u64 k = w->dtKeys[ri];
+                    u32 s = (u32)(k ^ (k >> 32)) & (nc - 1);
+                    while (nk[s] != 0) s = (s + 1) & (nc - 1);
+                    nk[s] = k;
+                    nv[s] = w->dtVals[ri];
+                    nb[s] = w->dtBusy[ri];
+                }
+                ri++;
+            }
+            dealloc<u64>(w->dtKeys);
+            dealloc<IrType*>(w->dtVals);
+            dealloc<u8>(w->dtBusy);
+            w->dtKeys = nk;
+            w->dtVals = nv;
+            w->dtBusy = nb;
+            w->dtCap = nc;
+        }
+    }
+    u64 key = (u64)(usize)dd + 1;
+    u32 slot = (u32)(key ^ (key >> 32)) & (w->dtCap - 1);
+    while (w->dtKeys[slot] != 0)
+    {
+        if (w->dtKeys[slot] == key)
+        {
+            w->dtBusy[slot] = b;
+            if (v != null) w->dtVals[slot] = v;
+            return;
+        }
+        slot = (slot + 1) & (w->dtCap - 1);
+    }
+    w->dtKeys[slot] = key;
+    w->dtBusy[slot] = b;
+    if (v != null) w->dtVals[slot] = v;
+    w->dtLen++;
+}
+
 pub str muvMangle(Muv* w, NodeId declId, Str name);
 
 /* ── Ty → IrType* memo (see Muv.tyKeys) ──────────────────────────────── */
@@ -1042,6 +1168,57 @@ pub void muvTdMapPut(Muv* w, Str name, u32 v)
     w->tdKeys[slot] = (u32)name + 1;
     w->tdVals[slot] = v;
     w->tdLen++;
+}
+
+/* ── recursive-type abort/patch (see Muv.buildBlocked) ───────────────── */
+
+pub void muvPatchSite(Muv* w, IrType* owner, IrType** arr, u32 idx, Ty ty)
+{
+    if (w->patchLen >= w->patchCap)
+    {
+        u32 nc = w->patchCap == 0 ? 16 : w->patchCap * 2;
+        IrType** no = alloc<IrType*>((usize)nc);
+        IrType*** na = alloc<IrType**>((usize)nc);
+        u32* ni = alloc<u32>((usize)nc);
+        Ty* nt = alloc<Ty>((usize)nc);
+        if (no == null || na == null || ni == null || nt == null) return;
+        u32 i = 0;
+        while (i < w->patchLen)
+        {
+            no[i] = w->patchOwners[i]; na[i] = w->patchArrs[i];
+            ni[i] = w->patchIdxs[i]; nt[i] = w->patchTys[i]; i++;
+        }
+        if (w->patchOwners != null) dealloc<IrType*>(w->patchOwners);
+        if (w->patchArrs != null) dealloc<IrType**>(w->patchArrs);
+        if (w->patchIdxs != null) dealloc<u32>(w->patchIdxs);
+        if (w->patchTys != null) dealloc<Ty>(w->patchTys);
+        w->patchOwners = no; w->patchArrs = na; w->patchIdxs = ni; w->patchTys = nt;
+        w->patchCap = nc;
+    }
+    w->patchOwners[w->patchLen] = owner;
+    w->patchArrs[w->patchLen] = arr;
+    w->patchIdxs[w->patchLen] = idx;
+    w->patchTys[w->patchLen] = ty;
+    w->patchLen++;
+}
+
+pub void muvDegTy(Muv* w, Ty t)
+{
+    if (w->degLen >= w->degCap)
+    {
+        u32 nc = w->degCap == 0 ? 16 : w->degCap * 2;
+        Ty* nd = alloc<Ty>((usize)nc);
+        if (nd == null) return;
+        u32 i = 0;
+        while (i < w->degLen) { nd[i] = w->degTys[i]; i++; }
+        if (w->degTys != null) dealloc<Ty>(w->degTys);
+        w->degTys = nd;
+        w->degCap = nc;
+    }
+    /* dedup: same Ty recorded by every ancestor build */
+    u32 i = 0;
+    while (i < w->degLen) { if (w->degTys[i] == t) return; i++; }
+    w->degTys[w->degLen++] = t;
 }
 
 /* write v as lowercase hex into the mangle buffer */

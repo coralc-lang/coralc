@@ -7,7 +7,7 @@
 # Function: @main
 # ABI: SystemV (Linux/Unix)
 # Attributes: [ leaf ]
-# Stack Frame: 144 bytes
+# Stack Frame: 128 bytes
 # ========================================================
     .text
 .globl main
@@ -15,7 +15,7 @@
 main:
     pushq %rbp
     movq %rsp, %rbp
-    subq $144, %rsp
+    subq $128, %rsp
 .Lmain_BB2:
     leaq -8(%rbp), %rax
     movq %rax, -16(%rbp)
@@ -31,22 +31,17 @@ main:
     movq -16(%rbp), %rax
     movq (%rax), %rcx
     movq %rcx, -32(%rbp)
-    movq -16(%rbp), %rax
-    movq %rax, -40(%rbp)
-    movq -40(%rbp), %rax
-    movq (%rax), %rcx
-    movq %rcx, -48(%rbp)
     movq -32(%rbp), %rax
     movabsq $3, %rcx
     addq %rcx, %rax
-    movq %rax, -56(%rbp)
-    movq -48(%rbp), %rax
-    movq -56(%rbp), %rcx
+    movq %rax, -40(%rbp)
+    movq -32(%rbp), %rax
+    movq -40(%rbp), %rcx
     addq %rcx, %rax
-    movq %rax, -64(%rbp)
-    movq -64(%rbp), %rax
-    movq %rax, -72(%rbp)
-    movq -72(%rbp), %rax
+    movq %rax, -48(%rbp)
+    movq -48(%rbp), %rax
+    movq %rax, -56(%rbp)
+    movq -56(%rbp), %rax
     jmp .Lmain_epilogue
 .Lmain_epilogue:
     movq %rbp, %rsp

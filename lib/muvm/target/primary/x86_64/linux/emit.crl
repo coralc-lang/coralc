@@ -40,6 +40,8 @@ pub struct VReg
     u8 klass;      /* 0 = gpr, 1 = xmm, 2 = forced spill */
     bool isConst;
     u64 constVal;
+    u32 nuses;
+    u8 noEmit;
     IrType* type;
 }
 
@@ -150,6 +152,13 @@ pub struct EmitCtx
     u32[32] memW;
     u32 nmem;
     str labelPrefix;
+    /* div pairing: rax/rdx still hold quot/rem for (divA,divB,divSigned)
+     * from the immediately preceding div-family inst — a following
+     * sdiv/srem (etc) on the same operands reuses them for free. */
+    IrValue* divA;
+    IrValue* divB;
+    u8 divSigned;
+    u8 divValid;
 
     EmitCtx new()
     {
@@ -178,7 +187,11 @@ pub struct EmitCtx
             .ncse = 0,
             .capCse = 0,
             .nmem = 0,
-            .labelPrefix = str::empty()
+            .labelPrefix = str::empty(),
+            .divA = null,
+            .divB = null,
+            .divSigned = 0,
+            .divValid = 0
         };
         for (u32 i = 0; i < 8; i++) c.calleeList[i] = 0;
         vmapInit(&c.vmap, 256);
@@ -224,6 +237,14 @@ pub struct EmitCtx
                 i64 goff = gepConstOffset(self, ii, &gok);
                 ident = gok && goff == 0;
             }
+            /* bitcast across register classes (int<->float) is not a
+             * no-op: dst lives in a different reg file and needs a
+             * real movd/movq. Only alias within the same class. */
+            if (ident && ii->opcode == IrOpcode::Bitcast &&
+                ii->base.type != null && ii->ops[0] != null &&
+                ii->ops[0]->type != null &&
+                typeIsSse(ii->base.type) != typeIsSse(ii->ops[0]->type))
+                ident = false;
             if (ident && ii->nops > 0 && isVRegOperand(ii->ops[0]))
             {
                 i32 sid = vmapFind(&self.vmap, ii->ops[0]);
@@ -257,6 +278,8 @@ pub struct EmitCtx
         r->klass = 0;
         r->isConst = false;
         r->constVal = 0;
+        r->nuses = 0;
+        r->noEmit = 0;
         r->type = v->type;
         vmapPut(&self.vmap, v, id);
         return id;
@@ -433,6 +456,15 @@ void emitWordReg(EmitCtx* c, u8 r)
         }
     }
 }
+
+/* emit reg name at exact operand width (8/16/32/64) */
+void emitRegExact(EmitCtx* c, u8 r, u32 w)
+{
+    if (w <= 8) { emitByteReg(c, r); return; }
+    if (w <= 16) { emitWordReg(c, r); return; }
+    c->emit(regForWidth(r, w <= 32 ? 32 : 64));
+}
+
 
 u8 argRegPhys(u8 i)
 {
@@ -631,6 +663,15 @@ i32 spillOff(EmitCtx* c, i32 slot)
     return c->savedBytes + 8 * (slot + 1);
 }
 
+/* can `imm` be encoded as a store-immediate? mem imm is imm32
+ * (sign-extended for 64-bit operands, raw for <=32). */
+bool storeImmEncodable(u32 w, u64 imm)
+{
+    if (regW(w) <= 32)
+        return (imm >> 32) == 0 || (imm >> 32) == 0xFFFFFFFFu;
+    return (i64)(i32)(u32)imm == (i64)imm;
+}
+
 /* alloca slot byte offset */
 i32 allocaOffOf(EmitCtx* c, IrValue* v)
 {
@@ -683,6 +724,19 @@ str asmSymName(IrValue* v)
     return v != null ? v->name : str::empty();
 }
 
+/* RIP-relative symbol name for global/func/string address operands */
+void emitRipSymName(EmitCtx* c, IrValue* v)
+{
+    if (v != null && v->kind == IrValueKind::StringConst)
+    {
+        IrStringConst* sc = (IrStringConst*)v;
+        if (!sc->base.name.isEmpty()) c->emit(sc->base.name);
+        else { c->emit(".Lstr_"); c->emitU64((u64)sc->base.id); }
+        return;
+    }
+    c->emit(asmSymName(v));
+}
+
 /* load an IR operand into phys gpr `dphys` at width w (bits).
  * Handles const / vreg-in-reg / spilled / global-lea. */
 void loadToReg(EmitCtx* c, IrValue* src, u8 dphys, u32 w)
@@ -733,6 +787,20 @@ void loadToReg(EmitCtx* c, IrValue* src, u8 dphys, u32 w)
         c->emit("\t# isel: unmapped operand\n");
         return;
     }
+    /* noEmit-folded allocas have no register home: rematerialize the
+     * address as leaq -off(%rbp). Normal allocas use their vreg. */
+    if (src->kind == IrValueKind::Inst &&
+        ((IrInst*)src)->opcode == IrOpcode::Alloca &&
+        c->vregs[(usize)vid].noEmit != 0)
+    {
+        i32 ao = allocaOffOf(c, src);
+        if (ao >= 0)
+        {
+            c->emit("\tleaq -"); c->emitI64((i64)ao); c->emit("(%rbp), ");
+            c->emit(dreg); c->emitLine("");
+            return;
+        }
+    }
     VReg* r = &c->vregs[(usize)vid];
     if (r->phys == (i32)dphys) return;
     c->emit("\tmov"); c->emit(intSfx(rw)); c->emit(" ");
@@ -775,8 +843,24 @@ void emitOpReg(EmitCtx* c, str sop, u32 w, u8 srcPhys, u8 dstPhys)
 /* emit `op $imm, dst` or `op mem, dst` */
 void emitOpImm(EmitCtx* c, str sop, u32 w, u64 imm, u8 dstPhys)
 {
-    c->emit("\t"); c->emit(sop); c->emit(intSfx(regW(w))); c->emit(" $");
-    c->emitU64(imm); c->emit(", ");
+    u32 rw = regW(w);
+    /* x86 imm is imm32: raw for 32-bit ops, sign-extended for 64-bit.
+     * Anything wider needs a movabs into a scratch reg first. */
+    bool ok = rw <= 32 ?
+        ((imm >> 32) == 0 || (imm >> 32) == 0xFFFFFFFFu) :
+        ((i64)(i32)(u32)imm == (i64)imm);
+    if (!ok)
+    {
+        c->emit("\tmovabsq $"); c->emitU64(imm); c->emit(", %r11\n");
+        c->emit("\t"); c->emit(sop); c->emit(intSfx(rw)); c->emit(" %r11, ");
+        c->emit(regForWidth(dstPhys, rw)); c->emitLine("");
+        return;
+    }
+    c->emit("\t"); c->emit(sop); c->emit(intSfx(rw)); c->emit(" $");
+    if (rw <= 32) c->emitU64(imm & 0xFFFFFFFFu);
+    else if ((i64)imm < 0) c->emitI64((i64)imm);
+    else c->emitU64(imm);
+    c->emit(", ");
     c->emit(regForWidth(dstPhys, regW(w))); c->emitLine("");
 }
 
@@ -873,13 +957,12 @@ void iselShift(EmitCtx* c, IrInst* inst, str sop)
     IrValue* a = inst->nops > 0 ? inst->ops[0] : null;
     IrValue* cnt = inst->nops > 1 ? inst->ops[1] : null;
     loadToReg(c, a, useR, w);
-    str dreg = regForWidth(useR, regW(w));
 
     if (cnt != null && cnt->kind == IrValueKind::ConstInt)
     {
         u64 k = cnt->valData & (w >= 64 ? 63 : 31);
         c->emit("\t"); c->emit(sop); c->emit(" $");
-        c->emitU64(k); c->emit(", "); c->emit(dreg); c->emitLine("");
+        c->emitU64(k); c->emit(", "); emitRegExact(c, useR, w); c->emitLine("");
     }
     else
     {
@@ -891,29 +974,92 @@ void iselShift(EmitCtx* c, IrInst* inst, str sop)
         if (cp == (i32)regs::RCX)
         {
             c->emit("\t"); c->emit(sop); c->emit(" %cl, ");
-            c->emit(dreg); c->emitLine("");
+            emitRegExact(c, useR, w); c->emitLine("");
         }
         else if (useR == regs::RCX)
         {
             /* dst in rcx: move result out, load count, shift r10, back */
-            c->emit("\tmov"); c->emit(intSfx(regW(w))); c->emit(" ");
-            c->emit("%rcx"); c->emit(", %r10"); c->emitLine("");
+            c->emit("\tmov"); c->emit(intSfx(w)); c->emit(" ");
+            emitRegExact(c, regs::RCX, w); c->emit(", ");
+            emitRegExact(c, regs::SCRATCH_A, w); c->emitLine("");
             loadToReg(c, cnt, regs::RCX, w);
             c->emit("\t"); c->emit(sop); c->emit(" %cl, ");
-            c->emit(regForWidth(regs::SCRATCH_A, regW(w))); c->emitLine("");
-            c->emit("\tmov"); c->emit(intSfx(regW(w))); c->emit(" ");
-            c->emit(regForWidth(regs::SCRATCH_A, regW(w))); c->emit(", %rcx"); c->emitLine("");
+            emitRegExact(c, regs::SCRATCH_A, w); c->emitLine("");
+            c->emit("\tmov"); c->emit(intSfx(w)); c->emit(" ");
+            emitRegExact(c, regs::SCRATCH_A, w); c->emit(", ");
+            emitRegExact(c, regs::RCX, w); c->emitLine("");
         }
         else
         {
-            c->emitLine("\tpush %rcx");
+            c->emitLine("\tpushq %rcx");
             loadToReg(c, cnt, regs::RCX, w);
             c->emit("\t"); c->emit(sop); c->emit(" %cl, ");
-            c->emit(dreg); c->emitLine("");
-            c->emitLine("\tpop %rcx");
+            emitRegExact(c, useR, w); c->emitLine("");
+            c->emitLine("\tpopq %rcx");
         }
     }
     if (dp < 0) storeToVReg(c, dvid, useR, w);
+}
+
+/* reg name holding operand v at width w; materializes into `scratch`
+ * only when the operand has no phys home. Avoids the mov a->scratch
+ * that loadToReg would emit for operands already in a register. */
+str operandRegFor(EmitCtx* c, IrValue* v, u32 w, u8 scratch)
+{
+    u32 rw = regW(w);
+    i32 vid = isVRegOperand(v) ? vmapFind(&c->vmap, v) : -1;
+    if (vid >= 0 && c->vregs[(usize)vid].phys >= 0 &&
+        c->vregs[(usize)vid].klass != 1)
+        return regForWidth((u8)c->vregs[(usize)vid].phys, rw);
+    loadToReg(c, v, scratch, w);
+    return regForWidth(scratch, rw);
+}
+
+/* emit `cmp b, a` (AT&T: computes a - b) choosing the cheapest form:
+ * a in its own reg when possible, b as imm / reg / spill-slot mem. */
+void emitCmpPair(EmitCtx* c, IrValue* a, IrValue* b, u32 w)
+{
+    u32 rw = regW(w);
+    str areg = operandRegFor(c, a, w, regs::SCRATCH_A);
+    if (b != null && b->kind == IrValueKind::ConstInt)
+    {
+        /* cmp imm is imm32 (sign-extended at 64-bit) — wider consts
+         * go through a scratch reg */
+        if (storeImmEncodable(w, b->valData))
+        {
+            c->emit("\tcmp"); c->emit(intSfx(rw)); c->emit(" $");
+            if (rw <= 32) c->emitU64(b->valData & 0xFFFFFFFFu);
+            else if ((i64)b->valData < 0) c->emitI64((i64)b->valData);
+            else c->emitU64(b->valData);
+            c->emit(", "); c->emit(areg); c->emitLine("");
+            return;
+        }
+        c->emit("\tmovabsq $"); c->emitU64(b->valData); c->emit(", %r11\n");
+        c->emit("\tcmp"); c->emit(intSfx(rw)); c->emit(" %r11, ");
+        c->emit(areg); c->emitLine("");
+        return;
+    }
+    i32 bvid = isVRegOperand(b) ? vmapFind(&c->vmap, b) : -1;
+    if (bvid >= 0 && c->vregs[(usize)bvid].phys >= 0 &&
+        c->vregs[(usize)bvid].klass != 1)
+    {
+        c->emit("\tcmp"); c->emit(intSfx(rw)); c->emit(" ");
+        c->emit(regForWidth((u8)c->vregs[(usize)bvid].phys, rw));
+        c->emit(", "); c->emit(areg); c->emitLine("");
+    }
+    else if (bvid >= 0 && c->vregs[(usize)bvid].phys < 0 &&
+             c->vregs[(usize)bvid].klass != 1)
+    {
+        c->emit("\tcmp"); c->emit(intSfx(rw)); c->emit(" -");
+        c->emitI64((i64)spillOff(c, c->vregs[(usize)bvid].slot));
+        c->emit("(%rbp), "); c->emit(areg); c->emitLine("");
+    }
+    else
+    {
+        str breg = operandRegFor(c, b, w, regs::SCRATCH_B);
+        c->emit("\tcmp"); c->emit(intSfx(rw)); c->emit(" ");
+        c->emit(breg); c->emit(", "); c->emit(areg); c->emitLine("");
+    }
 }
 
 void iselICmp(EmitCtx* c, IrInst* inst)
@@ -921,33 +1067,7 @@ void iselICmp(EmitCtx* c, IrInst* inst)
     IrValue* a = inst->nops > 0 ? inst->ops[0] : null;
     IrValue* b = inst->nops > 1 ? inst->ops[1] : null;
     u32 w = a != null && a->type != null ? a->type->width : 64;
-    u32 rw = regW(w);
-    /* a -> r10 scratch, cmp b against it */
-    loadToReg(c, a, regs::SCRATCH_A, w);
-    str creg = regForWidth(regs::SCRATCH_A, rw);
-    if (b != null && b->kind == IrValueKind::ConstInt)
-    {
-        c->emit("\tcmp"); c->emit(intSfx(rw)); c->emit(" $");
-        c->emitU64(b->valData); c->emit(", "); c->emit(creg); c->emitLine("");
-    }
-    else
-    {
-        i32 bvid = isVRegOperand(b) ? vmapFind(&c->vmap, b) : -1;
-        if (bvid >= 0 && c->vregs[(usize)bvid].phys >= 0 &&
-            c->vregs[(usize)bvid].klass != 1)
-        {
-            c->emit("\tcmp"); c->emit(intSfx(rw)); c->emit(" ");
-            c->emit(regForWidth((u8)c->vregs[(usize)bvid].phys, rw));
-            c->emit(", "); c->emit(creg); c->emitLine("");
-        }
-        else
-        {
-            loadToReg(c, b, regs::SCRATCH_B, w);
-            c->emit("\tcmp"); c->emit(intSfx(rw)); c->emit(" ");
-            c->emit(regForWidth(regs::SCRATCH_B, rw));
-            c->emit(", "); c->emit(creg); c->emitLine("");
-        }
-    }
+    emitCmpPair(c, a, b, w);
     /* setcc into dst (i1 materialized as 0/1 in a 32-bit reg) */
     u32 dvid = c->vregFor(&inst->base);
     i32 dp = (i32)c->vregs[(usize)dvid].phys;
@@ -981,14 +1101,25 @@ void emitUnimplemented(EmitCtx* ctx, IrInst* inst, String* err)
 
 /* ================= concrete opcode selectors ================= */
 
+/* frame offset of an alloca root, or -1. Lets gep chains fold straight
+ * to `leaq disp(%rbp)` instead of lea+lea through the alloca vreg. */
+i32 allocaRootOff(EmitCtx* c, IrValue* v)
+{
+    if (v == null || v->kind != IrValueKind::Inst) return -1;
+    IrInst* i = (IrInst*)v;
+    if (i->opcode != IrOpcode::Alloca) return -1;
+    return allocaOffOf(c, v);
+}
+
 void iselAlloca(EmitCtx* c, IrInst* inst)
 {
+    u32 dvid = c->vregFor(&inst->base);
+    if (c->vregs[(usize)dvid].noEmit != 0) return; /* folded into gep users */
     IrType* et = inst->base.type;
     if (et != null && et->kind == IrTypeKind::Ptr) et = et->elem;
     u32 sz = et != null ? c->ictx->irTypeSizeOf(et) : 8;
     if (sz == 0) sz = 8;
     i32 off = allocaSlotFor(c, &inst->base, sz);
-    u32 dvid = c->vregFor(&inst->base);
     i32 dp = (i32)c->vregs[(usize)dvid].phys;
     u8 useR = dp >= 0 ? (u8)dp : regs::SCRATCH_A;
     c->emit("\tleaq -"); c->emitI64((i64)off); c->emit("(%rbp), ");
@@ -1024,6 +1155,25 @@ void iselLoad(EmitCtx* c, IrInst* inst)
     u32 dvid = c->vregFor(&inst->base);
     i32 dp = (i32)c->vregs[(usize)dvid].phys;
     u8 useR = dp >= 0 ? (u8)dp : regs::SCRATCH_A;
+    /* global/func/string address: fold to a RIP-relative load */
+    if (addr != null && (addr->kind == IrValueKind::Global ||
+        addr->kind == IrValueKind::Func || addr->kind == IrValueKind::StringConst))
+    {
+        c->emit("\t");
+        if (w <= 8) c->emit("movzbl ");
+        else if (w <= 16) c->emit("movzwl ");
+        else if (w <= 32) c->emit("movl ");
+        else c->emit("movq ");
+        emitRipSymName(c, addr); c->emit("(%rip), ");
+        c->emit(regForWidth(useR, w <= 32 ? 32 : 64)); c->emitLine("");
+        if (dp < 0) storeToVReg(c, dvid, useR, w);
+        if (inst->nops > 0)
+        {
+            IrValue* canon = c->cseFind(&inst->base);
+            c->memRecord(canonAddr(c, inst->ops[0]), canon != null ? canon : &inst->base, w);
+        }
+        return;
+    }
     /* address -> scratch if spilled */
     i32 avid = isVRegOperand(addr) ? vmapFind(&c->vmap, addr) : -1;
     u8 addrR;
@@ -1065,6 +1215,40 @@ void iselStore(EmitCtx* c, IrInst* inst)
         c->emit("\t# isel: aggregate/vector store unsupported\n");
         return;
     }
+    /* global/func/string address: fold to a RIP-relative store */
+    if (addr != null && (addr->kind == IrValueKind::Global ||
+        addr->kind == IrValueKind::Func || addr->kind == IrValueKind::StringConst))
+    {
+        if (val != null && val->kind == IrValueKind::ConstInt &&
+            storeImmEncodable(w, val->valData))
+        {
+            c->emit("\tmov"); c->emit(intSfx(w)); c->emit(" $");
+            if (w <= 32) c->emitU64(val->valData & 0xFFFFFFFFu);
+            else if ((i64)val->valData < 0) c->emitI64((i64)val->valData);
+            else c->emitU64(val->valData);
+            c->emit(", ");
+            emitRipSymName(c, addr); c->emit("(%rip)"); c->emitLine("");
+        }
+        else
+        {
+            i32 vvid = isVRegOperand(val) ? vmapFind(&c->vmap, val) : -1;
+            u8 vp;
+            if (vvid >= 0 && c->vregs[(usize)vvid].phys >= 0 &&
+                c->vregs[(usize)vvid].klass != 1)
+                vp = (u8)c->vregs[(usize)vvid].phys;
+            else
+            {
+                loadToReg(c, val, regs::SCRATCH_A, w);
+                vp = regs::SCRATCH_A;
+            }
+            c->emit("\tmov"); c->emit(intSfx(w)); c->emit(" ");
+            if (w <= 8) emitByteReg(c, vp);
+            else if (w <= 16) emitWordReg(c, vp);
+            else c->emit(regForWidth(vp, w <= 32 ? 32 : 64));
+            c->emit(", "); emitRipSymName(c, addr); c->emit("(%rip)"); c->emitLine("");
+        }
+        return;
+    }
     i32 avid = isVRegOperand(addr) ? vmapFind(&c->vmap, addr) : -1;
     u8 addrR;
     if (avid >= 0 && c->vregs[(usize)avid].phys >= 0)
@@ -1074,10 +1258,14 @@ void iselStore(EmitCtx* c, IrInst* inst)
         loadToReg(c, addr, regs::SCRATCH_B, 64);
         addrR = regs::SCRATCH_B;
     }
-    if (val != null && val->kind == IrValueKind::ConstInt)
+    if (val != null && val->kind == IrValueKind::ConstInt &&
+        storeImmEncodable(w, val->valData))
     {
         c->emit("\tmov"); c->emit(intSfx(w)); c->emit(" $");
-        c->emitU64(val->valData); c->emit(", (");
+        if (w <= 32) c->emitU64(val->valData & 0xFFFFFFFFu);
+        else if ((i64)val->valData < 0) c->emitI64((i64)val->valData);
+        else c->emitU64(val->valData);
+        c->emit(", (");
         c->emit(regName(addrR)); c->emit(")"); c->emitLine("");
         return;
     }
@@ -1159,11 +1347,40 @@ i64 gepConstOffset(EmitCtx* c, IrInst* inst, bool* ok)
     return cOff;
 }
 
+/* follow a chain of all-const-index geps upward: returns the first
+ * non-foldable operand and accumulates ancestor byte offsets into *acc.
+ * `gep g1, c; gep g2, d` where both const => root of g1's base + c+d. */
+IrValue* gepFoldRoot(EmitCtx* c, IrValue* v, i64* acc)
+{
+    u32 guard = 0;
+    while (v != null && v->kind == IrValueKind::Inst && guard++ < 32)
+    {
+        IrInst* g = (IrInst*)v;
+        if (g->opcode != IrOpcode::Gep || g->nops < 2) break;
+        bool allConst = true;
+        for (u32 gi = 1; gi < g->nops; gi++)
+            if (g->ops[gi] == null ||
+                g->ops[gi]->kind != IrValueKind::ConstInt)
+                allConst = false;
+        if (!allConst) break;
+        bool ok = false;
+        i64 o = gepConstOffset(c, g, &ok);
+        if (!ok) break;
+        *acc += o;
+        v = g->ops[0];
+    }
+    return v;
+}
+
 void iselGep(EmitCtx* c, IrInst* inst)
 {
     /* ops[0]=base ptr, ops[1..]=indices; const offsets accumulate,
-     * dynamic indices scale by elem size and add. */
+     * dynamic indices scale by elem size and add. Ancestor const geps
+     * fold into a single root+offset so `gep (gep (gep a))` emits one
+     * leaq instead of a chain. */
     IrValue* base = inst->nops > 0 ? inst->ops[0] : null;
+    i64 chainOff = 0;
+    IrValue* root = gepFoldRoot(c, base, &chainOff);
     u32 dvid = c->vregFor(&inst->base);
     /* gep+0 is a vreg alias; same-vid dst needs no code */
     if (isVRegOperand(base))
@@ -1185,16 +1402,27 @@ void iselGep(EmitCtx* c, IrInst* inst)
         if (allConst)
         {
             bool ok = false;
-            i64 cOff = gepConstOffset(c, inst, &ok);
+            i64 cOff = chainOff + gepConstOffset(c, inst, &ok);
             if (ok)
             {
-                i32 avid = isVRegOperand(base) ? vmapFind(&c->vmap, base) : -1;
+                i32 aoff = allocaRootOff(c, root);
+                if (aoff >= 0)
+                {
+                    /* root is an alloca: single lea straight off rbp */
+                    c->emit("\tleaq "); c->emitI64(cOff - (i64)aoff);
+                    c->emit("(%rbp), ");
+                    c->emit(regForWidth(useR, 64)); c->emitLine("");
+                }
+                else
+                {
+                i32 avid = isVRegOperand(root) ? vmapFind(&c->vmap, root) : -1;
                 u8 addrR;
-                if (avid >= 0 && c->vregs[(usize)avid].phys >= 0)
+                if (avid >= 0 && c->vregs[(usize)avid].phys >= 0 &&
+                    c->vregs[(usize)avid].klass != 1)
                     addrR = (u8)c->vregs[(usize)avid].phys;
                 else
                 {
-                    loadToReg(c, base, regs::SCRATCH_B, 64);
+                    loadToReg(c, root, regs::SCRATCH_B, 64);
                     addrR = regs::SCRATCH_B;
                 }
                 if (cOff == 0)
@@ -1211,17 +1439,20 @@ void iselGep(EmitCtx* c, IrInst* inst)
                     c->emit(regName(addrR)); c->emit("), ");
                     c->emit(regForWidth(useR, 64)); c->emitLine("");
                 }
+                }
                 if (dp < 0) storeToVReg(c, dvid, useR, 64);
                 return;
             }
         }
     }
 
-    /* general path: base into dst reg, fold dynamic indices */
-    loadToReg(c, base, useR, 64);
+    /* general path: root into dst reg, fold dynamic indices. Index
+     * scaling still uses `base`'s pointee type — only the address
+     * origin moved to the folded root. */
+    loadToReg(c, root, useR, 64);
     IrType* cur = base != null ? base->type : null;
     if (cur != null && cur->kind == IrTypeKind::Ptr) cur = cur->elem;
-    i64 cOff = 0;
+    i64 cOff = chainOff;
     for (u32 gi = 1; gi < inst->nops; gi++)
     {
         IrValue* ix = inst->ops[gi];
@@ -1334,6 +1565,71 @@ str jccFor(IrICmpPred p)
     return "jne";
 }
 
+str jccInverseFor(IrICmpPred p)
+{
+    switch (p)
+    {
+        IrICmpPred::Eq => { return "jne"; },
+        IrICmpPred::Ne => { return "je"; },
+        IrICmpPred::Slt => { return "jge"; },
+        IrICmpPred::Sle => { return "jg"; },
+        IrICmpPred::Sgt => { return "jle"; },
+        IrICmpPred::Sge => { return "jl"; },
+        IrICmpPred::Ult => { return "jae"; },
+        IrICmpPred::Ule => { return "ja"; },
+        IrICmpPred::Ugt => { return "jbe"; },
+        IrICmpPred::Uge => { return "jb"; },
+    }
+    return "je";
+}
+
+IrBlock* blockOperand(IrValue* v)
+{
+    if (v == null || v->kind != IrValueKind::Block) return null;
+    return (IrBlock*)v;
+}
+
+void emitPhiEdgeName(EmitCtx* c, IrInst* inst, str tag)
+{
+    c->emit(".Lphi"); c->emitU64((u64)c->func->base.id); c->emit("_");
+    c->emitU64((u64)inst->base.id); c->emit("_"); c->emit(tag);
+}
+
+/* conditional branch with edge phi copies: the false-edge jump goes first
+ * (flags still live), true-edge copies run on the fallthrough, and the
+ * false edge either jumps straight to its block or through a trampoline
+ * that performs its phi copies. */
+void emitCondBrEdges(EmitCtx* c, IrInst* inst, str falseJcc, IrValue* tb, IrValue* fb)
+{
+    IrBlock* pred = inst->parent;
+    IrBlock* tbb = blockOperand(tb);
+    IrBlock* fbb = blockOperand(fb);
+    bool tphi = tbb != null && pred != null && phiCopyCountFor(c, pred, tbb) > 0;
+    bool fphi = fbb != null && pred != null && phiCopyCountFor(c, pred, fbb) > 0;
+    if (!tphi && !fphi)
+    {
+        emitJccToBB(c, falseJcc, fb);
+        emitJmpToBB(c, tb);
+        return;
+    }
+    if (fphi)
+    {
+        c->emit("\t"); c->emit(falseJcc); c->emit(" ");
+        emitPhiEdgeName(c, inst, "f"); c->emitLine("");
+        if (tphi) emitPhiCopiesFor(c, pred, tbb);
+        emitJmpToBB(c, tb);
+        emitPhiEdgeName(c, inst, "f"); c->emitLine(":");
+        emitPhiCopiesFor(c, pred, fbb);
+        emitJmpToBB(c, fb);
+    }
+    else
+    {
+        emitJccToBB(c, falseJcc, fb);
+        if (tphi) emitPhiCopiesFor(c, pred, tbb);
+        emitJmpToBB(c, tb);
+    }
+}
+
 void iselCondBr(EmitCtx* c, IrInst* inst)
 {
     IrValue* cond = inst->nops > 0 ? inst->ops[0] : null;
@@ -1347,40 +1643,16 @@ void iselCondBr(EmitCtx* c, IrInst* inst)
         IrValue* a = ic->nops > 0 ? ic->ops[0] : null;
         IrValue* b = ic->nops > 1 ? ic->ops[1] : null;
         u32 w = a != null && a->type != null ? a->type->width : 64;
-        u32 rw = regW(w);
-        loadToReg(c, a, regs::SCRATCH_A, w);
-        str creg = regForWidth(regs::SCRATCH_A, rw);
-        if (b != null && b->kind == IrValueKind::ConstInt)
-        {
-            c->emit("\tcmp"); c->emit(intSfx(rw)); c->emit(" $");
-            c->emitU64(b->valData); c->emit(", "); c->emit(creg); c->emitLine("");
-        }
-        else
-        {
-            i32 bvid = isVRegOperand(b) ? vmapFind(&c->vmap, b) : -1;
-            if (bvid >= 0 && c->vregs[(usize)bvid].phys >= 0 &&
-                c->vregs[(usize)bvid].klass != 1)
-            {
-                c->emit("\tcmp"); c->emit(intSfx(rw)); c->emit(" ");
-                c->emit(regForWidth((u8)c->vregs[(usize)bvid].phys, rw));
-                c->emit(", "); c->emit(creg); c->emitLine("");
-            }
-            else
-            {
-                loadToReg(c, b, regs::SCRATCH_B, w);
-                c->emit("\tcmp"); c->emit(intSfx(rw)); c->emit(" ");
-                c->emit(regForWidth(regs::SCRATCH_B, rw));
-                c->emit(", "); c->emit(creg); c->emitLine("");
-            }
-        }
-        emitJccToBB(c, jccFor(ic->icmpPred), tb);
-        emitJmpToBB(c, fb);
+        emitCmpPair(c, a, b, w);
+        emitCondBrEdges(c, inst, jccInverseFor(ic->icmpPred), tb, fb);
         return;
     }
     /* generic: test cond, jcc */
     if (cond != null && cond->kind == IrValueKind::ConstInt)
     {
         IrValue* tgt = cond->valData != 0 ? tb : fb;
+        IrBlock* sb = blockOperand(tgt);
+        if (sb != null && inst->parent != null) emitPhiCopiesFor(c, inst->parent, sb);
         emitJmpToBB(c, tgt);
         return;
     }
@@ -1404,8 +1676,150 @@ void iselCondBr(EmitCtx* c, IrInst* inst)
         c->emit("\t# isel: unsupported condbr operand\n");
         return;
     }
-    emitJccToBB(c, "je", fb);
-    emitJmpToBB(c, tb);
+    emitCondBrEdges(c, inst, "je", tb, fb);
+}
+
+/* ================= switch =================
+ * ops: [sel, defaultBlock, (caseVal, caseBlock)*]. Each edge may carry
+ * phi copies, so edges with copies jump through a per-edge trampoline
+ * `.Lsw<func>_<inst>_<idx>` (idx == ncases is the default edge). */
+
+void emitSwLabelName(EmitCtx* c, IrInst* inst, u32 idx)
+{
+    c->emit(".Lsw"); c->emitU64((u64)c->func->base.id); c->emit("_");
+    c->emitU64((u64)inst->base.id); c->emit("_"); c->emitU64((u64)idx);
+}
+
+bool swEdgeNeedsTramp(EmitCtx* c, IrInst* inst, IrValue* blkVal, u32 idx)
+{
+    (void)idx;
+    IrBlock* sb = blockOperand(blkVal);
+    IrBlock* pred = inst->parent;
+    if (sb == null || pred == null) return false;
+    return phiCopyCountFor(c, pred, sb) > 0;
+}
+
+/* append the reference for edge idx: trampoline label or BB label */
+void emitSwTargetRef(EmitCtx* c, IrInst* inst, IrValue* blkVal, u32 idx)
+{
+    if (swEdgeNeedsTramp(c, inst, blkVal, idx)) emitSwLabelName(c, inst, idx);
+    else emitBBLabelName(c, blkVal);
+}
+
+void emitSwTrampoline(EmitCtx* c, IrInst* inst, IrValue* blkVal, u32 idx)
+{
+    if (!swEdgeNeedsTramp(c, inst, blkVal, idx)) return;
+    emitSwLabelName(c, inst, idx); c->emitLine(":");
+    IrBlock* sb = blockOperand(blkVal);
+    emitPhiCopiesFor(c, inst->parent, sb);
+    emitJmpToBB(c, blkVal);
+}
+
+void emitSwTableLabel(EmitCtx* c, IrInst* inst)
+{
+    c->emit(".LJTI"); c->emitU64((u64)c->func->base.id); c->emit("_");
+    c->emitU64((u64)inst->base.id);
+}
+
+void iselSwitch(EmitCtx* c, IrInst* inst)
+{
+    IrValue* sel = inst->nops > 0 ? inst->ops[0] : null;
+    IrValue* def = inst->nops > 1 ? inst->ops[1] : null;
+    u32 ncases = inst->nops >= 2 ? (inst->nops - 2) / 2 : 0;
+    if (sel == null || def == null || ncases == 0)
+    {
+        c->emit("\t# isel: malformed switch\n");
+        return;
+    }
+    u32 w = sel->type != null ? sel->type->width : 64;
+    u32 rw = regW(w);
+    u64 mask = 0xFFFFFFFFFFFFFFFFULL;
+    if (w < 64) mask = ((u64)1 << (u64)w) - 1;
+
+    u64* cvals = alloc<u64>((usize)ncases);
+    IrValue** cblks = alloc<IrValue*>((usize)ncases);
+    bool allConst = true;
+    u64 vmin = 0xFFFFFFFFFFFFFFFFULL;
+    u64 vmax = 0;
+    for (u32 i = 0; i < ncases; i++)
+    {
+        IrValue* cv = inst->ops[2 + i * 2];
+        cblks[i] = inst->ops[3 + i * 2];
+        if (cv == null || cv->kind != IrValueKind::ConstInt)
+        { allConst = false; cvals[i] = 0; continue; }
+        u64 v = cv->valData & mask;
+        cvals[i] = v;
+        if (v < vmin) vmin = v;
+        if (v > vmax) vmax = v;
+    }
+    u64 span = (vmax >= vmin) ? (vmax - vmin + 1) : 0;
+    bool useTable = allConst && span > 0 && span <= 256 &&
+                    span <= (u64)ncases * 8 &&
+                    storeImmEncodable(w, vmin); /* sub $vmin must encode */
+
+    if (useTable)
+    {
+        /* sel - vmin in r10, unsigned range check, PIC jump table */
+        loadToReg(c, sel, regs::SCRATCH_A, w);
+        str sreg = regForWidth(regs::SCRATCH_A, rw);
+        if (vmin != 0)
+        {
+            c->emit("\tsub"); c->emit(intSfx(rw)); c->emit(" $");
+            c->emitU64(vmin); c->emit(", "); c->emit(sreg); c->emitLine("");
+        }
+        c->emit("\tcmp"); c->emit(intSfx(rw)); c->emit(" $");
+        c->emitU64(span - 1); c->emit(", "); c->emit(sreg); c->emitLine("");
+        c->emit("\tja "); emitSwTargetRef(c, inst, def, ncases); c->emitLine("");
+        c->emit("\tleaq "); emitSwTableLabel(c, inst); c->emit("(%rip), ");
+        c->emit(regForWidth(regs::SCRATCH_B, 64)); c->emitLine("");
+        c->emit("\tmovslq ("); c->emit(regForWidth(regs::SCRATCH_B, 64));
+        c->emit(","); c->emit(regForWidth(regs::SCRATCH_A, 64));
+        c->emit(",4), "); c->emit(regForWidth(regs::SCRATCH_A, 64));
+        c->emitLine("");
+        c->emit("\taddq "); c->emit(regForWidth(regs::SCRATCH_B, 64));
+        c->emit(", "); c->emit(regForWidth(regs::SCRATCH_A, 64));
+        c->emitLine("");
+        c->emit("\tjmp *"); c->emit(regForWidth(regs::SCRATCH_A, 64));
+        c->emitLine("");
+        /* table in .rodata: 32-bit offsets from the table base —
+         * position-independent and linker-resolved */
+        c->emitLine("\t.section\t.rodata");
+        c->emit("\t.p2align\t2\n");
+        emitSwTableLabel(c, inst); c->emitLine(":");
+        for (u64 e = 0; e < span; e++)
+        {
+            u64 want = vmin + e;
+            u32 hit = ncases;
+            for (u32 i = 0; i < ncases; i++)
+                if (cvals[i] == want) { hit = i; break; }
+            IrValue* tb = hit < ncases ? cblks[hit] : def;
+            c->emit("\t.long ");
+            emitSwTargetRef(c, inst, tb, hit);
+            c->emit("-"); emitSwTableLabel(c, inst); c->emitLine("");
+        }
+        c->emitLine("\t.text");
+        for (u32 i = 0; i < ncases; i++)
+            emitSwTrampoline(c, inst, cblks[i], i);
+        emitSwTrampoline(c, inst, def, ncases);
+    }
+    else
+    {
+        /* compare chain */
+        for (u32 i = 0; i < ncases; i++)
+        {
+            IrValue* cv = inst->ops[2 + i * 2];
+            if (cv == null) continue;
+            emitCmpPair(c, sel, cv, w);
+            c->emit("\tje "); emitSwTargetRef(c, inst, cblks[i], i);
+            c->emitLine("");
+        }
+        c->emit("\tjmp "); emitSwTargetRef(c, inst, def, ncases); c->emitLine("");
+        for (u32 i = 0; i < ncases; i++)
+            emitSwTrampoline(c, inst, cblks[i], i);
+        emitSwTrampoline(c, inst, def, ncases);
+    }
+    if (cvals != null) dealloc<u64>(cvals);
+    if (cblks != null) dealloc<IrValue*>(cblks);
 }
 
 /* epilogue: restore callee-saved (reverse), rbp, ret */
@@ -1424,14 +1838,14 @@ void emitEpilogue(EmitCtx* c)
             c->emitLine("\tmovq %rbp, %rsp");
         for (u32 i = c->ncallee; i > 0; i--)
         {
-            c->emit("\tpop "); c->emit(regName(c->calleeList[i-1])); c->emitLine("");
+            c->emit("\tpopq "); c->emit(regName(c->calleeList[i-1])); c->emitLine("");
             c->emit("\t.cfi_restore "); c->emit(regName(c->calleeList[i-1])); c->emitLine("");
         }
         c->emitLine("\tpopq %rbp");
         c->emitLine("\t.cfi_restore %rbp");
     }
     c->emitLine("\t.cfi_def_cfa %rsp, 8");
-    c->emitLine("\tret");
+    c->emitLine("\tretq");
 }
 
 void iselRet(EmitCtx* c, IrInst* inst)
@@ -1462,6 +1876,28 @@ void iselDivRem(EmitCtx* c, IrInst* inst, bool isSigned, bool wantRem)
     IrValue* b = inst->nops > 1 ? inst->ops[1] : null;
     u32 w = a != null && a->type != null ? a->type->width : 64;
     u32 rw = regW(w);
+    /* paired div: previous inst already ran idiv on (a,b,signed) —
+     * rax=quot rdx=rem are still live, skip straight to the result. */
+    if (c->divValid != 0 && c->divA == a && c->divB == b &&
+        c->divSigned == (isSigned ? 1 : 0))
+    {
+        u32 dvid = c->vregFor(&inst->base);
+        i32 dp = (i32)c->vregs[(usize)dvid].phys;
+        u8 srcR = wantRem ? regs::RDX : regs::RAX;
+        if (dp >= 0)
+        {
+            if ((i32)srcR != dp)
+            {
+                c->emit("\tmov"); c->emit(intSfx(rw)); c->emit(" ");
+                c->emit(regForWidth(srcR, rw)); c->emit(", ");
+                c->emit(regForWidth((u8)dp, rw)); c->emitLine("");
+            }
+        }
+        else storeToVReg(c, dvid, srcR, w);
+        /* a result landing in rax/rdx clobbers the pair — drop it */
+        if (dp == (i32)regs::RAX || dp == (i32)regs::RDX) c->divValid = 0;
+        return;
+    }
     /* dividend -> rax */
     loadToReg(c, a, regs::RAX, w);
     /* sign/zero extend into rdx */
@@ -1471,7 +1907,9 @@ void iselDivRem(EmitCtx* c, IrInst* inst, bool isSigned, bool wantRem)
     }
     else
     {
-        c->emit("\txor"); c->emit(intSfx(rw)); c->emit(" %edx, %edx\n");
+        c->emit("\txor"); c->emit(intSfx(rw)); c->emit(" ");
+        c->emit(regForWidth(regs::RDX, rw)); c->emit(", ");
+        c->emit(regForWidth(regs::RDX, rw)); c->emitLine("");
     }
     /* divisor -> scratch (never rax/rdx) */
     loadToReg(c, b, regs::SCRATCH_A, w);
@@ -1492,6 +1930,10 @@ void iselDivRem(EmitCtx* c, IrInst* inst, bool isSigned, bool wantRem)
         }
     }
     else storeToVReg(c, dvid, srcR, w);
+    /* remember the pair so an adjacent matching div reuses rax/rdx —
+     * unless the result mov clobbered one of them */
+    c->divA = a; c->divB = b; c->divSigned = isSigned ? 1 : 0;
+    c->divValid = (dp == (i32)regs::RAX || dp == (i32)regs::RDX) ? 0 : 1;
 }
 
 void iselSelect(EmitCtx* c, IrInst* inst)
@@ -1550,6 +1992,55 @@ void iselCast(EmitCtx* c, IrInst* inst)
         i32 sv = vmapFind(&c->vmap, src);
         if (sv >= 0 && (u32)sv == dvid) return;
     }
+    /* cross-class bitcast (int<->float): real movd/movq between reg
+     * files — the vreg alias path only covers same-class bitcasts. */
+    if (inst->opcode == IrOpcode::Bitcast && isVRegOperand(src))
+    {
+        i32 sv = vmapFind(&c->vmap, src);
+        u8 sk = sv >= 0 ? c->vregs[(usize)sv].klass : 0;
+        u8 dk = c->vregs[(usize)dvid].klass;
+        if (sk != dk)
+        {
+            if (sk == 1)
+            {
+                /* xmm -> gpr */
+                i32 sp2 = sv >= 0 ? (i32)c->vregs[(usize)sv].phys : -1;
+                u8 useX = sp2 >= 0 ? (u8)sp2 : regs::XMM15;
+                if (sp2 < 0) loadToXmm(c, src, useX, sw);
+                u8 useR = dp >= 0 ? (u8)dp : regs::SCRATCH_A;
+                if (sw <= 32)
+                {
+                    c->emit("\tmovd "); emitXmmReg(c, useX); c->emit(", ");
+                    c->emit(regForWidth(useR, 32)); c->emitLine("");
+                }
+                else
+                {
+                    c->emit("\tmovq "); emitXmmReg(c, useX); c->emit(", ");
+                    c->emit(regName(useR)); c->emitLine("");
+                }
+                if (dp < 0) storeToVReg(c, dvid, useR, dw);
+            }
+            else
+            {
+                /* gpr -> xmm */
+                u8 useX = dp >= 0 ? (u8)dp : regs::XMM15;
+                u8 useR = regs::SCRATCH_A;
+                loadToReg(c, src, useR, sw);
+                if (sw <= 32)
+                {
+                    c->emit("\tmovd "); c->emit(regForWidth(useR, 32)); c->emit(", ");
+                    emitXmmReg(c, useX); c->emitLine("");
+                }
+                else
+                {
+                    c->emit("\tmovq "); c->emit(regName(useR)); c->emit(", ");
+                    emitXmmReg(c, useX); c->emitLine("");
+                }
+                if (dp < 0) storeFromXmm(c, dvid, useX, dw);
+            }
+            return;
+        }
+    }
     u8 useR = dp >= 0 ? (u8)dp : regs::SCRATCH_A;
     loadToReg(c, src, useR, sw);
 
@@ -1572,6 +2063,726 @@ void iselCast(EmitCtx* c, IrInst* inst)
         else => { }
     }
     if (dp < 0) storeToVReg(c, dvid, useR, dw);
+}
+
+/* ================= xmm (float/scalar-sse) helpers ================= */
+
+/* load `src` into xmm phys `dphys`. w: 32=f32 movss path, else f64. */
+void loadToXmm(EmitCtx* c, IrValue* src, u8 dphys, u32 w)
+{
+    str mv = w <= 32 ? "movss " : "movsd ";
+    if (src == null)
+    {
+        c->emit("\txorps "); emitXmmReg(c, dphys); c->emit(", ");
+        emitXmmReg(c, dphys); c->emitLine("");
+        return;
+    }
+    if (src->kind == IrValueKind::ConstFloat || src->kind == IrValueKind::ConstInt)
+    {
+        /* valData holds the raw bit pattern for both kinds */
+        if (w <= 32)
+        {
+            c->emit("\tmovl $"); c->emitU64(src->valData & 0xFFFFFFFFu); c->emit(", %r10d\n");
+            c->emit("\tmovd %r10d, "); emitXmmReg(c, dphys); c->emitLine("");
+        }
+        else
+        {
+            c->emit("\tmovq $"); c->emitU64(src->valData); c->emit(", %r10\n");
+            c->emit("\tmovq %r10, "); emitXmmReg(c, dphys); c->emitLine("");
+        }
+        return;
+    }
+    if (isVRegOperand(src))
+    {
+        i32 vid = vmapFind(&c->vmap, src);
+        if (vid >= 0)
+        {
+            VReg* r = &c->vregs[(usize)vid];
+            if (r->klass == 1)
+            {
+                i32 p = (i32)r->phys;
+                if (p >= 0)
+                {
+                    if ((u8)p != dphys)
+                    {
+                        c->emit("\tmovaps "); emitXmmReg(c, (u8)p); c->emit(", ");
+                        emitXmmReg(c, dphys); c->emitLine("");
+                    }
+                }
+                else
+                {
+                    c->emit("\t"); c->emit(mv); c->emit("-");
+                    c->emitI64((i64)spillOff(c, r->slot)); c->emit("(%rbp), ");
+                    emitXmmReg(c, dphys); c->emitLine("");
+                }
+            }
+            else if (r->klass == 0)
+            {
+                /* gpr-held value moving into xmm (e.g. bitcast path) */
+                i32 p = (i32)r->phys;
+                u8 g = p >= 0 ? (u8)p : regs::SCRATCH_A;
+                if (p < 0) loadToReg(c, src, g, w);
+                if (w <= 32)
+                {
+                    c->emit("\tmovd "); c->emit(regForWidth(g, 32)); c->emit(", ");
+                    emitXmmReg(c, dphys); c->emitLine("");
+                }
+                else
+                {
+                    c->emit("\tmovq "); c->emit(regName(g)); c->emit(", ");
+                    emitXmmReg(c, dphys); c->emitLine("");
+                }
+            }
+            return;
+        }
+    }
+    /* label / global / unknown: materialize address then load would be
+     * wrong for a value — emit a comment rather than bad code */
+    c->emit("\t# isel: xmm load unsupported operand\n");
+}
+
+/* store xmm phys `sphys` into vreg vid's home */
+void storeFromXmm(EmitCtx* c, u32 vid, u8 sphys, u32 w)
+{
+    VReg* r = &c->vregs[vid];
+    str mv = w <= 32 ? "movss " : "movsd ";
+    if (r->phys >= 0 && r->klass == 1)
+    {
+        if ((u8)r->phys != sphys)
+        {
+            c->emit("\tmovaps "); emitXmmReg(c, sphys); c->emit(", ");
+            emitXmmReg(c, (u8)r->phys); c->emitLine("");
+        }
+        return;
+    }
+    if (r->klass == 0)
+    {
+        u8 g = r->phys >= 0 ? (u8)r->phys : regs::SCRATCH_A;
+        if (w <= 32)
+        {
+            c->emit("\tmovd "); emitXmmReg(c, sphys); c->emit(", ");
+            c->emit(regForWidth(g, 32)); c->emitLine("");
+        }
+        else
+        {
+            c->emit("\tmovq "); emitXmmReg(c, sphys); c->emit(", ");
+            c->emit(regName(g)); c->emitLine("");
+        }
+        if (r->phys < 0) storeToVReg(c, vid, g, w);
+        return;
+    }
+    /* spilled xmm */
+    if (r->slot >= 0)
+    {
+        c->emit("\t"); c->emit(mv); emitXmmReg(c, sphys); c->emit(", -");
+        c->emitI64((i64)spillOff(c, r->slot)); c->emit("(%rbp)\n");
+        return;
+    }
+    c->emit("\t# isel: xmm store nowhere to go\n");
+}
+
+/* pick dst xmm for a float-producing inst; returns phys or -1 */
+i32 xmmDstPhys(EmitCtx* c, u32 vid)
+{
+    VReg* r = &c->vregs[vid];
+    if (r->klass == 1 && r->phys >= 0) return (i32)r->phys;
+    return -1;
+}
+
+/* FAdd/FSub/FMul/FDiv/FSqrt — 2-address like the int path */
+void iselFArith(EmitCtx* c, IrInst* inst, str sop32, str sop64)
+{
+    if (inst->nops < 1) return;
+    IrType* bt = inst->base.type;
+    u32 w = bt != null ? bt->width : 64;
+    str sop = w <= 32 ? sop32 : sop64;
+    u32 dvid = c->vregFor(&inst->base);
+    i32 dp = xmmDstPhys(c, dvid);
+    u8 useX = dp >= 0 ? (u8)dp : regs::XMM15;
+
+    if (inst->opcode == IrOpcode::FSqrt)
+    {
+        IrValue* a = inst->ops[0];
+        i32 avid = isVRegOperand(a) ? vmapFind(&c->vmap, a) : -1;
+        i32 ap = avid >= 0 ? (i32)c->vregs[(usize)avid].phys : -1;
+        if (ap >= 0 && c->vregs[(usize)avid].klass == 1 && (u8)ap != useX)
+        {
+            /* sqrt directly from src reg */
+            c->emit("\t"); c->emit(sop); c->emit(" ");
+            emitXmmReg(c, (u8)ap); c->emit(", "); emitXmmReg(c, useX); c->emitLine("");
+        }
+        else
+        {
+            loadToXmm(c, a, useX, w);
+            c->emit("\t"); c->emit(sop); c->emit(" ");
+            emitXmmReg(c, useX); c->emit(", "); emitXmmReg(c, useX); c->emitLine("");
+        }
+        if (dp < 0) storeFromXmm(c, dvid, useX, w);
+        return;
+    }
+
+    IrValue* a = inst->ops[0];
+    IrValue* b = inst->ops[1];
+    loadToXmm(c, a, useX, w);
+    /* b: reg / spill-slot mem operand / const */
+    i32 bvid = isVRegOperand(b) ? vmapFind(&c->vmap, b) : -1;
+    bool done = false;
+    if (bvid >= 0)
+    {
+        VReg* br = &c->vregs[(usize)bvid];
+        if (br->klass == 1)
+        {
+            i32 bp = (i32)br->phys;
+            if (bp >= 0)
+            {
+                if ((u8)bp != useX)
+                {
+                    c->emit("\t"); c->emit(sop); c->emit(" ");
+                    emitXmmReg(c, (u8)bp); c->emit(", ");
+                    emitXmmReg(c, useX); c->emitLine("");
+                }
+                done = true;
+            }
+            else if (br->slot >= 0)
+            {
+                c->emit("\t"); c->emit(sop); c->emit(" -");
+                c->emitI64((i64)spillOff(c, br->slot)); c->emit("(%rbp), ");
+                emitXmmReg(c, useX); c->emitLine("");
+                done = true;
+            }
+        }
+    }
+    if (!done)
+    {
+        loadToXmm(c, b, regs::XMM15, w);
+        c->emit("\t"); c->emit(sop); c->emit(" ");
+        emitXmmReg(c, regs::XMM15); c->emit(", ");
+        emitXmmReg(c, useX); c->emitLine("");
+    }
+    if (dp < 0) storeFromXmm(c, dvid, useX, w);
+}
+
+/* Fma = a*b+c lowered as mul+add (same as fast backend — not fused) */
+void iselFma(EmitCtx* c, IrInst* inst)
+{
+    if (inst->nops < 3) return;
+    IrType* bt = inst->base.type;
+    u32 w = bt != null ? bt->width : 64;
+    str ms = w <= 32 ? "mulss" : "mulsd";
+    str asop = w <= 32 ? "addss" : "addsd";
+    u32 dvid = c->vregFor(&inst->base);
+    i32 dp = xmmDstPhys(c, dvid);
+    u8 useX = dp >= 0 ? (u8)dp : regs::XMM15;
+    IrValue*[3] ops = { inst->ops[0], inst->ops[1], inst->ops[2] };
+    str[2] sops = { ms, asop };
+    for (u32 i = 0; i < 3; i++)
+    {
+        if (i == 0) { loadToXmm(c, ops[0], useX, w); continue; }
+        IrValue* v = ops[i];
+        i32 bvid = isVRegOperand(v) ? vmapFind(&c->vmap, v) : -1;
+        VReg* br = bvid >= 0 ? &c->vregs[(usize)bvid] : null;
+        str sop = sops[i - 1];
+        if (br != null && br->klass == 1)
+        {
+            i32 bp = (i32)br->phys;
+            if (bp >= 0)
+            {
+                c->emit("\t"); c->emit(sop); c->emit(" ");
+                emitXmmReg(c, (u8)bp); c->emit(", ");
+                emitXmmReg(c, useX); c->emitLine("");
+                continue;
+            }
+            if (br->slot >= 0)
+            {
+                c->emit("\t"); c->emit(sop); c->emit(" -");
+                c->emitI64((i64)spillOff(c, br->slot)); c->emit("(%rbp), ");
+                emitXmmReg(c, useX); c->emitLine("");
+                continue;
+            }
+        }
+        loadToXmm(c, v, regs::XMM15, w);
+        c->emit("\t"); c->emit(sop); c->emit(" ");
+        emitXmmReg(c, regs::XMM15); c->emit(", ");
+        emitXmmReg(c, useX); c->emitLine("");
+    }
+    if (dp < 0) storeFromXmm(c, dvid, useX, w);
+}
+
+/* FAbs: clear the sign bit in the raw fp bits via gpr btr */
+void iselFAbs(EmitCtx* c, IrInst* inst)
+{
+    if (inst->nops < 1) return;
+    IrType* bt = inst->base.type;
+    u32 w = bt != null ? bt->width : 64;
+    u32 dvid = c->vregFor(&inst->base);
+    i32 dp = xmmDstPhys(c, dvid);
+    u8 useX = dp >= 0 ? (u8)dp : regs::XMM15;
+    loadToXmm(c, inst->ops[0], useX, w);
+    u8 g = regs::SCRATCH_A;
+    if (w <= 32)
+    {
+        c->emit("\tmovd "); emitXmmReg(c, useX); c->emit(", ");
+        c->emit(regForWidth(g, 32)); c->emitLine("");
+        c->emit("\tbtrl $31, "); c->emit(regForWidth(g, 32)); c->emitLine("");
+        c->emit("\tmovd "); c->emit(regForWidth(g, 32)); c->emit(", ");
+        emitXmmReg(c, useX); c->emitLine("");
+    }
+    else
+    {
+        c->emit("\tmovq "); emitXmmReg(c, useX); c->emit(", ");
+        c->emit(regName(g)); c->emitLine("");
+        c->emit("\tbtrq $63, "); c->emit(regName(g)); c->emitLine("");
+        c->emit("\tmovq "); c->emit(regName(g)); c->emit(", ");
+        emitXmmReg(c, useX); c->emitLine("");
+    }
+    if (dp < 0) storeFromXmm(c, dvid, useX, w);
+}
+
+/* FCmp -> i1 in a gpr. Mirrors fast backend's ucomiss/setcc logic. */
+void iselFCmp(EmitCtx* c, IrInst* inst)
+{
+    if (inst->nops < 2) return;
+    IrValue* a = inst->ops[0];
+    IrValue* b = inst->ops[1];
+    u32 w = a->type != null ? a->type->width : 64;
+    str uop = w <= 32 ? "ucomiss " : "ucomisd ";
+    u32 dvid = c->vregFor(&inst->base);
+    i32 dp = (i32)c->vregs[(usize)dvid].phys;
+    u8 useR = dp >= 0 ? (u8)dp : regs::SCRATCH_A;
+    u8 useX = regs::XMM15;
+    /* a into an xmm: its own phys when available, else scratch */
+    i32 avid = isVRegOperand(a) ? vmapFind(&c->vmap, a) : -1;
+    i32 ap = avid >= 0 ? (i32)c->vregs[(usize)avid].phys : -1;
+    if (ap >= 0 && c->vregs[(usize)avid].klass == 1)
+        useX = (u8)ap;
+    else
+        loadToXmm(c, a, useX, w);
+    /* b: spilled -> mem operand, else xmm14 scratch... need a 2nd xmm.
+     * xmm14 is allocatable; use it only if no vreg owns it. */
+    i32 bvid = isVRegOperand(b) ? vmapFind(&c->vmap, b) : -1;
+    u8 bx = 0xFF;
+    bool bmem = false;
+    i32 bspill = -1;
+    if (bvid >= 0)
+    {
+        VReg* br = &c->vregs[(usize)bvid];
+        if (br->klass == 1)
+        {
+            i32 bp = (i32)br->phys;
+            if (bp >= 0) bx = (u8)bp;
+            else if (br->slot >= 0) { bmem = true; bspill = spillOff(c, br->slot); }
+        }
+    }
+    if (!bmem && bx == 0xFF)
+    {
+        /* const/unknown b: find a scratch xmm != xmm15 */
+        bx = xmmScratch2(c, useX);
+        if (bx == 0xFF)
+        {
+            c->emit("\t# isel: fcmp needs second xmm scratch\n");
+            return;
+        }
+        loadToXmm(c, b, bx, w);
+    }
+    c->emit("\t"); c->emit(uop);
+    if (bmem)
+    {
+        c->emit("-"); c->emitU64((u64)bspill); c->emit("(%rbp), ");
+    }
+    else emitXmmReg(c, bx);
+    c->emit(", "); emitXmmReg(c, useX); c->emitLine("");
+
+    str setInst = "sete";
+    u32 fmode = 0;
+    switch (inst->fcmpPred)
+    {
+        IrFCmpPred::Oeq => { setInst = "sete"; fmode = 1; },
+        IrFCmpPred::One => { setInst = "setne"; fmode = 1; },
+        IrFCmpPred::Olt => { setInst = "setb"; fmode = 1; },
+        IrFCmpPred::Ole => { setInst = "setbe"; fmode = 1; },
+        IrFCmpPred::Ogt => { setInst = "seta"; fmode = 0; },
+        IrFCmpPred::Oge => { setInst = "setae"; fmode = 1; },
+        IrFCmpPred::Ueq => { setInst = "sete"; fmode = 2; },
+        IrFCmpPred::Une => { setInst = "setne"; fmode = 2; },
+        IrFCmpPred::Ult => { setInst = "setb"; fmode = 0; },
+        IrFCmpPred::Ule => { setInst = "setbe"; fmode = 0; },
+        IrFCmpPred::Ugt => { setInst = "seta"; fmode = 2; },
+        IrFCmpPred::Uge => { setInst = "setae"; fmode = 2; },
+        else => { setInst = "sete"; fmode = 0; }
+    }
+    c->emit("\t"); c->emit(setInst); c->emit(" ");
+    emitByteReg(c, useR); c->emitLine("");
+    if (fmode == 1)
+    {
+        c->emit("\tsetnp %r10b\n");
+        c->emit("\tandb %r10b, "); emitByteReg(c, useR); c->emitLine("");
+    }
+    else if (fmode == 2)
+    {
+        c->emit("\tsetp %r10b\n");
+        c->emit("\torb %r10b, "); emitByteReg(c, useR); c->emitLine("");
+    }
+    c->emit("\tmovzbl "); emitByteReg(c, useR); c->emit(", ");
+    c->emit(regForWidth(useR, 32)); c->emitLine("");
+    if (dp < 0) storeToVReg(c, dvid, useR, 32);
+}
+
+/* second scratch xmm: xmm15 when not `avoid`, else xmm14 if free */
+u8 xmmScratch2(EmitCtx* c, u8 avoid)
+{
+    if (avoid != regs::XMM15) return regs::XMM15;
+    for (u32 i = 0; i < c->nvregs; i++)
+        if (c->vregs[i].klass == 1 && c->vregs[i].phys == 14) return 0xFF;
+    return 14;
+}
+
+/* float<->int and float<->float casts */
+void iselFCast(EmitCtx* c, IrInst* inst)
+{
+    if (inst->nops < 1) return;
+    IrValue* src = inst->ops[0];
+    IrType* st = src->type;
+    u32 sw = st != null ? st->width : 64;
+    IrType* dt = inst->base.type;
+    u32 dw = dt != null ? dt->width : 64;
+    u32 dvid = c->vregFor(&inst->base);
+
+    switch (inst->opcode)
+    {
+        IrOpcode::FpTrunc | IrOpcode::FpExt =>
+        {
+            /* f64<->f32 through xmm; dst is xmm-class */
+            i32 dp = xmmDstPhys(c, dvid);
+            u8 useX = dp >= 0 ? (u8)dp : regs::XMM15;
+            str cvt = inst->opcode == IrOpcode::FpTrunc ? "cvtsd2ss " : "cvtss2sd ";
+            /* src into xmm: prefer direct reg form when possible */
+            i32 sv = isVRegOperand(src) ? vmapFind(&c->vmap, src) : -1;
+            i32 sp = sv >= 0 ? (i32)c->vregs[(usize)sv].phys : -1;
+            if (sp >= 0 && c->vregs[(usize)sv].klass == 1 && (u8)sp != useX)
+            {
+                c->emit("\t"); c->emit(cvt); emitXmmReg(c, (u8)sp);
+                c->emit(", "); emitXmmReg(c, useX); c->emitLine("");
+            }
+            else
+            {
+                loadToXmm(c, src, useX, sw);
+                c->emit("\t"); c->emit(cvt); emitXmmReg(c, useX);
+                c->emit(", "); emitXmmReg(c, useX); c->emitLine("");
+            }
+            if (dp < 0) storeFromXmm(c, dvid, useX, dw);
+        },
+        IrOpcode::SiToFp | IrOpcode::UiToFp =>
+        {
+            i32 dp = xmmDstPhys(c, dvid);
+            u8 useX = dp >= 0 ? (u8)dp : regs::XMM15;
+            bool toF32 = dw <= 32;
+            str cvt = toF32 ? "cvtsi2ss " : "cvtsi2sd ";
+            str adds = toF32 ? "addss " : "addsd ";
+            u8 g = regs::SCRATCH_A;
+            loadToReg(c, src, g, sw);
+            if (inst->opcode == IrOpcode::UiToFp && sw > 32)
+            {
+                /* (v>>1)*2 + (v&1): both halves fit in signed i64 */
+                u8 bx = xmmScratch2(c, useX);
+                if (bx == 0xFF)
+                {
+                    c->emit("\t# isel: uitofp64 needs 2nd xmm\n");
+                    return;
+                }
+                c->emit("\tmovq "); c->emit(regName(g)); c->emit(", %r11\n");
+                c->emit("\tmovq %r11, %r10\n");
+                c->emit("\tshrq $1, %r11\n");
+                c->emit("\tandq $1, %r10\n");
+                c->emit("\t"); c->emit(cvt); c->emit("%r11, ");
+                emitXmmReg(c, useX); c->emitLine("");
+                c->emit("\t"); c->emit(adds); emitXmmReg(c, useX); c->emit(", ");
+                emitXmmReg(c, useX); c->emitLine("");
+                c->emit("\t"); c->emit(cvt); c->emit("%r10, ");
+                emitXmmReg(c, bx); c->emitLine("");
+                c->emit("\t"); c->emit(adds); emitXmmReg(c, bx); c->emit(", ");
+                emitXmmReg(c, useX); c->emitLine("");
+                if (dp < 0) storeFromXmm(c, dvid, useX, dw);
+                return;
+            }
+            c->emit("\t"); c->emit(cvt); c->emit(regForWidth(g, sw <= 32 ? 32 : 64));
+            c->emit(", "); emitXmmReg(c, useX); c->emitLine("");
+            if (dp < 0) storeFromXmm(c, dvid, useX, dw);
+        },
+        IrOpcode::FpToSi | IrOpcode::FpToUi =>
+        {
+            /* cvtt -> gpr; unsigned >INT64_MAX is a known gap (same as fast) */
+            i32 dp = (i32)c->vregs[(usize)dvid].phys;
+            u8 useR = dp >= 0 ? (u8)dp : regs::SCRATCH_A;
+            bool fromF32 = sw <= 32;
+            u8 useX = regs::XMM15;
+            loadToXmm(c, src, useX, sw);
+            c->emit("\tcvtt"); c->emit(fromF32 ? "ss" : "sd"); c->emit("2si ");
+            emitXmmReg(c, useX); c->emit(", ");
+            c->emit(regForWidth(useR, dw <= 32 ? 32 : 64)); c->emitLine("");
+            if (dp < 0) storeToVReg(c, dvid, useR, dw);
+        },
+        else => { c->emit("\t# isel: unhandled fcast\n"); }
+    }
+}
+
+/* unary bit ops: popcnt/lzcnt/tzcnt/bswap/rot — dst = op(src) */
+void iselBitop(EmitCtx* c, IrInst* inst)
+{
+    if (inst->nops < 1) return;
+    IrValue* src = inst->ops[0];
+    u32 w = inst->base.type != null ? inst->base.type->width : 64;
+    u32 dvid = c->vregFor(&inst->base);
+    i32 dp = (i32)c->vregs[(usize)dvid].phys;
+    u8 useR = dp >= 0 ? (u8)dp : regs::SCRATCH_A;
+    loadToReg(c, src, useR, w);
+    str suff = w <= 32 ? "l" : "q";
+    switch (inst->opcode)
+    {
+        IrOpcode::CtPop | IrOpcode::CtLz | IrOpcode::CtTz =>
+        {
+            /* no 8/16-bit forms: zero-extend into 32 bits, run the
+             * 32/64-bit op; lzcnt needs a width bias correction */
+            str mn = inst->opcode == IrOpcode::CtPop ? "popcnt" :
+                     inst->opcode == IrOpcode::CtLz ? "lzcnt" : "tzcnt";
+            u32 bias = 0;
+            if (w <= 8)
+            {
+                c->emit("\tmovzbl "); emitByteReg(c, useR); c->emit(", ");
+                c->emit(regForWidth(useR, 32)); c->emitLine("");
+                bias = 24;
+            }
+            else if (w <= 16)
+            {
+                c->emit("\tmovzwl "); emitWordReg(c, useR); c->emit(", ");
+                c->emit(regForWidth(useR, 32)); c->emitLine("");
+                bias = 16;
+            }
+            u32 ow = w >= 64 ? 64 : 32;
+            str oreg = regForWidth(useR, ow);
+            c->emit("\t"); c->emit(mn); c->emit(intSfx(ow)); c->emit(" ");
+            c->emit(oreg); c->emit(", "); c->emit(oreg); c->emitLine("");
+            if (bias > 0 && inst->opcode == IrOpcode::CtLz)
+            {
+                c->emit("\tsubl $"); c->emitU64((u64)bias); c->emit(", ");
+                c->emit(regForWidth(useR, 32)); c->emitLine("");
+            }
+        },
+        IrOpcode::Bswap =>
+        {
+            if (w <= 8) { /* single byte: identity */ }
+            else if (w <= 16)
+            {
+                /* no bswap r16: rotate the 16-bit reg by 8 */
+                c->emit("\trolw $8, "); emitWordReg(c, useR); c->emitLine("");
+            }
+            else
+            {
+                c->emit("\tbswap"); c->emit(suff); c->emit(" ");
+                c->emit(regForWidth(useR, regW(w))); c->emitLine("");
+            }
+        },
+        IrOpcode::Rotl | IrOpcode::Rotr =>
+        {
+            /* count in %cl for non-const (same dance as iselShift) */
+            bool left = inst->opcode == IrOpcode::Rotl;
+            IrValue* cnt = inst->nops > 1 ? inst->ops[1] : null;
+            str sop = left ? "rol" : "ror";
+            str rsfx = intSfx(w);
+            if (cnt != null && cnt->kind == IrValueKind::ConstInt)
+            {
+                u64 k = cnt->valData & (w >= 64 ? 63 : 31);
+                c->emit("\t"); c->emit(sop); c->emit(rsfx); c->emit(" $");
+                c->emitU64(k); c->emit(", "); emitRegExact(c, useR, w); c->emitLine("");
+            }
+            else
+            {
+                i32 cvid = isVRegOperand(cnt) ? vmapFind(&c->vmap, cnt) : -1;
+                i32 cp = cvid >= 0 ? c->vregs[(usize)cvid].phys : -1;
+                if (cp == (i32)regs::RCX)
+                {
+                    c->emit("\t"); c->emit(sop); c->emit(rsfx); c->emit(" %cl, ");
+                    emitRegExact(c, useR, w); c->emitLine("");
+                }
+                else if (useR == regs::RCX)
+                {
+                    c->emit("\tmov"); c->emit(intSfx(w)); c->emit(" ");
+                    emitRegExact(c, regs::RCX, w); c->emit(", ");
+                    emitRegExact(c, regs::SCRATCH_A, w); c->emitLine("");
+                    loadToReg(c, cnt, regs::RCX, w);
+                    c->emit("\t"); c->emit(sop); c->emit(rsfx); c->emit(" %cl, ");
+                    emitRegExact(c, regs::SCRATCH_A, w); c->emitLine("");
+                    c->emit("\tmov"); c->emit(intSfx(w)); c->emit(" ");
+                    emitRegExact(c, regs::SCRATCH_A, w); c->emit(", ");
+                    emitRegExact(c, regs::RCX, w); c->emitLine("");
+                }
+                else
+                {
+                    c->emitLine("\tpushq %rcx");
+                    loadToReg(c, cnt, regs::RCX, w);
+                    c->emit("\t"); c->emit(sop); c->emit(rsfx); c->emit(" %cl, ");
+                    emitRegExact(c, useR, w); c->emitLine("");
+                    c->emitLine("\tpopq %rcx");
+                }
+            }
+        },
+        else => { }
+    }
+    if (dp < 0) storeToVReg(c, dvid, useR, w);
+}
+
+/* MulHi/SMulHi: high half of the 2w-bit product.
+ * w>=32: mul/imul leaves it in rdx. w<32: canonicalize operands to
+ * 32 bits, mul32 (product fits in eax), then shift eax right by w. */
+void iselMulHi(EmitCtx* c, IrInst* inst)
+{
+    if (inst->nops < 2) return;
+    IrValue* a = inst->ops[0];
+    IrValue* b = inst->ops[1];
+    u32 w = inst->base.type != null ? inst->base.type->width : 64;
+    bool sgn = inst->opcode == IrOpcode::SMulHi;
+    u32 dvid = c->vregFor(&inst->base);
+    i32 dp = (i32)c->vregs[(usize)dvid].phys;
+    u8 useR = dp >= 0 ? (u8)dp : regs::SCRATCH_B;
+    u8 ra = regs::RAX;
+    u8 rc = regs::SCRATCH_A;
+    /* canonicalize <=16-bit operands into 32-bit regs first — a 64-bit
+     * mul would read garbage upper bits */
+    loadToReg(c, a, ra, w);
+    if (w <= 8)
+    {
+        c->emit("\t"); c->emit(sgn ? "movsbl %al, %eax" : "movzbl %al, %eax"); c->emitLine("");
+    }
+    else if (w <= 16)
+    {
+        c->emit("\t"); c->emit(sgn ? "movswl %ax, %eax" : "movzwl %ax, %eax"); c->emitLine("");
+    }
+    loadToReg(c, b, rc, w);
+    if (w <= 8)
+    {
+        c->emit("\t"); c->emit(sgn ? "movsbl %cl, %ecx" : "movzbl %cl, %ecx"); c->emitLine("");
+    }
+    else if (w <= 16)
+    {
+        c->emit("\t"); c->emit(sgn ? "movswl %cx, %ecx" : "movzwl %cx, %ecx"); c->emitLine("");
+    }
+    bool bInSlot = false;
+    i32 bvid = isVRegOperand(b) ? vmapFind(&c->vmap, b) : -1;
+    VReg* br = bvid >= 0 ? &c->vregs[(usize)bvid] : null;
+    if (br != null && br->phys < 0 && br->slot >= 0) bInSlot = true;
+    /* for narrow widths b was already materialized into rcx above;
+     * the slot form only applies at w>=32 where we skipped loadToReg? —
+     * loadToReg always ran, so rcx always holds b. Use reg form. */
+    c->emit("\t"); c->emit(sgn ? "imul" : "mul");
+    c->emit(w >= 64 ? "q" : "l"); c->emit(" ");
+    c->emit(regForWidth(rc, w >= 64 ? 64 : 32)); c->emitLine("");
+    (void)bInSlot;
+    if (w < 32)
+    {
+        /* product sits in eax; high w bits = eax >>w */
+        c->emit("\tmovl %eax, "); c->emit(regForWidth(useR, 32)); c->emitLine("");
+        c->emit("\t"); c->emit(sgn ? "sarl" : "shrl"); c->emit(" $");
+        c->emitU64((u64)w); c->emit(", "); c->emit(regForWidth(useR, 32)); c->emitLine("");
+    }
+    else
+    {
+        /* 32-bit mul zero-extends rdx, so movq %rdx works for w=32 too */
+        c->emit("\tmovq %rdx, "); c->emit(regName(useR)); c->emitLine("");
+        if (w == 32) { /* dst i32 reads low 32 = edx */ }
+    }
+    if (dp < 0) storeToVReg(c, dvid, useR, w);
+}
+
+/* SMin/SMax/UMin/UMax: dst=a; cmp b,a; cmov */
+void iselMinMax(EmitCtx* c, IrInst* inst)
+{
+    if (inst->nops < 2) return;
+    IrValue* a = inst->ops[0];
+    IrValue* b = inst->ops[1];
+    u32 w = inst->base.type != null ? inst->base.type->width : 64;
+    u32 dvid = c->vregFor(&inst->base);
+    i32 dp = (i32)c->vregs[(usize)dvid].phys;
+    u8 useR = dp >= 0 ? (u8)dp : regs::SCRATCH_A;
+    /* dst starts as a; b overwrites when it wins */
+    loadToReg(c, a, useR, w);
+    i32 bvid = isVRegOperand(b) ? vmapFind(&c->vmap, b) : -1;
+    VReg* br = bvid >= 0 ? &c->vregs[(usize)bvid] : null;
+    str suff = w <= 32 ? "l" : "q";
+    bool bInSlot = br != null && br->phys < 0 && br->slot >= 0;
+    u8 bs = regs::SCRATCH_B;
+    /* materialize b into a reg BEFORE the cmp line — loadToReg emits
+     * whole lines and can't interleave inside an operand */
+    if (!bInSlot) loadToReg(c, b, bs, w);
+    c->emit("\tcmp"); c->emit(suff); c->emit(" ");
+    if (bInSlot)
+    {
+        c->emit("-"); c->emitI64((i64)spillOff(c, br->slot)); c->emit("(%rbp), ");
+    }
+    else c->emit(regForWidth(bs, w));
+    c->emit(", "); c->emit(regForWidth(useR, w)); c->emitLine("");
+    /* after cmp b,a: a-b. want dst=b when:
+     *  smin: a>b (SF!=OF -> use cmovg on a-b? a-b>0 => a>b) -> cmovg
+     *  Actually cmp src,dst computes dst-src = a-b. */
+    str cc = "";
+    bool hascc = false;
+    switch (inst->opcode)
+    {
+        IrOpcode::SMin => { cc = "cmovg "; hascc = true; },  /* a>b -> take b */
+        IrOpcode::SMax => { cc = "cmovl "; hascc = true; },  /* a<b -> take b */
+        IrOpcode::UMin => { cc = "cmova "; hascc = true; },  /* a>b unsigned -> take b */
+        IrOpcode::UMax => { cc = "cmovb "; hascc = true; },  /* a<b unsigned -> take b */
+        else => { }
+    }
+    if (hascc)
+    {
+        /* bs already holds b unless it was a slot operand */
+        if (bInSlot)
+        {
+            c->emit("\tmov"); c->emit(suff); c->emit(" -");
+            c->emitI64((i64)spillOff(c, br->slot)); c->emit("(%rbp), ");
+            c->emit(regForWidth(bs, w)); c->emitLine("");
+        }
+        c->emit("\t"); c->emit(cc); c->emit(regForWidth(bs, w)); c->emit(", ");
+        c->emit(regForWidth(useR, w)); c->emitLine("");
+    }
+    if (dp < 0) storeToVReg(c, dvid, useR, w);
+}
+
+/* Abs: dst = |a| via sign-mask */
+void iselAbs(EmitCtx* c, IrInst* inst)
+{
+    if (inst->nops < 1) return;
+    IrValue* src = inst->ops[0];
+    u32 w = inst->base.type != null ? inst->base.type->width : 64;
+    u32 dvid = c->vregFor(&inst->base);
+    i32 dp = (i32)c->vregs[(usize)dvid].phys;
+    u8 useR = dp >= 0 ? (u8)dp : regs::SCRATCH_A;
+    u8 ms = regs::SCRATCH_B;
+    loadToReg(c, src, useR, w);
+    /* narrow operands: sign-extend into 32 bits so the mask idiom
+     * sees a clean sign bit (upper bits may be garbage) */
+    if (w <= 8)
+    {
+        c->emit("\tmovsbl "); emitByteReg(c, useR); c->emit(", ");
+        c->emit(regForWidth(useR, 32)); c->emitLine("");
+        w = 32;
+    }
+    else if (w <= 16)
+    {
+        c->emit("\tmovswl "); emitWordReg(c, useR); c->emit(", ");
+        c->emit(regForWidth(useR, 32)); c->emitLine("");
+        w = 32;
+    }
+    /* ms = a >>s (w-1) ; useR = (a ^ ms) - ms */
+    c->emit("\tmov"); c->emit(w <= 32 ? "l" : "q"); c->emit(" ");
+    c->emit(regForWidth(useR, w)); c->emit(", ");
+    c->emit(regForWidth(ms, w)); c->emitLine("");
+    c->emit("\tsar"); c->emit(w <= 32 ? "l" : "q"); c->emit(" $");
+    c->emitU64((u64)(w - 1)); c->emit(", "); c->emit(regForWidth(ms, w)); c->emitLine("");
+    c->emit("\txor"); c->emit(w <= 32 ? "l" : "q"); c->emit(" ");
+    c->emit(regForWidth(ms, w)); c->emit(", "); c->emit(regForWidth(useR, w)); c->emitLine("");
+    c->emit("\tsub"); c->emit(w <= 32 ? "l" : "q"); c->emit(" ");
+    c->emit(regForWidth(ms, w)); c->emit(", "); c->emit(regForWidth(useR, w)); c->emitLine("");
+    if (dp < 0) storeToVReg(c, dvid, useR, w);
 }
 
 /* phys reg currently holding `av`, or -1 for const/mem/global/unmapped */
@@ -1851,30 +3062,56 @@ void emitCopyToVReg(EmitCtx* c, IrValue* src, u32 dstVid, u32 w)
     storeToVReg(c, dstVid, useR, w);
 }
 
-void emitPhiCopies(EmitCtx* c, IrBlock* pred)
+/* true when copying src into dstVid needs no instruction: same vreg,
+ * or both already sit in the same phys reg. */
+bool phiSrcIsIdentity(EmitCtx* c, u32 dvid, IrValue* src)
 {
-    /* gather (dstVid, src) pairs for phis in successors */
+    i32 svid = isVRegOperand(src) ? vmapFind(&c->vmap, src) : -1;
+    if (svid < 0) return false;
+    if ((u32)svid == dvid) return true;
+    VReg* dr = &c->vregs[(usize)dvid];
+    VReg* sr = &c->vregs[(usize)svid];
+    return dr->phys >= 0 && sr->phys == dr->phys;
+}
+
+u32 phiCopyCountFor(EmitCtx* c, IrBlock* pred, IrBlock* sb)
+{
+    if (pred == null || sb == null) return 0;
+    u32 n = 0;
+    for (u32 pi = 0; pi < sb->ninsts; pi++)
+    {
+        IrInst* phi = sb->insts[pi];
+        if (phi == null || phi->opcode != IrOpcode::Phi) break;
+        u32 dvid = c->vregFor(&phi->base);
+        for (u32 k = 0; k + 1 < phi->nops; k += 2)
+            if (phi->ops[k + 1] == &pred->base && phi->ops[k] != null &&
+                !phiSrcIsIdentity(c, dvid, phi->ops[k])) n++;
+    }
+    return n;
+}
+
+void emitPhiCopiesFor(EmitCtx* c, IrBlock* pred, IrBlock* sb)
+{
+    if (pred == null || sb == null) return;
+    /* gather (dstVid, src) pairs for phis in this successor */
     u32[256] ddst;
     IrValue*[256] ssrc;
     i32[256] scoef; /* -1 = normal src, >=0 = scratch reg index */
     u32 n = 0;
-    for (u32 si = 0; si < pred->nsuccs && n < 250; si++)
+    for (u32 pi = 0; pi < sb->ninsts && n < 256; pi++)
     {
-        IrBlock* sb = pred->succs[si];
-        if (sb == null) continue;
-        for (u32 pi = 0; pi < sb->ninsts; pi++)
+        IrInst* phi = sb->insts[pi];
+        if (phi == null || phi->opcode != IrOpcode::Phi) break;
+        u32 dvid = c->vregFor(&phi->base);
+        for (u32 k = 0; k + 1 < phi->nops && n < 256; k += 2)
         {
-            IrInst* phi = sb->insts[pi];
-            if (phi == null || phi->opcode != IrOpcode::Phi) break;
-            for (u32 k = 0; k + 1 < phi->nops && n < 256; k += 2)
+            if (phi->ops[k + 1] == &pred->base && phi->ops[k] != null &&
+                !phiSrcIsIdentity(c, dvid, phi->ops[k]))
             {
-                if (phi->ops[k + 1] == &pred->base && phi->ops[k] != null)
-                {
-                    ddst[n] = c->vregFor(&phi->base);
-                    ssrc[n] = phi->ops[k];
-                    scoef[n] = -1;
-                    n++;
-                }
+                ddst[n] = dvid;
+                ssrc[n] = phi->ops[k];
+                scoef[n] = -1;
+                n++;
             }
         }
     }
@@ -1951,10 +3188,23 @@ void emitPhiCopies(EmitCtx* c, IrBlock* pred)
     }
 }
 
+void emitPhiCopies(EmitCtx* c, IrBlock* pred)
+{
+    if (pred == null) return;
+    for (u32 si = 0; si < pred->nsuccs; si++)
+        emitPhiCopiesFor(c, pred, pred->succs[si]);
+}
+
 /* ================= top-level per-inst dispatch ================= */
 
 bool emitInst(EmitCtx* ctx, IrInst* inst, String* err)
 {
+    /* rax/rdx div results only survive an adjacent div-family inst */
+    switch (inst->opcode)
+    {
+        IrOpcode::UDiv | IrOpcode::SDiv | IrOpcode::URem | IrOpcode::SRem => {},
+        else => { ctx->divValid = 0; },
+    }
     switch (inst->opcode)
     {
         IrOpcode::Add => { iselAlu(ctx, inst, "add"); return true; },
@@ -1988,7 +3238,11 @@ bool emitInst(EmitCtx* ctx, IrInst* inst, String* err)
             if (dp < 0) storeToVReg(ctx, dvid, useR, w);
             return true;
         },
-        IrOpcode::ICmp => { iselICmp(ctx, inst); return true; },
+        IrOpcode::ICmp => {
+            u32 dv = ctx->vregFor(&inst->base);
+            if (ctx->vregs[dv].noEmit != 0) return true;
+            iselICmp(ctx, inst); return true;
+        },
         IrOpcode::UDiv => { iselDivRem(ctx, inst, false, false); return true; },
         IrOpcode::SDiv => { iselDivRem(ctx, inst, true, false); return true; },
         IrOpcode::URem => { iselDivRem(ctx, inst, false, true); return true; },
@@ -1996,9 +3250,14 @@ bool emitInst(EmitCtx* ctx, IrInst* inst, String* err)
         IrOpcode::Alloca => { iselAlloca(ctx, inst); return true; },
         IrOpcode::Load => { iselLoad(ctx, inst); return true; },
         IrOpcode::Store => { iselStore(ctx, inst); return true; },
-        IrOpcode::Gep => { iselGep(ctx, inst); return true; },
+        IrOpcode::Gep => {
+            u32 gv = ctx->vregFor(&inst->base);
+            if (ctx->vregs[gv].noEmit != 0) return true;
+            iselGep(ctx, inst); return true;
+        },
         IrOpcode::Br => { iselBr(ctx, inst); return true; },
         IrOpcode::CondBr => { iselCondBr(ctx, inst); return true; },
+        IrOpcode::Switch => { iselSwitch(ctx, inst); return true; },
         IrOpcode::Ret => { iselRet(ctx, inst); return true; },
         IrOpcode::Select => { iselSelect(ctx, inst); return true; },
         IrOpcode::Trunc | IrOpcode::Bitcast | IrOpcode::Zext | IrOpcode::Sext => {
@@ -2009,6 +3268,31 @@ bool emitInst(EmitCtx* ctx, IrInst* inst, String* err)
         },
         IrOpcode::Call => { iselCall(ctx, inst); return true; },
         IrOpcode::Phi => { return true; }, /* copies emitted on edges */
+        IrOpcode::FAdd => { iselFArith(ctx, inst, "addss", "addsd"); return true; },
+        IrOpcode::FSub => { iselFArith(ctx, inst, "subss", "subsd"); return true; },
+        IrOpcode::FMul => { iselFArith(ctx, inst, "mulss", "mulsd"); return true; },
+        IrOpcode::FDiv => { iselFArith(ctx, inst, "divss", "divsd"); return true; },
+        IrOpcode::FSqrt => { iselFArith(ctx, inst, "sqrtss", "sqrtsd"); return true; },
+        IrOpcode::Fma => { iselFma(ctx, inst); return true; },
+        IrOpcode::FAbs => { iselFAbs(ctx, inst); return true; },
+        IrOpcode::FCmp => { iselFCmp(ctx, inst); return true; },
+        IrOpcode::FpTrunc | IrOpcode::FpExt |
+        IrOpcode::SiToFp | IrOpcode::UiToFp |
+        IrOpcode::FpToSi | IrOpcode::FpToUi => {
+            iselFCast(ctx, inst); return true;
+        },
+        IrOpcode::CtPop | IrOpcode::CtLz | IrOpcode::CtTz |
+        IrOpcode::Bswap | IrOpcode::Rotl | IrOpcode::Rotr => {
+            iselBitop(ctx, inst); return true;
+        },
+        IrOpcode::MulHi | IrOpcode::SMulHi => {
+            iselMulHi(ctx, inst); return true;
+        },
+        IrOpcode::SMin | IrOpcode::SMax |
+        IrOpcode::UMin | IrOpcode::UMax => {
+            iselMinMax(ctx, inst); return true;
+        },
+        IrOpcode::Abs => { iselAbs(ctx, inst); return true; },
         else => {
             emitUnimplemented(ctx, inst, err);
             return false;
@@ -2030,6 +3314,8 @@ bool coalesceOps0(IrOpcode op)
         IrOpcode::Lshr | IrOpcode::Neg | IrOpcode::Not |
         IrOpcode::Trunc | IrOpcode::Bitcast | IrOpcode::Zext |
         IrOpcode::Sext | IrOpcode::ICmp | IrOpcode::Gep |
+        IrOpcode::FAdd | IrOpcode::FSub | IrOpcode::FMul |
+        IrOpcode::FDiv | IrOpcode::FSqrt | IrOpcode::FAbs |
         IrOpcode::Load | IrOpcode::Call => { return true; },
         else => { return false; },
     }
@@ -2174,6 +3460,40 @@ void runRegAlloc(EmitCtx* ctx)
     u64* adj = alloc<u64>((usize)n * (usize)words);
     for (usize i = 0; i < (usize)n * (usize)words; i++) adj[i] = 0;
 
+    /* values live at a block's entry are simultaneously live — they
+     * pairwise interfere. This is the ONLY edge source for values
+     * with no defining inst (function args): def-point edges never
+     * fire for them, so two live args could otherwise share a phys. */
+    for (u32 b = 0; b < nb; b++)
+    {
+        usize bw = (usize)b * (usize)words;
+        for (u32 w = 0; w < (u32)words; w++)
+        {
+            u64 bits = liveIn[bw + (usize)w];
+            while (bits != 0)
+            {
+                u32 bit = 0; u64 t = bits;
+                while ((t & 1) == 0) { t >>= 1; bit++; }
+                bits &= bits - 1;
+                u32 x = (w << 6) + bit;
+                if (x >= n) continue;
+                for (u32 w2 = 0; w2 < (u32)words; w2++)
+                {
+                    u64 bits2 = liveIn[bw + (usize)w2];
+                    while (bits2 != 0)
+                    {
+                        u32 bit2 = 0; u64 t2 = bits2;
+                        while ((t2 & 1) == 0) { t2 >>= 1; bit2++; }
+                        bits2 &= bits2 - 1;
+                        u32 y = (w2 << 6) + bit2;
+                        if (y <= x || y >= n) continue;
+                        adj[(usize)x * (usize)words + ((usize)y >> 6)] |= (u64)1 << (u64)(y & 63);
+                        adj[(usize)y * (usize)words + ((usize)x >> 6)] |= (u64)1 << (u64)(x & 63);
+                    }
+                }
+            }
+        }
+    }
 
     for (u32 b = 0; b < nb; b++)
     {
@@ -2298,7 +3618,9 @@ void runRegAlloc(EmitCtx* ctx)
         {
             for (u32 ci = 0; ci < ncall; ci++)
             {
-                if (callPos[ci] > defPos[v] && callPos[ci] < lastUse[v])
+                if (lastUse[v] != 0xFFFFFFFFu &&
+                    (defPos[v] == 0xFFFFFFFFu || callPos[ci] > defPos[v]) &&
+                    callPos[ci] < lastUse[v])
                 {
                     klass[v] = (klass[v] == 1) ? (u8)2 : (u8)3;
                     break;
@@ -2317,13 +3639,21 @@ void runRegAlloc(EmitCtx* ctx)
                      &regs::ALLOC_ORDER[0], regs::ALLOC_ORDER_LEN,
                      &regs::XMM_ALLOC_ORDER[0], regs::XMM_ALLOC_LEN,
                      &regs::CS_ALLOC_ORDER[0], regs::CS_ALLOC_LEN,
+                     null,
                      physOut, slotOut);
 
     for (u32 v = 0; v < n; v++)
     {
         ctx->vregs[v].phys = physOut[v];
         ctx->vregs[v].slot = slotOut[v];
-        if (physOut[v] >= 0 && regs::regIsCalleeSaved((u8)physOut[v]))
+        /* register file: xmm for sse-typed values, gpr otherwise.
+         * (the allocator's local klass[] also encodes spill-only /
+         * callee-saved hints — those live in phys/slot, not here) */
+        ctx->vregs[v].klass = typeIsSse(ctx->vregs[v].type) ? 1 : 0;
+        /* xmm phys indices share the 0-15 space with gprs — only gpr
+         * klass values can mark callee-saved regs used */
+        if (ctx->vregs[v].klass == 0 && physOut[v] >= 0 &&
+            regs::regIsCalleeSaved((u8)physOut[v]))
         {
             while (ctx->usedCallee.count() < 16) ctx->usedCallee.push((u8)0);
             ctx->usedCallee.atPtr((usize)physOut[v])[0] = 1;
@@ -2539,6 +3869,46 @@ void emitArgMoves(EmitCtx* c)
     }
 }
 
+/* ================= clang-style spacing =================
+ * LLVM emits instruction lines as `\t<mnemonic>\t<operands>` while
+ * directives (.cfi_*, .p2align) keep a single space. Our emitters write
+ * `\t<mnemonic> <operands>` everywhere, so normalize in one pass. */
+
+void clangifyLine(String* out, str line)
+{
+    if (line.len >= 2 && line.ptr[0] == '\t' && line.ptr[1] != '.' &&
+        line.ptr[1] != '#' && line.ptr[1] != ' ')
+    {
+        for (usize i = 1; i < line.len; i++)
+        {
+            if (line.ptr[i] == ' ')
+            {
+                out->appendView(str::fromParts(line.ptr, i));
+                out->pushChar('\t');
+                out->appendView(str::fromParts(line.ptr + i + 1, line.len - i - 1));
+                return;
+            }
+        }
+    }
+    out->appendView(line);
+}
+
+str clangifyAsm(str src)
+{
+    String out = String::new();
+    usize start = 0;
+    for (usize i = 0; i <= src.len; i++)
+    {
+        if (i == src.len || src.ptr[i] == 10)
+        {
+            clangifyLine(&out, str::fromParts(src.ptr + start, i - start));
+            out.pushChar('\n');
+            start = i + 1;
+        }
+    }
+    return out.asView();
+}
+
 /* ================= function driver ================= */
 
 pub str emitFuncAsm(IrFunc* func, IrContext* ctx)
@@ -2599,11 +3969,67 @@ pub str emitFuncAsm(IrFunc* func, IrContext* ctx)
             {
                 IrValue* ov = inst->ops[k];
                 if (ov == null || !isVRegOperand(ov)) continue;
-                ec.vregFor(ov);
+                u32 ovv = ec.vregFor(ov);
+                ec.vregs[ovv].nuses++;
             }
         }
     }
     runRegAlloc(&ec);
+
+    /* mark compares whose only use is a fused condbr: iselCondBr re-uses
+     * the icmp operands directly, so the setcc result would be dead. */
+    for (u32 b = 0; b < func->nblocks; b++)
+    {
+        IrBlock* bb = func->blocks[b];
+        if (bb == null) continue;
+        for (u32 i = 0; i < bb->ninsts; i++)
+        {
+            IrInst* inst = bb->insts[i];
+            if (inst == null || inst->opcode != IrOpcode::CondBr || inst->nops < 1)
+                continue;
+            IrValue* cond = inst->ops[0];
+            if (cond == null || cond->kind != IrValueKind::Inst) continue;
+            IrInst* ic = (IrInst*)cond;
+            if (ic->opcode != IrOpcode::ICmp) continue;
+            u32 cv = ec.vregFor(&ic->base);
+            if (ec.vregs[cv].nuses == 1) ec.vregs[cv].noEmit = 1;
+        }
+    }
+
+    /* const-gep folding: a gep with all-constant indices whose every
+     * user is another gep (as its base operand) never needs a register
+     * — users fold through it via gepFoldRoot. Dead geps (no users)
+     * qualify too. */
+    for (u32 b = 0; b < func->nblocks; b++)
+    {
+        IrBlock* bb = func->blocks[b];
+        if (bb == null) continue;
+        for (u32 i = 0; i < bb->ninsts; i++)
+        {
+            IrInst* inst = bb->insts[i];
+            if (inst == null || inst->opcode != IrOpcode::Gep || inst->nops < 2)
+                continue;
+            bool allConst = true;
+            for (u32 gi = 1; gi < inst->nops; gi++)
+                if (inst->ops[gi] == null ||
+                    inst->ops[gi]->kind != IrValueKind::ConstInt)
+                    allConst = false;
+            if (!allConst) continue;
+            bool foldable = true;
+            for (u32 ui = 0; ui < inst->base.nusers; ui++)
+            {
+                IrInst* u = inst->base.users[ui];
+                if (u == null || u->opcode != IrOpcode::Gep || u->nops < 1 ||
+                    u->ops[0] != &inst->base)
+                { foldable = false; break; }
+            }
+            if (foldable)
+            {
+                u32 gv = ec.vregFor(&inst->base);
+                ec.vregs[gv].noEmit = 1;
+            }
+        }
+    }
 
     /* pre-scan allocas so the prologue reserves their frame space */
     for (u32 b = 0; b < func->nblocks; b++)
@@ -2622,6 +4048,43 @@ pub str emitFuncAsm(IrFunc* func, IrContext* ctx)
         }
     }
 
+    /* alloca folding: an alloca used only as the base operand of
+     * all-const geps never needs a register — every use folds to
+     * rbp-off(+const) inside iselGep. Mark noEmit and pre-assign the
+     * frame slot so allocaOffOf resolves during emission. */
+    for (u32 b = 0; b < func->nblocks; b++)
+    {
+        IrBlock* bb = func->blocks[b];
+        if (bb == null) continue;
+        for (u32 i = 0; i < bb->ninsts; i++)
+        {
+            IrInst* inst = bb->insts[i];
+            if (inst == null || inst->opcode != IrOpcode::Alloca) continue;
+            bool foldable = true;
+            for (u32 ui = 0; ui < inst->base.nusers; ui++)
+            {
+                IrInst* u = inst->base.users[ui];
+                if (u == null || u->opcode != IrOpcode::Gep || u->nops < 1 ||
+                    u->ops[0] != &inst->base)
+                { foldable = false; break; }
+                bool uc = true;
+                for (u32 gi = 1; gi < u->nops; gi++)
+                    if (u->ops[gi] == null ||
+                        u->ops[gi]->kind != IrValueKind::ConstInt)
+                        uc = false;
+                if (!uc) { foldable = false; break; }
+            }
+            if (!foldable) continue;
+            IrType* et = inst->base.type;
+            if (et != null && et->kind == IrTypeKind::Ptr) et = et->elem;
+            u32 sz = et != null ? ctx->irTypeSizeOf(et) : 8;
+            if (sz == 0) sz = 8;
+            allocaSlotFor(&ec, &inst->base, sz);
+            u32 av = ec.vregFor(&inst->base);
+            ec.vregs[av].noEmit = 1;
+        }
+    }
+
     ec.forceFrame = funcNeedsFrame(func);
 
     /* header + prologue, clang-style layout */
@@ -2629,6 +4092,9 @@ pub str emitFuncAsm(IrFunc* func, IrContext* ctx)
     ec.emitLine("\t.text");
     ec.emit("\t.globl\t"); ec.emit(func->base.name);
     emitFuncBeginComment(&ec, func->base.name);
+    /* GNU as rejects a symbol in .p2align's max-skip operand (clang's
+     * `.p2align 4, .Lfunc_endN, nop` is llvm-mc syntax), so keep the
+     * bare form. */
     ec.emit("\t.p2align\t4\n");
     ec.emit("\t.type\t"); ec.emit(func->base.name); ec.emit(",@function\n");
     ec.emit(func->base.name); ec.emit(":");
@@ -2641,14 +4107,17 @@ pub str emitFuncAsm(IrFunc* func, IrContext* ctx)
     {
         IrBlock* bb = func->blocks[b];
         if (bb == null) continue;
+        ec.emit("# %bb."); ec.emitU64((u64)b); ec.emitLine(":");
+        ec.divValid = 0;
         emitBBLabelFor(&ec, &bb->base);
         for (u32 i = 0; i < bb->ninsts; i++)
         {
             IrInst* inst = bb->insts[i];
             if (inst == null) continue;
-            /* phi copies go on the edge: emit right before terminator */
-            if (inst->opcode == IrOpcode::Br || inst->opcode == IrOpcode::CondBr ||
-                inst->opcode == IrOpcode::Switch)
+            /* phi copies go on the edge: emit right before terminator.
+             * CondBr/Switch handle their own per-edge copies inside
+             * their isel (each edge is distinct). */
+            if (inst->opcode == IrOpcode::Br)
                 emitPhiCopies(&ec, bb);
             String err = String::new();
             if (!emitInst(&ec, inst, &err))
@@ -2666,7 +4135,7 @@ pub str emitFuncAsm(IrFunc* func, IrContext* ctx)
     ec.emitLine("\t.cfi_endproc");
     emitFuncEndComment(&ec);
 
-    str result = ec.out.asView();
+    str result = clangifyAsm(ec.out.asView());
     if (ec.vregs != null) dealloc<VReg>(ec.vregs);
     if (ec.allocaVals != null) dealloc<IrValue*>(ec.allocaVals);
     if (ec.allocaOffs != null) dealloc<i32>(ec.allocaOffs);
@@ -2845,7 +4314,7 @@ void emitDataAsm(String* out, IrModule* modd, IrContext* ctx)
     if (modd == null) return;
     if (modd->nconstStrings > 0)
     {
-        out->appendView("\t.section .rodata\n");
+        out->appendView("\t.section\t.rodata\n");
         for (u32 i = 0; i < modd->nconstStrings; i++)
         {
             IrStringConst* sc = modd->constStrings[i];
@@ -2867,7 +4336,7 @@ void emitDataAsm(String* out, IrModule* modd, IrContext* ctx)
     {
         IrGlobal* g = modd->globals[gi];
         if (g == null || g->isExtern) continue;
-        out->appendView(g->isConst ? "\t.section .rodata\n" : "\t.data\n");
+        out->appendView(g->isConst ? "\t.section\t.rodata\n" : "\t.section\t.data\n");
         u32 align = g->alignment != 0 ? g->alignment : 8;
         emitDataAlign(out, align);
         out->appendView("\t.type\t"); out->appendView(g->base.name); out->appendView(",@object\n");
@@ -2902,7 +4371,8 @@ pub str emitModuleAsm(IrModule* modd, IrContext* ctx)
         if (s.len > 0) { out.appendView(s); out.pushChar('\n'); }
     }
     emitDataAsm(&out, modd, ctx);
-    out.appendView("\n\t.section .note.GNU-stack,\"\",@progbits\n");
+    out.appendView("\n\t.ident\t\"muvm\"\n");
+    out.appendView("\t.section\t\".note.GNU-stack\",\"\",@progbits\n");
     return out.asView();
 }
 
