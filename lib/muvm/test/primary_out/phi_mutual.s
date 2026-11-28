@@ -17,11 +17,11 @@ main:                                   # @main
 # %bb.0:
 .LBB1_3:
 	leaq	-16(%rbp), %rdi
-	movq	%rdi, %r9
+	movq	%rdi, %rsi
 	movq	%rdi, %r8
 	movq	%r8, %r10
-	movq	%r10, %r9
-	movq	%r9, %r8
+	movq	%r10, %rsi
+	movq	%rsi, %r8
 	jmp	.LBB1_6
 # %bb.1:
 .LBB1_6:
@@ -30,7 +30,7 @@ main:                                   # @main
 	jmp	.LBB1_6
 # %bb.2:
 .LBB1_7:
-	movq	(%r9), %rdi
+	movq	(%rsi), %rdi
 	movl	%edi, %eax
 	movq	%rbp, %rsp
 	popq	%rbp
