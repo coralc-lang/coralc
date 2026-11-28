@@ -1,0 +1,549 @@
+#[[no_drop_all]]
+import muvm::irtypes {
+    IrModule, IrFunc, IrBlock, IrInst, IrValue, IrValueKind,
+    IrType, IrTypeKind, IrContext, IrGlobal, IrStringConst,
+    IrArrayConst, IrStructConst, IrStructType
+};
+import muvm::irOps { IrOpcode, IrICmpPred, IrFCmpPred, irOpcodeStr };
+import muvm::regalloc::graph { graphAssignNodes };
+import std::string { String };
+import std::mman { alloc, dealloc, copy };
+import std::vec { Vec };
+import platform::libc { snprintf };
+import core::cchar { cchar };
+
+use muvm::target::primary::x86_64::linux::regs;
+use muvm::target::primary::x86_64::linux::linux { ArgClass, classifyArg, typeSizeBytes, typeIsSse, INT_ARG_REGS, SSE_ARG_REGS };
+use muvm::target::primary::x86_64::linux::prologue;
+
+use muvm::target::primary::x86_64::linux::core { EmitCtx, VReg, intSfx, isVRegOperand, loadToReg, regForWidth, regName, regW, spillOff, storeImmEncodable, storeToVReg, vmapFind };
+use muvm::target::primary::x86_64::linux::isel_int { emitCmpPair };
+use muvm::target::primary::x86_64::linux::simd { simdCopyVec, simdLoadVec, simdStoreVec };
+
+pub void emitBBLabelName(EmitCtx* c, IrValue* bv)
+{
+    c->emit(".LBB"); c->emitU64((u64)c->func->base.id); c->emit("_");
+    c->emitU64(bv != null ? (u64)bv->id : (u64)0);
+}
+
+pub void emitBBLabelFor(EmitCtx* c, IrValue* bv)
+{
+    emitBBLabelName(c, bv);
+    c->emitLine(":");
+}
+
+pub void emitJmpToBB(EmitCtx* c, IrValue* target)
+{
+    c->emit("\tjmp "); emitBBLabelName(c, target); c->emitLine("");
+}
+
+pub void emitJccToBB(EmitCtx* c, str jcc, IrValue* target)
+{
+    c->emit("\t"); c->emit(jcc); c->emit(" ");
+    emitBBLabelName(c, target); c->emitLine("");
+}
+
+pub void iselBr(EmitCtx* c, IrInst* inst)
+{
+    if (inst->nops > 0 && inst->ops[0] != null) emitJmpToBB(c, inst->ops[0]);
+}
+
+/* jcc mnemonic for an ICmp pred (used by condbr fusion) */
+pub str jccFor(IrICmpPred p)
+{
+    switch (p)
+    {
+        IrICmpPred::Eq => { return "je"; },
+        IrICmpPred::Ne => { return "jne"; },
+        IrICmpPred::Slt => { return "jl"; },
+        IrICmpPred::Sle => { return "jle"; },
+        IrICmpPred::Sgt => { return "jg"; },
+        IrICmpPred::Sge => { return "jge"; },
+        IrICmpPred::Ult => { return "jb"; },
+        IrICmpPred::Ule => { return "jbe"; },
+        IrICmpPred::Ugt => { return "ja"; },
+        IrICmpPred::Uge => { return "jae"; },
+    }
+    return "jne";
+}
+
+pub str jccInverseFor(IrICmpPred p)
+{
+    switch (p)
+    {
+        IrICmpPred::Eq => { return "jne"; },
+        IrICmpPred::Ne => { return "je"; },
+        IrICmpPred::Slt => { return "jge"; },
+        IrICmpPred::Sle => { return "jg"; },
+        IrICmpPred::Sgt => { return "jle"; },
+        IrICmpPred::Sge => { return "jl"; },
+        IrICmpPred::Ult => { return "jae"; },
+        IrICmpPred::Ule => { return "ja"; },
+        IrICmpPred::Ugt => { return "jbe"; },
+        IrICmpPred::Uge => { return "jb"; },
+    }
+    return "je";
+}
+
+IrBlock* blockOperand(IrValue* v)
+{
+    if (v == null || v->kind != IrValueKind::Block) return null;
+    return (IrBlock*)v;
+}
+
+pub void emitPhiEdgeName(EmitCtx* c, IrInst* inst, str tag)
+{
+    c->emit(".Lphi"); c->emitU64((u64)c->func->base.id); c->emit("_");
+    c->emitU64((u64)inst->base.id); c->emit("_"); c->emit(tag);
+}
+
+/* conditional branch with edge phi copies: the false-edge jump goes first
+ * (flags still live), true-edge copies run on the fallthrough, and the
+ * false edge either jumps straight to its block or through a trampoline
+ * that performs its phi copies. */
+pub void emitCondBrEdges(EmitCtx* c, IrInst* inst, str falseJcc, IrValue* tb, IrValue* fb)
+{
+    IrBlock* pred = inst->parent;
+    IrBlock* tbb = blockOperand(tb);
+    IrBlock* fbb = blockOperand(fb);
+    bool tphi = tbb != null && pred != null && phiCopyCountFor(c, pred, tbb) > 0;
+    bool fphi = fbb != null && pred != null && phiCopyCountFor(c, pred, fbb) > 0;
+    if (!tphi && !fphi)
+    {
+        emitJccToBB(c, falseJcc, fb);
+        emitJmpToBB(c, tb);
+        return;
+    }
+    if (fphi)
+    {
+        c->emit("\t"); c->emit(falseJcc); c->emit(" ");
+        emitPhiEdgeName(c, inst, "f"); c->emitLine("");
+        if (tphi) emitPhiCopiesFor(c, pred, tbb);
+        emitJmpToBB(c, tb);
+        emitPhiEdgeName(c, inst, "f"); c->emitLine(":");
+        emitPhiCopiesFor(c, pred, fbb);
+        emitJmpToBB(c, fb);
+    }
+    else
+    {
+        emitJccToBB(c, falseJcc, fb);
+        if (tphi) emitPhiCopiesFor(c, pred, tbb);
+        emitJmpToBB(c, tb);
+    }
+}
+
+pub void iselCondBr(EmitCtx* c, IrInst* inst)
+{
+    IrValue* cond = inst->nops > 0 ? inst->ops[0] : null;
+    IrValue* tb = inst->nops > 1 ? inst->ops[1] : null;
+    IrValue* fb = inst->nops > 2 ? inst->ops[2] : null;
+    /* fused icmp: cond produced by a single-use ICmp inst -> cmp+jcc */
+    if (cond != null && cond->kind == IrValueKind::Inst &&
+        ((IrInst*)cond)->opcode == IrOpcode::ICmp)
+    {
+        IrInst* ic = (IrInst*)cond;
+        IrValue* a = ic->nops > 0 ? ic->ops[0] : null;
+        IrValue* b = ic->nops > 1 ? ic->ops[1] : null;
+        u32 w = a != null && a->type != null ? a->type->width : 64;
+        emitCmpPair(c, a, b, w);
+        emitCondBrEdges(c, inst, jccInverseFor(ic->icmpPred), tb, fb);
+        return;
+    }
+    /* generic: test cond, jcc */
+    if (cond != null && cond->kind == IrValueKind::ConstInt)
+    {
+        IrValue* tgt = cond->valData != 0 ? tb : fb;
+        IrBlock* sb = blockOperand(tgt);
+        if (sb != null && inst->parent != null) emitPhiCopiesFor(c, inst->parent, sb);
+        emitJmpToBB(c, tgt);
+        return;
+    }
+    u32 w = cond != null && cond->type != null ? regW(cond->type->width) : 64;
+    i32 cvid = isVRegOperand(cond) ? vmapFind(&c->vmap, cond) : -1;
+    if (cvid >= 0 && c->vregs[(usize)cvid].phys >= 0 &&
+        c->vregs[(usize)cvid].klass != 1)
+    {
+        str r = regForWidth((u8)c->vregs[(usize)cvid].phys, w);
+        c->emit("\ttest"); c->emit(intSfx(w)); c->emit(" ");
+        c->emit(r); c->emit(", "); c->emit(r); c->emitLine("");
+    }
+    else if (cvid >= 0 && c->vregs[(usize)cvid].phys < 0)
+    {
+        c->emit("\tcmp"); c->emit(intSfx(w)); c->emit(" $0, -");
+        c->emitI64((i64)spillOff(c, c->vregs[(usize)cvid].slot));
+        c->emit("(%rbp)"); c->emitLine("");
+    }
+    else
+    {
+        c->emit("\t# isel: unsupported condbr operand\n");
+        return;
+    }
+    emitCondBrEdges(c, inst, "je", tb, fb);
+}
+
+/* ================= switch =================
+ * ops: [sel, defaultBlock, (caseVal, caseBlock)*]. Each edge may carry
+ * phi copies, so edges with copies jump through a per-edge trampoline
+ * `.Lsw<func>_<inst>_<idx>` (idx == ncases is the default edge). */
+
+pub void emitSwLabelName(EmitCtx* c, IrInst* inst, u32 idx)
+{
+    c->emit(".Lsw"); c->emitU64((u64)c->func->base.id); c->emit("_");
+    c->emitU64((u64)inst->base.id); c->emit("_"); c->emitU64((u64)idx);
+}
+
+pub bool swEdgeNeedsTramp(EmitCtx* c, IrInst* inst, IrValue* blkVal, u32 idx)
+{
+    (void)idx;
+    IrBlock* sb = blockOperand(blkVal);
+    IrBlock* pred = inst->parent;
+    if (sb == null || pred == null) return false;
+    return phiCopyCountFor(c, pred, sb) > 0;
+}
+
+/* append the reference for edge idx: trampoline label or BB label */
+pub void emitSwTargetRef(EmitCtx* c, IrInst* inst, IrValue* blkVal, u32 idx)
+{
+    if (swEdgeNeedsTramp(c, inst, blkVal, idx)) emitSwLabelName(c, inst, idx);
+    else emitBBLabelName(c, blkVal);
+}
+
+pub void emitSwTrampoline(EmitCtx* c, IrInst* inst, IrValue* blkVal, u32 idx)
+{
+    if (!swEdgeNeedsTramp(c, inst, blkVal, idx)) return;
+    emitSwLabelName(c, inst, idx); c->emitLine(":");
+    IrBlock* sb = blockOperand(blkVal);
+    emitPhiCopiesFor(c, inst->parent, sb);
+    emitJmpToBB(c, blkVal);
+}
+
+pub void emitSwTableLabel(EmitCtx* c, IrInst* inst)
+{
+    c->emit(".LJTI"); c->emitU64((u64)c->func->base.id); c->emit("_");
+    c->emitU64((u64)inst->base.id);
+}
+
+pub void iselSwitch(EmitCtx* c, IrInst* inst)
+{
+    IrValue* sel = inst->nops > 0 ? inst->ops[0] : null;
+    IrValue* def = inst->nops > 1 ? inst->ops[1] : null;
+    u32 ncases = inst->nops >= 2 ? (inst->nops - 2) / 2 : 0;
+    if (sel == null || def == null || ncases == 0)
+    {
+        c->emit("\t# isel: malformed switch\n");
+        return;
+    }
+    u32 w = sel->type != null ? sel->type->width : 64;
+    u32 rw = regW(w);
+    u64 mask = 0xFFFFFFFFFFFFFFFFULL;
+    if (w < 64) mask = ((u64)1 << (u64)w) - 1;
+
+    u64* cvals = alloc<u64>((usize)ncases);
+    IrValue** cblks = alloc<IrValue*>((usize)ncases);
+    bool allConst = true;
+    u64 vmin = 0xFFFFFFFFFFFFFFFFULL;
+    u64 vmax = 0;
+    for (u32 i = 0; i < ncases; i++)
+    {
+        IrValue* cv = inst->ops[2 + i * 2];
+        cblks[i] = inst->ops[3 + i * 2];
+        if (cv == null || cv->kind != IrValueKind::ConstInt)
+        { allConst = false; cvals[i] = 0; continue; }
+        u64 v = cv->valData & mask;
+        cvals[i] = v;
+        if (v < vmin) vmin = v;
+        if (v > vmax) vmax = v;
+    }
+    u64 span = (vmax >= vmin) ? (vmax - vmin + 1) : 0;
+    bool useTable = allConst && span > 0 && span <= 256 &&
+                    span <= (u64)ncases * 8 &&
+                    storeImmEncodable(w, vmin); /* sub $vmin must encode */
+
+    if (useTable)
+    {
+        /* sel - vmin in r10, unsigned range check, PIC jump table */
+        loadToReg(c, sel, regs::SCRATCH_A, w);
+        str sreg = regForWidth(regs::SCRATCH_A, rw);
+        if (vmin != 0)
+        {
+            c->emit("\tsub"); c->emit(intSfx(rw)); c->emit(" $");
+            c->emitU64(vmin); c->emit(", "); c->emit(sreg); c->emitLine("");
+        }
+        c->emit("\tcmp"); c->emit(intSfx(rw)); c->emit(" $");
+        c->emitU64(span - 1); c->emit(", "); c->emit(sreg); c->emitLine("");
+        c->emit("\tja "); emitSwTargetRef(c, inst, def, ncases); c->emitLine("");
+        c->emit("\tleaq "); emitSwTableLabel(c, inst); c->emit("(%rip), ");
+        c->emit(regForWidth(regs::SCRATCH_B, 64)); c->emitLine("");
+        c->emit("\tmovslq ("); c->emit(regForWidth(regs::SCRATCH_B, 64));
+        c->emit(","); c->emit(regForWidth(regs::SCRATCH_A, 64));
+        c->emit(",4), "); c->emit(regForWidth(regs::SCRATCH_A, 64));
+        c->emitLine("");
+        c->emit("\taddq "); c->emit(regForWidth(regs::SCRATCH_B, 64));
+        c->emit(", "); c->emit(regForWidth(regs::SCRATCH_A, 64));
+        c->emitLine("");
+        c->emit("\tjmp *"); c->emit(regForWidth(regs::SCRATCH_A, 64));
+        c->emitLine("");
+        /* table in .rodata: 32-bit offsets from the table base —
+         * position-independent and linker-resolved */
+        c->emitLine("\t.section\t.rodata");
+        c->emit("\t.p2align\t2\n");
+        emitSwTableLabel(c, inst); c->emitLine(":");
+        for (u64 e = 0; e < span; e++)
+        {
+            u64 want = vmin + e;
+            u32 hit = ncases;
+            for (u32 i = 0; i < ncases; i++)
+                if (cvals[i] == want) { hit = i; break; }
+            IrValue* tb = hit < ncases ? cblks[hit] : def;
+            c->emit("\t.long ");
+            emitSwTargetRef(c, inst, tb, hit);
+            c->emit("-"); emitSwTableLabel(c, inst); c->emitLine("");
+        }
+        c->emitLine("\t.text");
+        for (u32 i = 0; i < ncases; i++)
+            emitSwTrampoline(c, inst, cblks[i], i);
+        emitSwTrampoline(c, inst, def, ncases);
+    }
+    else
+    {
+        /* compare chain */
+        for (u32 i = 0; i < ncases; i++)
+        {
+            IrValue* cv = inst->ops[2 + i * 2];
+            if (cv == null) continue;
+            emitCmpPair(c, sel, cv, w);
+            c->emit("\tje "); emitSwTargetRef(c, inst, cblks[i], i);
+            c->emitLine("");
+        }
+        c->emit("\tjmp "); emitSwTargetRef(c, inst, def, ncases); c->emitLine("");
+        for (u32 i = 0; i < ncases; i++)
+            emitSwTrampoline(c, inst, cblks[i], i);
+        emitSwTrampoline(c, inst, def, ncases);
+    }
+    if (cvals != null) dealloc<u64>(cvals);
+    if (cblks != null) dealloc<IrValue*>(cblks);
+}
+
+/* epilogue: restore callee-saved (reverse), rbp, ret */
+pub void emitEpilogue(EmitCtx* c)
+{
+    bool frame = c->forceFrame || c->ncallee > 0 || c->frameSize > 0 || c->allocaBytes > 0;
+    if (frame)
+    {
+        /* rsp -> just below callee pushes, then pop in reverse */
+        if (c->savedBytes > 0)
+        {
+            c->emit("\tleaq -"); c->emitI64((i64)c->savedBytes);
+            c->emit("(%rbp), %rsp\n");
+        }
+        else
+            c->emitLine("\tmovq %rbp, %rsp");
+        for (u32 i = c->ncallee; i > 0; i--)
+        {
+            c->emit("\tpopq "); c->emit(regName(c->calleeList[i-1])); c->emitLine("");
+            c->emit("\t.cfi_restore "); c->emit(regName(c->calleeList[i-1])); c->emitLine("");
+        }
+        c->emitLine("\tpopq %rbp");
+        c->emitLine("\t.cfi_restore %rbp");
+    }
+    c->emitLine("\t.cfi_def_cfa %rsp, 8");
+    c->emitLine("\tretq");
+}
+
+pub void iselRet(EmitCtx* c, IrInst* inst)
+{
+    IrValue* rv = inst->nops > 0 ? inst->ops[0] : null;
+    IrType* rt = c->func->retType;
+    if (rv != null && rt != null && rt->kind != IrTypeKind::Void)
+    {
+        u32 sz = typeSizeBytes(rt);
+        if (sz <= 8)
+        {
+            u32 w = rt->kind == IrTypeKind::Int ? rt->width : 64;
+            loadToReg(c, rv, regs::RAX, w);
+        }
+        else
+        {
+            c->emit("\t# isel: multi-register/aggregate return unsupported\n");
+        }
+    }
+    emitEpilogue(c);
+}
+
+
+/* ================= phi copies ================= */
+
+pub void emitCopyToVReg(EmitCtx* c, IrValue* src, u32 dstVid, u32 w)
+{
+    /* vector phi dst: 16B copy through xmm homes */
+    if (dstVid < c->nvregs && c->vregs[(usize)dstVid].klass == 1)
+    {
+        simdCopyVec(c, src, dstVid);
+        return;
+    }
+    i32 dp = (i32)c->vregs[(usize)dstVid].phys;
+    u8 useR = dp >= 0 ? (u8)dp : regs::SCRATCH_A;
+    loadToReg(c, src, useR, w);
+    storeToVReg(c, dstVid, useR, w);
+}
+
+/* true when copying src into dstVid needs no instruction: same vreg,
+ * or both already sit in the same phys reg. */
+pub bool phiSrcIsIdentity(EmitCtx* c, u32 dvid, IrValue* src)
+{
+    i32 svid = isVRegOperand(src) ? vmapFind(&c->vmap, src) : -1;
+    if (svid < 0) return false;
+    if ((u32)svid == dvid) return true;
+    VReg* dr = &c->vregs[(usize)dvid];
+    VReg* sr = &c->vregs[(usize)svid];
+    return dr->phys >= 0 && sr->phys == dr->phys;
+}
+
+pub u32 phiCopyCountFor(EmitCtx* c, IrBlock* pred, IrBlock* sb)
+{
+    if (pred == null || sb == null) return 0;
+    u32 n = 0;
+    for (u32 pi = 0; pi < sb->ninsts; pi++)
+    {
+        IrInst* phi = sb->insts[pi];
+        if (phi == null || phi->opcode != IrOpcode::Phi) break;
+        u32 dvid = c->vregFor(&phi->base);
+        for (u32 k = 0; k + 1 < phi->nops; k += 2)
+            if (phi->ops[k + 1] == &pred->base && phi->ops[k] != null &&
+                !phiSrcIsIdentity(c, dvid, phi->ops[k])) n++;
+    }
+    return n;
+}
+
+pub void emitPhiCopiesFor(EmitCtx* c, IrBlock* pred, IrBlock* sb)
+{
+    if (pred == null || sb == null) return;
+    /* gather (dstVid, src) pairs for phis in this successor */
+    u32[256] ddst;
+    IrValue*[256] ssrc;
+    i32[256] scoef; /* -1 = normal src, >=0 = scratch reg index */
+    u32 n = 0;
+    for (u32 pi = 0; pi < sb->ninsts && n < 256; pi++)
+    {
+        IrInst* phi = sb->insts[pi];
+        if (phi == null || phi->opcode != IrOpcode::Phi) break;
+        u32 dvid = c->vregFor(&phi->base);
+        for (u32 k = 0; k + 1 < phi->nops && n < 256; k += 2)
+        {
+            if (phi->ops[k + 1] == &pred->base && phi->ops[k] != null &&
+                !phiSrcIsIdentity(c, dvid, phi->ops[k]))
+            {
+                ddst[n] = dvid;
+                ssrc[n] = phi->ops[k];
+                scoef[n] = -1;
+                n++;
+            }
+        }
+    }
+    if (n == 0) return;
+    u8[256] done;
+    for (u32 i = 0; i < n; i++) done[i] = 0;
+    u8[2] scrBusy = { 0, 0 };
+    u8 xmmBusy = 0; /* XMM15 is the single xmm cycle scratch */
+    u32 remaining = n;
+    while (remaining > 0)
+    {
+        bool progress = false;
+        for (u32 i = 0; i < n; i++)
+        {
+            if (done[i]) continue;
+            /* conflict: src vreg is itself a pending dst */
+            i32 svid = scoef[i] < 0 && isVRegOperand(ssrc[i])
+                       ? vmapFind(&c->vmap, ssrc[i]) : -1;
+            bool conflict = false;
+            if (svid >= 0)
+            {
+                for (u32 j = 0; j < n; j++)
+                    if (!done[j] && ddst[j] == (u32)svid) { conflict = true; break; }
+            }
+            if (conflict) continue;
+            /* emit */
+            u32 w = c->vregs[(usize)ddst[i]].type != null
+                    ? c->vregs[(usize)ddst[i]].type->width : 64;
+            if (scoef[i] >= 0)
+            {
+                /* src is scratch: r10/r11 for gpr, XMM15 (idx 2) for xmm */
+                if (scoef[i] == 2)
+                {
+                    simdStoreVec(c, ddst[i], regs::XMM15);
+                }
+                else
+                {
+                    storeToVReg(c, ddst[i],
+                                scoef[i] == 0 ? regs::SCRATCH_A : regs::SCRATCH_B, w);
+                }
+            }
+            else emitCopyToVReg(c, ssrc[i], ddst[i], w);
+            done[i] = 1;
+            remaining--;
+            progress = true;
+        }
+        if (!progress && remaining > 0)
+        {
+            /* cycle: break via scratch r10 (idx0) or r11 (idx1) */
+            u32 i = 0;
+            while (i < n && (done[i] || scoef[i] >= 0)) i++;
+            if (i >= n) break;
+            u32 w = c->vregs[(usize)ddst[i]].type != null
+                    ? c->vregs[(usize)ddst[i]].type->width : 64;
+            /* vector dst: break the cycle through XMM15 instead of a
+             * gpr scratch (16B won't fit) */
+            if (ddst[i] < c->nvregs && c->vregs[(usize)ddst[i]].klass == 1)
+            {
+                if (xmmBusy)
+                {
+                    c->emit("\t# phi cycle overflow (xmm)\n");
+                    for (u32 j = 0; j < n; j++) done[j] = 1;
+                    break;
+                }
+                xmmBusy = 1;
+                simdLoadVec(c, ssrc[i], regs::XMM15);
+                i32 svid = isVRegOperand(ssrc[i]) ? vmapFind(&c->vmap, ssrc[i]) : -1;
+                for (u32 j = 0; j < n; j++)
+                {
+                    if (done[j] || j == i) continue;
+                    if (scoef[j] < 0 && svid >= 0 && isVRegOperand(ssrc[j]) &&
+                        vmapFind(&c->vmap, ssrc[j]) == svid)
+                        scoef[j] = 2;
+                }
+                scoef[i] = 2;
+                continue;
+            }
+            u32 scrIdx = scrBusy[0] ? 1 : 0;
+            if (scrBusy[0] && scrBusy[1])
+            {
+                c->emit("\t# phi cycle overflow\n");
+                for (u32 j = 0; j < n; j++) done[j] = 1;
+                break;
+            }
+            scrBusy[scrIdx] = 1;
+            /* save src_i into scratch */
+            loadToReg(c, ssrc[i], scrIdx == 0 ? regs::SCRATCH_A : regs::SCRATCH_B, w);
+            /* all pending copies whose src == ssrc_i vreg now read scratch */
+            i32 svid = isVRegOperand(ssrc[i]) ? vmapFind(&c->vmap, ssrc[i]) : -1;
+            for (u32 j = 0; j < n; j++)
+            {
+                if (done[j] || j == i) continue;
+                if (scoef[j] < 0 && svid >= 0 && isVRegOperand(ssrc[j]) &&
+                    vmapFind(&c->vmap, ssrc[j]) == svid)
+                    scoef[j] = (i32)scrIdx;
+            }
+            scoef[i] = (i32)scrIdx;
+            /* dst_i now reads scratch — will resolve next pass since
+             * scratch isn't a vreg dst */
+        }
+    }
+}
+
+pub void emitPhiCopies(EmitCtx* c, IrBlock* pred)
+{
+    if (pred == null) return;
+    for (u32 si = 0; si < pred->nsuccs; si++)
+        emitPhiCopiesFor(c, pred, pred->succs[si]);
+}
+

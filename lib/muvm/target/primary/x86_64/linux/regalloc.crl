@@ -1,0 +1,412 @@
+#[[no_drop_all]]
+import muvm::irtypes {
+    IrModule, IrFunc, IrBlock, IrInst, IrValue, IrValueKind,
+    IrType, IrTypeKind, IrContext, IrGlobal, IrStringConst,
+    IrArrayConst, IrStructConst, IrStructType
+};
+import muvm::irOps { IrOpcode, IrICmpPred, IrFCmpPred, irOpcodeStr };
+import muvm::regalloc::graph { graphAssignNodes };
+import std::string { String };
+import std::mman { alloc, dealloc, copy };
+import std::vec { Vec };
+import platform::libc { snprintf };
+import core::cchar { cchar };
+
+use muvm::target::primary::x86_64::linux::regs;
+use muvm::target::primary::x86_64::linux::linux { ArgClass, classifyArg, typeSizeBytes, typeIsSse, INT_ARG_REGS, SSE_ARG_REGS };
+use muvm::target::primary::x86_64::linux::prologue;
+
+use muvm::target::primary::x86_64::linux::core { EmitCtx, blockIndexOf, instHasDef, isVRegOperand, vmapFind };
+
+/* ================= liveness + regalloc ================= */
+
+/* opcodes where ops[0] is materialized into dst first and may share
+ * its color when it dies at the def (2-address coalescing) */
+pub bool coalesceOps0(IrOpcode op)
+{
+    switch (op)
+    {
+        IrOpcode::Add | IrOpcode::Sub | IrOpcode::And | IrOpcode::Or |
+        IrOpcode::Xor | IrOpcode::Mul | IrOpcode::Shl | IrOpcode::Ashr |
+        IrOpcode::Lshr | IrOpcode::Neg | IrOpcode::Not |
+        IrOpcode::Trunc | IrOpcode::Bitcast | IrOpcode::Zext |
+        IrOpcode::Sext | IrOpcode::ICmp | IrOpcode::Gep |
+        IrOpcode::FAdd | IrOpcode::FSub | IrOpcode::FMul |
+        IrOpcode::FDiv | IrOpcode::FSqrt | IrOpcode::FAbs |
+        IrOpcode::Load | IrOpcode::Call => { return true; },
+        else => { return false; },
+    }
+}
+
+
+pub void runRegAlloc(EmitCtx* ctx)
+{
+    IrFunc* func = ctx->func;
+    u32 n = ctx->nvregs;
+    u32 nb = func->nblocks;
+    if (n == 0 || nb == 0) return;
+    u32 words = (n + 63) >> 6;
+    usize nbits = (usize)nb * (usize)words;
+
+    u32* bstart = alloc<u32>((usize)nb);
+    u32* bend = alloc<u32>((usize)nb);
+    u32* succOff = alloc<u32>((usize)nb + 1);
+    u32 totalSucc = 0;
+    for (u32 b = 0; b < nb; b++)
+    {
+        succOff[b] = totalSucc;
+        IrBlock* bb = func->blocks[b];
+        totalSucc += bb != null ? bb->nsuccs : 0;
+    }
+    succOff[nb] = totalSucc;
+    u32* succIdx = alloc<u32>((usize)(totalSucc > 0 ? totalSucc : 1));
+    {
+        u32 sp = 0;
+        for (u32 b = 0; b < nb; b++)
+        {
+            IrBlock* bb = func->blocks[b];
+            if (bb == null) continue;
+            for (u32 s = 0; s < bb->nsuccs; s++)
+            {
+                i32 si = blockIndexOf(func, bb->succs[s]);
+                succIdx[sp++] = si >= 0 ? (u32)si : b;
+            }
+        }
+    }
+
+    u64* useB = alloc<u64>(nbits);
+    u64* defB = alloc<u64>(nbits);
+    u64* liveIn = alloc<u64>(nbits);
+    u64* liveOut = alloc<u64>(nbits);
+    for (usize i = 0; i < nbits; i++)
+    { useB[i] = 0; defB[i] = 0; liveIn[i] = 0; liveOut[i] = 0; }
+
+    u32* defPos = alloc<u32>((usize)n);
+    u32* lastUse = alloc<u32>((usize)n);
+    i32* preferSet = alloc<i32>((usize)n);
+    /* positions of call instructions — values live across them must
+     * not sit in caller-saved regs */
+    u32* callPos = alloc<u32>((usize)nb * 8 + 16);
+    u32 ncall = 0;
+    for (u32 i = 0; i < n; i++) { defPos[i] = 0xFFFFFFFFu; lastUse[i] = 0xFFFFFFFFu; preferSet[i] = -1; }
+
+    u32 pos = 0;
+    for (u32 b = 0; b < nb; b++)
+    {
+        IrBlock* bb = func->blocks[b];
+        bstart[b] = pos;
+        if (bb == null) { bend[b] = pos; continue; }
+        for (u32 ii = 0; ii < bb->ninsts; ii++)
+        {
+            IrInst* inst = bb->insts[ii];
+            if (inst == null) { pos++; continue; }
+            if (inst->opcode == IrOpcode::Call && ncall < nb * 8 + 16)
+                callPos[ncall++] = pos;
+            for (u32 k = 0; k < inst->nops; k++)
+            {
+                IrValue* ov = inst->ops[k];
+                if (!isVRegOperand(ov)) continue;
+                i32 vid = vmapFind(&ctx->vmap, ov);
+                if (vid < 0 || (u32)vid >= n) continue;
+                u32 v = (u32)vid;
+                u64 m = (u64)1 << (u64)(v & 63);
+                usize w = (usize)v >> 6;
+                usize rb = (usize)b * (usize)words;
+                if ((defB[rb + w] & m) == 0)
+                    useB[rb + w] |= m;
+                if (lastUse[v] == 0xFFFFFFFFu || pos > lastUse[v])
+                    lastUse[v] = pos;
+            }
+            if (instHasDef(inst))
+            {
+                i32 did = vmapFind(&ctx->vmap, &inst->base);
+                if (did >= 0 && (u32)did < n)
+                {
+                    u32 v = (u32)did;
+                    defB[(usize)b * (usize)words + ((usize)v >> 6)] |= (u64)1 << (u64)(v & 63);
+                    if (defPos[v] == 0xFFFFFFFFu) defPos[v] = pos;
+                    /* coalescing hint: prefer ops[0]'s color */
+                    if (inst->nops > 0 && isVRegOperand(inst->ops[0]))
+                    {
+                        i32 pv = vmapFind(&ctx->vmap, inst->ops[0]);
+                        if (pv >= 0) preferSet[v] = pv;
+                    }
+                }
+            }
+            pos++;
+        }
+        bend[b] = pos;
+    }
+
+    bool changed = true;
+    while (changed)
+    {
+        changed = false;
+        for (u32 bi = nb; bi > 0; bi--)
+        {
+            u32 b = bi - 1;
+            bool outDiff = false;
+            for (u32 s = succOff[b]; s < succOff[b + 1]; s++)
+            {
+                u32 si = succIdx[s];
+                usize siw = (usize)si * (usize)words;
+                usize bw = (usize)b * (usize)words;
+                for (usize w = 0; w < (usize)words; w++)
+                {
+                    u64 add = liveIn[siw + w] & ~liveOut[bw + w];
+                    if (add != 0) { liveOut[bw + w] |= add; outDiff = true; }
+                }
+            }
+            usize bw2 = (usize)b * (usize)words;
+            for (usize w = 0; w < (usize)words; w++)
+            {
+                u64 nw = useB[bw2 + w] |
+                         (liveOut[bw2 + w] & ~defB[bw2 + w]);
+                if (nw != liveIn[bw2 + w])
+                { liveIn[bw2 + w] = nw; changed = true; }
+            }
+            if (outDiff) changed = true;
+        }
+    }
+
+    /* ---- interference from live sets (precise, no interval holes)
+     * adj[v*words+w] bit u = vregs v,u interfere. For each inst:
+     * def interferes with every value live-after; plus def vs each
+     * operand that dies at this inst (except ops[0] for ops that
+     * materialize ops[0] into the dst first — coalescible). */
+    u64* adj = alloc<u64>((usize)n * (usize)words);
+    for (usize i = 0; i < (usize)n * (usize)words; i++) adj[i] = 0;
+
+    /* values live at a block's entry are simultaneously live — they
+     * pairwise interfere. This is the ONLY edge source for values
+     * with no defining inst (function args): def-point edges never
+     * fire for them, so two live args could otherwise share a phys. */
+    for (u32 b = 0; b < nb; b++)
+    {
+        usize bw = (usize)b * (usize)words;
+        for (u32 w = 0; w < (u32)words; w++)
+        {
+            u64 bits = liveIn[bw + (usize)w];
+            while (bits != 0)
+            {
+                u32 bit = 0; u64 t = bits;
+                while ((t & 1) == 0) { t >>= 1; bit++; }
+                bits &= bits - 1;
+                u32 x = (w << 6) + bit;
+                if (x >= n) continue;
+                for (u32 w2 = 0; w2 < (u32)words; w2++)
+                {
+                    u64 bits2 = liveIn[bw + (usize)w2];
+                    while (bits2 != 0)
+                    {
+                        u32 bit2 = 0; u64 t2 = bits2;
+                        while ((t2 & 1) == 0) { t2 >>= 1; bit2++; }
+                        bits2 &= bits2 - 1;
+                        u32 y = (w2 << 6) + bit2;
+                        if (y <= x || y >= n) continue;
+                        adj[(usize)x * (usize)words + ((usize)y >> 6)] |= (u64)1 << (u64)(y & 63);
+                        adj[(usize)y * (usize)words + ((usize)x >> 6)] |= (u64)1 << (u64)(x & 63);
+                    }
+                }
+            }
+        }
+    }
+
+    for (u32 b = 0; b < nb; b++)
+    {
+        IrBlock* bb = func->blocks[b];
+        if (bb == null) continue;
+        /* cur = live-after set, seeded with liveOut[b] */
+        u64* cur = alloc<u64>((usize)words);
+        for (u32 w = 0; w < words; w++)
+            cur[w] = liveOut[(usize)b * (usize)words + (usize)w];
+        for (u32 ii = bb->ninsts; ii > 0; ii--)
+        {
+            IrInst* inst = bb->insts[ii - 1];
+            if (inst == null) continue;
+            u32 pos = bstart[b] + (ii - 1);
+            /* def interferes with live-after */
+            i32 did = -1;
+            if (instHasDef(inst))
+                did = vmapFind(&ctx->vmap, &inst->base);
+            if (did >= 0 && (u32)did < n)
+            {
+                u32 dv = (u32)did;
+                for (u32 w = 0; w < words; w++)
+                {
+                    u64 bits = cur[w];
+                    while (bits != 0)
+                    {
+                        u32 bit = 0; u64 t = bits;
+                        while ((t & 1) == 0) { t >>= 1; bit++; }
+                        bits &= bits - 1;
+                        u32 ov = (w << 6) + bit;
+                        if (ov < n && ov != dv)
+                        {
+                            adj[(usize)dv * (usize)words + ((usize)ov >> 6)] |= (u64)1 << (u64)(ov & 63);
+                            adj[(usize)ov * (usize)words + ((usize)dv >> 6)] |= (u64)1 << (u64)(dv & 63);
+                        }
+                    }
+                }
+            }
+            /* def vs dying operands (ops[0] exempt for 2-addr ops) */
+            if (did >= 0 && (u32)did < n)
+            {
+                u32 dv = (u32)did;
+                bool c0 = coalesceOps0(inst->opcode);
+                for (u32 k = 0; k < inst->nops; k++)
+                {
+                    if (k == 0 && c0) continue;
+                    IrValue* ov = inst->ops[k];
+                    if (!isVRegOperand(ov)) continue;
+                    i32 ovv = vmapFind(&ctx->vmap, ov);
+                    if (ovv < 0 || (u32)ovv >= n) continue;
+                    if (lastUse[(u32)ovv] == pos)
+                    {
+                        u32 uv = (u32)ovv;
+                        adj[(usize)dv * (usize)words + ((usize)uv >> 6)] |= (u64)1 << (u64)(uv & 63);
+                        adj[(usize)uv * (usize)words + ((usize)dv >> 6)] |= (u64)1 << (u64)(dv & 63);
+                    }
+                }
+            }
+            /* operands used by the same inst are simultaneously live at
+             * its input; distinct SSA values must not share a phys reg
+             * (store val/addr, add a/b, call args, ...). Phi operands are
+             * per-edge and handled by edge copies, so skip them. */
+            if (inst->opcode != IrOpcode::Phi)
+            {
+                for (u32 k = 0; k < inst->nops; k++)
+                {
+                    IrValue* ov = inst->ops[k];
+                    if (!isVRegOperand(ov)) continue;
+                    i32 av = vmapFind(&ctx->vmap, ov);
+                    if (av < 0 || (u32)av >= n) continue;
+                    for (u32 l = k + 1; l < inst->nops; l++)
+                    {
+                        IrValue* ow = inst->ops[l];
+                        if (!isVRegOperand(ow)) continue;
+                        i32 bv2 = vmapFind(&ctx->vmap, ow);
+                        if (bv2 < 0 || (u32)bv2 >= n || bv2 == av) continue;
+                        u32 x = (u32)av;
+                        u32 y = (u32)bv2;
+                        adj[(usize)x * (usize)words + ((usize)y >> 6)] |= (u64)1 << (u64)(y & 63);
+                        adj[(usize)y * (usize)words + ((usize)x >> 6)] |= (u64)1 << (u64)(x & 63);
+                    }
+                }
+            }
+            /* update live set: remove def, add uses */
+            if (did >= 0 && (u32)did < n)
+            {
+                u32 dv = (u32)did;
+                cur[(usize)dv >> 6] &= ~((u64)1 << (u64)(dv & 63));
+            }
+            for (u32 k = 0; k < inst->nops; k++)
+            {
+                IrValue* ov = inst->ops[k];
+                if (!isVRegOperand(ov)) continue;
+                i32 ovv = vmapFind(&ctx->vmap, ov);
+                if (ovv >= 0 && (u32)ovv < n)
+                {
+                    u32 uv = (u32)ovv;
+                    cur[(usize)uv >> 6] |= (u64)1 << (u64)(uv & 63);
+                }
+            }
+        }
+        dealloc<u64>(cur);
+    }
+
+    /* klass/size/prefer arrays */
+    u8* klass = alloc<u8>((usize)n);
+    u32* szs = alloc<u32>((usize)n);
+    i32* prefer = alloc<i32>((usize)n);
+    for (u32 v = 0; v < n; v++)
+    {
+        klass[v] = (u8)ctx->vregs[v].klass;
+        szs[v] = 8;
+        if (ctx->vregs[v].type != null)
+        {
+            if (typeIsSse(ctx->vregs[v].type)) klass[v] = klass[v] == 2 ? 2 : 1;
+            u32 tsz = typeSizeBytes(ctx->vregs[v].type);
+            if (tsz > 8) szs[v] = tsz;
+        }
+        /* values live across calls: gpr -> callee-saved class (3),
+         * xmm -> spill (caller-saved on SysV) */
+        if (klass[v] != 2)
+        {
+            for (u32 ci = 0; ci < ncall; ci++)
+            {
+                if (lastUse[v] != 0xFFFFFFFFu &&
+                    (defPos[v] == 0xFFFFFFFFu || callPos[ci] > defPos[v]) &&
+                    callPos[ci] < lastUse[v])
+                {
+                    klass[v] = (klass[v] == 1) ? (u8)2 : (u8)3;
+                    break;
+                }
+            }
+        }
+        prefer[v] = -1;
+    }
+    /* prefer hints from the earlier walk (ops[0] coalesce candidates) */
+    for (u32 v = 0; v < n; v++)
+        if (preferSet[v] >= 0) prefer[v] = preferSet[v];
+
+    i32* physOut = alloc<i32>((usize)n);
+    i32* slotOut = alloc<i32>((usize)n);
+    graphAssignNodes(n, words, adj, klass, szs, prefer,
+                     &regs::ALLOC_ORDER[0], regs::ALLOC_ORDER_LEN,
+                     &regs::XMM_ALLOC_ORDER[0], regs::XMM_ALLOC_LEN,
+                     &regs::CS_ALLOC_ORDER[0], regs::CS_ALLOC_LEN,
+                     null,
+                     physOut, slotOut);
+
+    for (u32 v = 0; v < n; v++)
+    {
+        ctx->vregs[v].phys = physOut[v];
+        ctx->vregs[v].slot = slotOut[v];
+        /* register file: xmm for sse-typed values, gpr otherwise.
+         * (the allocator's local klass[] also encodes spill-only /
+         * callee-saved hints — those live in phys/slot, not here) */
+        ctx->vregs[v].klass = typeIsSse(ctx->vregs[v].type) ? 1 : 0;
+        /* xmm phys indices share the 0-15 space with gprs — only gpr
+         * klass values can mark callee-saved regs used */
+        if (ctx->vregs[v].klass == 0 && physOut[v] >= 0 &&
+            regs::regIsCalleeSaved((u8)physOut[v]))
+        {
+            while (ctx->usedCallee.count() < 16) ctx->usedCallee.push((u8)0);
+            ctx->usedCallee.atPtr((usize)physOut[v])[0] = 1;
+        }
+    }
+    ctx->frameSize = 0;
+    for (u32 v = 0; v < n; v++)
+        if (slotOut[v] >= 0)
+        {
+            u32 need = (szs[v] + 7) / 8;
+            if ((i32)(slotOut[v] + (i32)need) * 8 > ctx->frameSize)
+                ctx->frameSize = (i32)(slotOut[v] + (i32)need) * 8;
+        }
+    /* round frameSize up to 8 */
+    ctx->frameSize = (ctx->frameSize + 7) & ~7;
+
+    dealloc<u64>(adj);
+    dealloc<u8>(klass); dealloc<u32>(szs); dealloc<i32>(prefer);
+    dealloc<i32>(physOut); dealloc<i32>(slotOut);
+    dealloc<i32>(preferSet);
+
+    /* callee-saved list in push order: rbx, r12, r13, r14, r15 */
+    u8[5] csOrder = { regs::RBX, regs::R12, regs::R13, regs::R14, regs::R15 };
+    for (u32 i = 0; i < 5; i++)
+    {
+        u8 r = csOrder[i];
+        if (ctx->usedCallee.count() > (usize)r &&
+            ctx->usedCallee.atPtr((usize)r)[0] != 0 && ctx->ncallee < 8)
+            ctx->calleeList[ctx->ncallee++] = r;
+    }
+    ctx->savedBytes = (i32)ctx->ncallee * 8;
+
+    dealloc<u32>(bstart); dealloc<u32>(bend);
+    dealloc<u32>(succOff); dealloc<u32>(succIdx);
+    dealloc<u64>(useB); dealloc<u64>(defB);
+    dealloc<u64>(liveIn); dealloc<u64>(liveOut);
+    dealloc<u32>(defPos); dealloc<u32>(lastUse); dealloc<u32>(callPos);
+}
+

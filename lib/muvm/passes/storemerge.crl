@@ -1,0 +1,246 @@
+#[[no_drop_all]]
+// storemerge — merge adjacent constant stores into one wider store.
+//
+// Two `store iN c1, p` / `store iN c2, q` insts merge into a single
+// `store i(2N) c, p` when:
+//   - they sit in the same block with only memory-transparent insts
+//     between them (no load/store/call/barrier — nothing may observe
+//     the second half early or the first half late),
+//   - alias analysis proves p and q name the same object at provably
+//     adjacent byte offsets (q == p + N/8, either order),
+//   - both stored values are constants and N in {8,16,32} so the
+//     combined width is a natural store width (16/32/64).
+//
+// The combined constant assumes little-endian byte order (same
+// assumption as microopt's byte-concat loads): the lower-addressed
+// store supplies the low bits of the wide value.
+//
+// Non-constant pairs are left alone: widening them needs zext/shl/or
+// plumbing that costs more than the saved store on current targets.
+
+import muvm::irtypes { IrContext, IrModule, IrFunc, IrBlock, IrInst, IrValue, IrValueKind, IrType };
+import muvm::irOps { IrOpcode };
+import muvm::passes::alias_analysis { AliasAnalysis, OFFSET_UNKNOWN };
+import muvm::passes::common { gVerbose };
+import std::ios { eprintln };
+
+// Pending candidate: the earliest unmerged const store of a run,
+// plus the byte offset/width it currently covers (a merged store
+// covers 2N bits, so track coverage explicitly).
+struct Pending
+{
+    IrInst* inst;
+    i64 off;
+    u32 widthBits;
+}
+
+pub struct StoreMergePass
+{
+    IrContext* ctx;
+    IrModule* mod;
+    AliasAnalysis aa;
+    u64 merges;
+
+    StoreMergePass new(IrContext* ctx, IrModule* m)
+    {
+        return StoreMergePass {
+            .ctx = ctx,
+            .mod = m,
+            .aa = AliasAnalysis::new(ctx),
+            .merges = 0
+        };
+    }
+
+    void deinit()
+    {
+        self.aa.deinit();
+    }
+
+    bool isConstInt(IrValue* v)
+    {
+        return v != null && v->kind == IrValueKind::ConstInt;
+    }
+
+    // Anything that reads or writes memory contents, calls out, or is a
+    // terminator breaks a merge run. Alloca/GEP/bitcast/arith are
+    // transparent.
+    bool isBarrier(IrOpcode op)
+    {
+        switch (op)
+        {
+            IrOpcode::Load |
+            IrOpcode::Store |
+            IrOpcode::AtomicLoad |
+            IrOpcode::AtomicStore |
+            IrOpcode::AtomicRmw |
+            IrOpcode::AtomicCmpXchg |
+            IrOpcode::Fence |
+            IrOpcode::Call |
+            IrOpcode::InlineAsm |
+            IrOpcode::GcRoot |
+            IrOpcode::GcWriteBarrier |
+            IrOpcode::GcSafepoint |
+            IrOpcode::LandingPad |
+            IrOpcode::Br |
+            IrOpcode::CondBr |
+            IrOpcode::Switch |
+            IrOpcode::Ret |
+            IrOpcode::Unreachable |
+            IrOpcode::Noret => { return true; },
+            else => { return false; }
+        }
+    }
+
+    u32 valueWidth(IrInst* store)
+    {
+        if (store->nops < 1 || store->ops[0] == null || store->ops[0]->type == null)
+            return 0;
+        return store->ops[0]->type->width;
+    }
+
+    // Try to fold `cur` into `p`. On success `cur` is erased and `p`
+    // now covers the union; returns true.
+    bool tryMerge(Pending* p, IrInst* cur)
+    {
+        if (p->inst == null || cur == null) return false;
+        if (cur->nops < 2 || p->inst->nops < 2) return false;
+        IrValue* pv = p->inst->ops[0];
+        IrValue* cv = cur->ops[0];
+        if (!self.isConstInt(pv) || !self.isConstInt(cv)) return false;
+        // pending's covered width must equal cur's width for a natural
+        // doubling (iN + iN -> i2N); a merged i64 can't take another i32
+        if (p->widthBits != self.valueWidth(cur)) return false;
+        u32 w = p->widthBits;
+        if (w != 8 && w != 16 && w != 32) return false;
+        u32 wb = w / 8;
+        IrValue* cp = cur->ops[1];
+        if (cp == null) return false;
+        i64 coff = 0;
+        u32 cobj = self.aa.decomposeAddr(cp, &coff);
+        if (cobj == 0 || coff == OFFSET_UNKNOWN) return false;
+        IrValue* pp = p->inst->ops[1];
+        if (pp == null) return false;
+        i64 poff0 = 0;
+        u32 pobj = self.aa.decomposeAddr(pp, &poff0);
+        if (pobj == 0 || poff0 == OFFSET_UNKNOWN) return false;
+        if (pobj != cobj) return false;
+        // pending covers [p->off, p->off + widthBits/8); cur covers
+        // [coff, coff + wb). Adjacency either direction.
+        i64 pendHi = p->off + (i64)(p->widthBits / 8);
+        i64 curHi = coff + (i64)wb;
+        bool curAbove = (coff == pendHi);
+        bool curBelow = (curHi == p->off);
+        if (!curAbove && !curBelow) return false;
+
+        // Which store supplies the low bits (LE)?
+        IrValue* lowVal;
+        IrValue* highVal;
+        IrValue* lowPtr;
+        i64 newOff;
+        if (curBelow)
+        {
+            lowVal = cv; highVal = pv; lowPtr = cp; newOff = coff;
+        }
+        else
+        {
+            lowVal = pv; highVal = cv; lowPtr = pp; newOff = p->off;
+        }
+        u64 mask = ((u64)1 << (u64)w) - 1;
+        u64 comb = (lowVal->valData & mask) |
+                   ((highVal->valData & mask) << (u64)w);
+        IrType* wty = self.ctx->tyInt(w * 2);
+        IrValue* cst = self.ctx->constInt(wty, comb);
+
+        IrInst* t = p->inst;
+        IrValue* oldV = t->ops[0];
+        IrValue* oldP = t->ops[1];
+        oldV->removeUser(t);
+        if (oldP != lowPtr) oldP->removeUser(t);
+        t->ops[0] = cst;
+        t->ops[1] = lowPtr;
+        cst->addUser(t);
+        lowPtr->addUser(t);
+        cur->erase();
+        p->off = newOff;
+        p->widthBits = w * 2;
+        self.merges++;
+        if (gVerbose)
+            eprintln("storemerge: merged 2x i{} const stores @{}", (u64)w, (u64)newOff);
+        return true;
+    }
+
+    bool runFunc(IrFunc* f)
+    {
+        if (f == null || f->isExtern) return false;
+        bool changed = false;
+        for (u32 bi = 0; bi < f->nblocks; bi++)
+        {
+            IrBlock* bb = f->blocks[bi];
+            if (bb == null) continue;
+            Pending p = Pending { null, 0, 0 };
+            u32 i = 0;
+            while (i < bb->ninsts)
+            {
+                IrInst* inst = bb->insts[i];
+                if (inst == null) { i++; continue; }
+                if (inst->opcode == IrOpcode::Store && inst->nops >= 2 &&
+                    self.isConstInt(inst->ops[0]))
+                {
+                    if (p.inst != null && self.tryMerge(&p, inst))
+                    {
+                        changed = true;
+                        // cur was erased: insts shifted left, the next
+                        // inst to examine is at the same index i
+                        continue;
+                    }
+                    i64 off = 0;
+                    u32 obj = self.aa.decomposeAddr(inst->ops[1], &off);
+                    if (obj != 0 && off != OFFSET_UNKNOWN &&
+                        self.valueWidth(inst) != 0)
+                    {
+                        p.inst = inst;
+                        p.off = off;
+                        p.widthBits = self.valueWidth(inst);
+                    }
+                    else
+                    {
+                        p.inst = null;
+                    }
+                    i++;
+                    continue;
+                }
+                if (self.isBarrier(inst->opcode))
+                {
+                    p.inst = null;
+                    i++;
+                    continue;
+                }
+                i++;
+            }
+        }
+        return changed;
+    }
+
+    bool run()
+    {
+        if (self.mod == null) return false;
+        for (u32 fi = 0; fi < self.mod->nfuncs; fi++)
+        {
+            IrFunc* f = self.mod->funcs[fi];
+            if (f == null || f->isExtern) continue;
+            self.aa.analyze(f);
+            self.runFunc(f);
+        }
+        return self.merges > 0;
+    }
+}
+
+pub bool muvmPassStoreMerge(IrFunc* func, rawptr userdata)
+{
+    IrModule* m = func != null ? func->parent : null;
+    if (m == null || m->nfuncs == 0 || func != m->funcs[0]) return false;
+    StoreMergePass st = StoreMergePass::new(m->ctx, m);
+    bool r = st.run();
+    st.deinit();
+    return r;
+}

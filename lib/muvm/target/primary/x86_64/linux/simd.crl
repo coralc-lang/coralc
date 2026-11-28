@@ -1,0 +1,1368 @@
+#[[no_drop_all]]
+// simd.crl: SSE4.1-class packed-vector isel for x86_64 linux primary.
+//
+// Coverage model: the IR vectorizer (passes/simd_vec, slp_vec) emits
+// 128-bit vectors — i8x16 i16x8 i32x4 i64x2 f32x4 f64x2 — as Load/Store
+// of Vector type plus VecAdd/VecSub/VecMul/VecDiv, VecFAdd/FSub/FMul/
+// FDiv, VecMin/VecMax (unsigned int contract), VecBroadcast,
+// ShuffleVector, ExtractElement, InsertElement.
+//
+// Packed forms used (the "width cheats"):
+//   i8/i16/i32/i64 add/sub  -> paddb/w/d/q, psubb/w/d/q   (any lanes)
+//   i16 mul                 -> pmullw  (low 16 = wrap)
+//   i32 mul                 -> pmulld   (SSE4.1)
+//   i32 min/max             -> pminud/pmaxud (unsigned contract)
+//   i16 min/max             -> pminuw/pmaxuw (SSE4.1)
+//   i8  min/max             -> pminub/pmaxub (SSE2)
+//   f32 arith               -> addps/subps/mulps/divps/minps/maxps
+//   f64 arith               -> addpd/subpd/mulpd/divpd/minpd/maxpd
+//   broadcast i32/f32        -> movd + pshufd $0
+//   broadcast i64/f64        -> movq + punpcklqdq (unpcklpd for f64)
+//   broadcast i16/i8         -> gpr shift-replicate + punpcklqdq /
+//                               punpcklbw chain
+//   extract i32              -> pextrd (SSE4.1); i16 -> pextrw;
+//                             i8 -> pextrb (SSE4.1); i64 -> movq/pshufd
+//   insert i32/i16/i8        -> pinsrd/pinsrw/pinsrb
+//   shuffle i32x4/f32x4      -> pshufd when single-source
+//
+// Lane-wise fallback (scratch-memory path) for what has no packed
+// form: i64 mul/div/minmax, i8 mul, VecDiv, dynamic extract/insert
+// index, two-source shuffles, sub-128-bit vectors, vector constants.
+// Scratch lives in the alloca frame region (allocaSlotFor, 48B per
+// flagged inst — emitFuncAsm pre-reserves via simdNeedsScratch).
+// xmm15 is the only scratch xmm (0-14 are allocatable); paths that
+// would need two simultaneous xmm temps route through gpr/scratch
+// instead of touching allocatable regs.
+
+import muvm::irtypes {
+    IrInst, IrValue, IrValueKind, IrType, IrTypeKind, IrArrayConst
+};
+import muvm::irOps { IrOpcode };
+import std::string { String };
+
+use muvm::target::primary::x86_64::linux::regs;
+use muvm::target::primary::x86_64::linux::linux { typeSizeBytes, typeIsSse };
+use muvm::target::primary::x86_64::linux::core {
+    EmitCtx, VReg, Shape, TyClass, tyClassOf,
+    isVRegOperand, vmapFind, loadToReg, storeToVReg,
+    loadToXmm, storeFromXmm, spillOff, allocaSlotFor,
+    emitByteReg, emitWordReg, emitXmmReg, emitRegExact,
+    regName, regForWidth, intSfx, regW, xmmDstPhys,
+    emitRipSymName, canonAddr
+};
+
+pub const u32 SIMD_SCRATCH = 48;
+
+/* ================= vector type helpers ================= */
+
+pub IrType* simdVecTy(IrInst* inst)
+{
+    if (inst->base.type != null && inst->base.type->kind == IrTypeKind::Vector)
+        return inst->base.type;
+    if (inst->nops > 0 && inst->ops[0] != null && inst->ops[0]->type != null &&
+        inst->ops[0]->type->kind == IrTypeKind::Vector)
+        return inst->ops[0]->type;
+    return null;
+}
+
+pub u32 simdElemW(IrType* vt)
+{
+    return vt->elem != null ? vt->elem->width : 64;
+}
+
+pub u32 simdLanes(IrType* vt)
+{
+    return vt->count > 0 ? vt->count : 1;
+}
+
+pub u32 simdLaneBytes(IrType* vt)
+{
+    IrType* e = vt->elem;
+    u32 s = e != null ? typeSizeBytes(e) : 8;
+    return s != 0 ? s : 1;
+}
+
+pub u32 simdVecBytes(IrType* vt)
+{
+    return typeSizeBytes(vt);
+}
+
+pub bool simdVecFloat(IrType* vt)
+{
+    return vt->elem != null && vt->elem->kind == IrTypeKind::Float;
+}
+
+pub bool simdVecInt(IrType* vt)
+{
+    return vt->elem != null && vt->elem->kind == IrTypeKind::Int;
+}
+
+/* packed xmm path requires the whole vector to fit one xmm */
+pub bool simdPacked(IrType* vt)
+{
+    return vt != null && simdVecBytes(vt) <= 16;
+}
+
+pub bool simdIsConstVec(IrValue* v)
+{
+    return v != null && (v->kind == IrValueKind::ConstArray ||
+                         v->kind == IrValueKind::StructConst);
+}
+
+/* is `v` a vreg currently sitting in a phys xmm? */
+bool simdHasPhysXmm(EmitCtx* c, IrValue* v)
+{
+    if (!isVRegOperand(v)) return false;
+    i32 vid = vmapFind(&c->vmap, v);
+    return vid >= 0 && c->vregs[(usize)vid].klass == 1 &&
+           c->vregs[(usize)vid].phys >= 0;
+}
+
+/* does vreg vid have a phys xmm home? */
+bool simdVidHasXmm(EmitCtx* c, u32 vid)
+{
+    return c->vregs[vid].klass == 1 && c->vregs[vid].phys >= 0;
+}
+
+/* ================= xmm vector load/store ================= */
+
+/* 16 bytes of vector value -> xmm dst. */
+pub void simdLoadVec(EmitCtx* c, IrValue* v, u8 dst)
+{
+    if (v == null)
+    {
+        c->emit("\txorps "); emitXmmReg(c, dst); c->emit(", ");
+        emitXmmReg(c, dst); c->emitLine("");
+        return;
+    }
+    if (isVRegOperand(v))
+    {
+        i32 vid = vmapFind(&c->vmap, v);
+        if (vid >= 0)
+        {
+            VReg* r = &c->vregs[(usize)vid];
+            if (r->klass == 1)
+            {
+                if (r->phys >= 0)
+                {
+                    if ((u8)r->phys != dst)
+                    {
+                        c->emit("\tmovaps "); emitXmmReg(c, (u8)r->phys);
+                        c->emit(", "); emitXmmReg(c, dst); c->emitLine("");
+                    }
+                }
+                else if (r->slot >= 0)
+                {
+                    c->emit("\tmovups -");
+                    c->emitI64((i64)spillOff(c, r->slot)); c->emit("(%rbp), ");
+                    emitXmmReg(c, dst); c->emitLine("");
+                }
+                else c->emit("\t# isel: simd vreg has no home\n");
+            }
+            else
+            {
+                /* gpr-held vector (bitcast oddity): low qword via movq,
+                 * upper zeroed — 16B vectors should never land here */
+                i32 p = (i32)r->phys;
+                u8 g = p >= 0 ? (u8)p : regs::SCRATCH_A;
+                if (p < 0) loadToReg(c, v, g, 64);
+                c->emit("\tmovq "); c->emit(regName(g)); c->emit(", ");
+                emitXmmReg(c, dst); c->emitLine("");
+            }
+            return;
+        }
+    }
+    if (v->kind == IrValueKind::Global || v->kind == IrValueKind::Func)
+    {
+        c->emit("\tmovups "); emitRipSymName(c, v); c->emit("(%rip), ");
+        emitXmmReg(c, dst); c->emitLine("");
+        return;
+    }
+    if (v->kind == IrValueKind::ConstInt || v->kind == IrValueKind::ConstFloat)
+    {
+        /* raw bit pattern in low qword, zero upper */
+        c->emit("\tmovq $"); c->emitU64(v->valData); c->emit(", %r10\n");
+        c->emit("\tmovq %r10, "); emitXmmReg(c, dst); c->emitLine("");
+        return;
+    }
+    if (simdIsConstVec(v))
+    {
+        /* materialize element constants into scratch, then movups.
+         * Keyed by the const value itself (unique pointer). */
+        i32 off = allocaSlotFor(c, v, SIMD_SCRATCH);
+        simdConstToMem(c, v, off);
+        c->emit("\tmovups -"); c->emitI64((i64)off); c->emit("(%rbp), ");
+        emitXmmReg(c, dst); c->emitLine("");
+        return;
+    }
+    c->emit("\t# isel: simd operand kind unsupported\n");
+}
+
+/* xmm -> vreg home (16 bytes) */
+pub void simdStoreVec(EmitCtx* c, u32 vid, u8 src)
+{
+    VReg* r = &c->vregs[vid];
+    if (r->klass == 1)
+    {
+        if (r->phys >= 0)
+        {
+            if ((u8)r->phys != src)
+            {
+                c->emit("\tmovaps "); emitXmmReg(c, src); c->emit(", ");
+                emitXmmReg(c, (u8)r->phys); c->emitLine("");
+            }
+        }
+        else if (r->slot >= 0)
+        {
+            c->emit("\tmovups "); emitXmmReg(c, src); c->emit(", -");
+            c->emitI64((i64)spillOff(c, r->slot)); c->emit("(%rbp)\n");
+        }
+        else c->emit("\t# isel: simd store nowhere to go\n");
+        return;
+    }
+    /* non-xmm home: write qword chunks via gpr roundtrip */
+    if (r->slot >= 0)
+    {
+        c->emit("\tmovq "); emitXmmReg(c, src); c->emit(", -");
+        c->emitI64((i64)spillOff(c, r->slot)); c->emit("(%rbp)\n");
+        c->emit("\tpshufd $0x4E, "); emitXmmReg(c, src); c->emit(", %xmm15\n");
+        c->emit("\tmovq %xmm15, -"); c->emitI64((i64)spillOff(c, r->slot) - 8);
+        c->emit("(%rbp)\n");
+        return;
+    }
+    c->emit("\t# isel: simd store unsupported home\n");
+}
+
+/* vector value -> scratch memory at -off(%rbp). Always copies. */
+pub void simdVecToScratch(EmitCtx* c, IrValue* v, i32 off)
+{
+    if (isVRegOperand(v))
+    {
+        i32 vid = vmapFind(&c->vmap, v);
+        if (vid >= 0)
+        {
+            VReg* r = &c->vregs[(usize)vid];
+            if (r->klass == 1)
+            {
+                if (r->phys >= 0)
+                {
+                    c->emit("\tmovups "); emitXmmReg(c, (u8)r->phys);
+                    c->emit(", -"); c->emitI64((i64)off); c->emit("(%rbp)\n");
+                }
+                else if (r->slot >= 0)
+                {
+                    c->emit("\tmovups -"); c->emitI64((i64)spillOff(c, r->slot));
+                    c->emit(", -"); c->emitI64((i64)off); c->emit("(%rbp)\n");
+                }
+                else c->emit("\t# isel: simd scratch src homeless\n");
+                return;
+            }
+        }
+    }
+    if (v != null && (v->kind == IrValueKind::Global || v->kind == IrValueKind::Func))
+    {
+        c->emit("\tleaq "); emitRipSymName(c, v); c->emit("(%rip), %r11\n");
+        c->emit("\tmovups (%r11), -"); c->emitI64((i64)off); c->emit("(%rbp)\n");
+        return;
+    }
+    if (v != null && (v->kind == IrValueKind::ConstInt || v->kind == IrValueKind::ConstFloat))
+    {
+        c->emit("\tmovq $"); c->emitU64(v->valData); c->emit(", %r10\n");
+        c->emit("\tmovq %r10, -"); c->emitI64((i64)off); c->emit("(%rbp)\n");
+        c->emit("\tmovq $0, %r10\n\tmovq %r10, -");
+        c->emitI64((i64)off - 8); c->emit("(%rbp)\n");
+        return;
+    }
+    if (simdIsConstVec(v))
+    {
+        simdConstToMem(c, v, off);
+        return;
+    }
+    c->emit("\t# isel: simd scratch operand unsupported\n");
+}
+
+/* build a ConstArray vector's bytes at -off(%rbp); tail zeroed */
+void simdConstToMem(EmitCtx* c, IrValue* v, i32 off)
+{
+    IrType* vt = v->type;
+    if (vt == null || vt->kind != IrTypeKind::Vector)
+    { c->emit("\t# isel: simd const bad type\n"); return; }
+    IrArrayConst* ac = v->kind == IrValueKind::ConstArray ? (IrArrayConst*)v : null;
+    if (ac == null || ac->elems == null)
+    { c->emit("\t# isel: simd const unsupported\n"); return; }
+    u32 ew = simdElemW(vt);
+    u32 lb = simdLaneBytes(vt);
+    u32 n = ac->nelems < simdLanes(vt) ? ac->nelems : simdLanes(vt);
+    for (u32 i = 0; i < n; i++)
+    {
+        IrValue* e = ac->elems[i];
+        if (e == null) continue;
+        u64 bits = e->valData;
+        i32 moff = off + (i32)(i * lb);
+        if (ew <= 8)
+        {
+            c->emit("\tmovb $"); c->emitU64(bits & 0xFFu); c->emit(", -");
+            c->emitI64((i64)moff); c->emit("(%rbp)\n");
+        }
+        else if (ew <= 16)
+        {
+            c->emit("\tmovw $"); c->emitU64(bits & 0xFFFFu); c->emit(", -");
+            c->emitI64((i64)moff); c->emit("(%rbp)\n");
+        }
+        else if (ew <= 32)
+        {
+            c->emit("\tmovl $"); c->emitU64(bits & 0xFFFFFFFFu); c->emit(", -");
+            c->emitI64((i64)moff); c->emit("(%rbp)\n");
+        }
+        else
+        {
+            c->emit("\tmovq $"); c->emitU64(bits); c->emit(", %r10\n");
+            c->emit("\tmovq %r10, -"); c->emitI64((i64)moff); c->emit("(%rbp)\n");
+        }
+    }
+    /* zero remaining qwords of the 16B slot so upper lanes are defined */
+    u32 covered = n * lb;
+    for (u32 o = covered; o + 8 <= 16; o += 8)
+    {
+        if (o < covered) continue;
+        c->emit("\tmovq $0, %r10\n\tmovq %r10, -");
+        c->emitI64((i64)(off + (i32)o)); c->emit("(%rbp)\n");
+    }
+    if (covered < 16 && (covered % 8) != 0)
+    {
+        /* partial qword tail: zero the rest via byte stores is overkill;
+         * the slot was not pre-zeroed — clear remaining bytes <8 */
+        u32 o = covered;
+        while (o < 16)
+        {
+            if (o + 8 <= 16) break;
+            c->emit("\tmovb $0, -"); c->emitI64((i64)(off + (i32)o));
+            c->emit("(%rbp)\n");
+            o++;
+        }
+    }
+}
+
+/* dst vreg's xmm home or XMM15 staging */
+pub u8 simdDstXmm(EmitCtx* c, u32 vid)
+{
+    i32 dp = xmmDstPhys(c, vid);
+    return dp >= 0 ? (u8)dp : regs::XMM15;
+}
+
+/* source xmm for a vector operand: phys reg if available, else load
+ * into `stage` (caller picks a free xmm — XMM15 unless dst owns it) */
+u8 simdSrcXmm(EmitCtx* c, IrValue* v, u8 stage)
+{
+    if (simdHasPhysXmm(c, v))
+    {
+        i32 vid = vmapFind(&c->vmap, v);
+        return (u8)c->vregs[(usize)vid].phys;
+    }
+    simdLoadVec(c, v, stage);
+    return stage;
+}
+
+/* ================= packed binops ================= */
+
+/* shared 2-operand packed emitter: dst = a <pop><sfx> b */
+void simdPackedBin(EmitCtx* c, IrInst* inst, str pop, str sfx)
+{
+    IrType* vt = simdVecTy(inst);
+    u32 dvid = c->vregFor(&inst->base);
+    u8 useX = simdDstXmm(c, dvid);
+    IrValue* a = inst->nops > 0 ? inst->ops[0] : null;
+    IrValue* b = inst->nops > 1 ? inst->ops[1] : null;
+
+    simdLoadVec(c, a, useX);
+    i32 bvid = isVRegOperand(b) ? vmapFind(&c->vmap, b) : -1;
+    bool done = false;
+    if (bvid >= 0)
+    {
+        VReg* br = &c->vregs[(usize)bvid];
+        if (br->klass == 1 && br->phys >= 0)
+        {
+            if ((u8)br->phys != useX)
+            {
+                c->emit("\t"); c->emit(pop); c->emit(sfx); c->emit(" ");
+                emitXmmReg(c, (u8)br->phys); c->emit(", ");
+                emitXmmReg(c, useX); c->emitLine("");
+            }
+            done = true;
+        }
+        else if (br->klass == 1 && br->slot >= 0)
+        {
+            c->emit("\t"); c->emit(pop); c->emit(sfx); c->emit(" -");
+            c->emitI64((i64)spillOff(c, br->slot)); c->emit("(%rbp), ");
+            emitXmmReg(c, useX); c->emitLine("");
+            done = true;
+        }
+    }
+    if (!done)
+    {
+        /* stage b in XMM15 unless useX owns it — then reuse useX is
+         * impossible (b != a); spill dst? b goes to XMM15 only when
+         * useX != XMM15; otherwise b's own phys or a second path:
+         * if useX == XMM15 and b has no phys, load b FIRST into
+         * XMM15? can't — a is there. Fall back: load b into the
+         * dst's spill slot is wrong; use gpr scratch? Simplest:
+         * when useX==XMM15 && b lacks phys xmm, emit op via mem
+         * form is impossible for const/global — materialize b
+         * into XMM15 BEFORE loading a. Reorder handled by caller
+         * contract: we pre-load b here when needed. */
+        if (useX == regs::XMM15 && !simdHasPhysXmm(c, b))
+        {
+            /* a already in XMM15 — move a aside is impossible; instead
+             * reload a after b: load b->XMM15 would clobber a.
+             * Use dst spill slot as temp: store a, load b, op, reload.
+             * Only when dst spilled (useX==XMM15 means phys<0). */
+            VReg* dr = &c->vregs[dvid];
+            if (dr->slot >= 0)
+            {
+                c->emit("\tmovups "); emitXmmReg(c, useX); c->emit(", -");
+                c->emitI64((i64)spillOff(c, dr->slot)); c->emit("(%rbp)\n");
+                simdLoadVec(c, b, regs::XMM15);
+                c->emit("\tmovups -"); c->emitI64((i64)spillOff(c, dr->slot));
+                c->emit("(%rbp), "); emitXmmReg(c, useX); c->emitLine("");
+                c->emit("\t"); c->emit(pop); c->emit(sfx); c->emit(" ");
+                emitXmmReg(c, regs::XMM15); c->emit(", ");
+                emitXmmReg(c, useX); c->emitLine("");
+                done = true;
+            }
+        }
+        if (!done)
+        {
+            simdLoadVec(c, b, regs::XMM15);
+            c->emit("\t"); c->emit(pop); c->emit(sfx); c->emit(" ");
+            emitXmmReg(c, regs::XMM15); c->emit(", ");
+            emitXmmReg(c, useX); c->emitLine("");
+        }
+    }
+    simdStoreVec(c, dvid, useX);
+}
+
+pub void simdBinOp(EmitCtx* c, IrInst* inst, str pop)
+{
+    IrType* vt = simdVecTy(inst);
+    u32 ew = simdElemW(vt);
+    str sfx = ew <= 8 ? "b" : ew <= 16 ? "w" : ew <= 32 ? "d" : "q";
+    simdPackedBin(c, inst, pop, sfx);
+}
+
+pub void simdFloatBin(EmitCtx* c, IrInst* inst, str pop)
+{
+    IrType* vt = simdVecTy(inst);
+    str sfx = simdElemW(vt) <= 32 ? "ps" : "pd";
+    simdPackedBin(c, inst, pop, sfx);
+}
+
+/* unsigned integer min/max lane-wise (VecMin/VecMax contract) */
+pub void simdMinMax(EmitCtx* c, IrInst* inst, bool isMin)
+{
+    IrType* vt = simdVecTy(inst);
+    if (simdVecFloat(vt))
+    {
+        simdFloatBin(c, inst, isMin ? "min" : "max");
+        return;
+    }
+    u32 ew = simdElemW(vt);
+    str sfx = ew <= 8 ? "ub" : ew <= 16 ? "uw" : "ud";
+    simdPackedBin(c, inst, isMin ? "pmin" : "pmax", sfx);
+}
+
+/* ================= lane-wise fallback ================= */
+
+/* load lane bits at -memOff(%rbp) into gpr; ew = elem width bits */
+void simdLaneLoad(EmitCtx* c, i32 memOff, u32 ew, u8 gpr, bool signExt)
+{
+    c->emit("\t");
+    if (ew <= 8) c->emit(signExt ? "movsbq " : "movzbl ");
+    else if (ew <= 16) c->emit(signExt ? "movswq " : "movzwl ");
+    else if (ew <= 32) c->emit(signExt ? "movslq " : "movl ");
+    else c->emit("movq ");
+    c->emit("-"); c->emitI64((i64)memOff); c->emit("(%rbp), ");
+    c->emit(regForWidth(gpr, ew <= 32 ? 32 : 64)); c->emitLine("");
+}
+
+void simdLaneStore(EmitCtx* c, i32 memOff, u32 ew, u8 gpr)
+{
+    c->emit("\t");
+    if (ew <= 8) { c->emit("movb "); emitByteReg(c, gpr); }
+    else if (ew <= 16) { c->emit("movw "); emitWordReg(c, gpr); }
+    else if (ew <= 32) { c->emit("movl "); c->emit(regForWidth(gpr, 32)); }
+    else { c->emit("movq "); c->emit(regName(gpr)); }
+    c->emit(", -"); c->emitI64((i64)memOff); c->emit("(%rbp)\n");
+}
+
+/* lane-wise integer binop for ops with no packed form:
+ * VecMul i8/i64, VecDiv (signed), VecMin/VecMax i64 (unsigned). */
+pub void simdSlowBin(EmitCtx* c, IrInst* inst)
+{
+    IrType* vt = simdVecTy(inst);
+    u32 ew = simdElemW(vt);
+    u32 lb = simdLaneBytes(vt);
+    u32 n = simdLanes(vt);
+    bool isDiv = inst->opcode == IrOpcode::VecDiv;
+    bool isMin = inst->opcode == IrOpcode::VecMin;
+    bool isMinMax = isMin || inst->opcode == IrOpcode::VecMax;
+    bool isMul = inst->opcode == IrOpcode::VecMul;
+
+    i32 S = allocaSlotFor(c, &inst->base, SIMD_SCRATCH);
+    simdVecToScratch(c, inst->ops[0], S);
+    simdVecToScratch(c, inst->nops > 1 ? inst->ops[1] : null, S + 16);
+
+    for (u32 lane = 0; lane < n; lane++)
+    {
+        i32 ao = S + (i32)(lane * lb);
+        i32 bo = S + 16 + (i32)(lane * lb);
+        i32 dOff = S + 32 + (i32)(lane * lb);
+        if (isDiv)
+        {
+            /* signed: sign-extend to 64, cqo, idiv — matches fast's
+             * documented INT_MIN/-1 wrap (no trap in 64-bit) */
+            simdLaneLoad(c, ao, ew, regs::RAX, true);
+            simdLaneLoad(c, bo, ew, regs::SCRATCH_B, true);
+            c->emitLine("\tcqo");
+            c->emit("\tidivq "); c->emit(regName(regs::SCRATCH_B)); c->emitLine("");
+            simdLaneStore(c, dOff, ew, regs::RAX);
+        }
+        else if (isMul)
+        {
+            simdLaneLoad(c, ao, ew, regs::SCRATCH_A, false);
+            simdLaneLoad(c, bo, ew, regs::SCRATCH_B, false);
+            c->emit("\timulq "); c->emit(regName(regs::SCRATCH_B)); c->emit(", ");
+            c->emit(regName(regs::SCRATCH_A)); c->emitLine("");
+            simdLaneStore(c, dOff, ew, regs::SCRATCH_A);
+        }
+        else /* unsigned min/max */
+        {
+            simdLaneLoad(c, ao, ew, regs::SCRATCH_A, false);
+            simdLaneLoad(c, bo, ew, regs::SCRATCH_B, false);
+            c->emit("\tcmpq "); c->emit(regName(regs::SCRATCH_B)); c->emit(", ");
+            c->emit(regName(regs::SCRATCH_A)); c->emitLine("");
+            c->emit(isMin ? "\tcmova " : "\tcmovb ");
+            c->emit(regName(regs::SCRATCH_B)); c->emit(", ");
+            c->emit(regName(regs::SCRATCH_A)); c->emitLine("");
+            simdLaneStore(c, dOff, ew, regs::SCRATCH_A);
+        }
+    }
+    u32 dvid = c->vregFor(&inst->base);
+    u8 useX = simdDstXmm(c, dvid);
+    c->emit("\tmovups -"); c->emitI64((i64)(S + 32)); c->emit("(%rbp), ");
+    emitXmmReg(c, useX); c->emitLine("");
+    simdStoreVec(c, dvid, useX);
+}
+
+/* ================= broadcast ================= */
+
+pub void simdBroadcast(EmitCtx* c, IrInst* inst)
+{
+    IrType* vt = simdVecTy(inst);
+    if (vt == null) { c->emit("\t# isel: simd broadcast bad type\n"); return; }
+    u32 ew = simdElemW(vt);
+    u32 dvid = c->vregFor(&inst->base);
+    u8 useX = simdDstXmm(c, dvid);
+    IrValue* s = inst->nops > 0 ? inst->ops[0] : null;
+
+    if (simdVecFloat(vt))
+    {
+        u32 sw = vt->elem != null ? vt->elem->width : 64;
+        loadToXmm(c, s, useX, sw);
+        if (ew <= 32)
+        {
+            c->emit("\tpshufd $0, "); emitXmmReg(c, useX); c->emit(", ");
+            emitXmmReg(c, useX); c->emitLine("");
+        }
+        else
+        {
+            c->emit("\tpunpcklpd "); emitXmmReg(c, useX); c->emit(", ");
+            emitXmmReg(c, useX); c->emitLine("");
+        }
+        simdStoreVec(c, dvid, useX);
+        return;
+    }
+    if (!simdVecInt(vt)) { c->emit("\t# isel: simd broadcast bad elem\n"); return; }
+
+    /* integer: replicate the scalar bit pattern through gpr r10 */
+    loadToReg(c, s, regs::SCRATCH_A, ew);
+    if (ew <= 8)
+    {
+        /* movq puts byte in dword0; 3x punpcklbw duplicates to 8 in
+         * the low qword, punpcklqdq mirrors to 16 */
+        c->emit("\tmovzbl "); emitByteReg(c, regs::SCRATCH_A); c->emit(", ");
+        c->emit(regForWidth(regs::SCRATCH_A, 32)); c->emitLine("");
+        c->emit("\tmovq "); c->emit(regName(regs::SCRATCH_A)); c->emit(", ");
+        emitXmmReg(c, useX); c->emitLine("");
+        for (u32 i = 0; i < 3; i++)
+        {
+            c->emit("\tpunpcklbw "); emitXmmReg(c, useX); c->emit(", ");
+            emitXmmReg(c, useX); c->emitLine("");
+        }
+        c->emit("\tpunpcklqdq "); emitXmmReg(c, useX); c->emit(", ");
+        emitXmmReg(c, useX); c->emitLine("");
+    }
+    else if (ew <= 16)
+    {
+        /* r10 = word; r11 = r10<<16; r10 |= r11 (2 words);
+         * r11 = r10<<32; r10 |= r11 (4 words in low qword);
+         * movq + punpcklqdq -> 8 words */
+        c->emit("\tmovzwl "); emitWordReg(c, regs::SCRATCH_A); c->emit(", ");
+        c->emit(regForWidth(regs::SCRATCH_A, 32)); c->emitLine("");
+        c->emit("\tmovq "); c->emit(regName(regs::SCRATCH_A)); c->emit(", %r11\n");
+        c->emit("\tshlq $16, %r11\n\torq %r11, ");
+        c->emit(regName(regs::SCRATCH_A)); c->emitLine("");
+        c->emit("\tmovq "); c->emit(regName(regs::SCRATCH_A)); c->emit(", %r11\n");
+        c->emit("\tshlq $32, %r11\n\torq %r11, ");
+        c->emit(regName(regs::SCRATCH_A)); c->emitLine("");
+        c->emit("\tmovq "); c->emit(regName(regs::SCRATCH_A)); c->emit(", ");
+        emitXmmReg(c, useX); c->emitLine("");
+        c->emit("\tpunpcklqdq "); emitXmmReg(c, useX); c->emit(", ");
+        emitXmmReg(c, useX); c->emitLine("");
+    }
+    else if (ew <= 32)
+    {
+        c->emit("\tmovd "); c->emit(regForWidth(regs::SCRATCH_A, 32));
+        c->emit(", "); emitXmmReg(c, useX); c->emitLine("");
+        c->emit("\tpshufd $0, "); emitXmmReg(c, useX); c->emit(", ");
+        emitXmmReg(c, useX); c->emitLine("");
+    }
+    else
+    {
+        c->emit("\tmovq "); c->emit(regName(regs::SCRATCH_A)); c->emit(", ");
+        emitXmmReg(c, useX); c->emitLine("");
+        c->emit("\tpunpcklqdq "); emitXmmReg(c, useX); c->emit(", ");
+        emitXmmReg(c, useX); c->emitLine("");
+    }
+    simdStoreVec(c, dvid, useX);
+}
+
+/* ================= extract / insert ================= */
+
+/* int lane -> gpr dst for const index; src xmm already chosen */
+void simdExtractIntLane(EmitCtx* c, u8 srcX, u32 lane, u32 ew,
+                        u32 dvid, bool spilled)
+{
+    u8 g = spilled ? regs::SCRATCH_A : (u8)c->vregs[dvid].phys;
+    if (ew <= 8)
+    {
+        c->emit("\tpextrb $"); c->emitU64((u64)lane); c->emit(", ");
+        emitXmmReg(c, srcX); c->emit(", ");
+        c->emit(regForWidth(g, 32)); c->emitLine("");
+    }
+    else if (ew <= 16)
+    {
+        c->emit("\tpextrw $"); c->emitU64((u64)lane); c->emit(", ");
+        emitXmmReg(c, srcX); c->emit(", ");
+        c->emit(regForWidth(g, 32)); c->emitLine("");
+    }
+    else if (ew <= 32)
+    {
+        c->emit("\tpextrd $"); c->emitU64((u64)lane); c->emit(", ");
+        emitXmmReg(c, srcX); c->emit(", ");
+        c->emit(regForWidth(g, 32)); c->emitLine("");
+    }
+    else
+    {
+        if (lane == 0)
+        {
+            c->emit("\tmovq "); emitXmmReg(c, srcX); c->emit(", ");
+            c->emit(regName(g)); c->emitLine("");
+        }
+        else
+        {
+            c->emit("\tpshufd $0x4E, "); emitXmmReg(c, srcX); c->emit(", %xmm15\n");
+            c->emit("\tmovq %xmm15, "); c->emit(regName(g)); c->emitLine("");
+        }
+    }
+    if (spilled) storeToVReg(c, dvid, g, ew);
+}
+
+/* float lane -> xmm scalar via gpr roundtrip when src/dst xmm homes
+ * collide on XMM15; direct shufps-family otherwise */
+void simdExtractFloatLane(EmitCtx* c, IrValue* vec, u32 lane, u32 ew,
+                          u32 dvid, u8 useX, u8 stageX)
+{
+    i32 svid = isVRegOperand(vec) ? vmapFind(&c->vmap, vec) : -1;
+    bool srcPhys = svid >= 0 && simdVidHasXmm(c, (u32)svid);
+    u8 srcX = srcPhys ? (u8)c->vregs[(usize)svid].phys : stageX;
+    if (!srcPhys) simdLoadVec(c, vec, stageX);
+
+    if (srcX != useX || useX != regs::XMM15)
+    {
+        /* distinct xmm regs available */
+        if (ew <= 32)
+        {
+            u32 imm = lane | (lane << 2) | (lane << 4) | (lane << 6);
+            c->emit("\tpshufd $"); c->emitU64((u64)imm); c->emit(", ");
+            emitXmmReg(c, srcX); c->emit(", "); emitXmmReg(c, useX);
+            c->emitLine("");
+        }
+        else if (lane == 0)
+        {
+            if (srcX != useX)
+            {
+                c->emit("\tmovaps "); emitXmmReg(c, srcX); c->emit(", ");
+                emitXmmReg(c, useX); c->emitLine("");
+            }
+        }
+        else
+        {
+            c->emit("\tpshufd $0x4E, "); emitXmmReg(c, srcX); c->emit(", ");
+            emitXmmReg(c, useX); c->emitLine("");
+        }
+        storeFromXmm(c, dvid, useX, ew);
+        return;
+    }
+    /* srcX == useX == XMM15: gpr roundtrip, sequential reuse is safe */
+    if (ew <= 32)
+    {
+        u32 imm = lane | (lane << 2) | (lane << 4) | (lane << 6);
+        c->emit("\tpshufd $"); c->emitU64((u64)imm); c->emit(", ");
+        emitXmmReg(c, srcX); c->emit(", "); emitXmmReg(c, srcX); c->emitLine("");
+        c->emit("\tmovd "); emitXmmReg(c, srcX); c->emit(", %r10d\n");
+        c->emit("\tmovd %r10d, "); emitXmmReg(c, srcX); c->emitLine("");
+    }
+    else
+    {
+        /* f64: lane1 needs a qword swap first (in place is fine —
+         * the src staging reg is dead after this inst) */
+        if (lane != 0)
+        {
+            c->emit("\tpshufd $0x4E, "); emitXmmReg(c, srcX); c->emit(", ");
+            emitXmmReg(c, srcX); c->emitLine("");
+        }
+        c->emit("\tmovq "); emitXmmReg(c, srcX); c->emit(", %r10\n");
+        c->emit("\tmovq %r10, "); emitXmmReg(c, srcX); c->emitLine("");
+    }
+    storeFromXmm(c, dvid, srcX, ew);
+}
+
+pub void simdExtract(EmitCtx* c, IrInst* inst)
+{
+    IrType* vt = simdVecTy(inst);
+    if (vt == null) { c->emit("\t# isel: simd extract bad type\n"); return; }
+    IrValue* vec = inst->nops > 0 ? inst->ops[0] : null;
+    IrValue* idx = inst->nops > 1 ? inst->ops[1] : null;
+    u32 ew = simdElemW(vt);
+    u32 lb = simdLaneBytes(vt);
+    u32 dvid = c->vregFor(&inst->base);
+
+    if (idx != null && idx->kind == IrValueKind::ConstInt && simdPacked(vt))
+    {
+        u32 lane = (u32)(idx->valData & 0xFFFFFFFFu);
+        if (simdVecFloat(vt))
+        {
+            u8 useX = simdDstXmm(c, dvid);
+            /* staging xmm: XMM15 unless dst owns it, then the src
+             * phys (if any) — handled inside */
+            simdExtractFloatLane(c, vec, lane, ew, dvid, useX, regs::XMM15);
+            return;
+        }
+        /* int lane -> gpr; src phys or XMM15 staging (no conflict —
+         * dst is a gpr) */
+        u8 srcX = simdSrcXmm(c, vec, regs::XMM15);
+        i32 dp = (i32)c->vregs[dvid].phys;
+        bool spilled = dp < 0 || c->vregs[dvid].klass != 0;
+        simdExtractIntLane(c, srcX, lane, ew, dvid, spilled);
+        return;
+    }
+
+    /* dynamic index: lane-wise via memory */
+    if (!simdPacked(vt)) { c->emit("\t# isel: simd extract oversized\n"); return; }
+    if (idx == null) { c->emit("\t# isel: simd extract no index\n"); return; }
+
+    /* vec bytes -> rbp scratch (reuse spill slot when possible) */
+    i32 vecOff = -1;
+    i32 svid = isVRegOperand(vec) ? vmapFind(&c->vmap, vec) : -1;
+    if (svid >= 0 && c->vregs[(usize)svid].klass == 1 &&
+        c->vregs[(usize)svid].phys < 0 && c->vregs[(usize)svid].slot >= 0)
+        vecOff = spillOff(c, c->vregs[(usize)svid].slot);
+    else
+    {
+        vecOff = allocaSlotFor(c, &inst->base, SIMD_SCRATCH);
+        simdVecToScratch(c, vec, vecOff);
+    }
+    /* idx -> r10; addr -> r11 = rbp - vecOff + idx*lb */
+    loadToReg(c, idx, regs::SCRATCH_A, 64);
+    c->emit("\tleaq -"); c->emitI64((i64)vecOff); c->emit("(%rbp,%r10,");
+    c->emitU64((u64)lb); c->emit("), %r11\n");
+    if (simdVecFloat(vt))
+    {
+        u8 useX = simdDstXmm(c, dvid);
+        c->emit(ew <= 32 ? "\tmovss (%r11), " : "\tmovsd (%r11), ");
+        emitXmmReg(c, useX); c->emitLine("");
+        storeFromXmm(c, dvid, useX, ew);
+    }
+    else
+    {
+        i32 dp = (i32)c->vregs[dvid].phys;
+        bool spilled = dp < 0 || c->vregs[dvid].klass != 0;
+        u8 g = spilled ? regs::SCRATCH_A : (u8)dp;
+        c->emit("\t");
+        if (ew <= 8) c->emit("movzbl ");
+        else if (ew <= 16) c->emit("movzwl ");
+        else if (ew <= 32) c->emit("movl ");
+        else c->emit("movq ");
+        c->emit("(%r11), "); c->emit(regForWidth(g, ew <= 32 ? 32 : 64));
+        c->emitLine("");
+        if (spilled) storeToVReg(c, dvid, g, ew);
+    }
+}
+
+/* scalar bits -> gpr r10 (int) — float handled separately via xmm */
+void simdScalarToGpr(EmitCtx* c, IrValue* s, u32 ew, bool isFloat)
+{
+    if (isFloat)
+    {
+        u8 sx;
+        if (simdHasPhysXmm(c, s))
+        {
+            i32 svid = vmapFind(&c->vmap, s);
+            sx = (u8)c->vregs[(usize)svid].phys;
+        }
+        else
+        {
+            loadToXmm(c, s, regs::XMM15, ew);
+            sx = regs::XMM15;
+        }
+        c->emit(ew <= 32 ? "\tmovd " : "\tmovq ");
+        emitXmmReg(c, sx); c->emit(", ");
+        c->emit(ew <= 32 ? "%r10d" : "%r10"); c->emitLine("");
+    }
+    else
+    {
+        loadToReg(c, s, regs::SCRATCH_A, ew);
+    }
+}
+
+pub void simdInsert(EmitCtx* c, IrInst* inst)
+{
+    IrType* vt = simdVecTy(inst);
+    if (vt == null) { c->emit("\t# isel: simd insert bad type\n"); return; }
+    IrValue* vec = inst->nops > 0 ? inst->ops[0] : null;
+    IrValue* scalar = inst->nops > 1 ? inst->ops[1] : null;
+    IrValue* idx = inst->nops > 2 ? inst->ops[2] : null;
+    u32 ew = simdElemW(vt);
+    u32 lb = simdLaneBytes(vt);
+    bool isF = simdVecFloat(vt);
+    u32 dvid = c->vregFor(&inst->base);
+
+    if (idx != null && idx->kind == IrValueKind::ConstInt && simdPacked(vt) && ew <= 32)
+    {
+        u32 lane = (u32)(idx->valData & 0xFFFFFFFFu);
+        u8 useX = simdDstXmm(c, dvid);
+        /* scalar bits FIRST — float scalars may stage through XMM15
+         * which the vec load would then clobber */
+        simdScalarToGpr(c, scalar, ew, isF);
+        /* dst = copy of src vec */
+        simdLoadVec(c, vec, useX);
+        if (ew <= 8)
+        {
+            c->emit("\tpinsrb $"); c->emitU64((u64)lane); c->emit(", %r10d, ");
+            emitXmmReg(c, useX); c->emitLine("");
+        }
+        else if (ew <= 16)
+        {
+            c->emit("\tpinsrw $"); c->emitU64((u64)lane); c->emit(", %r10d, ");
+            emitXmmReg(c, useX); c->emitLine("");
+        }
+        else
+        {
+            c->emit("\tpinsrd $"); c->emitU64((u64)lane); c->emit(", %r10d, ");
+            emitXmmReg(c, useX); c->emitLine("");
+        }
+        simdStoreVec(c, dvid, useX);
+        return;
+    }
+
+    /* dynamic index, i64/f64 lane, or oversized: scratch path */
+    if (!simdPacked(vt)) { c->emit("\t# isel: simd insert oversized\n"); return; }
+    if (idx == null || scalar == null) { c->emit("\t# isel: simd insert bad ops\n"); return; }
+
+    i32 S = allocaSlotFor(c, &inst->base, SIMD_SCRATCH);
+    simdVecToScratch(c, vec, S);
+    /* scalar bits -> r11 (keeps r10 free for idx/addr) */
+    if (isF)
+    {
+        u8 sx;
+        if (simdHasPhysXmm(c, scalar))
+        {
+            i32 svid = vmapFind(&c->vmap, scalar);
+            sx = (u8)c->vregs[(usize)svid].phys;
+        }
+        else
+        {
+            loadToXmm(c, scalar, regs::XMM15, ew);
+            sx = regs::XMM15;
+        }
+        c->emit(ew <= 32 ? "\tmovd " : "\tmovq ");
+        emitXmmReg(c, sx); c->emit(", ");
+        c->emit(ew <= 32 ? "%r11d" : "%r11"); c->emitLine("");
+    }
+    else
+    {
+        loadToReg(c, scalar, regs::SCRATCH_B, ew);
+    }
+    /* idx -> r10; lane addr -> r10 = rbp - S + idx*lb */
+    loadToReg(c, idx, regs::SCRATCH_A, 64);
+    c->emit("\tleaq -"); c->emitI64((i64)S); c->emit("(%rbp,%r10,");
+    c->emitU64((u64)lb); c->emit("), %r10\n");
+    /* store scalar bits at (%r10) */
+    c->emit("\t");
+    if (ew <= 8) { c->emit("movb "); emitByteReg(c, regs::SCRATCH_B); }
+    else if (ew <= 16) { c->emit("movw "); emitWordReg(c, regs::SCRATCH_B); }
+    else if (ew <= 32) { c->emit("movl "); c->emit("%r11d"); }
+    else { c->emit("movq "); c->emit("%r11"); }
+    c->emit(", (%r10)\n");
+    u8 useX = simdDstXmm(c, dvid);
+    c->emit("\tmovups -"); c->emitI64((i64)S); c->emit("(%rbp), ");
+    emitXmmReg(c, useX); c->emitLine("");
+    simdStoreVec(c, dvid, useX);
+}
+
+/* ================= shuffle ================= */
+
+pub void simdShuffle(EmitCtx* c, IrInst* inst)
+{
+    IrType* vt = simdVecTy(inst);
+    if (vt == null || inst->nops < 3) { c->emit("\t# isel: simd shuffle bad\n"); return; }
+    u32 ew = simdElemW(vt);
+    u32 nres = simdLanes(vt);
+    u32 dvid = c->vregFor(&inst->base);
+    u8 useX = simdDstXmm(c, dvid);
+    u32 n1 = inst->ops[0]->type != null ? inst->ops[0]->type->count : nres;
+
+    u64[16] mask;
+    bool allConst = nres <= 16;
+    bool single = true;
+    for (u32 j = 0; j < nres; j++)
+    {
+        IrValue* m = inst->ops[2 + j];
+        if (m == null || m->kind != IrValueKind::ConstInt) { allConst = false; break; }
+        mask[j] = m->valData;
+        if (mask[j] >= (u64)n1) single = false;
+    }
+    if (!allConst) { c->emit("\t# isel: simd shuffle nonconst mask\n"); return; }
+
+    /* fast paths need a free staging xmm when dst is spilled: only
+     * take them when src has a phys xmm or dst has a phys xmm */
+    bool dstPhys = simdVidHasXmm(c, dvid);
+    bool srcPhys = simdHasPhysXmm(c, inst->ops[0]);
+    bool fastOk = dstPhys || srcPhys;
+
+    if (single && fastOk)
+    {
+        if (ew <= 32 && nres == 4)
+        {
+            /* pshufd: dst dword j = src dword mask[j] */
+            u32 imm = (u32)(mask[0] | (mask[1] << 2) | (mask[2] << 4) | (mask[3] << 6));
+            u8 srcX = simdSrcXmm(c, inst->ops[0], regs::XMM15);
+            if (srcX == useX && srcX == regs::XMM15)
+            {
+                /* same reg: pshufd in place is still correct */
+            }
+            c->emit("\tpshufd $"); c->emitU64((u64)imm); c->emit(", ");
+            emitXmmReg(c, srcX); c->emit(", "); emitXmmReg(c, useX);
+            c->emitLine("");
+            simdStoreVec(c, dvid, useX);
+            return;
+        }
+        if (ew > 32 && nres == 2)
+        {
+            u64 m0 = mask[0];
+            u64 m1 = mask[1];
+            u8 srcX = simdSrcXmm(c, inst->ops[0], regs::XMM15);
+            if (m0 == 0 && m1 == 1)
+            {
+                if (srcX != useX)
+                {
+                    c->emit("\tmovaps "); emitXmmReg(c, srcX); c->emit(", ");
+                    emitXmmReg(c, useX); c->emitLine("");
+                }
+            }
+            else if (m0 == 1 && m1 == 0)
+            {
+                c->emit("\tpshufd $0x4E, "); emitXmmReg(c, srcX); c->emit(", ");
+                emitXmmReg(c, useX); c->emitLine("");
+            }
+            else if (m0 == m1)
+            {
+                /* duplicate one qword: swap if needed then punpcklqdq */
+                if (m0 == 1)
+                {
+                    c->emit("\tpshufd $0x4E, "); emitXmmReg(c, srcX); c->emit(", ");
+                    emitXmmReg(c, useX); c->emitLine("");
+                }
+                else if (srcX != useX)
+                {
+                    c->emit("\tmovaps "); emitXmmReg(c, srcX); c->emit(", ");
+                    emitXmmReg(c, useX); c->emitLine("");
+                }
+                c->emit("\tpunpcklqdq "); emitXmmReg(c, useX); c->emit(", ");
+                emitXmmReg(c, useX); c->emitLine("");
+            }
+            else
+            {
+                c->emit("\t# isel: simd shuffle qword perm unsupported\n");
+                return;
+            }
+            simdStoreVec(c, dvid, useX);
+            return;
+        }
+    }
+
+    /* generic: both sources -> scratch, per-lane bit copy */
+    if (!simdPacked(vt)) { c->emit("\t# isel: simd shuffle oversized\n"); return; }
+    u32 lb = simdLaneBytes(vt);
+    i32 S = allocaSlotFor(c, &inst->base, SIMD_SCRATCH);
+    simdVecToScratch(c, inst->ops[0], S);
+    simdVecToScratch(c, inst->nops > 1 ? inst->ops[1] : null, S + 16);
+    for (u32 j = 0; j < nres; j++)
+    {
+        u64 mi = mask[j];
+        u32 srcBase = 0;
+        u64 lane = mi;
+        if (mi >= (u64)n1) { srcBase = 16; lane = mi - (u64)n1; }
+        i32 so = S + (i32)srcBase + (i32)(lane * (u64)lb);
+        i32 dOff = S + 32 + (i32)(j * lb);
+        c->emit("\t");
+        if (ew <= 8) c->emit("movzbl ");
+        else if (ew <= 16) c->emit("movzwl ");
+        else if (ew <= 32) c->emit("movl ");
+        else c->emit("movq ");
+        c->emit("-"); c->emitI64((i64)so); c->emit("(%rbp), %r10\n");
+        c->emit("\t");
+        if (ew <= 8) { c->emit("movb "); emitByteReg(c, regs::SCRATCH_A); }
+        else if (ew <= 16) { c->emit("movw "); emitWordReg(c, regs::SCRATCH_A); }
+        else if (ew <= 32) { c->emit("movl "); c->emit("%r10d"); }
+        else { c->emit("movq "); c->emit("%r10"); }
+        c->emit(", -"); c->emitI64((i64)dOff); c->emit("(%rbp)\n");
+    }
+    c->emit("\tmovups -"); c->emitI64((i64)(S + 32)); c->emit("(%rbp), ");
+    emitXmmReg(c, useX); c->emitLine("");
+    simdStoreVec(c, dvid, useX);
+}
+
+/* ================= vector load / store ================= */
+
+/* exact-size memory -> scratch copy for sub-128 vectors */
+void simdCopyMemToScratch(EmitCtx* c, u8 addrR, i32 S, u32 bytes)
+{
+    u32 done = 0;
+    while (done + 8 <= bytes)
+    {
+        c->emit("\tmovq "); c->emitI64((i64)done); c->emit("(");
+        c->emit(regName(addrR)); c->emit("), %r10\n");
+        c->emit("\tmovq %r10, -"); c->emitI64((i64)(S + (i32)done));
+        c->emit("(%rbp)\n");
+        done += 8;
+    }
+    u32 rem = bytes - done;
+    if (rem >= 4)
+    {
+        c->emit("\tmovl "); c->emitI64((i64)done); c->emit("(");
+        c->emit(regName(addrR)); c->emit("), %r10d\n");
+        c->emit("\tmovl %r10d, -"); c->emitI64((i64)(S + (i32)done));
+        c->emit("(%rbp)\n");
+        done += 4; rem -= 4;
+    }
+    if (rem >= 2)
+    {
+        c->emit("\tmovzwl "); c->emitI64((i64)done); c->emit("(");
+        c->emit(regName(addrR)); c->emit("), %r10d\n");
+        c->emit("\tmovw %r10w, -"); c->emitI64((i64)(S + (i32)done));
+        c->emit("(%rbp)\n");
+        done += 2; rem -= 2;
+    }
+    if (rem >= 1)
+    {
+        c->emit("\tmovzbl "); c->emitI64((i64)done); c->emit("(");
+        c->emit(regName(addrR)); c->emit("), %r10d\n");
+        c->emit("\tmovb %r10b, -"); c->emitI64((i64)(S + (i32)done));
+        c->emit("(%rbp)\n");
+        done += 1;
+    }
+    /* zero the rest of the 16B scratch slot */
+    for (u32 o = done; o + 8 <= 16; o += 8)
+    {
+        c->emit("\tmovq $0, %r10\n\tmovq %r10, -");
+        c->emitI64((i64)(S + (i32)o)); c->emit("(%rbp)\n");
+    }
+    if (done < 16 && (done % 8) != 0)
+    {
+        u32 o = done;
+        while (o < 16 && (o % 8) != 0) { o++; }
+        /* bytes between done and next qword boundary already copied;
+         * zero any remaining tail bytes */
+        for (u32 p = done; p < 16 && (p / 8) * 8 + 8 > bytes; p++)
+        {
+            if (p >= bytes)
+            {
+                c->emit("\tmovb $0, -"); c->emitI64((i64)(S + (i32)p));
+                c->emit("(%rbp)\n");
+            }
+        }
+    }
+}
+
+pub void simdVecLoad(EmitCtx* c, IrInst* inst)
+{
+    IrType* vt = inst->base.type;
+    if (vt == null || vt->kind != IrTypeKind::Vector)
+    { c->emit("\t# isel: simd load bad type\n"); return; }
+    u32 bytes = simdVecBytes(vt);
+    IrValue* addr = inst->nops > 0 ? inst->ops[0] : null;
+    u32 dvid = c->vregFor(&inst->base);
+    u8 useX = simdDstXmm(c, dvid);
+
+    if (bytes == 16)
+    {
+        if (addr != null && (addr->kind == IrValueKind::Global ||
+            addr->kind == IrValueKind::Func || addr->kind == IrValueKind::StringConst))
+        {
+            c->emit("\tmovups "); emitRipSymName(c, addr); c->emit("(%rip), ");
+            emitXmmReg(c, useX); c->emitLine("");
+        }
+        else
+        {
+            i32 avid = isVRegOperand(addr) ? vmapFind(&c->vmap, addr) : -1;
+            u8 addrR;
+            if (avid >= 0 && c->vregs[(usize)avid].phys >= 0)
+                addrR = (u8)c->vregs[(usize)avid].phys;
+            else
+            {
+                loadToReg(c, addr, regs::SCRATCH_B, 64);
+                addrR = regs::SCRATCH_B;
+            }
+            c->emit("\tmovups ("); c->emit(regName(addrR)); c->emit("), ");
+            emitXmmReg(c, useX); c->emitLine("");
+        }
+        simdStoreVec(c, dvid, useX);
+        return;
+    }
+    if (bytes > 16 || bytes == 0)
+    {
+        c->emit("\t# isel: simd load oversized vector\n");
+        return;
+    }
+    /* sub-128-bit: exact-size copy into scratch then movups */
+    i32 S = allocaSlotFor(c, &inst->base, SIMD_SCRATCH);
+    i32 avid = isVRegOperand(addr) ? vmapFind(&c->vmap, addr) : -1;
+    u8 addrR;
+    if (avid >= 0 && c->vregs[(usize)avid].phys >= 0)
+        addrR = (u8)c->vregs[(usize)avid].phys;
+    else
+    {
+        loadToReg(c, addr, regs::SCRATCH_B, 64);
+        addrR = regs::SCRATCH_B;
+    }
+    simdCopyMemToScratch(c, addrR, S, bytes);
+    c->emit("\tmovups -"); c->emitI64((i64)S); c->emit("(%rbp), ");
+    emitXmmReg(c, useX); c->emitLine("");
+    simdStoreVec(c, dvid, useX);
+}
+
+pub void simdVecStore(EmitCtx* c, IrInst* inst)
+{
+    IrValue* val = inst->nops > 0 ? inst->ops[0] : null;
+    IrValue* addr = inst->nops > 1 ? inst->ops[1] : null;
+    IrType* vt = val != null ? val->type : null;
+    if (vt == null || vt->kind != IrTypeKind::Vector)
+    { c->emit("\t# isel: simd store bad val type\n"); return; }
+    u32 bytes = simdVecBytes(vt);
+
+    /* vector -> xmm (XMM15 staging for non-phys) */
+    u8 srcX = regs::XMM15;
+    if (simdHasPhysXmm(c, val))
+    {
+        i32 vvid = vmapFind(&c->vmap, val);
+        srcX = (u8)c->vregs[(usize)vvid].phys;
+    }
+    else
+    {
+        simdLoadVec(c, val, regs::XMM15);
+    }
+
+    /* addr -> gpr */
+    i32 avid = isVRegOperand(addr) ? vmapFind(&c->vmap, addr) : -1;
+    u8 addrR;
+    if (avid >= 0 && c->vregs[(usize)avid].phys >= 0)
+        addrR = (u8)c->vregs[(usize)avid].phys;
+    else
+    {
+        loadToReg(c, addr, regs::SCRATCH_B, 64);
+        addrR = regs::SCRATCH_B;
+    }
+
+    if (bytes == 16)
+    {
+        c->emit("\tmovups "); emitXmmReg(c, srcX); c->emit(", (");
+        c->emit(regName(addrR)); c->emit(")"); c->emitLine("");
+        return;
+    }
+    if (bytes > 16 || bytes == 0)
+    {
+        c->emit("\t# isel: simd store oversized vector\n");
+        return;
+    }
+    /* sub-128: spill xmm to scratch, exact-size gpr copy out */
+    i32 S = allocaSlotFor(c, &inst->base, SIMD_SCRATCH);
+    c->emit("\tmovups "); emitXmmReg(c, srcX); c->emit(", -");
+    c->emitI64((i64)S); c->emit("(%rbp)\n");
+    u32 done = 0;
+    while (done + 8 <= bytes)
+    {
+        c->emit("\tmovq -"); c->emitI64((i64)(S + (i32)done)); c->emit("(%rbp), %r10\n");
+        c->emit("\tmovq %r10, "); c->emitI64((i64)done); c->emit("(");
+        c->emit(regName(addrR)); c->emit(")\n");
+        done += 8;
+    }
+    u32 rem = bytes - done;
+    if (rem >= 4)
+    {
+        c->emit("\tmovl -"); c->emitI64((i64)(S + (i32)done)); c->emit("(%rbp), %r10d\n");
+        c->emit("\tmovl %r10d, "); c->emitI64((i64)done); c->emit("(");
+        c->emit(regName(addrR)); c->emit(")\n");
+        done += 4; rem -= 4;
+    }
+    if (rem >= 2)
+    {
+        c->emit("\tmovzwl -"); c->emitI64((i64)(S + (i32)done)); c->emit("(%rbp), %r10d\n");
+        c->emit("\tmovw %r10w, "); c->emitI64((i64)done); c->emit("(");
+        c->emit(regName(addrR)); c->emit(")\n");
+        done += 2; rem -= 2;
+    }
+    if (rem >= 1)
+    {
+        c->emit("\tmovzbl -"); c->emitI64((i64)(S + (i32)done)); c->emit("(%rbp), %r10d\n");
+        c->emit("\tmovb %r10b, "); c->emitI64((i64)done); c->emit("(");
+        c->emit(regName(addrR)); c->emit(")\n");
+    }
+}
+
+/* ================= phi copies ================= */
+
+/* 16B vector copy src -> dst vreg home. Direct reg/slot moves when
+ * both homes are known; XMM15 staging otherwise. */
+pub void simdCopyVec(EmitCtx* c, IrValue* src, u32 dstVid)
+{
+    VReg* dr = &c->vregs[dstVid];
+    if (dr->klass != 1) { c->emit("\t# isel: simdCopyVec non-xmm dst\n"); return; }
+    i32 svid = isVRegOperand(src) ? vmapFind(&c->vmap, src) : -1;
+    if (svid >= 0 && c->vregs[(usize)svid].klass == 1)
+    {
+        VReg* sr = &c->vregs[(usize)svid];
+        if (sr->phys >= 0 && dr->phys >= 0)
+        {
+            if ((u8)sr->phys != (u8)dr->phys)
+            {
+                c->emit("\tmovaps "); emitXmmReg(c, (u8)sr->phys); c->emit(", ");
+                emitXmmReg(c, (u8)dr->phys); c->emitLine("");
+            }
+            return;
+        }
+        if (sr->phys >= 0 && dr->phys < 0 && dr->slot >= 0)
+        {
+            c->emit("\tmovups "); emitXmmReg(c, (u8)sr->phys); c->emit(", -");
+            c->emitI64((i64)spillOff(c, dr->slot)); c->emit("(%rbp)\n");
+            return;
+        }
+        if (sr->phys < 0 && sr->slot >= 0 && dr->phys >= 0)
+        {
+            c->emit("\tmovups -"); c->emitI64((i64)spillOff(c, sr->slot));
+            c->emit("(%rbp), "); emitXmmReg(c, (u8)dr->phys); c->emitLine("");
+            return;
+        }
+        if (sr->phys < 0 && sr->slot >= 0 && dr->slot >= 0)
+        {
+            c->emit("\tmovups -"); c->emitI64((i64)spillOff(c, sr->slot));
+            c->emit("(%rbp), -"); c->emitI64((i64)spillOff(c, dr->slot));
+            c->emit("(%rbp)\n");
+            return;
+        }
+    }
+    simdLoadVec(c, src, regs::XMM15);
+    simdStoreVec(c, dstVid, regs::XMM15);
+}
+
+/* ================= scratch pre-scan predicate ================= */
+
+/* precise mirror of the isel paths: true iff the inst will call
+ * allocaSlotFor. Over-approximation is safe (stack bytes only). */
+pub bool simdNeedsScratch(EmitCtx* c, IrInst* inst)
+{
+    IrType* vt = simdVecTy(inst);
+    if (vt == null) return false;
+    if (!simdPacked(vt)) return false; /* oversized -> unsupported path */
+    /* const-vector operands always materialize via scratch */
+    for (u32 i = 0; i < inst->nops; i++)
+        if (simdIsConstVec(inst->ops[i])) return true;
+
+    switch (inst->opcode)
+    {
+        IrOpcode::VecAdd | IrOpcode::VecSub |
+        IrOpcode::VecFAdd | IrOpcode::VecFSub | IrOpcode::VecFMul | IrOpcode::VecFDiv |
+        IrOpcode::VecBroadcast => { return false; },
+        IrOpcode::VecMul => {
+            u32 ew = simdElemW(vt);
+            return !(ew == 16 || ew == 32);
+        },
+        IrOpcode::VecDiv => { return true; },
+        IrOpcode::VecMin | IrOpcode::VecMax => {
+            if (simdVecFloat(vt)) return false;
+            u32 ew = simdElemW(vt);
+            return !(ew == 8 || ew == 16 || ew == 32);
+        },
+        IrOpcode::ShuffleVector => { return true; }, /* generic path */
+        IrOpcode::ExtractElement => {
+            IrValue* idx = inst->nops > 1 ? inst->ops[1] : null;
+            if (idx == null || idx->kind != IrValueKind::ConstInt) return true;
+            /* const idx: packed unless float && both homes collide */
+            if (!simdVecFloat(vt)) return false;
+            u32 dvid = c->vregFor(&inst->base);
+            bool dstPhys = simdVidHasXmm(c, dvid);
+            bool srcPhys = simdHasPhysXmm(c, inst->ops[0]);
+            return !(dstPhys || srcPhys);
+        },
+        IrOpcode::InsertElement => {
+            IrValue* idx = inst->nops > 2 ? inst->ops[2] : null;
+            if (idx == null || idx->kind != IrValueKind::ConstInt) return true;
+            return simdElemW(vt) > 32;
+        },
+        IrOpcode::Load | IrOpcode::Store => {
+            /* scratch only for sub-128 vectors */
+            return simdVecBytes(vt) != 16;
+        },
+        else => { return false; },
+    }
+}
+
+/* ================= dispatch ================= */
+
+pub void simdVecOp(EmitCtx* c, IrInst* inst)
+{
+    switch (inst->opcode)
+    {
+        IrOpcode::VecAdd => { simdBinOp(c, inst, "padd"); return; },
+        IrOpcode::VecSub => { simdBinOp(c, inst, "psub"); return; },
+        IrOpcode::VecMul => {
+            IrType* vt = simdVecTy(inst);
+            u32 ew = vt != null ? simdElemW(vt) : 64;
+            if (ew == 16) { simdBinOp(c, inst, "pmullw"); return; }
+            if (ew == 32) { simdBinOp(c, inst, "pmulld"); return; }
+            simdSlowBin(c, inst); return;
+        },
+        IrOpcode::VecDiv => { simdSlowBin(c, inst); return; },
+        IrOpcode::VecFAdd => { simdFloatBin(c, inst, "add"); return; },
+        IrOpcode::VecFSub => { simdFloatBin(c, inst, "sub"); return; },
+        IrOpcode::VecFMul => { simdFloatBin(c, inst, "mul"); return; },
+        IrOpcode::VecFDiv => { simdFloatBin(c, inst, "div"); return; },
+        IrOpcode::VecMin => { simdMinMax(c, inst, true); return; },
+        IrOpcode::VecMax => { simdMinMax(c, inst, false); return; },
+        IrOpcode::VecBroadcast => { simdBroadcast(c, inst); return; },
+        IrOpcode::ShuffleVector => { simdShuffle(c, inst); return; },
+        IrOpcode::ExtractElement => { simdExtract(c, inst); return; },
+        IrOpcode::InsertElement => { simdInsert(c, inst); return; },
+        else => { c->emit("\t# isel: unknown vec op\n"); return; },
+    }
+}

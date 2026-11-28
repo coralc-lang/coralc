@@ -1,0 +1,286 @@
+#[[no_drop_all]]
+import muvm::irtypes {
+    IrModule, IrFunc, IrBlock, IrInst, IrValue, IrValueKind,
+    IrType, IrTypeKind, IrContext, IrGlobal, IrStringConst,
+    IrArrayConst, IrStructConst, IrStructType
+};
+import muvm::irOps { IrOpcode, IrICmpPred, IrFCmpPred, irOpcodeStr };
+import muvm::regalloc::graph { graphAssignNodes };
+import std::string { String };
+import std::mman { alloc, dealloc, copy };
+import std::vec { Vec };
+import platform::libc { snprintf };
+import core::cchar { cchar };
+
+use muvm::target::primary::x86_64::linux::regs;
+use muvm::target::primary::x86_64::linux::linux { ArgClass, classifyArg, typeSizeBytes, typeIsSse, INT_ARG_REGS, SSE_ARG_REGS };
+use muvm::target::primary::x86_64::linux::prologue;
+
+use muvm::target::primary::x86_64::linux::core { EmitCtx, argRegPhys, asmSymName, emitXmmReg, isVRegOperand, loadToReg, regName, spillOff, storeToVReg, vmapFind };
+
+pub i32 callArgSrcPhys(EmitCtx* c, IrValue* av)
+{
+    if (av == null || !isVRegOperand(av)) return -1;
+    i32 vid = vmapFind(&c->vmap, av);
+    if (vid < 0) return -1;
+    return c->vregs[(usize)vid].phys;
+}
+
+/* store one integer stack arg at `off(%rsp)` (off already final) */
+pub void emitIntStackArg(EmitCtx* c, IrValue* av, u32 off)
+{
+    if (av != null && av->kind == IrValueKind::ConstInt &&
+        (av->valData >> 32) == 0)
+    {
+        c->emit("\tmovq $"); c->emitU64(av->valData); c->emit(", ");
+        c->emitI64((i64)off); c->emit("(%rsp)\n");
+        return;
+    }
+    loadToReg(c, av, regs::SCRATCH_A, 64);
+    c->emit("\tmovq %r10, "); c->emitI64((i64)off); c->emit("(%rsp)\n");
+}
+
+/* move the call result (rax/xmm0) into the dst vreg */
+pub void emitCallResult(EmitCtx* c, IrInst* inst)
+{
+    if (inst->base.type == null || inst->base.type->kind == IrTypeKind::Void)
+        return;
+    if (typeIsSse(inst->base.type))
+    {
+        u32 dvid = c->vregFor(&inst->base);
+        i32 dp = (i32)c->vregs[(usize)dvid].phys;
+        if (dp >= 0 && c->vregs[(usize)dvid].klass == 1)
+        {
+            c->emit("\tmovaps "); emitXmmReg(c, 0); c->emit(", ");
+            emitXmmReg(c, (u8)dp); c->emitLine("");
+        }
+        else if (dp < 0)
+        {
+            c->emit("\tmovups "); emitXmmReg(c, 0); c->emit(", -");
+            c->emitI64((i64)spillOff(c, c->vregs[(usize)dvid].slot));
+            c->emit("(%rbp)\n");
+        }
+        return;
+    }
+    u32 dvid = c->vregFor(&inst->base);
+    u32 w = inst->base.type->kind == IrTypeKind::Int ? inst->base.type->width : 64;
+    storeToVReg(c, dvid, regs::RAX, w);
+}
+
+pub void iselCall(EmitCtx* c, IrInst* inst)
+{
+    c->memClear();
+    IrValue* fv = inst->nops > 0 ? inst->ops[0] : null;
+    if (fv == null || (fv->kind != IrValueKind::Func && fv->kind != IrValueKind::Global))
+    {
+        c->emit("\t# isel: indirect/unsupported call target\n");
+        return;
+    }
+    str fname = asmSymName(fv);
+    u32 nargs = inst->nops > 1 ? inst->nops - 1 : 0;
+    if (nargs > 32)
+    {
+        c->emit("\t# isel: too many call args\n");
+        return;
+    }
+
+    /* classify each arg; int->rdi..r9, sse->xmm0-7, overflow->stack */
+    ArgClass* cls = alloc<ArgClass>(32);
+    u8* dstK = alloc<u8>(32);    /* 0=int reg idx, 1=xmm reg idx, 2=stack slot idx */
+    u8* dstI = alloc<u8>(32);
+    u32 nInt = 0;
+    u32 nXmm = 0;
+    u32 nStack = 0;
+    for (u32 i = 0; i < nargs; i++)
+    {
+        IrValue* av = inst->ops[i + 1];
+        ArgClass cl = classifyArg(av);
+        cls[i] = cl;
+        if (cl == ArgClass::INTEGER)
+        {
+            if (nInt < 6) { dstK[i] = 0; dstI[i] = (u8)nInt; nInt++; }
+            else { dstK[i] = 2; dstI[i] = (u8)nStack; nStack++; }
+        }
+        else if (cl == ArgClass::SSE)
+        {
+            if (nXmm < 8) { dstK[i] = 1; dstI[i] = (u8)nXmm; nXmm++; }
+            else { dstK[i] = 2; dstI[i] = (u8)nStack; nStack++; }
+        }
+        else { dstK[i] = 2; dstI[i] = (u8)nStack; nStack++; }
+    }
+
+    /* fast path: no SSE args -> store stack args first, then move the
+     * <=6 integer arg regs directly in a parallel-copy-safe order.
+     * Falls back to the temp-stack path if the order has a cycle. */
+    bool direct = (nXmm == 0);
+    u8[6] dOrder;
+    u32 dN = 0;
+    u8[6] emDst;
+    IrValue*[6] emSrc;
+    if (direct)
+    {
+        u8[6] dmDst;
+        i32[6] dmPhys;
+        u8[6] dmDone;
+        u32 dn = 0;
+        u32 en = 0;
+        for (u32 i = 0; i < nargs; i++)
+        {
+            if (dstK[i] != 0) continue;
+            u8 dp2 = argRegPhys(dstI[i]);
+            IrValue* av = inst->ops[i + 1];
+            emDst[en] = dp2;
+            emSrc[en] = av;
+            en++;
+            if (dn < 6)
+            {
+                dmDst[dn] = dp2;
+                dmPhys[dn] = callArgSrcPhys(c, av);
+                dmDone[dn] = 0;
+                dn++;
+            }
+        }
+        u32 dRem = dn;
+        bool ok = true;
+        while (dRem > 0 && ok)
+        {
+            bool prog = false;
+            for (u32 t = 0; t < dn; t++)
+            {
+                if (dmDone[t]) continue;
+                if ((i32)dmDst[t] == dmPhys[t]) { dmDone[t] = 1; dRem--; prog = true; continue; }
+                bool blocked = false;
+                for (u32 u = 0; u < dn; u++)
+                    if (!dmDone[u] && dmPhys[u] == (i32)dmDst[t]) { blocked = true; break; }
+                if (!blocked) { dOrder[dN++] = (u8)t; dmDone[t] = 1; dRem--; prog = true; }
+            }
+            if (!prog) ok = false;
+        }
+        if (!ok || en != dn) direct = false;
+        else
+        {
+            u32 dSub = nStack * 8;
+            if (dSub > 0 && (dSub % 16) == 8) dSub += 8;
+            if (dSub > 0)
+            {
+                c->emit("\tsubq $"); c->emitI64((i64)dSub); c->emit(", %rsp\n");
+            }
+            for (u32 i = 0; i < nargs; i++)
+                if (dstK[i] == 2) emitIntStackArg(c, inst->ops[i + 1], (u32)dstI[i] * 8);
+            for (u32 oi = 0; oi < dN; oi++)
+                loadToReg(c, emSrc[dOrder[oi]], emDst[dOrder[oi]], 64);
+            IrType* fty2 = fv->kind == IrValueKind::Func ? ((IrFunc*)fv)->base.type : null;
+            if (fty2 != null && fty2->isVararg)
+            {
+                c->emit("\tmovb $0, %al\n");
+            }
+            c->emit("\tcall "); c->emit(fname); c->emitLine("");
+            if (dSub > 0)
+            {
+                c->emit("\taddq $"); c->emitI64((i64)dSub); c->emit(", %rsp\n");
+            }
+            emitCallResult(c, inst);
+            dealloc<ArgClass>(cls);
+            dealloc<u8>(dstK);
+            dealloc<u8>(dstI);
+            return;
+        }
+    }
+
+    /* temp slots for reg-class args live above the stack args:
+     * stack args occupy rsp+0..nStack*8 (final), temps at
+     * (nStack + t)*8. Total area padded to 16B. */
+    u32 nTemp = nInt + nXmm;
+    u32 totalSlots = nStack + nTemp;
+    u32 subBytes = totalSlots * 8;
+    if (subBytes > 0 && (subBytes % 16) == 8) subBytes += 8;
+    if (subBytes > 0)
+    {
+        c->emit("\tsubq $"); c->emitI64((i64)subBytes); c->emit(", %rsp\n");
+    }
+
+    /* phase 1: evaluate every arg into its temp/final slot */
+    u32 ti = 0;
+    for (u32 i = 0; i < nargs; i++)
+    {
+        IrValue* av = inst->ops[i + 1];
+        u32 off;
+        if (dstK[i] == 2) off = (u32)dstI[i] * 8;
+        else { off = (nStack + ti) * 8; ti++; }
+        if (cls[i] == ArgClass::SSE)
+        {
+            /* xmm value -> 16B temp; use xmm15 scratch for spilled */
+            i32 vid = isVRegOperand(av) ? vmapFind(&c->vmap, av) : -1;
+            u32 sz = av != null && av->type != null ? typeSizeBytes(av->type) : 8;
+            c->emit("\tmovups ");
+            if (vid >= 0 && c->vregs[(usize)vid].phys >= 0)
+            {
+                emitXmmReg(c, (u8)c->vregs[(usize)vid].phys);
+            }
+            else if (vid >= 0)
+            {
+                c->emit("-"); c->emitI64((i64)spillOff(c, c->vregs[(usize)vid].slot));
+                c->emit("(%rbp)");
+            }
+            else
+            {
+                /* const/other: zero the temp (approximation) */
+                c->emit("# isel: sse const arg unsupported\n");
+                continue;
+            }
+            c->emit(", "); c->emitI64((i64)off); c->emit("(%rsp)\n");
+            (void)sz;
+        }
+        else
+        {
+            if (av != null && av->kind == IrValueKind::ConstInt &&
+                (av->valData >> 32) == 0)
+            {
+                c->emit("\tmovq $"); c->emitU64(av->valData); c->emit(", ");
+                c->emitI64((i64)off); c->emit("(%rsp)\n");
+            }
+            else
+            {
+                loadToReg(c, av, regs::SCRATCH_A, 64);
+                c->emit("\tmovq %r10, "); c->emitI64((i64)off); c->emit("(%rsp)\n");
+            }
+        }
+    }
+
+    /* phase 2: temps -> ABI registers */
+    ti = 0;
+    for (u32 i = 0; i < nargs; i++)
+    {
+        if (dstK[i] == 2) continue;
+        u32 off = (nStack + ti) * 8;
+        ti++;
+        if (dstK[i] == 0)
+        {
+            c->emit("\tmovq "); c->emitI64((i64)off); c->emit("(%rsp), ");
+            c->emit(regName(argRegPhys(dstI[i]))); c->emitLine("");
+        }
+        else
+        {
+            c->emit("\tmovups "); c->emitI64((i64)off); c->emit("(%rsp), ");
+            emitXmmReg(c, dstI[i]); c->emitLine("");
+        }
+    }
+
+    /* varargs: AL = number of vector regs used */
+    IrType* fty = fv->kind == IrValueKind::Func ? ((IrFunc*)fv)->base.type : null;
+    if (fty != null && fty->isVararg)
+    {
+        c->emit("\tmovb $"); c->emitU64((u64)nXmm); c->emitLine(", %al");
+    }
+
+    c->emit("\tcall "); c->emit(fname); c->emitLine("");
+    if (subBytes > 0)
+    {
+        c->emit("\taddq $"); c->emitI64((i64)subBytes); c->emit(", %rsp\n");
+    }
+    emitCallResult(c, inst);
+    dealloc<ArgClass>(cls);
+    dealloc<u8>(dstK);
+    dealloc<u8>(dstI);
+}
+

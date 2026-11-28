@@ -1,0 +1,393 @@
+#[[no_drop_all]]
+import muvm::irtypes {
+    IrModule, IrFunc, IrBlock, IrInst, IrValue, IrValueKind,
+    IrType, IrTypeKind, IrContext, IrGlobal, IrStringConst,
+    IrArrayConst, IrStructConst, IrStructType
+};
+import muvm::irOps { IrOpcode, IrICmpPred, IrFCmpPred, irOpcodeStr };
+import muvm::regalloc::graph { graphAssignNodes };
+import std::string { String };
+import std::mman { alloc, dealloc, copy };
+import std::vec { Vec };
+import platform::libc { snprintf };
+import core::cchar { cchar };
+
+use muvm::target::primary::x86_64::linux::regs;
+use muvm::target::primary::x86_64::linux::linux { ArgClass, classifyArg, typeSizeBytes, typeIsSse, INT_ARG_REGS, SSE_ARG_REGS };
+use muvm::target::primary::x86_64::linux::prologue;
+
+use muvm::target::primary::x86_64::linux::core { EmitCtx, allocaOffOf, allocaSlotFor, canonAddr, emitByteReg, emitOpReg, emitRipSymName, emitWordReg, gepConstOffset, gepFoldRoot, intSfx, isVRegOperand, loadToReg, regForWidth, regName, storeImmEncodable, storeToVReg, vmapFind };
+use muvm::target::primary::x86_64::linux::simd { simdVecLoad, simdVecStore };
+
+/* ================= concrete opcode selectors ================= */
+
+/* frame offset of an alloca root, or -1. Lets gep chains fold straight
+ * to `leaq disp(%rbp)` instead of lea+lea through the alloca vreg. */
+pub i32 allocaRootOff(EmitCtx* c, IrValue* v)
+{
+    if (v == null || v->kind != IrValueKind::Inst) return -1;
+    IrInst* i = (IrInst*)v;
+    if (i->opcode != IrOpcode::Alloca) return -1;
+    return allocaOffOf(c, v);
+}
+
+pub void iselAlloca(EmitCtx* c, IrInst* inst)
+{
+    u32 dvid = c->vregFor(&inst->base);
+    if (c->vregs[(usize)dvid].noEmit != 0) return; /* folded into gep users */
+    IrType* et = inst->base.type;
+    if (et != null && et->kind == IrTypeKind::Ptr) et = et->elem;
+    u32 sz = et != null ? c->ictx->irTypeSizeOf(et) : 8;
+    if (sz == 0) sz = 8;
+    i32 off = allocaSlotFor(c, &inst->base, sz);
+    i32 dp = (i32)c->vregs[(usize)dvid].phys;
+    u8 useR = dp >= 0 ? (u8)dp : regs::SCRATCH_A;
+    c->emit("\tleaq -"); c->emitI64((i64)off); c->emit("(%rbp), ");
+    c->emit(regName(useR)); c->emitLine("");
+    if (dp < 0) storeToVReg(c, dvid, useR, 64);
+}
+
+pub void iselLoad(EmitCtx* c, IrInst* inst)
+{
+    /* redundant load: dst vreg already holds the value — emit nothing */
+    if (c->cseFind(&inst->base) != null && inst->nops > 0)
+    {
+        IrValue* addr = canonAddr(c, inst->ops[0]);
+        u32 w = inst->base.type != null ? inst->base.type->width : 64;
+        IrValue* prev = c->memLookup(addr, w);
+        if (prev != null)
+        {
+            IrValue* canon = c->cseFind(&inst->base);
+            c->memRecord(addr, canon != null ? canon : &inst->base, w);
+            return;
+        }
+    }
+    IrType* rt = inst->base.type;
+    if (rt != null && rt->kind == IrTypeKind::Vector)
+    {
+        simdVecLoad(c, inst);
+        return;
+    }
+    if (rt != null && (rt->kind == IrTypeKind::Struct ||
+        rt->kind == IrTypeKind::Array || rt->kind == IrTypeKind::Union))
+    {
+        /* aggregate load: the "value" is the address itself. vregFor
+         * identity-aliases it to the pointer operand; a non-vreg
+         * pointer materializes into the dst gpr. */
+        u32 dvid = c->vregFor(&inst->base);
+        if (inst->nops > 0 && isVRegOperand(inst->ops[0]))
+        {
+            i32 sv = vmapFind(&c->vmap, inst->ops[0]);
+            if (sv >= 0 && (u32)sv == dvid) return;
+        }
+        i32 dp = (i32)c->vregs[(usize)dvid].phys;
+        u8 useR = dp >= 0 ? (u8)dp : regs::SCRATCH_A;
+        loadToReg(c, inst->ops[0], useR, 64);
+        if (dp < 0) storeToVReg(c, dvid, useR, 64);
+        return;
+    }
+    u32 w = rt != null ? rt->width : 64;
+    IrValue* addr = inst->nops > 0 ? inst->ops[0] : null;
+    u32 dvid = c->vregFor(&inst->base);
+    i32 dp = (i32)c->vregs[(usize)dvid].phys;
+    u8 useR = dp >= 0 ? (u8)dp : regs::SCRATCH_A;
+    /* global/func/string address: fold to a RIP-relative load */
+    if (addr != null && (addr->kind == IrValueKind::Global ||
+        addr->kind == IrValueKind::Func || addr->kind == IrValueKind::StringConst))
+    {
+        c->emit("\t");
+        if (w <= 8) c->emit("movzbl ");
+        else if (w <= 16) c->emit("movzwl ");
+        else if (w <= 32) c->emit("movl ");
+        else c->emit("movq ");
+        emitRipSymName(c, addr); c->emit("(%rip), ");
+        c->emit(regForWidth(useR, w <= 32 ? 32 : 64)); c->emitLine("");
+        if (dp < 0) storeToVReg(c, dvid, useR, w);
+        if (inst->nops > 0)
+        {
+            IrValue* canon = c->cseFind(&inst->base);
+            c->memRecord(canonAddr(c, inst->ops[0]), canon != null ? canon : &inst->base, w);
+        }
+        return;
+    }
+    /* address -> scratch if spilled */
+    i32 avid = isVRegOperand(addr) ? vmapFind(&c->vmap, addr) : -1;
+    u8 addrR;
+    if (avid >= 0 && c->vregs[(usize)avid].phys >= 0)
+        addrR = (u8)c->vregs[(usize)avid].phys;
+    else
+    {
+        loadToReg(c, addr, regs::SCRATCH_B, 64);
+        addrR = regs::SCRATCH_B;
+    }
+    /* load width forms: 8->movzbl 16->movzwl 32->movl else movq */
+    c->emit("\t");
+    if (w <= 8) c->emit("movzbl ");
+    else if (w <= 16) c->emit("movzwl ");
+    else if (w <= 32) c->emit("movl ");
+    else c->emit("movq ");
+    c->emit("("); c->emit(regName(addrR)); c->emit("), ");
+    c->emit(regForWidth(useR, w <= 32 ? 32 : 64)); c->emitLine("");
+    if (dp < 0) storeToVReg(c, dvid, useR, w);
+    if (inst->nops > 0)
+    {
+        IrValue* canon = c->cseFind(&inst->base);
+        c->memRecord(canonAddr(c, inst->ops[0]), canon != null ? canon : &inst->base, w);
+    }
+}
+
+pub void iselStore(EmitCtx* c, IrInst* inst)
+{
+    c->memClear();
+    IrValue* val = inst->nops > 0 ? inst->ops[0] : null;
+    IrValue* addr = inst->nops > 1 ? inst->ops[1] : null;
+    u32 w = val != null && val->type != null ? val->type->width : 64;
+    if (val != null && val->type != null &&
+        val->type->kind == IrTypeKind::Vector)
+    {
+        simdVecStore(c, inst);
+        return;
+    }
+    if (val != null && val->type != null &&
+        (val->type->kind == IrTypeKind::Struct ||
+         val->type->kind == IrTypeKind::Array ||
+         val->type->kind == IrTypeKind::Union))
+    {
+        /* aggregate copy: both operands are pointers; rep movsb with
+         * the arg regs saved since they may hold live vregs */
+        u32 sz = typeSizeBytes(val->type);
+        if (sz == 0) sz = 8;
+        c->emitLine("\tpushq %rsi");
+        c->emitLine("\tpushq %rdi");
+        c->emitLine("\tpushq %rcx");
+        loadToReg(c, val, regs::RSI, 64);
+        loadToReg(c, addr, regs::RDI, 64);
+        c->emit("\tmovq $"); c->emitU64((u64)sz); c->emit(", %rcx\n");
+        c->emitLine("\trep movsb");
+        c->emitLine("\tpopq %rcx");
+        c->emitLine("\tpopq %rdi");
+        c->emitLine("\tpopq %rsi");
+        return;
+    }
+    /* global/func/string address: fold to a RIP-relative store */
+    if (addr != null && (addr->kind == IrValueKind::Global ||
+        addr->kind == IrValueKind::Func || addr->kind == IrValueKind::StringConst))
+    {
+        if (val != null && val->kind == IrValueKind::ConstInt &&
+            storeImmEncodable(w, val->valData))
+        {
+            c->emit("\tmov"); c->emit(intSfx(w)); c->emit(" $");
+            if (w <= 32) c->emitU64(val->valData & 0xFFFFFFFFu);
+            else if ((i64)val->valData < 0) c->emitI64((i64)val->valData);
+            else c->emitU64(val->valData);
+            c->emit(", ");
+            emitRipSymName(c, addr); c->emit("(%rip)"); c->emitLine("");
+        }
+        else
+        {
+            i32 vvid = isVRegOperand(val) ? vmapFind(&c->vmap, val) : -1;
+            u8 vp;
+            if (vvid >= 0 && c->vregs[(usize)vvid].phys >= 0 &&
+                c->vregs[(usize)vvid].klass != 1)
+                vp = (u8)c->vregs[(usize)vvid].phys;
+            else
+            {
+                loadToReg(c, val, regs::SCRATCH_A, w);
+                vp = regs::SCRATCH_A;
+            }
+            c->emit("\tmov"); c->emit(intSfx(w)); c->emit(" ");
+            if (w <= 8) emitByteReg(c, vp);
+            else if (w <= 16) emitWordReg(c, vp);
+            else c->emit(regForWidth(vp, w <= 32 ? 32 : 64));
+            c->emit(", "); emitRipSymName(c, addr); c->emit("(%rip)"); c->emitLine("");
+        }
+        return;
+    }
+    i32 avid = isVRegOperand(addr) ? vmapFind(&c->vmap, addr) : -1;
+    u8 addrR;
+    if (avid >= 0 && c->vregs[(usize)avid].phys >= 0)
+        addrR = (u8)c->vregs[(usize)avid].phys;
+    else
+    {
+        loadToReg(c, addr, regs::SCRATCH_B, 64);
+        addrR = regs::SCRATCH_B;
+    }
+    if (val != null && val->kind == IrValueKind::ConstInt &&
+        storeImmEncodable(w, val->valData))
+    {
+        c->emit("\tmov"); c->emit(intSfx(w)); c->emit(" $");
+        if (w <= 32) c->emitU64(val->valData & 0xFFFFFFFFu);
+        else if ((i64)val->valData < 0) c->emitI64((i64)val->valData);
+        else c->emitU64(val->valData);
+        c->emit(", (");
+        c->emit(regName(addrR)); c->emit(")"); c->emitLine("");
+        return;
+    }
+    /* value -> scratch reg then store, or direct reg store */
+    i32 vvid = isVRegOperand(val) ? vmapFind(&c->vmap, val) : -1;
+    if (vvid >= 0 && c->vregs[(usize)vvid].phys >= 0 &&
+        c->vregs[(usize)vvid].klass != 1)
+    {
+        u8 vp = (u8)c->vregs[(usize)vvid].phys;
+        c->emit("\tmov"); c->emit(intSfx(w)); c->emit(" ");
+        if (w <= 8) emitByteReg(c, vp);
+        else if (w <= 16) emitWordReg(c, vp);
+        else c->emit(regForWidth(vp, w <= 32 ? 32 : 64));
+        c->emit(", ("); c->emit(regName(addrR)); c->emit(")"); c->emitLine("");
+        return;
+    }
+    loadToReg(c, val, regs::SCRATCH_A, w);
+    c->emit("\tmov"); c->emit(intSfx(w)); c->emit(" ");
+    if (w <= 8) emitByteReg(c, regs::SCRATCH_A);
+    else if (w <= 16) emitWordReg(c, regs::SCRATCH_A);
+    else c->emit(regForWidth(regs::SCRATCH_A, w <= 32 ? 32 : 64));
+    c->emit(", ("); c->emit(regName(addrR)); c->emit(")"); c->emitLine("");
+}
+
+
+pub void iselGep(EmitCtx* c, IrInst* inst)
+{
+    /* ops[0]=base ptr, ops[1..]=indices; const offsets accumulate,
+     * dynamic indices scale by elem size and add. Ancestor const geps
+     * fold into a single root+offset so `gep (gep (gep a))` emits one
+     * leaq instead of a chain. */
+    IrValue* base = inst->nops > 0 ? inst->ops[0] : null;
+    i64 chainOff = 0;
+    IrValue* root = gepFoldRoot(c, base, &chainOff);
+    u32 dvid = c->vregFor(&inst->base);
+    /* gep+0 is a vreg alias; same-vid dst needs no code */
+    if (isVRegOperand(base))
+    {
+        i32 bv = vmapFind(&c->vmap, base);
+        if (bv >= 0 && (u32)bv == dvid) return;
+    }
+    i32 dp = (i32)c->vregs[(usize)dvid].phys;
+    u8 useR = dp >= 0 ? (u8)dp : regs::SCRATCH_A;
+
+    /* fast path: all-const indices -> single leaq off(base),dst */
+    if (inst->nops > 1)
+    {
+        bool allConst = true;
+        for (u32 gi = 1; gi < inst->nops; gi++)
+            if (inst->ops[gi] == null ||
+                inst->ops[gi]->kind != IrValueKind::ConstInt)
+                allConst = false;
+        if (allConst)
+        {
+            bool ok = false;
+            i64 cOff = chainOff + gepConstOffset(c, inst, &ok);
+            if (ok)
+            {
+                i32 aoff = allocaRootOff(c, root);
+                if (aoff >= 0)
+                {
+                    /* root is an alloca: single lea straight off rbp */
+                    c->emit("\tleaq "); c->emitI64(cOff - (i64)aoff);
+                    c->emit("(%rbp), ");
+                    c->emit(regForWidth(useR, 64)); c->emitLine("");
+                }
+                else
+                {
+                i32 avid = isVRegOperand(root) ? vmapFind(&c->vmap, root) : -1;
+                u8 addrR;
+                if (avid >= 0 && c->vregs[(usize)avid].phys >= 0 &&
+                    c->vregs[(usize)avid].klass != 1)
+                    addrR = (u8)c->vregs[(usize)avid].phys;
+                else
+                {
+                    loadToReg(c, root, regs::SCRATCH_B, 64);
+                    addrR = regs::SCRATCH_B;
+                }
+                if (cOff == 0)
+                {
+                    if (addrR != useR)
+                    {
+                        c->emit("\tmovq "); c->emit(regForWidth(addrR, 64));
+                        c->emit(", "); c->emit(regForWidth(useR, 64)); c->emitLine("");
+                    }
+                }
+                else
+                {
+                    c->emit("\tleaq "); c->emitI64(cOff); c->emit("(");
+                    c->emit(regName(addrR)); c->emit("), ");
+                    c->emit(regForWidth(useR, 64)); c->emitLine("");
+                }
+                }
+                if (dp < 0) storeToVReg(c, dvid, useR, 64);
+                return;
+            }
+        }
+    }
+
+    /* general path: root into dst reg, fold dynamic indices. Index
+     * scaling still uses `base`'s pointee type — only the address
+     * origin moved to the folded root. */
+    loadToReg(c, root, useR, 64);
+    IrType* cur = base != null ? base->type : null;
+    if (cur != null && cur->kind == IrTypeKind::Ptr) cur = cur->elem;
+    i64 cOff = chainOff;
+    for (u32 gi = 1; gi < inst->nops; gi++)
+    {
+        IrValue* ix = inst->ops[gi];
+        if (ix == null) continue;
+        bool isConst = ix->kind == IrValueKind::ConstInt;
+        if (cur != null &&
+            (cur->kind == IrTypeKind::Struct || cur->kind == IrTypeKind::Union))
+        {
+            u32 fi = isConst ? (u32)(ix->valData & 0xFFFFFFFF) : 0;
+            if (cur->kind == IrTypeKind::Struct && fi < cur->nparams)
+            {
+                u64 off = 0;
+                bool packed = (cur->tflags & 1) != 0;
+                for (u32 f = 0; f <= fi && f < cur->nparams; f++)
+                {
+                    IrType* ft = cur->params[f];
+                    if (!packed && ft != null)
+                    {
+                        u64 al = (u64)c->ictx->irTypeAlignOf(ft);
+                        if (al > 1) off = (off + al - 1) / al * al;
+                    }
+                    if (f == fi) break;
+                    if (ft != null) off += (u64)c->ictx->irTypeSizeOf(ft);
+                }
+                cOff += (i64)off;
+                cur = cur->params[fi];
+            }
+            else cur = null;
+        }
+        else
+        {
+            IrType* et = null;
+            u64 esz = 1;
+            if (cur != null && (cur->kind == IrTypeKind::Array ||
+                                cur->kind == IrTypeKind::Vector)) et = cur->elem;
+            else if (cur != null && cur->kind == IrTypeKind::Ptr) et = cur->elem;
+            if (et != null) esz = (u64)c->ictx->irTypeSizeOf(et);
+            else if (cur != null &&
+                     (cur->kind == IrTypeKind::Int ||
+                      cur->kind == IrTypeKind::Float))
+                esz = (u64)c->ictx->irTypeSizeOf(cur);
+            if (esz == 0) esz = 1;
+            if (isConst)
+                cOff += (i64)ix->valData * (i64)esz;
+            else
+            {
+                loadToReg(c, ix, regs::SCRATCH_B, 64);
+                if (esz != 1)
+                {
+                    c->emit("\timulq $"); c->emitI64((i64)esz); c->emit(", ");
+                    c->emit(regForWidth(regs::SCRATCH_B, 64)); c->emitLine("");
+                }
+                emitOpReg(c, "add", 64, regs::SCRATCH_B, useR);
+            }
+            cur = et;
+        }
+    }
+    if (cOff != 0)
+    {
+        c->emit("\taddq $"); c->emitI64(cOff); c->emit(", ");
+        c->emit(regName(useR)); c->emitLine("");
+    }
+    if (dp < 0) storeToVReg(c, dvid, useR, 64);
+}
+

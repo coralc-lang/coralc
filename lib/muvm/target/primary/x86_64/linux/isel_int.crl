@@ -1,0 +1,700 @@
+#[[no_drop_all]]
+import muvm::irtypes {
+    IrModule, IrFunc, IrBlock, IrInst, IrValue, IrValueKind,
+    IrType, IrTypeKind, IrContext, IrGlobal, IrStringConst,
+    IrArrayConst, IrStructConst, IrStructType
+};
+import muvm::irOps { IrOpcode, IrICmpPred, IrFCmpPred, irOpcodeStr };
+import muvm::regalloc::graph { graphAssignNodes };
+import std::string { String };
+import std::mman { alloc, dealloc, copy };
+import std::vec { Vec };
+import platform::libc { snprintf };
+import core::cchar { cchar };
+
+use muvm::target::primary::x86_64::linux::regs;
+use muvm::target::primary::x86_64::linux::linux { ArgClass, classifyArg, typeSizeBytes, typeIsSse, INT_ARG_REGS, SSE_ARG_REGS };
+use muvm::target::primary::x86_64::linux::prologue;
+
+use muvm::target::primary::x86_64::linux::core { EmitCtx, Shape, TyClass, tyClassOf, VReg, emitByteReg, emitOpImm, emitOpMem, emitOpReg, emitRegExact, emitWordReg, emitXmmReg, intSfx, isVRegOperand, loadToReg, loadToXmm, regForWidth, regName, regW, shapeOf, spillOff, storeFromXmm, storeImmEncodable, storeToVReg, vmapFind };
+
+/* ================= isel rule tables =================
+ * Rule = {shape mask for operand B (and C), action id}.
+ * Shape masks are bitmasks over Shape bits; SH_ANY matches all.
+ * The matcher computes the actual shapes and picks the first rule
+ * whose mask intersects — rules are ordered cheapest-first. */
+
+/* actions for the binary int/logic group */
+pub enum AluAct
+{
+    ACT_ALU_REG = 0,   /* op breg, dst      (b in phys reg) */
+    ACT_ALU_IMM,       /* op $imm, dst      (b const)      */
+    ACT_ALU_MEM,       /* op slot(%rbp),dst (b spilled)    */
+    ACT_ALU_ANY        /* fallback: scratch  */
+}
+
+/* shared binary-op selector: dst = a <sop> b.
+ * operand A always materializes into the dst register first;
+ * operand B selects reg/imm/mem form by shape. */
+pub void iselAlu(EmitCtx* c, IrInst* inst, str sop)
+{
+    u32 w = inst->base.type != null ? inst->base.type->width : 64;
+    if (tyClassOf(inst->base.type) == TyClass::TC_VECTOR ||
+        tyClassOf(inst->base.type) == TyClass::TC_OTHER)
+    {
+        c->emit("\t# isel: unsupported type class for ");
+        c->emit(irOpcodeStr(inst->opcode)); c->emitLine("");
+        return;
+    }
+    u32 dvid = c->vregFor(&inst->base);
+    i32 dp = (i32)c->vregs[(usize)dvid].phys;
+    u8 useR = dp >= 0 ? (u8)dp : regs::SCRATCH_A;
+
+    /* rules for operand B, cheapest first */
+    IrValue* a = inst->nops > 0 ? inst->ops[0] : null;
+    IrValue* b = inst->nops > 1 ? inst->ops[1] : null;
+    u32 bshape = shapeOf(c, b);
+
+    loadToReg(c, a, useR, w);
+
+    if (b != null && b->kind == IrValueKind::ConstInt &&
+        (bshape & (u32)Shape::SH_CONST) != 0)
+    {
+        /* add/sub/or/xor/shift by 0 are no-ops (imul $0/$1 handled
+         * by caller rarely; keep emitting for safety) */
+        bool identOp = inst->opcode == IrOpcode::Add ||
+                       inst->opcode == IrOpcode::Sub ||
+                       inst->opcode == IrOpcode::And ||
+                       inst->opcode == IrOpcode::Or ||
+                       inst->opcode == IrOpcode::Xor;
+        if (!(identOp && b->valData == 0))
+            emitOpImm(c, sop, w, b->valData, useR);
+    }
+    else
+    {
+        i32 bvid = isVRegOperand(b) ? vmapFind(&c->vmap, b) : -1;
+        if (bvid >= 0 && c->vregs[(usize)bvid].phys >= 0 &&
+            (u8)c->vregs[(usize)bvid].phys != useR)
+        {
+            emitOpReg(c, sop, w, (u8)c->vregs[(usize)bvid].phys, useR);
+        }
+        else if (bvid >= 0 && c->vregs[(usize)bvid].phys < 0 &&
+                 c->vregs[(usize)bvid].klass != 1)
+        {
+            /* spilled gpr operand: memory form directly */
+            emitOpMem(c, sop, w, spillOff(c, c->vregs[(usize)bvid].slot), false, useR);
+        }
+        else
+        {
+            /* xmm/addr/any: materialize into scratch then op */
+            loadToReg(c, b, regs::SCRATCH_B, w);
+            emitOpReg(c, sop, w, regs::SCRATCH_B, useR);
+        }
+    }
+    if (dp < 0) storeToVReg(c, dvid, useR, w);
+}
+
+pub void iselShift(EmitCtx* c, IrInst* inst, str sop)
+{
+    u32 w = inst->base.type != null ? inst->base.type->width : 64;
+    u32 dvid = c->vregFor(&inst->base);
+    i32 dp = (i32)c->vregs[(usize)dvid].phys;
+    u8 useR = dp >= 0 ? (u8)dp : regs::SCRATCH_A;
+    IrValue* a = inst->nops > 0 ? inst->ops[0] : null;
+    IrValue* cnt = inst->nops > 1 ? inst->ops[1] : null;
+    loadToReg(c, a, useR, w);
+
+    if (cnt != null && cnt->kind == IrValueKind::ConstInt)
+    {
+        u64 k = cnt->valData & (w >= 64 ? 63 : 31);
+        c->emit("\t"); c->emit(sop); c->emit(" $");
+        c->emitU64(k); c->emit(", "); emitRegExact(c, useR, w); c->emitLine("");
+    }
+    else
+    {
+        /* count must be in %cl. If the count vreg already sits in rcx
+         * the shift is free; otherwise save/restore rcx around the
+         * move. If dst itself is rcx, shuttle through r10. */
+        i32 cvid = isVRegOperand(cnt) ? vmapFind(&c->vmap, cnt) : -1;
+        i32 cp = cvid >= 0 ? c->vregs[(usize)cvid].phys : -1;
+        if (cp == (i32)regs::RCX)
+        {
+            c->emit("\t"); c->emit(sop); c->emit(" %cl, ");
+            emitRegExact(c, useR, w); c->emitLine("");
+        }
+        else if (useR == regs::RCX)
+        {
+            /* dst in rcx: move result out, load count, shift r10, back */
+            c->emit("\tmov"); c->emit(intSfx(w)); c->emit(" ");
+            emitRegExact(c, regs::RCX, w); c->emit(", ");
+            emitRegExact(c, regs::SCRATCH_A, w); c->emitLine("");
+            loadToReg(c, cnt, regs::RCX, w);
+            c->emit("\t"); c->emit(sop); c->emit(" %cl, ");
+            emitRegExact(c, regs::SCRATCH_A, w); c->emitLine("");
+            c->emit("\tmov"); c->emit(intSfx(w)); c->emit(" ");
+            emitRegExact(c, regs::SCRATCH_A, w); c->emit(", ");
+            emitRegExact(c, regs::RCX, w); c->emitLine("");
+        }
+        else
+        {
+            c->emitLine("\tpushq %rcx");
+            loadToReg(c, cnt, regs::RCX, w);
+            c->emit("\t"); c->emit(sop); c->emit(" %cl, ");
+            emitRegExact(c, useR, w); c->emitLine("");
+            c->emitLine("\tpopq %rcx");
+        }
+    }
+    if (dp < 0) storeToVReg(c, dvid, useR, w);
+}
+
+/* reg name holding operand v at width w; materializes into `scratch`
+ * only when the operand has no phys home. Avoids the mov a->scratch
+ * that loadToReg would emit for operands already in a register. */
+pub str operandRegFor(EmitCtx* c, IrValue* v, u32 w, u8 scratch)
+{
+    u32 rw = regW(w);
+    i32 vid = isVRegOperand(v) ? vmapFind(&c->vmap, v) : -1;
+    if (vid >= 0 && c->vregs[(usize)vid].phys >= 0 &&
+        c->vregs[(usize)vid].klass != 1)
+        return regForWidth((u8)c->vregs[(usize)vid].phys, rw);
+    loadToReg(c, v, scratch, w);
+    return regForWidth(scratch, rw);
+}
+
+/* emit `cmp b, a` (AT&T: computes a - b) choosing the cheapest form:
+ * a in its own reg when possible, b as imm / reg / spill-slot mem. */
+pub void emitCmpPair(EmitCtx* c, IrValue* a, IrValue* b, u32 w)
+{
+    u32 rw = regW(w);
+    str areg = operandRegFor(c, a, w, regs::SCRATCH_A);
+    if (b != null && b->kind == IrValueKind::ConstInt)
+    {
+        /* cmp imm is imm32 (sign-extended at 64-bit) — wider consts
+         * go through a scratch reg */
+        if (storeImmEncodable(w, b->valData))
+        {
+            c->emit("\tcmp"); c->emit(intSfx(rw)); c->emit(" $");
+            if (rw <= 32) c->emitU64(b->valData & 0xFFFFFFFFu);
+            else if ((i64)b->valData < 0) c->emitI64((i64)b->valData);
+            else c->emitU64(b->valData);
+            c->emit(", "); c->emit(areg); c->emitLine("");
+            return;
+        }
+        c->emit("\tmovabsq $"); c->emitU64(b->valData); c->emit(", %r11\n");
+        c->emit("\tcmp"); c->emit(intSfx(rw)); c->emit(" %r11, ");
+        c->emit(areg); c->emitLine("");
+        return;
+    }
+    i32 bvid = isVRegOperand(b) ? vmapFind(&c->vmap, b) : -1;
+    if (bvid >= 0 && c->vregs[(usize)bvid].phys >= 0 &&
+        c->vregs[(usize)bvid].klass != 1)
+    {
+        c->emit("\tcmp"); c->emit(intSfx(rw)); c->emit(" ");
+        c->emit(regForWidth((u8)c->vregs[(usize)bvid].phys, rw));
+        c->emit(", "); c->emit(areg); c->emitLine("");
+    }
+    else if (bvid >= 0 && c->vregs[(usize)bvid].phys < 0 &&
+             c->vregs[(usize)bvid].klass != 1)
+    {
+        c->emit("\tcmp"); c->emit(intSfx(rw)); c->emit(" -");
+        c->emitI64((i64)spillOff(c, c->vregs[(usize)bvid].slot));
+        c->emit("(%rbp), "); c->emit(areg); c->emitLine("");
+    }
+    else
+    {
+        str breg = operandRegFor(c, b, w, regs::SCRATCH_B);
+        c->emit("\tcmp"); c->emit(intSfx(rw)); c->emit(" ");
+        c->emit(breg); c->emit(", "); c->emit(areg); c->emitLine("");
+    }
+}
+
+pub void iselICmp(EmitCtx* c, IrInst* inst)
+{
+    IrValue* a = inst->nops > 0 ? inst->ops[0] : null;
+    IrValue* b = inst->nops > 1 ? inst->ops[1] : null;
+    u32 w = a != null && a->type != null ? a->type->width : 64;
+    emitCmpPair(c, a, b, w);
+    /* setcc into dst (i1 materialized as 0/1 in a 32-bit reg) */
+    u32 dvid = c->vregFor(&inst->base);
+    i32 dp = (i32)c->vregs[(usize)dvid].phys;
+    u8 useR = dp >= 0 ? (u8)dp : regs::SCRATCH_A;
+    str setop = "setne";
+    switch (inst->icmpPred)
+    {
+        IrICmpPred::Eq => { setop = "sete"; },
+        IrICmpPred::Ne => { setop = "setne"; },
+        IrICmpPred::Slt => { setop = "setl"; },
+        IrICmpPred::Sle => { setop = "setle"; },
+        IrICmpPred::Sgt => { setop = "setg"; },
+        IrICmpPred::Sge => { setop = "setge"; },
+        IrICmpPred::Ult => { setop = "setb"; },
+        IrICmpPred::Ule => { setop = "setbe"; },
+        IrICmpPred::Ugt => { setop = "seta"; },
+        IrICmpPred::Uge => { setop = "setae"; },
+    }
+    c->emit("\t"); c->emit(setop); c->emit(" ");
+    emitByteReg(c, useR); c->emitLine("");
+    c->emit("\tmovzbl "); emitByteReg(c, useR); c->emit(", ");
+    c->emit(regForWidth(useR, 32)); c->emitLine("");
+    storeToVReg(c, dvid, useR, 32);
+}
+
+
+/* div/rem: dst = a / b or a % b. x86 needs rax=dividend (rdx sign/zero
+ * extended), divisor in a non-rax/rdx reg; result rax(quot)/rdx(rem). */
+pub void iselDivRem(EmitCtx* c, IrInst* inst, bool isSigned, bool wantRem)
+{
+    IrValue* a = inst->nops > 0 ? inst->ops[0] : null;
+    IrValue* b = inst->nops > 1 ? inst->ops[1] : null;
+    u32 w = a != null && a->type != null ? a->type->width : 64;
+    u32 rw = regW(w);
+    /* paired div: previous inst already ran idiv on (a,b,signed) —
+     * rax=quot rdx=rem are still live, skip straight to the result. */
+    if (c->divValid != 0 && c->divA == a && c->divB == b &&
+        c->divSigned == (isSigned ? 1 : 0))
+    {
+        u32 dvid = c->vregFor(&inst->base);
+        i32 dp = (i32)c->vregs[(usize)dvid].phys;
+        u8 srcR = wantRem ? regs::RDX : regs::RAX;
+        if (dp >= 0)
+        {
+            if ((i32)srcR != dp)
+            {
+                c->emit("\tmov"); c->emit(intSfx(rw)); c->emit(" ");
+                c->emit(regForWidth(srcR, rw)); c->emit(", ");
+                c->emit(regForWidth((u8)dp, rw)); c->emitLine("");
+            }
+        }
+        else storeToVReg(c, dvid, srcR, w);
+        /* a result landing in rax/rdx clobbers the pair — drop it */
+        if (dp == (i32)regs::RAX || dp == (i32)regs::RDX) c->divValid = 0;
+        return;
+    }
+    /* dividend -> rax */
+    loadToReg(c, a, regs::RAX, w);
+    /* sign/zero extend into rdx */
+    if (isSigned)
+    {
+        c->emit("\t"); c->emit(w <= 32 ? "cltd" : "cqo"); c->emitLine("");
+    }
+    else
+    {
+        c->emit("\txor"); c->emit(intSfx(rw)); c->emit(" ");
+        c->emit(regForWidth(regs::RDX, rw)); c->emit(", ");
+        c->emit(regForWidth(regs::RDX, rw)); c->emitLine("");
+    }
+    /* divisor -> scratch (never rax/rdx) */
+    loadToReg(c, b, regs::SCRATCH_A, w);
+    str dreg = regForWidth(regs::SCRATCH_A, rw);
+    c->emit("\t"); c->emit(isSigned ? "idiv" : "div"); c->emit(intSfx(rw));
+    c->emit(" "); c->emit(dreg); c->emitLine("");
+    /* result: quot in rax, rem in rdx */
+    u32 dvid = c->vregFor(&inst->base);
+    i32 dp = (i32)c->vregs[(usize)dvid].phys;
+    u8 srcR = wantRem ? regs::RDX : regs::RAX;
+    if (dp >= 0)
+    {
+        if ((i32)srcR != dp)
+        {
+            c->emit("\tmov"); c->emit(intSfx(rw)); c->emit(" ");
+            c->emit(regForWidth(srcR, rw)); c->emit(", ");
+            c->emit(regForWidth((u8)dp, rw)); c->emitLine("");
+        }
+    }
+    else storeToVReg(c, dvid, srcR, w);
+    /* remember the pair so an adjacent matching div reuses rax/rdx —
+     * unless the result mov clobbered one of them */
+    c->divA = a; c->divB = b; c->divSigned = isSigned ? 1 : 0;
+    c->divValid = (dp == (i32)regs::RAX || dp == (i32)regs::RDX) ? 0 : 1;
+}
+
+pub void iselSelect(EmitCtx* c, IrInst* inst)
+{
+    /* ops: cond, trueVal, falseVal */
+    if (inst->nops < 3) return;
+    IrValue* cond = inst->ops[0];
+    u32 w = inst->base.type != null ? inst->base.type->width : 64;
+    u32 dvid = c->vregFor(&inst->base);
+    i32 dp = (i32)c->vregs[(usize)dvid].phys;
+    u8 useR = dp >= 0 ? (u8)dp : regs::SCRATCH_A;
+    /* dst = falseVal; scratch = trueVal; cmov if cond */
+    loadToReg(c, inst->ops[2], useR, w);
+    loadToReg(c, inst->ops[1], regs::SCRATCH_B, w);
+    /* test cond */
+    i32 cvid = isVRegOperand(cond) ? vmapFind(&c->vmap, cond) : -1;
+    if (cvid >= 0 && c->vregs[(usize)cvid].phys >= 0)
+    {
+        str r = regForWidth((u8)c->vregs[(usize)cvid].phys, regW(w));
+        c->emit("\ttest"); c->emit(intSfx(regW(w))); c->emit(" ");
+        c->emit(r); c->emit(", "); c->emit(r); c->emitLine("");
+    }
+    else if (cond != null && cond->kind == IrValueKind::ConstInt)
+    {
+        /* const cond: just mov the right value — redo dst */
+        loadToReg(c, cond->valData != 0 ? inst->ops[1] : inst->ops[2], useR, w);
+        if (dp < 0) storeToVReg(c, dvid, useR, w);
+        return;
+    }
+    else
+    {
+        c->emit("\t# isel: unsupported select cond\n");
+        if (dp < 0) storeToVReg(c, dvid, useR, w);
+        return;
+    }
+    c->emit("\tcmovne "); c->emit(regForWidth(regs::SCRATCH_B, regW(w)));
+    c->emit(", "); c->emit(regForWidth(useR, regW(w))); c->emitLine("");
+    if (dp < 0) storeToVReg(c, dvid, useR, w);
+}
+
+pub void iselCast(EmitCtx* c, IrInst* inst)
+{
+    if (inst->nops < 1) return;
+    IrValue* src = inst->ops[0];
+    IrType* st = src->type;
+    u32 sw = st != null ? st->width : 64;
+    u32 dw = inst->base.type != null ? inst->base.type->width : 64;
+    if (inst->base.type != null && inst->base.type->kind == IrTypeKind::Void)
+        return; /* (void)x bitcast — pure no-op */
+    u32 dvid = c->vregFor(&inst->base);
+    i32 dp = (i32)c->vregs[(usize)dvid].phys;
+    /* bitcast/trunc are vreg aliases; a same-vid dst needs no code */
+    if ((inst->opcode == IrOpcode::Bitcast || inst->opcode == IrOpcode::Trunc) &&
+        isVRegOperand(src))
+    {
+        i32 sv = vmapFind(&c->vmap, src);
+        if (sv >= 0 && (u32)sv == dvid) return;
+    }
+    /* cross-class bitcast (int<->float): real movd/movq between reg
+     * files — the vreg alias path only covers same-class bitcasts. */
+    if (inst->opcode == IrOpcode::Bitcast && isVRegOperand(src))
+    {
+        i32 sv = vmapFind(&c->vmap, src);
+        u8 sk = sv >= 0 ? c->vregs[(usize)sv].klass : 0;
+        u8 dk = c->vregs[(usize)dvid].klass;
+        if (sk != dk)
+        {
+            if (sk == 1)
+            {
+                /* xmm -> gpr */
+                i32 sp2 = sv >= 0 ? (i32)c->vregs[(usize)sv].phys : -1;
+                u8 useX = sp2 >= 0 ? (u8)sp2 : regs::XMM15;
+                if (sp2 < 0) loadToXmm(c, src, useX, sw);
+                u8 useR = dp >= 0 ? (u8)dp : regs::SCRATCH_A;
+                if (sw <= 32)
+                {
+                    c->emit("\tmovd "); emitXmmReg(c, useX); c->emit(", ");
+                    c->emit(regForWidth(useR, 32)); c->emitLine("");
+                }
+                else
+                {
+                    c->emit("\tmovq "); emitXmmReg(c, useX); c->emit(", ");
+                    c->emit(regName(useR)); c->emitLine("");
+                }
+                if (dp < 0) storeToVReg(c, dvid, useR, dw);
+            }
+            else
+            {
+                /* gpr -> xmm */
+                u8 useX = dp >= 0 ? (u8)dp : regs::XMM15;
+                u8 useR = regs::SCRATCH_A;
+                loadToReg(c, src, useR, sw);
+                if (sw <= 32)
+                {
+                    c->emit("\tmovd "); c->emit(regForWidth(useR, 32)); c->emit(", ");
+                    emitXmmReg(c, useX); c->emitLine("");
+                }
+                else
+                {
+                    c->emit("\tmovq "); c->emit(regName(useR)); c->emit(", ");
+                    emitXmmReg(c, useX); c->emitLine("");
+                }
+                if (dp < 0) storeFromXmm(c, dvid, useX, dw);
+            }
+            return;
+        }
+    }
+    u8 useR = dp >= 0 ? (u8)dp : regs::SCRATCH_A;
+    loadToReg(c, src, useR, sw);
+
+    switch (inst->opcode)
+    {
+        IrOpcode::Bitcast | IrOpcode::Trunc => {
+            /* same-width reinterpret or low-bits keep: the value is
+             * already in useR; sub-width dst reads only low bits. */
+        },
+        IrOpcode::Zext => {
+            if (sw <= 8) { c->emit("\tmovzbl "); emitByteReg(c, useR); c->emit(", "); c->emit(regForWidth(useR, 32)); c->emitLine(""); }
+            else if (sw <= 16) { c->emit("\tmovzwl "); emitWordReg(c, useR); c->emit(", "); c->emit(regForWidth(useR, 32)); c->emitLine(""); }
+            else if (sw <= 32 && dw > 32) { /* movl already zero-extended via loadToReg */ }
+        },
+        IrOpcode::Sext => {
+            if (sw <= 8) { c->emit("\tmovsbl "); emitByteReg(c, useR); c->emit(", "); c->emit(regForWidth(useR, 32)); c->emitLine(""); }
+            else if (sw <= 16) { c->emit("\tmovswl "); emitWordReg(c, useR); c->emit(", "); c->emit(regForWidth(useR, 32)); c->emitLine(""); }
+            else if (sw <= 32 && dw > 32) { c->emit("\tmovslq "); c->emit(regForWidth(useR, 32)); c->emit(", "); c->emit(regName(useR)); c->emitLine(""); }
+        },
+        else => { }
+    }
+    if (dp < 0) storeToVReg(c, dvid, useR, dw);
+}
+
+
+pub void iselBitop(EmitCtx* c, IrInst* inst)
+{
+    if (inst->nops < 1) return;
+    IrValue* src = inst->ops[0];
+    u32 w = inst->base.type != null ? inst->base.type->width : 64;
+    u32 dvid = c->vregFor(&inst->base);
+    i32 dp = (i32)c->vregs[(usize)dvid].phys;
+    u8 useR = dp >= 0 ? (u8)dp : regs::SCRATCH_A;
+    loadToReg(c, src, useR, w);
+    str suff = w <= 32 ? "l" : "q";
+    switch (inst->opcode)
+    {
+        IrOpcode::CtPop | IrOpcode::CtLz | IrOpcode::CtTz =>
+        {
+            /* no 8/16-bit forms: zero-extend into 32 bits, run the
+             * 32/64-bit op; lzcnt needs a width bias correction */
+            str mn = inst->opcode == IrOpcode::CtPop ? "popcnt" :
+                     inst->opcode == IrOpcode::CtLz ? "lzcnt" : "tzcnt";
+            u32 bias = 0;
+            if (w <= 8)
+            {
+                c->emit("\tmovzbl "); emitByteReg(c, useR); c->emit(", ");
+                c->emit(regForWidth(useR, 32)); c->emitLine("");
+                bias = 24;
+            }
+            else if (w <= 16)
+            {
+                c->emit("\tmovzwl "); emitWordReg(c, useR); c->emit(", ");
+                c->emit(regForWidth(useR, 32)); c->emitLine("");
+                bias = 16;
+            }
+            u32 ow = w >= 64 ? 64 : 32;
+            str oreg = regForWidth(useR, ow);
+            c->emit("\t"); c->emit(mn); c->emit(intSfx(ow)); c->emit(" ");
+            c->emit(oreg); c->emit(", "); c->emit(oreg); c->emitLine("");
+            if (bias > 0 && inst->opcode == IrOpcode::CtLz)
+            {
+                c->emit("\tsubl $"); c->emitU64((u64)bias); c->emit(", ");
+                c->emit(regForWidth(useR, 32)); c->emitLine("");
+            }
+        },
+        IrOpcode::Bswap =>
+        {
+            if (w <= 8) { /* single byte: identity */ }
+            else if (w <= 16)
+            {
+                /* no bswap r16: rotate the 16-bit reg by 8 */
+                c->emit("\trolw $8, "); emitWordReg(c, useR); c->emitLine("");
+            }
+            else
+            {
+                c->emit("\tbswap"); c->emit(suff); c->emit(" ");
+                c->emit(regForWidth(useR, regW(w))); c->emitLine("");
+            }
+        },
+        IrOpcode::Rotl | IrOpcode::Rotr =>
+        {
+            /* count in %cl for non-const (same dance as iselShift) */
+            bool left = inst->opcode == IrOpcode::Rotl;
+            IrValue* cnt = inst->nops > 1 ? inst->ops[1] : null;
+            str sop = left ? "rol" : "ror";
+            str rsfx = intSfx(w);
+            if (cnt != null && cnt->kind == IrValueKind::ConstInt)
+            {
+                u64 k = cnt->valData & (w >= 64 ? 63 : 31);
+                c->emit("\t"); c->emit(sop); c->emit(rsfx); c->emit(" $");
+                c->emitU64(k); c->emit(", "); emitRegExact(c, useR, w); c->emitLine("");
+            }
+            else
+            {
+                i32 cvid = isVRegOperand(cnt) ? vmapFind(&c->vmap, cnt) : -1;
+                i32 cp = cvid >= 0 ? c->vregs[(usize)cvid].phys : -1;
+                if (cp == (i32)regs::RCX)
+                {
+                    c->emit("\t"); c->emit(sop); c->emit(rsfx); c->emit(" %cl, ");
+                    emitRegExact(c, useR, w); c->emitLine("");
+                }
+                else if (useR == regs::RCX)
+                {
+                    c->emit("\tmov"); c->emit(intSfx(w)); c->emit(" ");
+                    emitRegExact(c, regs::RCX, w); c->emit(", ");
+                    emitRegExact(c, regs::SCRATCH_A, w); c->emitLine("");
+                    loadToReg(c, cnt, regs::RCX, w);
+                    c->emit("\t"); c->emit(sop); c->emit(rsfx); c->emit(" %cl, ");
+                    emitRegExact(c, regs::SCRATCH_A, w); c->emitLine("");
+                    c->emit("\tmov"); c->emit(intSfx(w)); c->emit(" ");
+                    emitRegExact(c, regs::SCRATCH_A, w); c->emit(", ");
+                    emitRegExact(c, regs::RCX, w); c->emitLine("");
+                }
+                else
+                {
+                    c->emitLine("\tpushq %rcx");
+                    loadToReg(c, cnt, regs::RCX, w);
+                    c->emit("\t"); c->emit(sop); c->emit(rsfx); c->emit(" %cl, ");
+                    emitRegExact(c, useR, w); c->emitLine("");
+                    c->emitLine("\tpopq %rcx");
+                }
+            }
+        },
+        else => { }
+    }
+    if (dp < 0) storeToVReg(c, dvid, useR, w);
+}
+
+/* MulHi/SMulHi: high half of the 2w-bit product.
+ * w>=32: mul/imul leaves it in rdx. w<32: canonicalize operands to
+ * 32 bits, mul32 (product fits in eax), then shift eax right by w. */
+pub void iselMulHi(EmitCtx* c, IrInst* inst)
+{
+    if (inst->nops < 2) return;
+    IrValue* a = inst->ops[0];
+    IrValue* b = inst->ops[1];
+    u32 w = inst->base.type != null ? inst->base.type->width : 64;
+    bool sgn = inst->opcode == IrOpcode::SMulHi;
+    u32 dvid = c->vregFor(&inst->base);
+    i32 dp = (i32)c->vregs[(usize)dvid].phys;
+    u8 useR = dp >= 0 ? (u8)dp : regs::SCRATCH_B;
+    u8 ra = regs::RAX;
+    u8 rc = regs::SCRATCH_A;
+    /* canonicalize <=16-bit operands into 32-bit regs first — a 64-bit
+     * mul would read garbage upper bits */
+    loadToReg(c, a, ra, w);
+    if (w <= 8)
+    {
+        c->emit("\t"); c->emit(sgn ? "movsbl %al, %eax" : "movzbl %al, %eax"); c->emitLine("");
+    }
+    else if (w <= 16)
+    {
+        c->emit("\t"); c->emit(sgn ? "movswl %ax, %eax" : "movzwl %ax, %eax"); c->emitLine("");
+    }
+    loadToReg(c, b, rc, w);
+    if (w <= 8)
+    {
+        c->emit("\t"); c->emit(sgn ? "movsbl %cl, %ecx" : "movzbl %cl, %ecx"); c->emitLine("");
+    }
+    else if (w <= 16)
+    {
+        c->emit("\t"); c->emit(sgn ? "movswl %cx, %ecx" : "movzwl %cx, %ecx"); c->emitLine("");
+    }
+    bool bInSlot = false;
+    i32 bvid = isVRegOperand(b) ? vmapFind(&c->vmap, b) : -1;
+    VReg* br = bvid >= 0 ? &c->vregs[(usize)bvid] : null;
+    if (br != null && br->phys < 0 && br->slot >= 0) bInSlot = true;
+    /* for narrow widths b was already materialized into rcx above;
+     * the slot form only applies at w>=32 where we skipped loadToReg? —
+     * loadToReg always ran, so rcx always holds b. Use reg form. */
+    c->emit("\t"); c->emit(sgn ? "imul" : "mul");
+    c->emit(w >= 64 ? "q" : "l"); c->emit(" ");
+    c->emit(regForWidth(rc, w >= 64 ? 64 : 32)); c->emitLine("");
+    (void)bInSlot;
+    if (w < 32)
+    {
+        /* product sits in eax; high w bits = eax >>w */
+        c->emit("\tmovl %eax, "); c->emit(regForWidth(useR, 32)); c->emitLine("");
+        c->emit("\t"); c->emit(sgn ? "sarl" : "shrl"); c->emit(" $");
+        c->emitU64((u64)w); c->emit(", "); c->emit(regForWidth(useR, 32)); c->emitLine("");
+    }
+    else
+    {
+        /* 32-bit mul zero-extends rdx, so movq %rdx works for w=32 too */
+        c->emit("\tmovq %rdx, "); c->emit(regName(useR)); c->emitLine("");
+        if (w == 32) { /* dst i32 reads low 32 = edx */ }
+    }
+    if (dp < 0) storeToVReg(c, dvid, useR, w);
+}
+
+/* SMin/SMax/UMin/UMax: dst=a; cmp b,a; cmov */
+pub void iselMinMax(EmitCtx* c, IrInst* inst)
+{
+    if (inst->nops < 2) return;
+    IrValue* a = inst->ops[0];
+    IrValue* b = inst->ops[1];
+    u32 w = inst->base.type != null ? inst->base.type->width : 64;
+    u32 dvid = c->vregFor(&inst->base);
+    i32 dp = (i32)c->vregs[(usize)dvid].phys;
+    u8 useR = dp >= 0 ? (u8)dp : regs::SCRATCH_A;
+    /* dst starts as a; b overwrites when it wins */
+    loadToReg(c, a, useR, w);
+    i32 bvid = isVRegOperand(b) ? vmapFind(&c->vmap, b) : -1;
+    VReg* br = bvid >= 0 ? &c->vregs[(usize)bvid] : null;
+    str suff = w <= 32 ? "l" : "q";
+    bool bInSlot = br != null && br->phys < 0 && br->slot >= 0;
+    u8 bs = regs::SCRATCH_B;
+    /* materialize b into a reg BEFORE the cmp line — loadToReg emits
+     * whole lines and can't interleave inside an operand */
+    if (!bInSlot) loadToReg(c, b, bs, w);
+    c->emit("\tcmp"); c->emit(suff); c->emit(" ");
+    if (bInSlot)
+    {
+        c->emit("-"); c->emitI64((i64)spillOff(c, br->slot)); c->emit("(%rbp), ");
+    }
+    else c->emit(regForWidth(bs, w));
+    c->emit(", "); c->emit(regForWidth(useR, w)); c->emitLine("");
+    /* after cmp b,a: a-b. want dst=b when:
+     *  smin: a>b (SF!=OF -> use cmovg on a-b? a-b>0 => a>b) -> cmovg
+     *  Actually cmp src,dst computes dst-src = a-b. */
+    str cc = "";
+    bool hascc = false;
+    switch (inst->opcode)
+    {
+        IrOpcode::SMin => { cc = "cmovg "; hascc = true; },  /* a>b -> take b */
+        IrOpcode::SMax => { cc = "cmovl "; hascc = true; },  /* a<b -> take b */
+        IrOpcode::UMin => { cc = "cmova "; hascc = true; },  /* a>b unsigned -> take b */
+        IrOpcode::UMax => { cc = "cmovb "; hascc = true; },  /* a<b unsigned -> take b */
+        else => { }
+    }
+    if (hascc)
+    {
+        /* bs already holds b unless it was a slot operand */
+        if (bInSlot)
+        {
+            c->emit("\tmov"); c->emit(suff); c->emit(" -");
+            c->emitI64((i64)spillOff(c, br->slot)); c->emit("(%rbp), ");
+            c->emit(regForWidth(bs, w)); c->emitLine("");
+        }
+        c->emit("\t"); c->emit(cc); c->emit(regForWidth(bs, w)); c->emit(", ");
+        c->emit(regForWidth(useR, w)); c->emitLine("");
+    }
+    if (dp < 0) storeToVReg(c, dvid, useR, w);
+}
+
+/* Abs: dst = |a| via sign-mask */
+pub void iselAbs(EmitCtx* c, IrInst* inst)
+{
+    if (inst->nops < 1) return;
+    IrValue* src = inst->ops[0];
+    u32 w = inst->base.type != null ? inst->base.type->width : 64;
+    u32 dvid = c->vregFor(&inst->base);
+    i32 dp = (i32)c->vregs[(usize)dvid].phys;
+    u8 useR = dp >= 0 ? (u8)dp : regs::SCRATCH_A;
+    u8 ms = regs::SCRATCH_B;
+    loadToReg(c, src, useR, w);
+    /* narrow operands: sign-extend into 32 bits so the mask idiom
+     * sees a clean sign bit (upper bits may be garbage) */
+    if (w <= 8)
+    {
+        c->emit("\tmovsbl "); emitByteReg(c, useR); c->emit(", ");
+        c->emit(regForWidth(useR, 32)); c->emitLine("");
+        w = 32;
+    }
+    else if (w <= 16)
+    {
+        c->emit("\tmovswl "); emitWordReg(c, useR); c->emit(", ");
+        c->emit(regForWidth(useR, 32)); c->emitLine("");
+        w = 32;
+    }
+    /* ms = a >>s (w-1) ; useR = (a ^ ms) - ms */
+    c->emit("\tmov"); c->emit(w <= 32 ? "l" : "q"); c->emit(" ");
+    c->emit(regForWidth(useR, w)); c->emit(", ");
+    c->emit(regForWidth(ms, w)); c->emitLine("");
+    c->emit("\tsar"); c->emit(w <= 32 ? "l" : "q"); c->emit(" $");
+    c->emitU64((u64)(w - 1)); c->emit(", "); c->emit(regForWidth(ms, w)); c->emitLine("");
+    c->emit("\txor"); c->emit(w <= 32 ? "l" : "q"); c->emit(" ");
+    c->emit(regForWidth(ms, w)); c->emit(", "); c->emit(regForWidth(useR, w)); c->emitLine("");
+    c->emit("\tsub"); c->emit(w <= 32 ? "l" : "q"); c->emit(" ");
+    c->emit(regForWidth(ms, w)); c->emit(", "); c->emit(regForWidth(useR, w)); c->emitLine("");
+    if (dp < 0) storeToVReg(c, dvid, useR, w);
+}
+
+/* phys reg currently holding `av`, or -1 for const/mem/global/unmapped */

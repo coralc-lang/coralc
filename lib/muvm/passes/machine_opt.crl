@@ -1,9 +1,10 @@
 #[[no_drop_all]]
-import muvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, FunctionAnalysisCache, irTypeEqual };
+import muvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind, IrType, FunctionAnalysisCache, irTypeEqual };
 import muvm::irOps { IrOpcode };
 import muvm::passes::alias_analysis { AliasAnalysis };
 import muvm::passes::memory_ssa { MemorySSA };
-import muvm::base::domtree { IrDomTree, irDomtreeNew, irDomtreeFree, irDomtreeDominates };
+import muvm::base::domtree { IrDomTree, irDomtreeNew, irDomtreeFree, irDomtreeDominates, irDomtreeChildCount, irDomtreeChild };
+import std::mman { alloc, dealloc };
 
 // Machine-level CSE/DSE pass using MemorySSA.
 //
@@ -19,6 +20,15 @@ import muvm::base::domtree { IrDomTree, irDomtreeNew, irDomtreeFree, irDomtreeDo
 // MemorySSA provides candidate defs; the actual legality of every rewrite
 // is re-established by AA + dominance + region scans, so the pass stays
 // sound even though the version web is a linear approximation.
+// avail-chain entry for cross-block redundant load elimination
+struct LoadCand
+{
+    IrInst* inst;
+    IrValue* addr;   // canonicalized
+    IrType* ty;
+    i32 next;        // next candidate with same addr, -1 = end
+}
+
 pub struct MachineOptPass
 {
     IrContext* ctx;
@@ -32,7 +42,13 @@ pub struct MachineOptPass
             .ctx = ctx,
             .forwardingDone = 0,
             .loadsEliminated = 0,
-            .storesEliminated = 0
+            .storesEliminated = 0,
+            .loadCands = null,
+            .loadCandCap = 0,
+            .nLoadCands = 0,
+            .lcKeys = null,
+            .lcVals = null,
+            .lcMask = 0
         };
     }
 
@@ -76,6 +92,9 @@ pub struct MachineOptPass
             IrBlock* bb = func->blocks[bi];
             if (self.processBlockWithMemorySSA(bb, &mssa, dt)) changed = true;
         }
+
+        // Pass 1.5 — cross-block redundant load elimination
+        if (self.eliminateRedundantLoads(func, &mssa, dt)) changed = true;
 
         // Pass 2 — dead store elimination using MemorySSA
         if (self.eliminateDeadStores(func, &mssa)) changed = true;
@@ -402,6 +421,198 @@ pub struct MachineOptPass
             return false;
         if (inst->nops < 2 || inst->ops[1] == null) return false;
         return inst->ops[1]->id == addr->id;
+    }
+
+    // ------------------------------------------------------------------
+    // Cross-block redundant load elimination.
+    //
+    // A load is redundant when an earlier load of the same canonical
+    // address and type dominates it with no may-alias write on any
+    // path between — exactly the canForward contract with the earlier
+    // load as "killer". Loads are visited in domtree preorder so every
+    // dominator is seen before its dominated blocks; per-address
+    // candidate chains are capped to bound the region scans.
+    // ------------------------------------------------------------------
+    IrValue* canonAddr(IrValue* v)
+    {
+        while (v != null && v->kind == IrValueKind::Inst)
+        {
+            IrInst* i = (IrInst*)v;
+            if (i->opcode == IrOpcode::Bitcast && i->nops >= 1)
+            {
+                v = i->ops[0];
+                continue;
+            }
+            if (i->opcode == IrOpcode::Gep && i->nops >= 2)
+            {
+                bool allZero = true;
+                for (u32 k = 1; k < i->nops; k++)
+                {
+                    if (i->ops[k] == null ||
+                        i->ops[k]->kind != IrValueKind::ConstInt ||
+                        i->ops[k]->valData != 0)
+                    {
+                        allZero = false;
+                        break;
+                    }
+                }
+                if (allZero) { v = i->ops[0]; continue; }
+            }
+            break;
+        }
+        return v;
+    }
+
+    u32 loadCandCap;
+    LoadCand* loadCands;
+    u32 nLoadCands;
+
+    usize* lcKeys;
+    i32* lcVals;
+    u32 lcMask;
+
+    void ensureLoadCands(u32 need)
+    {
+        if (need <= self.loadCandCap) return;
+        u32 nc = self.loadCandCap ? self.loadCandCap * 2 : 64;
+        while (nc < need) nc *= 2;
+        LoadCand* nn = alloc<LoadCand>((usize)nc);
+        for (u32 i = 0; i < self.nLoadCands; i++) nn[i] = self.loadCands[i];
+        if (self.loadCands != null) dealloc<LoadCand>(self.loadCands);
+        self.loadCands = nn;
+        self.loadCandCap = nc;
+    }
+
+    void ensureLcMap(u32 need)
+    {
+        u32 want = 16;
+        while (want < need * 2) want *= 2;
+        if (self.lcMask + 1 >= want) return;
+        if (self.lcKeys != null) { dealloc<usize>(self.lcKeys); dealloc<i32>(self.lcVals); }
+        self.lcKeys = alloc<usize>((usize)want);
+        self.lcVals = alloc<i32>((usize)want);
+        for (u32 i = 0; i < want; i++) { self.lcKeys[i] = 0; self.lcVals[i] = -1; }
+        self.lcMask = want - 1;
+        // rehash existing candidates
+        for (u32 i = 0; i < self.nLoadCands; i++)
+        {
+            usize k = (usize)self.loadCands[i].addr;
+            u32 h = (u32)(((u64)k * 0x9E3779B1UL) >> 16) & self.lcMask;
+            while (self.lcKeys[h] != 0 && self.lcKeys[h] != k)
+                h = (h + 1) & self.lcMask;
+            if (self.lcKeys[h] == 0) self.lcKeys[h] = k;
+            self.loadCands[i].next = self.lcVals[h];
+            self.lcVals[h] = (i32)i;
+        }
+    }
+
+    i32 lcHead(usize key)
+    {
+        if (self.lcKeys == null) return -1;
+        u32 h = (u32)(((u64)key * 0x9E3779B1UL) >> 16) & self.lcMask;
+        while (self.lcKeys[h] != 0)
+        {
+            if (self.lcKeys[h] == key) return self.lcVals[h];
+            h = (h + 1) & self.lcMask;
+        }
+        return -1;
+    }
+
+    void lcPush(usize key, i32 idx)
+    {
+        u32 h = (u32)(((u64)key * 0x9E3779B1UL) >> 16) & self.lcMask;
+        while (self.lcKeys[h] != 0 && self.lcKeys[h] != key)
+            h = (h + 1) & self.lcMask;
+        if (self.lcKeys[h] == 0) self.lcKeys[h] = key;
+        self.loadCands[idx].next = self.lcVals[h];
+        self.lcVals[h] = idx;
+    }
+
+    void lcReset()
+    {
+        self.nLoadCands = 0;
+        if (self.lcKeys != null)
+            for (u32 i = 0; i <= self.lcMask; i++) { self.lcKeys[i] = 0; self.lcVals[i] = -1; }
+    }
+
+    void loadCandDeinit()
+    {
+        if (self.loadCands != null) dealloc<LoadCand>(self.loadCands);
+        if (self.lcKeys != null) dealloc<usize>(self.lcKeys);
+        if (self.lcVals != null) dealloc<i32>(self.lcVals);
+        self.loadCands = null;
+        self.lcKeys = null;
+        self.lcVals = null;
+        self.loadCandCap = 0;
+        self.nLoadCands = 0;
+        self.lcMask = 0;
+    }
+
+    bool lcScanBlock(IrInst* inst, IrFunc* func, IrDomTree* dt, MemorySSA* mssa)
+    {
+        // caller guarantees opcode == Load with ops[0] and type
+        IrValue* caddr = self.canonAddr(inst->ops[0]);
+        if (caddr == null || inst->base.type == null) return false;
+        usize key = (usize)caddr;
+        self.ensureLcMap(self.nLoadCands + 8);
+        i32 ci = self.lcHead(key);
+        u32 tried = 0;
+        while (ci >= 0 && tried < 8)
+        {
+            LoadCand* cd = &self.loadCands[ci];
+            tried++;
+            if (cd->ty != null && inst->base.type != null &&
+                irTypeEqual(cd->ty, inst->base.type) &&
+                cd->inst != null && cd->inst->parent != null &&
+                self.canForward(cd->inst, inst, func, dt, mssa))
+            {
+                inst->base.replaceAllUses(&cd->inst->base);
+                inst->erase();
+                self.loadsEliminated++;
+                return true;
+            }
+            ci = cd->next;
+        }
+        // survives — becomes a candidate for later loads
+        self.ensureLoadCands(self.nLoadCands + 1);
+        u32 ni = self.nLoadCands++;
+        self.loadCands[ni].inst = inst;
+        self.loadCands[ni].addr = caddr;
+        self.loadCands[ni].ty = inst->base.type;
+        self.loadCands[ni].next = -1;
+        self.lcPush(key, (i32)ni);
+        return false;
+    }
+
+    void lcWalk(IrFunc* func, IrDomTree* dt, IrBlock* bb, MemorySSA* mssa, bool* changed)
+    {
+        if (bb == null) return;
+        u32 i = 0;
+        while (i < bb->ninsts)
+        {
+            IrInst* inst = bb->insts[i];
+            if (inst != null && inst->opcode == IrOpcode::Load &&
+                inst->nops > 0 && inst->ops[0] != null &&
+                self.lcScanBlock(inst, func, dt, mssa))
+            {
+                *changed = true;
+                continue;   // erased: insts shifted, same index is next
+            }
+            i++;
+        }
+        u32 nc = irDomtreeChildCount(dt, bb);
+        for (u32 i = 0; i < nc; i++)
+            self.lcWalk(func, dt, irDomtreeChild(dt, bb, i), mssa, changed);
+    }
+
+    bool eliminateRedundantLoads(IrFunc* func, MemorySSA* mssa, IrDomTree* dt)
+    {
+        if (func == null || dt == null) return false;
+        self.lcReset();
+        bool changed = false;
+        self.lcWalk(func, dt, func->blocks[0], mssa, &changed);
+        self.loadCandDeinit();
+        return changed;
     }
 }
 
